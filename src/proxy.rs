@@ -216,6 +216,7 @@ fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
                 crate::snippet::SnippetType::FilePath => "path",
                 crate::snippet::SnippetType::NumericConstant => "num",
                 crate::snippet::SnippetType::ErrorMessage => "err",
+                crate::snippet::SnippetType::ProperNoun => "ref",
             };
             let _ = writeln!(out, "    ├ {label}: {}", s.content);
         }
@@ -352,7 +353,7 @@ async fn lcm_compress(
         _ => {
             // Fallback: read from DB directly
             let db = state.dag.db();
-            let raw = db.get_messages_in_range(op.conv_id, op.from as i64, op.to as i64);
+            let raw = db.get_messages_in_range(op.conv_id, op.from, op.to);
             match raw {
                 Ok(msgs) if msgs.len() >= 2 => msgs,
                 _ => return (StatusCode::BAD_REQUEST, String::from("need at least 2 messages to compress")).into_response(),

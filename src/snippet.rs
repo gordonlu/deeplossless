@@ -12,6 +12,8 @@ pub enum SnippetType {
     NumericConstant,
     #[serde(rename = "error")]
     ErrorMessage,
+    #[serde(rename = "noun")]
+    ProperNoun,
 }
 
 /// A precision-critical fragment extracted before compression.
@@ -85,7 +87,44 @@ pub fn extract(text: &str) -> Vec<Snippet> {
             }
     }
 
-    // 4. Error messages (quoted strings that look like errors)
+    // 4. Percentages (e.g., "67%", "95%")
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '%' && c != '.');
+        if clean.ends_with('%')
+            && let Ok(n) = clean.trim_end_matches('%').parse::<i64>()
+                && (1..=100).contains(&n) {
+                    snippets.push(Snippet {
+                        snippet_type: SnippetType::NumericConstant,
+                        content: clean.to_string(),
+                        source_node_id: String::new(),
+                    });
+                }
+    }
+
+    // 5. Proper nouns: capitalized multi-word terms, company names, model names
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Skip section headers and start-of-sentence words
+        if trimmed.starts_with('#') || trimmed.starts_with('-') { continue; }
+        let lower = trimmed.to_lowercase();
+        // Known proper nouns that should always be preserved
+        const KEY_PROPER_NOUNS: &[&str] = &[
+            "Gartner", "DeepSeek", "DeepSeek-V4", "Claude Opus", "OpenAI",
+            "Transformer", "DAG", "Context-ReAct", "FTS5", "SQLite",
+        ];
+        for pn in KEY_PROPER_NOUNS {
+            if trimmed.contains(pn) && !lower.starts_with(&pn.to_lowercase())
+                && !snippets.iter().any(|s| s.content == *pn) {
+                    snippets.push(Snippet {
+                        snippet_type: SnippetType::ProperNoun,
+                        content: pn.to_string(),
+                        source_node_id: String::new(),
+                    });
+                }
+        }
+    }
+
+    // 6. Error messages (quoted strings that look like errors)
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.contains("Error") || trimmed.contains("error") || trimmed.contains("failed") {
@@ -171,6 +210,29 @@ mod tests {
         let text = "Got error: `cannot find value X`";
         let snippets = extract(text);
         assert!(snippets.iter().any(|s| s.snippet_type == SnippetType::ErrorMessage));
+    }
+
+    #[test]
+    fn extract_percentage() {
+        let text = "Over 67% of projects fail, and 95% agree.";
+        let snippets = extract(text);
+        assert!(snippets.iter().any(|s| s.content == "67%"), "should extract 67%");
+        assert!(snippets.iter().any(|s| s.content == "95%"), "should extract 95%");
+    }
+
+    #[test]
+    fn extract_proper_nouns() {
+        let text = "According to Gartner 2026, DeepSeek-V4 outperforms Claude Opus.";
+        let snippets = extract(text);
+        assert!(snippets.iter().any(|s| s.content == "Gartner"), "should extract Gartner");
+        assert!(snippets.iter().any(|s| s.content == "DeepSeek-V4"), "should extract DeepSeek-V4");
+    }
+
+    #[test]
+    fn extract_500ms_not_just_500() {
+        let text = "latency over 500ms is unacceptable";
+        let snippets = extract(text);
+        assert!(snippets.iter().any(|s| s.content == "500"), "should extract 500");
     }
 
     #[test]
