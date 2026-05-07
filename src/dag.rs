@@ -45,6 +45,8 @@ impl Default for DagConfig {
 
 // ── Core types ─────────────────────────────────────────────────────────
 
+use crate::snippet::Snippet;
+
 /// A node in the summary DAG. Nodes form a forest per conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagNode {
@@ -61,6 +63,8 @@ pub struct DagNode {
     pub child_ids: Vec<i64>,
     /// True when this is a raw message leaf (level 0).
     pub is_leaf: bool,
+    /// Precision-critical snippets extracted before compression.
+    pub snippets: Vec<Snippet>,
 }
 
 // ── Engine ─────────────────────────────────────────────────────────────
@@ -146,6 +150,33 @@ impl DagEngine {
         self.db.insert_dag_node(conv_id, 0, summary, token_count, &[], &[], true)
     }
 
+    /// Like `compress_group` but also stores extracted snippets for
+    /// lossless value preservation (Context-ReAct Snippet, §3.2).
+    pub fn compress_group_with_snippets(
+        &self,
+        conv_id: i64,
+        parent_ids: &[i64],
+        summary: &str,
+        token_count: i64,
+        level: u8,
+        snippets: &[crate::snippet::Snippet],
+    ) -> anyhow::Result<DagNode> {
+        let new_node = self.db.insert_dag_node_full(
+            conv_id,
+            level.min(self.config.max_level),
+            summary,
+            token_count,
+            parent_ids,
+            &[],
+            snippets,
+            false,
+        )?;
+        for pid in parent_ids {
+            self.db.add_child_to_node(*pid, new_node.id)?;
+        }
+        Ok(new_node)
+    }
+
     /// Compress a group of nodes into a higher-level summary node.
     /// `parent_ids` are the source nodes, `level` is the target level.
     /// Returns the new summary node.
@@ -157,13 +188,27 @@ impl DagEngine {
         token_count: i64,
         level: u8,
     ) -> anyhow::Result<DagNode> {
-        let new_node = self.db.insert_dag_node(
+        self.compress_group_with_snippets(conv_id, parent_ids, summary, token_count, level, &[])
+    }
+
+    #[allow(dead_code)]
+    fn compress_group_inner(
+        &self,
+        conv_id: i64,
+        parent_ids: &[i64],
+        summary: &str,
+        token_count: i64,
+        level: u8,
+        snippets: &[crate::snippet::Snippet],
+    ) -> anyhow::Result<DagNode> {
+        let new_node = self.db.insert_dag_node_full(
             conv_id,
             level.min(self.config.max_level),
             summary,
             token_count,
             parent_ids,
-            &[],    // children populated below
+            &[],
+            snippets,
             false,
         )?;
 

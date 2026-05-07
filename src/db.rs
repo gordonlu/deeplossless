@@ -118,6 +118,7 @@ impl Database {
                 token_count     INTEGER NOT NULL,
                 parent_ids      TEXT NOT NULL DEFAULT '[]',
                 child_ids       TEXT NOT NULL DEFAULT '[]',
+                snippets        TEXT NOT NULL DEFAULT '[]',
                 is_leaf         INTEGER NOT NULL DEFAULT 1,
                 created_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -201,13 +202,28 @@ impl Database {
         child_ids: &[i64],
         is_leaf: bool,
     ) -> anyhow::Result<DagNode> {
+        self.insert_dag_node_full(conversation_id, level, summary, token_count, parent_ids, child_ids, &[], is_leaf)
+    }
+
+    pub fn insert_dag_node_full(
+        &self,
+        conversation_id: i64,
+        level: u8,
+        summary: &str,
+        token_count: i64,
+        parent_ids: &[i64],
+        child_ids: &[i64],
+        snippets: &[crate::snippet::Snippet],
+        is_leaf: bool,
+    ) -> anyhow::Result<DagNode> {
         let conn = self.conn.lock().unwrap();
         let parent_json = serde_json::to_string(parent_ids)?;
         let child_json = serde_json::to_string(child_ids)?;
+        let snippet_json = serde_json::to_string(snippets)?;
         conn.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, is_leaf as i32],
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32],
         )?;
         let id = conn.last_insert_rowid();
         Ok(DagNode {
@@ -218,6 +234,7 @@ impl Database {
             token_count,
             parent_ids: parent_ids.to_vec(),
             child_ids: child_ids.to_vec(),
+            snippets: snippets.to_vec(),
             is_leaf,
         })
     }
@@ -225,7 +242,7 @@ impl Database {
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
              FROM dag_nodes WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
@@ -238,7 +255,7 @@ impl Database {
         // would also match ids like 12 appearing inside 123 or 412.
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
-                    n.token_count, n.parent_ids, n.child_ids, n.is_leaf
+                    n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf
              FROM dag_nodes n, json_each(n.parent_ids) AS j
              WHERE j.value = ?1
              LIMIT ?2",
@@ -254,7 +271,7 @@ impl Database {
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
              FROM dag_nodes WHERE conversation_id = ?1 AND level > 0
              ORDER BY level DESC, id DESC LIMIT 1",
         )?;
@@ -265,7 +282,7 @@ impl Database {
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
              FROM dag_nodes
              WHERE conversation_id = ?1 AND level = (
                  SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0
@@ -281,7 +298,7 @@ impl Database {
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
              FROM dag_nodes WHERE conversation_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -299,7 +316,7 @@ impl Database {
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
              FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1
              ORDER BY id ASC",
         )?;
@@ -369,7 +386,8 @@ impl Database {
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let parent_str: String = row.get(5)?;
         let child_str: String = row.get(6)?;
-        let is_leaf_int: i32 = row.get(7)?;
+        let snippet_str: String = row.get(7)?;
+        let is_leaf_int: i32 = row.get(8)?;
         Ok(DagNode {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -378,6 +396,7 @@ impl Database {
             token_count: row.get(4)?,
             parent_ids: serde_json::from_str(&parent_str).unwrap_or_default(),
             child_ids: serde_json::from_str(&child_str).unwrap_or_default(),
+            snippets: serde_json::from_str(&snippet_str).unwrap_or_default(),
             is_leaf: is_leaf_int != 0,
         })
     }

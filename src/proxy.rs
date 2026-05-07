@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/grep/:conv_id", get(lcm_grep))
         .route("/v1/lcm/expand/:node_id", get(lcm_expand))
         .route("/v1/lcm/status/:conv_id", get(lcm_status))
+        .route("/v1/lcm/snippets/:node_id", get(lcm_snippets))
         .route("/health", get(|| async { StatusCode::OK }))
 }
 
@@ -176,6 +177,18 @@ fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
                 node.parent_ids.len()
             );
         }
+        if !node.snippets.is_empty() {
+            let _ = writeln!(out, "  ├ snippets:");
+            for s in &node.snippets {
+                let label = match s.snippet_type {
+                    crate::snippet::SnippetType::CodeBlock => "code",
+                    crate::snippet::SnippetType::FilePath => "path",
+                    crate::snippet::SnippetType::NumericConstant => "num",
+                    crate::snippet::SnippetType::ErrorMessage => "err",
+                };
+                let _ = writeln!(out, "  │  [{label}] {}", s.content);
+            }
+        }
     }
     out
 }
@@ -218,6 +231,24 @@ async fn lcm_expand(
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("expand error: {e}")).into_response()
         }
+    }
+}
+
+async fn lcm_snippets(
+    State(state): State<AppState>,
+    Path(node_id): Path<i64>,
+) -> Response {
+    match state.dag.get_node(node_id) {
+        Ok(Some(node)) => {
+            Json(serde_json::json!({
+                "node_id": node_id,
+                "snippets": node.snippets,
+                "summary": node.summary,
+            }))
+            .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}")).into_response(),
     }
 }
 

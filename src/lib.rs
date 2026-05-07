@@ -5,6 +5,7 @@ pub mod dag;
 pub mod db;
 pub mod proxy;
 pub mod session;
+pub mod snippet;
 pub mod summarizer;
 pub mod tokenizer;
 

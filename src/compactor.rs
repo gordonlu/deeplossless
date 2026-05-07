@@ -197,7 +197,9 @@ async fn do_compress(
         Ok((summary, level)) => {
             let tc = crate::tokenizer::count(&summary) as i64;
             let dag_level = level.to_dag_level();
-            match dag.compress_group(conv_id, &node_ids, &summary, tc, dag_level) {
+            // Extract snippets before compression to preserve precision (#10)
+            let snippets = crate::snippet::extract(&text);
+            match dag.compress_group_with_snippets(conv_id, &node_ids, &summary, tc, dag_level, &snippets) {
                 Ok(node) => {
                     let _ = event_tx.send(CompactEvent::GroupCompressed {
                         conv_id,
