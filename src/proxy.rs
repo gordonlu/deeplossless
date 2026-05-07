@@ -5,7 +5,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
-use reqwest::Client;
 use serde_json::Value;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;

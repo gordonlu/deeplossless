@@ -1,9 +1,8 @@
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::dag::{DagEngine, DagConfig, DagNode};
 use crate::db::Database;
-use crate::summarizer::{Summarizer, SummarizerConfig, SummaryLevel};
+use crate::summarizer::{Summarizer, SummarizerConfig};
 
 /// Commands sent from the main thread to the compaction worker.
 pub enum CompactCommand {

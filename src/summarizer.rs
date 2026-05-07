@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// Three-level summarization escalation (LCM §2.3, Fig. 3).
 ///
