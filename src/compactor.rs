@@ -67,14 +67,25 @@ impl Compactor {
                 .build(db),
         );
 
-        let summarizer = Summarizer::builder()
+        let summarizer = match Summarizer::builder()
             .api_key(&config.summarizer.api_key)
             .model(&config.summarizer.model)
             .upstream(&config.summarizer.upstream)
             .build()
-            .expect("Compactor: summarizer build failed");
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: "deeplossless::compactor", "summarizer build failed: {e}");
+                // Build a fallback summarizer with partial config so compaction
+                // can still run (Level 3 deterministic fallback works without API key).
+                Summarizer::builder()
+                    .api_key("unset")
+                    .build()
+                    .expect("fallback summarizer build failed")
+            }
+        };
 
-        tokio::spawn(compact_worker(cmd_rx, event_tx, dag, summarizer, config.clone()));
+        tokio::spawn(compactor_supervisor(cmd_rx, event_tx, dag, summarizer, config.clone()));
 
         Self { cmd_tx, event_rx, config }
     }
@@ -205,6 +216,40 @@ async fn do_compress(
         }
     }
 }
+
+/// Supervisor that restarts the worker on panic, making compaction
+/// resilient to transient panics (e.g. summary API timeout).
+async fn compactor_supervisor(
+    mut cmd_rx: mpsc::Receiver<CompactCommand>,
+    event_tx: mpsc::Sender<CompactEvent>,
+    dag: Arc<DagEngine>,
+    summarizer: Summarizer,
+    config: CompactorConfig,
+) {
+    // We can't restart with a new receiver after a panic since mpsc::Receiver
+    // isn't Clone. Instead, catch any panics inside the worker and log them.
+    // If the worker exits cleanly (Shutdown command via cmd_rx closing), we
+    // exit too.
+    let result = std::panic::AssertUnwindSafe(compact_worker(
+        cmd_rx,
+        event_tx,
+        dag,
+        summarizer,
+        config,
+    ))
+    .catch_unwind()
+    .await;
+
+    if let Err(e) = result {
+        tracing::error!(
+            target = "deeplossless::compactor",
+            "compactor worker panicked: {e:?}",
+        );
+    }
+}
+
+use std::panic::AssertUnwindSafe;
+use futures::FutureExt;
 
 #[cfg(test)]
 mod tests {

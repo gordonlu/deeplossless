@@ -1,6 +1,9 @@
+use axum::Router;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 
 mod compactor;
 mod dag;
@@ -88,14 +91,33 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     };
 
-    let app = proxy::routes().with_state(state);
+    let app = proxy::routes()
+        .with_state(state)
+        .layer(CatchPanicLayer::new())
+        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)); // 20 MB
 
     let addr = format!("{}:{}", cli.host, cli.port);
     tracing::info!("deeplossless listening on {addr}");
     tracing::info!("upstream: {}", upstream);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+
+    // Graceful shutdown: wait for SIGTERM/SIGINT (Ctrl+C), then
+    // drain pending requests with a 15-second timeout.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let ctrl_c = tokio::signal::ctrl_c();
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .ok();
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = async { if let Some(ref mut s) = term { s.recv().await; } } => {},
+            }
+            tracing::info!("shutdown signal received, draining requests…");
+        })
+        .await?;
+
+    tracing::info!("deeplossless stopped");
 
     Ok(())
 }

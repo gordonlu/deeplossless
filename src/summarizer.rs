@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Three-level summarization escalation (LCM §2.3, Fig. 3).
 ///
@@ -92,6 +93,7 @@ impl SummarizerBuilder {
 ///
 /// Guarantees convergence: Level 3 (deterministic truncation) always
 /// produces output shorter than input, no LLM required.
+#[derive(Clone)]
 pub struct Summarizer {
     config: SummarizerConfig,
     client: reqwest::Client,
@@ -186,26 +188,54 @@ impl Summarizer {
             "temperature": 0.3,
         });
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .json(&body)
-            .send()
-            .await?;
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let result = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .json(&body)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LLM summarization failed: HTTP {status}: {text}");
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(value) => {
+                                if let Some(content) = value["choices"][0]["message"]["content"].as_str() {
+                                    return Ok(content.to_string());
+                                }
+                            }
+                            Err(e) => last_error = Some(anyhow::anyhow!("parse error: {e}")),
+                        }
+                    } else if status.as_u16() == 429 {
+                        // Rate limited — backoff and retry
+                        let delay = Duration::from_secs(2u64.pow(attempt as u32));
+                        tokio::time::sleep(delay).await;
+                        last_error = Some(anyhow::anyhow!("HTTP {status}"));
+                        continue;
+                    } else {
+                        let text = resp.text().await.unwrap_or_default();
+                        last_error = Some(anyhow::anyhow!("HTTP {status}: {text}"));
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("{e}"));
+                    if e.is_timeout() || e.is_connect() {
+                        let delay = Duration::from_secs(2u64.pow(attempt as u32));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                }
+            }
+            break;
         }
 
-        let value: serde_json::Value = resp.json().await?;
-        let content = value["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("LLM summarization: unexpected response format"))?;
-
-        Ok(content.to_string())
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("LLM summarization failed after {max_retries} retries")))
     }
 
     fn truncate(&self, text: &str) -> String {
