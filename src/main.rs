@@ -1,17 +1,12 @@
 use axum::Router;
 use clap::Parser;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
-mod compactor;
-mod dag;
-mod db;
-mod proxy;
-mod session;
-mod summarizer;
-mod tokenizer;
+use deeplossless::AppState;
+
+use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Lossless Context Management proxy for DeepSeek API")]
@@ -37,9 +32,9 @@ struct Cli {
 struct AppState {
     upstream: String,
     api_key: String,
-    db: Arc<db::Database>,
-    dag: Arc<dag::DagEngine>,
-    compactor: Arc<Mutex<compactor::Compactor>>,
+    db: Arc<deeplossless::db::Database>,
+    dag: Arc<deeplossless::dag::DagEngine>,
+    compactor: Arc<Mutex<deeplossless::compactor::Compactor>>,
     client: reqwest::Client,
 }
 
@@ -59,18 +54,18 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = cli.upstream.clone();
     let db = Arc::new(
-        db::Database::builder()
+        deeplossless::db::Database::builder()
             .path(&cli.db_path)
             .build()
             .await?,
     );
     let dag = Arc::new(
-        dag::DagEngine::builder()
+        deeplossless::dag::DagEngine::builder()
             .build(db.clone()),
     );
 
-    let compactor_config = crate::compactor::CompactorConfig {
-        summarizer: summarizer::SummarizerConfig {
+    let compactor_config = deeplossless::compactor::CompactorConfig {
+        summarizer: deeplossless::summarizer::SummarizerConfig {
             api_key: api_key.clone(),
             upstream: upstream.clone(),
             ..Default::default()
@@ -78,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let compactor = Arc::new(Mutex::new(
-        crate::compactor::Compactor::spawn(db.clone(), compactor_config),
+        deeplossless::compactor::Compactor::spawn(db.clone(), compactor_config),
     ));
 
     let state = AppState {

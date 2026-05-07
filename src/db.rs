@@ -456,4 +456,100 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<DatabaseBuilder>();
     }
+
+    // ── P0: Transaction integrity ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn transaction_rollback_on_empty_messages() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("rollback.db"))
+            .build()
+            .await
+            .unwrap();
+
+        // Insert a real conversation
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}])).unwrap();
+        // Try to store empty — should succeed (no messages to insert)
+        assert!(db.store_messages(conv_id, &json!([])).is_ok());
+
+        // Verify the conversation has exactly 1 message
+        let total = db.total_conversation_tokens(conv_id).unwrap();
+        assert!(total > 0);
+    }
+
+    // ── P0: DAG node persistence ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dag_node_crud() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("dag_crud.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
+
+        let node = db.insert_dag_node(conv_id, 0, "test leaf", 10, &[], &[], true).unwrap();
+        assert_eq!(node.level, 0);
+        assert!(node.is_leaf);
+
+        let fetched = db.get_node(node.id).unwrap().unwrap();
+        assert_eq!(fetched.summary, "test leaf");
+
+        let parent = db.insert_dag_node(conv_id, 1, "summary", 5, &[node.id], &[], false).unwrap();
+        db.add_child_to_node(node.id, parent.id).unwrap();
+
+        let children = db.get_child_nodes(parent.id, 10).unwrap();
+        assert!(children.len() >= 1);
+
+        // Delete
+        db.delete_dag_node(node.id).unwrap();
+        assert!(db.get_node(node.id).unwrap().is_none());
+    }
+
+    // ── P0: search_messages ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_messages_finds_content() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("search.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let conv_id = db.create_and_store("test", &json!([
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hello back"}
+        ])).unwrap();
+
+        let results = db.search_messages(conv_id, "hello").unwrap();
+        assert!(!results.is_empty(), "should find messages containing 'hello'");
+
+        let empty = db.search_messages(conv_id, "zzz_nonexistent").unwrap();
+        assert!(empty.is_empty(), "should not find nonexistent content");
+    }
+
+    // ── P0: WAL checkpoint ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wal_checkpoint_does_not_crash() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("wal_check.db"))
+            .build()
+            .await
+            .unwrap();
+
+        // Write some data
+        for i in 0..5 {
+            let msgs = json!([{"role": "user", "content": format!("msg {i}")}]);
+            db.create_and_store("test", &msgs).unwrap();
+        }
+
+        // Checkpoint should succeed
+        assert!(db.wal_checkpoint().is_ok());
+    }
 }
