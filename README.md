@@ -32,7 +32,7 @@ All messages are persisted verbatim. Summaries are assembled from a DAG of compr
 
 This project is inspired by and references:
 
-- **LongSeeker** — *Context-ReAct: Elastic Context Orchestration for Long-Horizon Search Agents* (2025). [arXiv 2605.05191](https://arxiv.org/abs/2605.05191)
+- **LongSeeker** — *Context-ReAct: Elastic Context Orchestration for Long-Horizon Search Agents* (May 2026). [arXiv 2605.05191](https://arxiv.org/abs/2605.05191)
 - **LCM Paper** — Clint Ehrlich & Theodore Blackman. *LCM: Lossless Context Management* (2026). [https://papers.voltropy.com/LCM](https://papers.voltropy.com/LCM)
 - **lossless-claw** — Josh Lehman / Martian Engineering. Lossless Context Management plugin for OpenClaw. [https://github.com/Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw)
 
