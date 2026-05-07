@@ -23,6 +23,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
+        .route("/v1/lcm/compress", post(lcm_compress))
+        .route("/v1/lcm/delete", post(lcm_delete))
+        .route("/v1/lcm/rollback", post(lcm_rollback))
         .route("/health", get(|| async { StatusCode::OK }))
 }
 
@@ -159,37 +162,60 @@ async fn chat_completions(
     }
 }
 
-/// Render DAG context nodes into a readable text block for injection.
+/// Render DAG context nodes into a structured, actionable context panel.
+/// Each node shows its summary, snippets, and available operations.
 fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    let _ = writeln!(out, "<lcm_context>");
+
+    // Collect for range-based operations
+    let ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
+
     for node in nodes {
-        if node.is_leaf {
-            let _ = writeln!(out, "[msg {}] {} ({} tok)", node.id, node.summary, node.token_count);
+        let header = if node.is_leaf {
+            format!("[msg {}] {} ({} tok)", node.id, node.summary, node.token_count)
         } else {
-            let _ = writeln!(
-                out,
+            format!(
                 "[summary {}] L{} — {} ({} tok, {} parents)",
                 node.id,
                 node.level,
                 node.summary,
                 node.token_count,
                 node.parent_ids.len()
-            );
+            )
+        };
+        let _ = writeln!(out, "  {header}");
+
+        // Snippets
+        for s in &node.snippets {
+            let label = match s.snippet_type {
+                crate::snippet::SnippetType::CodeBlock => "code",
+                crate::snippet::SnippetType::FilePath => "path",
+                crate::snippet::SnippetType::NumericConstant => "num",
+                crate::snippet::SnippetType::ErrorMessage => "err",
+            };
+            let _ = writeln!(out, "    ├ {label}: {}", s.content);
         }
-        if !node.snippets.is_empty() {
-            let _ = writeln!(out, "  ├ snippets:");
-            for s in &node.snippets {
-                let label = match s.snippet_type {
-                    crate::snippet::SnippetType::CodeBlock => "code",
-                    crate::snippet::SnippetType::FilePath => "path",
-                    crate::snippet::SnippetType::NumericConstant => "num",
-                    crate::snippet::SnippetType::ErrorMessage => "err",
-                };
-                let _ = writeln!(out, "  │  [{label}] {}", s.content);
-            }
+
+        // Available actions for this node
+        if node.level > 0 {
+            let _ = writeln!(out, "    └ /lcm/rollback {id}", id = node.id);
         }
     }
+
+    // Range operations at the bottom
+    if ids.len() >= 2 {
+        let first = ids.first().unwrap();
+        let last = ids.last().unwrap();
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  Operations:");
+        let _ = writeln!(out, "    /lcm/compress conv_id={cid} from={first} to={last}", cid = nodes[0].conversation_id);
+        let _ = writeln!(out, "    /lcm/delete conv_id={cid} id=<node_id>", cid = nodes[0].conversation_id);
+        let _ = writeln!(out, "    /lcm/rollback conv_id={cid} id=<summary_id>", cid = nodes[0].conversation_id);
+    }
+
+    let _ = writeln!(out, "</lcm_context>");
     out
 }
 
@@ -265,6 +291,118 @@ async fn lcm_status(
         "leaf_count": leaves.len(),
         "has_summary": tip.is_some(),
         "summary_level": tip.map(|n| n.level),
+    }))
+    .into_response()
+}
+
+// ── Context-ReAct operations ───────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct LcmRangeOp {
+    #[allow(dead_code)]
+    conv_id: i64,
+    from: i64,
+    to: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct LcmIdOp {
+    #[allow(dead_code)]
+    conv_id: i64,
+    id: i64,
+}
+
+/// Compress a range of nodes into a summary.  Returns the new summary
+/// text and node ID.  The caller (model) can then insert the summary
+/// into the conversation via a follow-up message.
+async fn lcm_compress(
+    State(state): State<AppState>,
+    Json(op): Json<LcmRangeOp>,
+) -> Response {
+    let leaves = match state.dag.get_leaves(op.conv_id) {
+        Ok(l) => l,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("error: {e}")).into_response(),
+    };
+    let ids: Vec<i64> = leaves.iter().map(|n| n.id)
+        .skip_while(|id| *id < op.from)
+        .take_while(|id| *id <= op.to)
+        .collect();
+    if ids.len() < 2 {
+        return (StatusCode::BAD_REQUEST, String::from("need at least 2 nodes to compress")).into_response();
+    }
+    let text = leaves.iter()
+        .filter(|n| ids.contains(&n.id))
+        .map(|n| n.summary.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+
+    let summarizer = match crate::summarizer::Summarizer::builder()
+        .api_key(&state.api_key)
+        .model("deepseek-v4-flash")
+        .upstream(&state.upstream)
+        .build()
+    {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("summarizer: {e}")).into_response(),
+    };
+
+    match summarizer.summarize_escalate(&text).await {
+        Ok((summary, _level)) => {
+            let tc = crate::tokenizer::count(&summary) as i64;
+            let snippets = crate::snippet::extract(&text);
+            match state.dag.compress_group_with_snippets(
+                op.conv_id, &ids, &summary, tc, 1, &snippets,
+            ) {
+                Ok(node) => Json(json!({
+                    "node_id": node.id,
+                    "summary": node.summary,
+                    "token_count": node.token_count,
+                    "snippets": node.snippets,
+                }))
+                .into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compress: {e}")).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("summarize: {e}")).into_response(),
+    }
+}
+
+/// Soft-delete a node from the DAG (mark is_leaf = 0 so it won't appear
+/// in active context assembly).  The raw data is still in the messages
+/// table and can be recovered via lcm_expand.
+async fn lcm_delete(
+    State(state): State<AppState>,
+    Json(op): Json<LcmIdOp>,
+) -> Response {
+    match state.dag.db().delete_dag_node(op.id) {
+        Ok(_) => Json(json!({"deleted": op.id})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")).into_response(),
+    }
+}
+
+/// Rollback: return the state of a specific summary node so the model
+/// can reconstruct its context to that point.  The caller receives the
+/// summary text and its children, which it can use as a checkpoint.
+async fn lcm_rollback(
+    State(state): State<AppState>,
+    Json(op): Json<LcmIdOp>,
+) -> Response {
+    let node = match state.dag.get_node(op.id) {
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::NOT_FOUND, "node not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}")).into_response(),
+    };
+    let children = state.dag.get_children(op.id).unwrap_or_default();
+    Json(json!({
+        "rollback_to": op.id,
+        "summary": node.summary,
+        "level": node.level,
+        "snippets": node.snippets,
+        "children": children.iter().map(|c| json!({
+            "id": c.id,
+            "summary": c.summary,
+            "token_count": c.token_count,
+        })).collect::<Vec<_>>(),
     }))
     .into_response()
 }
