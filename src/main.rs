@@ -50,10 +50,14 @@ async fn main() -> anyhow::Result<()> {
         .expect("DEEPSEEK_API_KEY must be set");
 
     let upstream = cli.upstream.clone();
+    let db = db::Database::builder()
+        .path(&cli.db_path)
+        .build()
+        .await?;
     let state = AppState {
         upstream: cli.upstream,
         api_key,
-        db: Arc::new(db::Database::open(&cli.db_path).await?),
+        db: Arc::new(db),
         client: reqwest::Client::builder()
             .build()?,
     };
