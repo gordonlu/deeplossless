@@ -1,5 +1,6 @@
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::dag::DagNode;
@@ -51,7 +52,11 @@ impl DatabaseBuilder {
 /// an mpsc channel to the main request handler, which is the sole writer.
 pub struct Database {
     conn: Mutex<Connection>,
+    write_count: AtomicU64,
 }
+
+/// Run a WAL checkpoint every N writes to limit WAL file growth.
+const CHECKPOINT_INTERVAL: u64 = 100;
 
 impl Database {
     pub fn builder() -> DatabaseBuilder {
@@ -72,9 +77,18 @@ impl Database {
              PRAGMA busy_timeout=5000;",
         )?;
 
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self { conn: Mutex::new(conn), write_count: AtomicU64::new(0) };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Run a WAL checkpoint to prevent the WAL file from growing
+    /// indefinitely under sustained write load.  Call periodically
+    /// (e.g. every N store_messages calls).
+    pub fn wal_checkpoint(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
@@ -158,6 +172,12 @@ impl Database {
         }
 
         tx.commit()?;
+        let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % CHECKPOINT_INTERVAL == 0 {
+            if let Err(e) = self.wal_checkpoint() {
+                tracing::warn!(target: "deeplossless::db", error = %e, "WAL checkpoint failed");
+            }
+        }
         Ok(())
     }
 

@@ -80,19 +80,16 @@ async fn chat_completions(
         }
     }
 
-    // Assemble DAG context and inject into system prompt
+    // Assemble DAG context and inject into ALL system messages
     let mut injected = req_body.clone();
-    if let Some(system_msg) = injected["messages"]
-        .as_array_mut()
-        .and_then(|arr| arr.iter_mut().find(|m| m["role"] == "system"))
-    {
-        // Inject into existing system message
-        let dag_ctx = state.dag.assemble_context(conv_id, 2000).unwrap_or_default();
-        if !dag_ctx.is_empty() {
-            let ctx_text = render_dag_context(&dag_ctx);
-            let existing = system_msg["content"].as_str().unwrap_or("");
-            let combined = format!("{}\n\n<lcm_context>\n{}\n</lcm_context>", existing, ctx_text);
-            system_msg["content"] = json!(combined);
+    let dag_ctx = state.dag.assemble_context(conv_id, 2000).unwrap_or_default();
+    if !dag_ctx.is_empty() {
+        let ctx_text = render_dag_context(&dag_ctx);
+        if let Some(arr) = injected["messages"].as_array_mut() {
+            for msg in arr.iter_mut().filter(|m| m["role"] == "system") {
+                let existing = msg["content"].as_str().unwrap_or("");
+                msg["content"] = json!(format!("{}\n\n<lcm_context>\n{}\n</lcm_context>", existing, ctx_text));
+            }
         }
     }
 
