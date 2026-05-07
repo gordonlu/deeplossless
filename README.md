@@ -29,7 +29,7 @@ deepseek config set base_url http://127.0.0.1:8080/v1
 | **Lossless persistence** | Every message stored verbatim in SQLite WAL-mode database. |
 | **Hierarchical DAG** | Multi-level summarization with lossless pointers. Three-level escalation (LLM → LLM aggressive → deterministic truncate). |
 | **Session tracking** | SHA-256 fingerprint over first 3 messages identifies multi-turn conversations. |
-| **Snippet extraction** | Before compression, extracts code blocks, file paths, numeric constants, and error messages. Preserved as structured metadata. |
+| **Snippet extraction** | Before compression, extracts code blocks, file paths, numeric constants, percentages, proper nouns, and error messages. Preserved as structured metadata. |
 | **FTS5 full-text search** | SQLite FTS5 with porter tokenizer for high-speed `lcm_grep`. |
 | **Context-ReAct operations** | Model-accessible endpoints for `compress`, `delete`, and `rollback` — active context management without data loss. |
 | **Structured context panel** | `<lcm_context>` block injected into system prompt shows summaries, snippets, and available operations per node. |
