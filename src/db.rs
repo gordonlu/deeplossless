@@ -242,6 +242,40 @@ impl Database {
         Ok(rows.next().transpose()?)
     }
 
+    pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+             FROM dag_nodes
+             WHERE conversation_id = ?1 AND level = (
+                 SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0
+             )
+             ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows { nodes.push(row?); }
+        Ok(nodes)
+    }
+
+    pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+             FROM dag_nodes WHERE conversation_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows { nodes.push(row?); }
+        Ok(nodes)
+    }
+
+    pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM dag_nodes WHERE id = ?1", rusqlite::params![node_id])?;
+        Ok(())
+    }
+
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

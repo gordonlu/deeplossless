@@ -246,6 +246,143 @@ impl DagEngine {
         nodes.reverse();
         Ok(nodes)
     }
+
+    // ── Garbage collection ──────────────────────────────────────────────
+
+    /// Collect unreachable ("ghost") nodes via mark-sweep from all active
+    /// tips. Returns IDs of ghost nodes removed, or `dry_run=true` to
+    /// just report without deleting.
+    pub fn collect_garbage(&self, conv_id: i64, dry_run: bool) -> anyhow::Result<Vec<i64>> {
+        let mut reachable = std::collections::HashSet::new();
+        let mut stack = Vec::new();
+
+        for tip in self.db.get_tip_nodes(conv_id)? {
+            stack.push(tip.id);
+        }
+        for leaf in self.db.get_leaf_nodes(conv_id)? {
+            stack.push(leaf.id);
+        }
+
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) { continue; }
+            if let Some(node) = self.db.get_node(id)? {
+                for pid in node.parent_ids {
+                    stack.push(pid);
+                }
+            }
+        }
+
+        let all_nodes = self.db.get_all_dag_nodes(conv_id)?;
+        let mut ghosts = Vec::new();
+        for node in all_nodes {
+            if !reachable.contains(&node.id) {
+                ghosts.push(node.id);
+            }
+        }
+
+        if !dry_run && !ghosts.is_empty() {
+            for gid in &ghosts {
+                self.db.delete_dag_node(*gid)?;
+            }
+        }
+        Ok(ghosts)
+    }
+
+    // ── Graphviz export ─────────────────────────────────────────────────
+
+    pub fn export_dot(&self, conv_id: i64) -> anyhow::Result<String> {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(out, "digraph LCM_DAG {{")?;
+        writeln!(out, "    rankdir=BT;")?;
+        writeln!(out, "    node [shape=box, style=filled, fontname=\"monospace\"];")?;
+
+        for node in self.db.get_all_dag_nodes(conv_id)? {
+            let color = match node.level {
+                0 => "\"#d5e8d4\"",
+                1 => "\"#dae8fc\"",
+                2 => "\"#ffe6cc\"",
+                _ => "\"#f8cecc\"",
+            };
+            let label = format!(
+                "{} {} ({})",
+                if node.is_leaf { "L" } else { "S" },
+                html_escape(&node.summary, 80),
+                node.token_count,
+            );
+            writeln!(out, "    n{} [label=\"{}\", fillcolor={color}];", node.id, label)?;
+            for pid in &node.parent_ids {
+                writeln!(out, "    n{} -> n{};", node.id, pid)?;
+            }
+        }
+        writeln!(out, "}}")?;
+        Ok(out)
+    }
+}
+
+fn html_escape(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in text.chars().take(max_chars) {
+        match ch {
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    if text.len() > max_chars { out.push_str("…"); }
+    out
+}
+
+/// Return true when a message content looks like a tool result.
+fn is_tool_result(content: &str) -> bool {
+    content.contains("tool_result") || content.contains("ToolResult")
+}
+
+/// Return true when a message content looks like a tool call.
+fn is_tool_use(content: &str) -> bool {
+    content.contains("tool_use") || content.contains("ToolUse")
+}
+
+/// Find safe split points in a slice of `(role, content)` pairs for
+/// compression grouping.  Splitting at these points guarantees that:
+///
+/// - No `tool_use` is separated from its corresponding `tool_result`
+/// - Group boundaries fall at clean turn boundaries
+///
+/// Returns indices (into `pairs`) that are *safe* split positions
+/// (everything before the index can be compressed as a complete unit).
+pub fn safe_split_points(pairs: &[(String, String)]) -> Vec<usize> {
+    // First pass: mark indices that are inside a tool chain
+    let mut inside_tool_chain = vec![false; pairs.len()];
+    for i in 0..pairs.len() {
+        if pairs[i].0 == "assistant" && is_tool_use(&pairs[i].1) {
+            inside_tool_chain[i] = true;
+            let mut j = i + 1;
+            while j < pairs.len() && pairs[j].0 == "user" && is_tool_result(&pairs[j].1) {
+                inside_tool_chain[j] = true;
+                j += 1;
+            }
+            // Also mark the next non-tool user message if it's clearly
+            // a continuation (starts the next turn)
+        }
+    }
+
+    // Second pass: user messages that are NOT inside a tool chain are safe splits
+    let mut safe = Vec::new();
+    safe.push(0); // always safe before the first message
+    for i in 0..pairs.len() {
+        if pairs[i].0 == "user" && !inside_tool_chain[i] {
+            safe.push(i);
+        }
+    }
+    safe.sort();
+    safe.dedup();
+    safe
 }
 
 #[cfg(test)]
@@ -365,5 +502,62 @@ mod tests {
             .build(setup_db().0);
         assert_eq!(engine.config.soft_threshold_ratio, 1.0);
         assert_eq!(engine.config.hard_threshold_ratio, 0.0);
+    }
+
+    #[test]
+    fn collect_garbage_dry_run_returns_no_ghosts_in_empty_dag() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let ghosts = engine.collect_garbage(conv_id, true).unwrap();
+        // No summary nodes yet, so no ghosts expected
+        assert!(ghosts.is_empty());
+    }
+
+    #[test]
+    fn export_dot_produces_valid_graphviz_header() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let dot = engine.export_dot(conv_id).unwrap();
+        assert!(dot.starts_with("digraph LCM_DAG"));
+        assert!(dot.ends_with("}\n"));
+    }
+
+    // ── safe_split_points tests ────────────────────────────────────────
+
+    #[test]
+    fn safe_split_simple_turns() {
+        let pairs = vec![
+            ("user".into(), "hello".into()),
+            ("assistant".into(), "hi".into()),
+            ("user".into(), "what is rust?".into()),
+            ("assistant".into(), "a language".into()),
+        ];
+        let points = safe_split_points(&pairs);
+        // Should split before each user message: index 0 and 2
+        assert!(points.contains(&0), "should split at start");
+        assert!(points.contains(&2), "should split before second user msg");
+    }
+
+    #[test]
+    fn safe_split_keeps_tool_pairs_together() {
+        let pairs = vec![
+            ("user".into(), "read src/main.rs".into()),
+            ("assistant".into(), "tool_use: read_file".into()),
+            ("user".into(), "tool_result: pub fn main()".into()),
+            ("user".into(), "now fix it".into()),
+        ];
+        let points = safe_split_points(&pairs);
+        // 0: before first user ✓
+        // after tool_use (index 1), fast-forward past tool_result (index 2)
+        // → safe at index 3 (after the tool chain)
+        assert!(points.contains(&0), "should split at message 0");
+        assert!(!points.contains(&2), "should NOT split inside tool chain");
+        assert!(points.contains(&3), "should split after tool chain");
+    }
+
+    #[test]
+    fn safe_split_empty() {
+        let points = safe_split_points(&[]);
+        assert_eq!(points, vec![0], "index 0 is always safe");
     }
 }
