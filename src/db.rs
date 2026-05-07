@@ -386,6 +386,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -501,8 +502,8 @@ mod tests {
         let parent = db.insert_dag_node(conv_id, 1, "summary", 5, &[node.id], &[], false).unwrap();
         db.add_child_to_node(node.id, parent.id).unwrap();
 
-        let children = db.get_child_nodes(parent.id, 10).unwrap();
-        assert!(children.len() >= 1);
+        let children = db.get_child_nodes(node.id, 10).unwrap();
+        assert!(children.len() >= 1, "parent should be a child of node");
 
         // Delete
         db.delete_dag_node(node.id).unwrap();

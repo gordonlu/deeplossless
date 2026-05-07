@@ -1,12 +1,10 @@
-use axum::Router;
 use clap::Parser;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use deeplossless::AppState;
-
-use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Lossless Context Management proxy for DeepSeek API")]
@@ -26,16 +24,6 @@ struct Cli {
     /// SQLite database path (supports ~/ and $HOME expansion)
     #[arg(long, default_value = "~/.deepseek/lcm/lcm.db")]
     db_path: String,
-}
-
-#[derive(Clone)]
-struct AppState {
-    upstream: String,
-    api_key: String,
-    db: Arc<deeplossless::db::Database>,
-    dag: Arc<deeplossless::dag::DagEngine>,
-    compactor: Arc<Mutex<deeplossless::compactor::Compactor>>,
-    client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -86,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
     };
 
-    let app = proxy::routes()
+    let app = deeplossless::proxy::routes()
         .with_state(state)
         .layer(CatchPanicLayer::new())
         .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)); // 20 MB
