@@ -127,6 +127,13 @@ impl Database {
                 ON messages(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_dag_conv
                 ON dag_nodes(conversation_id, level);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+                USING fts5(
+                    content,
+                    role UNINDEXED,
+                    tokenize='porter unicode61'
+                );
         ")?;
         Ok(())
     }
@@ -164,11 +171,18 @@ impl Database {
                 let content = msg["content"].to_string();
                 let token_count = crate::tokenizer::count_content(msg) as i64
                     + crate::tokenizer::MESSAGE_OVERHEAD_TOKENS as i64;
+                let plain = Self::strip_json_markup(&content);
                 tx.execute(
                     "INSERT INTO messages (conversation_id, role, content, token_count)
                      VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![conv_id, role, content, token_count],
                 )?;
+                let msg_id = tx.last_insert_rowid();
+                // Mirror into FTS5 index
+                let _ = tx.execute(
+                    "INSERT INTO messages_fts (rowid, content, role) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![msg_id, plain, role],
+                );
             }
         }
 
@@ -357,18 +371,24 @@ impl Database {
         Ok(())
     }
 
-    /// Search messages in a conversation for `query` (LIKE-based).
+    /// Search messages in a conversation using FTS5 full-text search.
+    /// Returns `(id, role, snippet, token_count)` ranked by relevance.
     pub fn search_messages(&self, conv_id: i64, query: &str) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
         let conn = self.conn.lock().unwrap();
-        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+        let safe = Self::fts_escape(query);
+        if safe.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut stmt = conn.prepare(
-            "SELECT id, role, substr(content, 1, 500), token_count
-             FROM messages
-             WHERE conversation_id = ?1 AND content LIKE ?2 ESCAPE '\\'
-             ORDER BY id ASC
+            "SELECT m.id, m.role, snippet(messages_fts, 0, '<b>', '</b>', '…', 32),
+                    m.token_count
+             FROM messages_fts
+             JOIN messages m ON m.id = messages_fts.rowid
+             WHERE messages_fts MATCH ?1 AND m.conversation_id = ?2
+             ORDER BY rank
              LIMIT 20",
         )?;
-        let rows = stmt.query_map(rusqlite::params![conv_id, pattern], |row| {
+        let rows = stmt.query_map(rusqlite::params![safe, conv_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -383,7 +403,44 @@ impl Database {
         Ok(results)
     }
 
-    fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
+    /// Strip JSON markup from content so FTS5 indexes only the plain text.
+/// Content can be either a plain string or a JSON array of content blocks.
+fn strip_json_markup(content: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+        match val {
+            serde_json::Value::String(s) => return s,
+            serde_json::Value::Array(arr) => {
+                let mut out = String::new();
+                for block in arr {
+                    if let Some(text) = block["text"].as_str() {
+                        if !out.is_empty() { out.push(' '); }
+                        out.push_str(text);
+                    }
+                }
+                return out;
+            }
+            _ => {}
+        }
+    }
+    content.to_string()
+}
+
+/// Escape a user query for FTS5 MATCH syntax.
+/// FTS5 special chars: ^ * " ( ) + - ~ ` `
+pub fn fts_escape(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for ch in query.chars() {
+        match ch {
+            '"' | '\'' | '*' | '^' | '(' | ')' | '+' | '-' | '~' | '`' => {
+                out.push(' ');
+            }
+            c => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let parent_str: String = row.get(5)?;
         let child_str: String = row.get(6)?;
         let snippet_str: String = row.get(7)?;

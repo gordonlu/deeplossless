@@ -21,15 +21,18 @@ deepseek config set base_url http://127.0.0.1:8080/v1
 ```
 deepseek-tui → deeplossless (127.0.0.1:8080) → api.deepseek.com
                    │
-                   └─ SQLite DB (~/.deepseek/lcm/lcm.db)
+                   ├─ SQLite DAG (lossless persistence)
+                   ├─ FTS5 full-text search
+                   └─ Snippet extraction (code/paths/numbers/errors)
 ```
 
-All messages are persisted verbatim. Summaries are assembled from a DAG of compressed nodes.
+All messages are persisted verbatim. Summaries are assembled from a DAG of compressed nodes with precision-critical snippets preserved before LLM compression.
 
 ## Attribution
 
 This project is inspired by and references:
 
+- **LongSeeker** — *Context-ReAct: Elastic Context Orchestration for Long-Horizon Search Agents* (2025). [arXiv 2605.05191](https://arxiv.org/abs/2605.05191)
 - **LCM Paper** — Clint Ehrlich & Theodore Blackman. *LCM: Lossless Context Management* (2026). [https://papers.voltropy.com/LCM](https://papers.voltropy.com/LCM)
 - **lossless-claw** — Josh Lehman / Martian Engineering. Lossless Context Management plugin for OpenClaw. [https://github.com/Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw)
 
