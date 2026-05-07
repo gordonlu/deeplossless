@@ -85,7 +85,7 @@ async fn proxy_non_streaming_round_trip() {
 
     let state = deeplossless::AppState {
         upstream: format!("http://{}", upstream_addr),
-        api_key: "test-key".to_string(),
+        api_key: std::sync::Arc::new(std::sync::Mutex::new(Some("test-key".to_string()))),
         db,
         dag,
         compactor,

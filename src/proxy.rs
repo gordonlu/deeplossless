@@ -37,13 +37,13 @@ async fn chat_completions(
     // Extract API key from Authorization header on first request
     {
         let mut key = state.api_key.lock().unwrap();
-        if key.is_none() {
-            if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                if let Some(bearer) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
-                    *key = Some(bearer.to_string());
-                    tracing::debug!(target: "deeplossless", "API key extracted from request header");
-                }
-            }
+        if key.is_none()
+            && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+            && let Some(bearer) = auth.strip_prefix("Bearer ")
+                .or_else(|| auth.strip_prefix("bearer "))
+        {
+            *key = Some(bearer.to_string());
+            tracing::debug!(target: "deeplossless", "API key extracted from request header");
         }
     }
 
