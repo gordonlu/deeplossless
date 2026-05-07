@@ -10,7 +10,11 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
+use crate::compactor::{CompactCommand, CompactEvent};
 use crate::AppState;
+
+/// Max context window for threshold calculations.
+const CONTEXT_WINDOW: usize = 1_000_000;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -52,6 +56,29 @@ async fn chat_completions(
             warn!("failed to store messages: {e}");
         }
     });
+
+    // Trigger async compaction review (soft threshold)
+    {
+        let mut compactor = state.compactor.lock().await;
+        let _ = compactor
+            .command(CompactCommand::ReviewAndCompact {
+                conv_id,
+                context_window: CONTEXT_WINDOW,
+            })
+            .await;
+        // Drain and log any resulting events
+        for event in compactor.drain_events() {
+            match event {
+                CompactEvent::GroupCompressed { tokens_saved, .. } => {
+                    tracing::debug!(target: "deeplossless", conv_id, tokens_saved, "compaction completed");
+                }
+                CompactEvent::BelowThreshold => {}
+                CompactEvent::Error { message } => {
+                    tracing::warn!(target: "deeplossless", conv_id, error = %message, "compaction error");
+                }
+            }
+        }
+    }
 
     // Assemble DAG context and inject into system prompt
     let mut injected = req_body.clone();

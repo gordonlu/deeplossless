@@ -65,15 +65,11 @@ pub struct DagNode {
 
 // ── Engine ─────────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct DagEngineBuilder {
     config: DagConfig,
 }
 
-impl Default for DagEngineBuilder {
-    fn default() -> Self {
-        Self { config: DagConfig::default() }
-    }
-}
 
 impl DagEngineBuilder {
     pub fn new() -> Self { Self::default() }

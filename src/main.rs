@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod compactor;
 mod dag;
@@ -35,6 +36,7 @@ struct AppState {
     api_key: String,
     db: Arc<db::Database>,
     dag: Arc<dag::DagEngine>,
+    compactor: Arc<Mutex<compactor::Compactor>>,
     client: reqwest::Client,
 }
 
@@ -63,11 +65,25 @@ async fn main() -> anyhow::Result<()> {
         dag::DagEngine::builder()
             .build(db.clone()),
     );
+
+    let compactor_config = crate::compactor::CompactorConfig {
+        summarizer: summarizer::SummarizerConfig {
+            api_key: api_key.clone(),
+            upstream: upstream.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let compactor = Arc::new(Mutex::new(
+        crate::compactor::Compactor::spawn(db.clone(), compactor_config),
+    ));
+
     let state = AppState {
         upstream: cli.upstream,
         api_key,
         db,
         dag,
+        compactor,
         client: reqwest::Client::builder()
             .build()?,
     };

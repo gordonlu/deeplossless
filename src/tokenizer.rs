@@ -4,7 +4,7 @@ use tiktoken::CoreBpe;
 static BPE: OnceLock<&CoreBpe> = OnceLock::new();
 
 fn encoding() -> &'static CoreBpe {
-    *BPE.get_or_init(|| {
+    BPE.get_or_init(|| {
         tiktoken::get_encoding("deepseek_v3")
             .expect("failed to load deepseek_v3 tokenizer")
     })

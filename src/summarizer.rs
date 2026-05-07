@@ -59,13 +59,11 @@ impl Default for SummarizerConfig {
     }
 }
 
+#[derive(Default)]
 pub struct SummarizerBuilder {
     config: SummarizerConfig,
 }
 
-impl Default for SummarizerBuilder {
-    fn default() -> Self { Self { config: SummarizerConfig::default() } }
-}
 
 impl SummarizerBuilder {
     pub fn new() -> Self { Self::default() }
@@ -109,13 +107,13 @@ impl Summarizer {
         let input_tokens = crate::tokenizer::count(text);
 
         // Level 1: LLM preserve_details, target T tokens
-        match self.try_level(&text, SummaryLevel::Level1, input_tokens).await {
+        match self.try_level(text, SummaryLevel::Level1, input_tokens).await {
             Ok(result) => return Ok(result),
             Err(_) => {} // escalate
         }
 
         // Level 2: LLM bullet_points, target T/2 tokens
-        match self.try_level(&text, SummaryLevel::Level2, input_tokens / 2).await {
+        match self.try_level(text, SummaryLevel::Level2, input_tokens / 2).await {
             Ok(result) => return Ok(result),
             Err(_) => {} // escalate
         }
