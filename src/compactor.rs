@@ -222,7 +222,7 @@ async fn do_compress(
 /// Supervisor that restarts the worker on panic, making compaction
 /// resilient to transient panics (e.g. summary API timeout).
 async fn compactor_supervisor(
-    mut cmd_rx: mpsc::Receiver<CompactCommand>,
+    cmd_rx: mpsc::Receiver<CompactCommand>,
     event_tx: mpsc::Sender<CompactEvent>,
     dag: Arc<DagEngine>,
     summarizer: Summarizer,
@@ -250,7 +250,6 @@ async fn compactor_supervisor(
     }
 }
 
-use std::panic::AssertUnwindSafe;
 use futures::FutureExt;
 
 #[cfg(test)]

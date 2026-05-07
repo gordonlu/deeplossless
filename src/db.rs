@@ -174,11 +174,10 @@ impl Database {
 
         tx.commit()?;
         let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % CHECKPOINT_INTERVAL == 0 {
-            if let Err(e) = self.wal_checkpoint() {
+        if count.is_multiple_of(CHECKPOINT_INTERVAL)
+            && let Err(e) = self.wal_checkpoint() {
                 tracing::warn!(target: "deeplossless::db", error = %e, "WAL checkpoint failed");
             }
-        }
         Ok(())
     }
 
@@ -205,6 +204,7 @@ impl Database {
         self.insert_dag_node_full(conversation_id, level, summary, token_count, parent_ids, child_ids, &[], is_leaf)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_dag_node_full(
         &self,
         conversation_id: i64,
@@ -522,7 +522,7 @@ mod tests {
         db.add_child_to_node(node.id, parent.id).unwrap();
 
         let children = db.get_child_nodes(node.id, 10).unwrap();
-        assert!(children.len() >= 1, "parent should be a child of node");
+        assert!(!children.is_empty(), "parent should be a child of node");
 
         // Delete
         db.delete_dag_node(node.id).unwrap();

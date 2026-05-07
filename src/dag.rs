@@ -379,7 +379,7 @@ fn html_escape(text: &str, max_chars: usize) -> String {
             c => out.push(c),
         }
     }
-    if text.len() > max_chars { out.push_str("…"); }
+    if text.len() > max_chars { out.push('…'); }
     out
 }
 

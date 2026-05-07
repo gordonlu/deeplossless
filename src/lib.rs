@@ -1,5 +1,7 @@
 //! deeplossless — Lossless Context Management proxy for DeepSeek API.
 
+#![allow(clippy::too_many_arguments)]
+
 pub mod compactor;
 pub mod dag;
 pub mod db;

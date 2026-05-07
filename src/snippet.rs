@@ -75,15 +75,14 @@ pub fn extract(text: &str) -> Vec<Snippet> {
     // 3. Numeric constants (standalone numbers, port numbers, status codes)
     for word in text.split_whitespace() {
         let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-        if let Ok(n) = clean.parse::<i64>() {
-            if n > 9 && n < 1_000_000 {
+        if let Ok(n) = clean.parse::<i64>()
+            && n > 9 && n < 1_000_000 {
                 snippets.push(Snippet {
                     snippet_type: SnippetType::NumericConstant,
                     content: clean.to_string(),
                     source_node_id: String::new(),
                 });
             }
-        }
     }
 
     // 4. Error messages (quoted strings that look like errors)
@@ -127,7 +126,7 @@ fn looks_like_path(s: &str) -> bool {
     if s.contains("//") || s.starts_with("http") { return false; }
     let has_sep = s.contains('/') || s.contains('\\');
     let has_dot = s.contains('.');
-    let has_src = s.contains("src") || s.contains("lib") || s.contains("bin");
+    let _has_src = s.contains("src") || s.contains("lib") || s.contains("bin");
     (has_sep || has_dot) && s.len() > 3 && s.len() < 200
 }
 

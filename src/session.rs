@@ -56,8 +56,8 @@ mod tests {
 
     #[test]
     fn fingerprint_differs_for_different_content() {
-        let a = fingerprint(&json!([{"role": "user", "content": "hello"}]).as_array().unwrap(), 1);
-        let b = fingerprint(&json!([{"role": "user", "content": "world"}]).as_array().unwrap(), 1);
+        let a = fingerprint(json!([{"role": "user", "content": "hello"}]).as_array().unwrap(), 1);
+        let b = fingerprint(json!([{"role": "user", "content": "world"}]).as_array().unwrap(), 1);
         assert_ne!(a, b, "different content must differ");
     }
 

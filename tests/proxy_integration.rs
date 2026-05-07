@@ -60,21 +60,21 @@ async fn proxy_non_streaming_round_trip() {
 
     // Build proxy pointed at the mock
     let db = Arc::new(
-        crate::db::Database::builder()
+        deeplossless::db::Database::builder()
             .path(std::env::temp_dir().join(format!("proxy_test_{}", std::process::id())))
             .build()
             .await
             .unwrap(),
     );
     let dag = Arc::new(
-        crate::dag::DagEngine::builder()
+        deeplossless::dag::DagEngine::builder()
             .build(db.clone()),
     );
     let compactor = Arc::new(tokio::sync::Mutex::new(
-        crate::compactor::Compactor::spawn(
+        deeplossless::compactor::Compactor::spawn(
             db.clone(),
-            crate::compactor::CompactorConfig {
-                summarizer: crate::summarizer::SummarizerConfig {
+            deeplossless::compactor::CompactorConfig {
+                summarizer: deeplossless::summarizer::SummarizerConfig {
                     api_key: "test".to_string(),
                     ..Default::default()
                 },
@@ -83,7 +83,7 @@ async fn proxy_non_streaming_round_trip() {
         ),
     ));
 
-    let state = crate::AppState {
+    let state = deeplossless::AppState {
         upstream: format!("http://{}", upstream_addr),
         api_key: "test-key".to_string(),
         db,
@@ -92,7 +92,7 @@ async fn proxy_non_streaming_round_trip() {
         client: reqwest::Client::new(),
     };
 
-    let app = crate::proxy::routes().with_state(state);
+    let app = deeplossless::proxy::routes().with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
