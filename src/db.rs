@@ -2,6 +2,8 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::dag::DagNode;
+
 const DEFAULT_DB_PATH: &str = "~/.deepseek/lcm/lcm.db";
 
 /// Builder for [`Database`].
@@ -144,6 +146,135 @@ impl Database {
 
         tx.commit()?;
         Ok(conv_id)
+    }
+
+    // ── DAG node operations ────────────────────────────────────────────
+
+    pub fn insert_dag_node(
+        &self,
+        conversation_id: i64,
+        level: u8,
+        summary: &str,
+        token_count: i64,
+        parent_ids: &[i64],
+        child_ids: &[i64],
+        is_leaf: bool,
+    ) -> anyhow::Result<DagNode> {
+        let conn = self.conn.lock().unwrap();
+        let parent_json = serde_json::to_string(parent_ids)?;
+        let child_json = serde_json::to_string(child_ids)?;
+        conn.execute(
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, is_leaf as i32],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(DagNode {
+            id,
+            conversation_id,
+            level,
+            summary: summary.to_string(),
+            token_count,
+            parent_ids: parent_ids.to_vec(),
+            child_ids: child_ids.to_vec(),
+            is_leaf,
+        })
+    }
+
+    pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+             FROM dag_nodes WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn get_child_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+             FROM dag_nodes WHERE parent_ids LIKE ?1 LIMIT ?2",
+        )?;
+        let pattern = format!("%{}%", node_id);
+        let rows = stmt.query_map(rusqlite::params![pattern, max_fanout as i64], Self::row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
+    }
+
+    pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+             FROM dag_nodes WHERE conversation_id = ?1 AND level > 0
+             ORDER BY level DESC, id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
+             FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
+    }
+
+    pub fn total_conversation_tokens(&self, conv_id: i64) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM messages WHERE conversation_id = ?1",
+            rusqlite::params![conv_id],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+
+    pub fn add_child_to_node(&self, parent_id: i64, child_id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: String = conn.query_row(
+            "SELECT child_ids FROM dag_nodes WHERE id = ?1",
+            rusqlite::params![parent_id],
+            |row| row.get(0),
+        )?;
+        let mut ids: Vec<i64> = serde_json::from_str(&existing).unwrap_or_default();
+        if !ids.contains(&child_id) {
+            ids.push(child_id);
+            let json = serde_json::to_string(&ids)?;
+            conn.execute(
+                "UPDATE dag_nodes SET child_ids = ?1 WHERE id = ?2",
+                rusqlite::params![json, parent_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
+        let parent_str: String = row.get(5)?;
+        let child_str: String = row.get(6)?;
+        let is_leaf_int: i32 = row.get(7)?;
+        Ok(DagNode {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            level: row.get(2)?,
+            summary: row.get(3)?,
+            token_count: row.get(4)?,
+            parent_ids: serde_json::from_str(&parent_str).unwrap_or_default(),
+            child_ids: serde_json::from_str(&child_str).unwrap_or_default(),
+            is_leaf: is_leaf_int != 0,
+        })
     }
 }
 

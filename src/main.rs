@@ -3,6 +3,7 @@ use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
 
+mod dag;
 mod db;
 mod proxy;
 mod tokenizer;
