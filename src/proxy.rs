@@ -19,10 +19,10 @@ const CONTEXT_WINDOW: usize = 1_000_000;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/lcm/grep/:conv_id", get(lcm_grep))
-        .route("/v1/lcm/expand/:node_id", get(lcm_expand))
-        .route("/v1/lcm/status/:conv_id", get(lcm_status))
-        .route("/v1/lcm/snippets/:node_id", get(lcm_snippets))
+        .route("/v1/lcm/grep/{conv_id}", get(lcm_grep))
+        .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
+        .route("/v1/lcm/status/{conv_id}", get(lcm_status))
+        .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
         .route("/health", get(|| async { StatusCode::OK }))
 }
 
