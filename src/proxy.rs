@@ -1,10 +1,11 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json, Router, routing::{get, post},
 };
+use std::collections::HashMap;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -245,9 +246,10 @@ fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
 async fn lcm_grep(
     State(state): State<AppState>,
     Path(conv_id): Path<i64>,
-    query: String,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    match state.db.search_messages(conv_id, &query) {
+    let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
+    match state.db.search_messages(conv_id, query) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
             "query": query,
@@ -333,29 +335,31 @@ struct LcmIdOp {
     id: i64,
 }
 
-/// Compress a range of nodes into a summary.  Returns the new summary
-/// text and node ID.  The caller (model) can then insert the summary
-/// into the conversation via a follow-up message.
+/// Compress a range of messages into a summary.  Returns the new summary
+/// text and node ID.  The caller (model) can insert the summary into
+/// the conversation via a follow-up message.
 async fn lcm_compress(
     State(state): State<AppState>,
     Json(op): Json<LcmRangeOp>,
 ) -> Response {
-    let leaves = match state.dag.get_leaves(op.conv_id) {
-        Ok(l) => l,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("error: {e}")).into_response(),
+    // Try DAG leaves first, then fall back to raw messages
+    let content: Vec<String> = match state.dag.get_leaves(op.conv_id) {
+        Ok(leaves) if leaves.len() >= 2 => leaves.iter()
+            .skip_while(|n| n.id < op.from)
+            .take_while(|n| n.id <= op.to)
+            .map(|n| n.summary.clone())
+            .collect(),
+        _ => {
+            // Fallback: read from DB directly
+            let db = state.dag.db();
+            let raw = db.get_messages_in_range(op.conv_id, op.from as i64, op.to as i64);
+            match raw {
+                Ok(msgs) if msgs.len() >= 2 => msgs,
+                _ => return (StatusCode::BAD_REQUEST, String::from("need at least 2 messages to compress")).into_response(),
+            }
+        }
     };
-    let ids: Vec<i64> = leaves.iter().map(|n| n.id)
-        .skip_while(|id| *id < op.from)
-        .take_while(|id| *id <= op.to)
-        .collect();
-    if ids.len() < 2 {
-        return (StatusCode::BAD_REQUEST, String::from("need at least 2 nodes to compress")).into_response();
-    }
-    let text = leaves.iter()
-        .filter(|n| ids.contains(&n.id))
-        .map(|n| n.summary.as_str())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
+    let text = content.join("\n---\n");
 
     let summarizer = match crate::summarizer::Summarizer::builder()
         .api_key(&get_cached_key(&state.api_key))
@@ -372,7 +376,7 @@ async fn lcm_compress(
             let tc = crate::tokenizer::count(&summary) as i64;
             let snippets = crate::snippet::extract(&text);
             match state.dag.compress_group_with_snippets(
-                op.conv_id, &ids, &summary, tc, 1, &snippets,
+                op.conv_id, &[], &summary, tc, 1, &snippets,
             ) {
                 Ok(node) => Json(json!({
                     "node_id": node.id,

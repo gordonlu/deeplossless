@@ -373,6 +373,24 @@ impl Database {
 
     /// Search messages in a conversation using FTS5 full-text search.
     /// Returns `(id, role, snippet, token_count)` ranked by relevance.
+    /// Get raw message content in a range of message IDs.
+    pub fn get_messages_in_range(&self, conv_id: i64, from_id: i64, to_id: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT content FROM messages
+             WHERE conversation_id = ?1 AND id BETWEEN ?2 AND ?3
+             ORDER BY id ASC LIMIT 50",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, from_id, to_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     pub fn search_messages(&self, conv_id: i64, query: &str) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let safe = Self::fts_escape(query);
