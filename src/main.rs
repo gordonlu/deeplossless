@@ -1,12 +1,11 @@
-use axum::{Router, routing::post, http::StatusCode};
 use clap::Parser;
 use std::sync::Arc;
-use tracing::info;
 
 mod compactor;
 mod dag;
 mod db;
 mod proxy;
+mod session;
 mod summarizer;
 mod tokenizer;
 
@@ -35,6 +34,7 @@ struct AppState {
     upstream: String,
     api_key: String,
     db: Arc<db::Database>,
+    dag: Arc<dag::DagEngine>,
     client: reqwest::Client,
 }
 
@@ -53,26 +53,30 @@ async fn main() -> anyhow::Result<()> {
         .expect("DEEPSEEK_API_KEY must be set");
 
     let upstream = cli.upstream.clone();
-    let db = db::Database::builder()
-        .path(&cli.db_path)
-        .build()
-        .await?;
+    let db = Arc::new(
+        db::Database::builder()
+            .path(&cli.db_path)
+            .build()
+            .await?,
+    );
+    let dag = Arc::new(
+        dag::DagEngine::builder()
+            .build(db.clone()),
+    );
     let state = AppState {
         upstream: cli.upstream,
         api_key,
-        db: Arc::new(db),
+        db,
+        dag,
         client: reqwest::Client::builder()
             .build()?,
     };
 
-    let app = Router::new()
-        .route("/v1/chat/completions", post(proxy::chat_completions))
-        .route("/health", post(|| async { StatusCode::OK }))
-        .with_state(state);
+    let app = proxy::routes().with_state(state);
 
     let addr = format!("{}:{}", cli.host, cli.port);
-    info!("deeplossless listening on {addr}");
-    info!("upstream: {}", upstream);
+    tracing::info!("deeplossless listening on {addr}");
+    tracing::info!("upstream: {}", upstream);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

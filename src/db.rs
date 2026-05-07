@@ -116,21 +116,32 @@ impl Database {
         Ok(())
     }
 
-    /// Persist a request's `messages` array and return the conversation ID.
-    pub fn store_messages(&self, model: &str, messages: &serde_json::Value) -> anyhow::Result<i64> {
+    /// Find a conversation by session fingerprint, or create one.
+    pub fn find_or_create_conversation(&self, fingerprint: &str, model: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        // Try to find existing conversation
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE session_id = ?1 LIMIT 1",
+                rusqlite::params![fingerprint],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        // Create new
+        conn.execute(
+            "INSERT INTO conversations (session_id, model) VALUES (?1, ?2)",
+            rusqlite::params![fingerprint, model],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Persist a request's `messages` array into an existing conversation.
+    pub fn store_messages(&self, conv_id: i64, messages: &serde_json::Value) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-
-        let session_id = messages
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|m| m["role"].as_str())
-            .unwrap_or("unknown");
-        tx.execute(
-            "INSERT INTO conversations (session_id, model) VALUES (?1, ?2)",
-            rusqlite::params![session_id, model],
-        )?;
-        let conv_id = tx.last_insert_rowid();
 
         if let Some(arr) = messages.as_array() {
             for msg in arr {
@@ -147,6 +158,14 @@ impl Database {
         }
 
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Legacy: create conversation + store messages in one call.
+    pub fn create_and_store(&self, model: &str, messages: &serde_json::Value) -> anyhow::Result<i64> {
+        let fp = crate::session::fingerprint(messages.as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3);
+        let conv_id = self.find_or_create_conversation(&fp, model)?;
+        self.store_messages(conv_id, messages)?;
         Ok(conv_id)
     }
 
@@ -267,6 +286,32 @@ impl Database {
         Ok(())
     }
 
+    /// Search messages in a conversation for `query` (LIKE-based).
+    pub fn search_messages(&self, conv_id: i64, query: &str) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT id, role, substr(content, 1, 500), token_count
+             FROM messages
+             WHERE conversation_id = ?1 AND content LIKE ?2 ESCAPE '\\'
+             ORDER BY id ASC
+             LIMIT 20",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, pattern], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let parent_str: String = row.get(5)?;
         let child_str: String = row.get(6)?;
@@ -319,7 +364,7 @@ mod tests {
             {"role": "user", "content": "hello"}
         ]);
 
-        let conv_id = db.store_messages("deepseek-v4-flash", &messages).unwrap();
+        let conv_id = db.create_and_store("deepseek-v4-flash", &messages).unwrap();
         assert!(conv_id > 0, "expected valid conversation ID");
 
         // Verify data was written

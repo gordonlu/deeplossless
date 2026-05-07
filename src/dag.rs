@@ -271,7 +271,7 @@ mod tests {
         .unwrap();
         let db = Arc::new(db);
         let conv_id = db
-            .store_messages("test", &serde_json::json!([{"role": "user", "content": "hi"}]))
+            .create_and_store("test", &serde_json::json!([{"role": "user", "content": "hi"}]))
             .unwrap();
         (db, conv_id)
     }
