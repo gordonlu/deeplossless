@@ -25,3 +25,10 @@ deepseek-tui → deeplossless (127.0.0.1:8080) → api.deepseek.com
 ```
 
 All messages are persisted verbatim. Summaries are assembled from a DAG of compressed nodes.
+
+## Attribution
+
+This project is inspired by and references:
+
+- **LCM Paper** — Clint Ehrlich & Theodore Blackman. *LCM: Lossless Context Management* (2026). [https://papers.voltropy.com/LCM](https://papers.voltropy.com/LCM)
+- **lossless-claw** — Josh Lehman / Martian Engineering. Lossless Context Management plugin for OpenClaw. [https://github.com/Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw)
