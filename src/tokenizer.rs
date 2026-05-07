@@ -1,38 +1,32 @@
-use std::sync::LazyLock;
-use tiktoken::CoreBPE;
+use std::sync::OnceLock;
+use tiktoken::CoreBpe;
 
-/// Lazily-initialized cl100k_base BPE tokenizer (used by DeepSeek V3/V4).
-static BPE: LazyLock<CoreBPE> = LazyLock::new(|| {
-    tiktoken::p50k_base().expect("failed to load p50k_base tokenizer")
-});
+static BPE: OnceLock<&CoreBpe> = OnceLock::new();
 
-/// Count tokens in a text string using cl100k_base encoding.
-/// Used for:
-///   - Accurate token accounting when storing messages
-///   - DAG node budget calculations
-///   - Context assembly threshold decisions
-pub fn count(text: &str) -> usize {
-    BPE.encode_with_special_tokens(text).len()
+fn encoding() -> &'static CoreBpe {
+    *BPE.get_or_init(|| {
+        tiktoken::get_encoding("deepseek_v3")
+            .expect("failed to load deepseek_v3 tokenizer")
+    })
 }
 
-/// Estimate token count for a JSON `Value` (message content).
-/// Handles both plain strings and structured content arrays.
+/// Count tokens in a text string using DeepSeek V3/V4 tokenizer.
+pub fn count(text: &str) -> usize {
+    encoding().count(text)
+}
+
+/// Count tokens in a JSON `Value` (message content).
+/// Handles plain strings, arrays (multi-block content), and nested structures.
 pub fn count_content(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(s) => count(s),
         serde_json::Value::Array(arr) => arr.iter().map(count_content).sum(),
-        serde_json::Value::Object(obj) => {
-            let mut total = 0;
-            for (_k, v) in obj {
-                total += count_content(v);
-            }
-            total
-        }
+        serde_json::Value::Object(obj) => obj.values().map(count_content).sum(),
         _ => 0,
     }
 }
 
-/// Estimate token overhead of a message's JSON structure (role + framing).
+/// Estimated token overhead per message for JSON framing (role + structure).
 pub const MESSAGE_OVERHEAD_TOKENS: usize = 12;
 
 #[cfg(test)]
@@ -54,5 +48,17 @@ mod tests {
     #[test]
     fn token_count_empty() {
         assert_eq!(count(""), 0);
+    }
+
+    #[test]
+    fn count_content_handles_string() {
+        let v = serde_json::json!("hello");
+        assert!(count_content(&v) > 0);
+    }
+
+    #[test]
+    fn count_content_handles_array() {
+        let v = serde_json::json!(["hello", "world"]);
+        assert!(count_content(&v) > 0);
     }
 }

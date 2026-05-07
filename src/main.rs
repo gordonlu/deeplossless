@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .expect("DEEPSEEK_API_KEY must be set");
 
+    let upstream = cli.upstream.clone();
     let state = AppState {
         upstream: cli.upstream,
         api_key,
@@ -64,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", cli.host, cli.port);
     info!("deeplossless listening on {addr}");
-    info!("upstream: {}", cli.upstream);
+    info!("upstream: {}", upstream);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
