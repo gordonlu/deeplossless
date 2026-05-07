@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json, Router, routing::{get, post},
 };
@@ -31,8 +31,22 @@ pub fn routes() -> Router<AppState> {
 
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
+    // Extract API key from Authorization header on first request
+    {
+        let mut key = state.api_key.lock().unwrap();
+        if key.is_none() {
+            if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                if let Some(bearer) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+                    *key = Some(bearer.to_string());
+                    tracing::debug!(target: "deeplossless", "API key extracted from request header");
+                }
+            }
+        }
+    }
+
     let req_body: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")).into_response(),
@@ -107,7 +121,7 @@ async fn chat_completions(
     let resp = match state
         .client
         .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", state.api_key))
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
         .json(&injected)
         .send()
@@ -164,6 +178,13 @@ async fn chat_completions(
 
 /// Render DAG context nodes into a structured, actionable context panel.
 /// Each node shows its summary, snippets, and available operations.
+/// Get the cached API key, or "unset" if none has been provided yet.
+/// The compactor will fall back to Level 3 (deterministic) if the key
+/// is "unset".
+fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
+    key.lock().unwrap().clone().unwrap_or_else(|| "unset".to_string())
+}
+
 fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -337,7 +358,7 @@ async fn lcm_compress(
         .join("\n---\n");
 
     let summarizer = match crate::summarizer::Summarizer::builder()
-        .api_key(&state.api_key)
+        .api_key(&get_cached_key(&state.api_key))
         .model("deepseek-v4-flash")
         .upstream(&state.upstream)
         .build()

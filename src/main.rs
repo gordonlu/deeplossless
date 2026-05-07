@@ -24,6 +24,11 @@ struct Cli {
     /// SQLite database path (supports ~/ and $HOME expansion)
     #[arg(long, default_value = "~/.deepseek/lcm/lcm.db")]
     db_path: String,
+
+    /// DeepSeek API key (optional — extracted from first request's
+    /// Authorization header if not provided here).
+    #[arg(long, env = "DEEPSEEK_API_KEY")]
+    api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -37,9 +42,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .expect("DEEPSEEK_API_KEY must be set");
-
     let upstream = cli.upstream.clone();
     let db = Arc::new(
         deeplossless::db::Database::builder()
@@ -52,9 +54,12 @@ async fn main() -> anyhow::Result<()> {
             .build(db.clone()),
     );
 
+    let initial_api_key = cli.api_key.clone()
+        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
+
     let compactor_config = deeplossless::compactor::CompactorConfig {
         summarizer: deeplossless::summarizer::SummarizerConfig {
-            api_key: api_key.clone(),
+            api_key: initial_api_key.clone().unwrap_or_default(),
             upstream: upstream.clone(),
             ..Default::default()
         },
@@ -66,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         upstream: cli.upstream,
-        api_key,
+        api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
         db,
         dag,
         compactor,
