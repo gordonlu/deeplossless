@@ -153,17 +153,17 @@ operations:
 
 ```
 <lcm_context>
-  [summary 42] L1 — 修复了端口绑定错误 (120 tok, 2 parents)
+  [summary 42] L1 — Fixed port binding error (120 tok, 2 parents)
     ├ path: src/main.rs
     ├ num: 8080
     └ /lcm/rollback 42
 
-  [msg 39] 当前问题: 部署失败 (45 tok)
+  [msg 39] Current: deployment failed (45 tok)
 
   Operations:
-    /lcm/compress conv_id=1 from=1 to=42 — 压缩范围
-    /lcm/delete conv_id=1 id=<node_id>   — 删除节点
-    /lcm/rollback conv_id=1 id=<node_id> — 回滚到节点
+    /lcm/compress conv_id=1 from=1 to=42 — compress node range
+    /lcm/delete conv_id=1 id=<node_id>   — delete node from context
+    /lcm/rollback conv_id=1 id=<node_id> — rollback to checkpoint
 </lcm_context>
 ```
 
