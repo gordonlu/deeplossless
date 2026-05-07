@@ -25,7 +25,7 @@ struct Cli {
     #[arg(long, default_value = "https://api.deepseek.com")]
     upstream: String,
 
-    /// SQLite database path
+    /// SQLite database path (supports ~/ and $HOME expansion)
     #[arg(long, default_value = "~/.deepseek/lcm/lcm.db")]
     db_path: String,
 }

@@ -59,7 +59,9 @@ impl Database {
     }
 
     async fn open(path: &Path) -> anyhow::Result<Self> {
-        let expanded = shellexpand::tilde(&path.to_string_lossy()).to_string();
+        let expanded = shellexpand::full(&path.to_string_lossy())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
         if let Some(parent) = Path::new(&expanded).parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -193,12 +195,16 @@ impl Database {
 
     pub fn get_child_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
+        // Use json_each() for precise JSON array matching — LIKE '%id%'
+        // would also match ids like 12 appearing inside 123 or 412.
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, is_leaf
-             FROM dag_nodes WHERE parent_ids LIKE ?1 LIMIT ?2",
+            "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
+                    n.token_count, n.parent_ids, n.child_ids, n.is_leaf
+             FROM dag_nodes n, json_each(n.parent_ids) AS j
+             WHERE j.value = ?1
+             LIMIT ?2",
         )?;
-        let pattern = format!("%{}%", node_id);
-        let rows = stmt.query_map(rusqlite::params![pattern, max_fanout as i64], Self::row_to_node)?;
+        let rows = stmt.query_map(rusqlite::params![node_id, max_fanout as i64], Self::row_to_node)?;
         let mut nodes = Vec::new();
         for row in rows {
             nodes.push(row?);
