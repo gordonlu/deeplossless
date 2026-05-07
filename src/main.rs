@@ -3,9 +3,11 @@ use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
 
+mod compactor;
 mod dag;
 mod db;
 mod proxy;
+mod summarizer;
 mod tokenizer;
 
 #[derive(Parser)]
