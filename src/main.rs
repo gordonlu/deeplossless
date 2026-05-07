@@ -5,6 +5,7 @@ use tracing::info;
 
 mod db;
 mod proxy;
+mod tokenizer;
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Lossless Context Management proxy for DeepSeek API")]
@@ -53,7 +54,6 @@ async fn main() -> anyhow::Result<()> {
         api_key,
         db: Arc::new(db::Database::open(&cli.db_path).await?),
         client: reqwest::Client::builder()
-            .http2_prior_knowledge()
             .build()?,
     };
 

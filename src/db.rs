@@ -90,9 +90,11 @@ impl Database {
                 for msg in arr {
                     let role = msg["role"].as_str().unwrap_or("unknown");
                     let content = msg["content"].to_string();
+                    let token_count = crate::tokenizer::count_content(msg) as i64
+                        + crate::tokenizer::MESSAGE_OVERHEAD_TOKENS as i64;
                     tx.execute(
-                        "INSERT INTO messages (conversation_id, role, content) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![conv_id, role, content],
+                        "INSERT INTO messages (conversation_id, role, content, token_count) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![conv_id, role, content, token_count],
                     )?;
                 }
             }
