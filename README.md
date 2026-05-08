@@ -1,12 +1,16 @@
 # deeplossless
 
 **Lossless Context Management proxy for DeepSeek API.** DAG-based conversation
-summarization with zero-loss SQLite persistence, FTS5 full-text search, and
+summarization with zero-loss SQLite persistence, full-text search, and
 Context-ReAct style active context operations.
 
 Acts as a transparent proxy between your AI client (e.g. deepseek-tui) and
 `api.deepseek.com`, storing every message verbatim while assembling lossless
 context summaries from a hierarchical DAG engine.
+
+> **Status: v0.1.0 — Proof of concept.** Core features work and are tested,
+> but the project is early-stage. Expect bugs, missing error handling, and
+> breaking changes. Not recommended for production use without review.
 
 ## Quick start
 
