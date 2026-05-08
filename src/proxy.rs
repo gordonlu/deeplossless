@@ -68,11 +68,28 @@ async fn chat_completions(
         }
     };
 
-    // Store messages asynchronously
+    // Store messages and create DAG leaf nodes asynchronously
     let db = state.db.clone();
+    let dag = state.dag.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = db.store_messages(conv_id, &messages) {
             warn!("failed to store messages: {e}");
+            return;
+        }
+        // Create a DAG leaf for each user/assistant message
+        if let Some(arr) = messages.as_array() {
+            for msg in arr {
+                let role = msg["role"].as_str().unwrap_or("");
+                if role == "user" || role == "assistant" {
+                    let tc = crate::tokenizer::count_content(msg) as i64
+                        + crate::tokenizer::MESSAGE_OVERHEAD_TOKENS as i64;
+                    // Use first 200 chars as leaf summary
+                    let summary = msg["content"].to_string().chars().take(200).collect::<String>();
+                    if let Err(e) = dag.insert_leaf(conv_id, &summary, tc) {
+                        tracing::warn!(target: "deeplossless", "failed to create DAG leaf: {e}");
+                    }
+                }
+            }
         }
     });
 
@@ -229,8 +246,8 @@ fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
 
     // Range operations at the bottom
     if ids.len() >= 2 {
-        let first = ids.first().unwrap();
-        let last = ids.last().unwrap();
+        let first = ids[0];
+        let last = ids[ids.len() - 1];
         let _ = writeln!(out);
         let _ = writeln!(out, "  Operations:");
         let _ = writeln!(out, "    /lcm/compress conv_id={cid} from={first} to={last}", cid = nodes[0].conversation_id);
