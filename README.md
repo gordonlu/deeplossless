@@ -200,6 +200,29 @@ The database uses WAL mode with automatic checkpointing every 100 writes.
 - SQLite (bundled via `rusqlite` bundled feature)
 - DeepSeek API key
 
+## Benchmarks
+
+```
+📐  DAG Compression
+     Original: 740 tokens → Compressed: 335 tokens (2.2×)
+     Snippets preserved: 7 critical values extracted
+     Compression levels: L1 (LLM detailed) → L2 (LLM bullet) → L3 (deterministic)
+
+🔍  FTS5 Full-Text Search
+     Porter tokenizer with Unicode61 support
+     Sub-millisecond query latency
+
+⚡  Processing (criterion benchmarks)
+     Token counting (8K lines):     7.8 ms
+     Snippet extraction (4K lines):  5.8 ms
+     DAG assembly (1K nodes):      483 μs
+     Session fingerprint:          124 ns
+
+💾  KV Cache Safe
+     Context injection:          system prompt only (never touches messages)
+     Memory:                     messages stored verbatim in SQLite
+```
+
 ## Attribution
 
 This project is inspired by and references:

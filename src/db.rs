@@ -93,6 +93,14 @@ impl Database {
 
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // FTS5 virtual table.  DROP + CREATE in separate calls to avoid
+        // residual shadow-table state from a prior interrupted migration.
+        conn.execute_batch("DROP TABLE IF EXISTS messages_fts;").ok();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE messages_fts
+             USING fts5(content, role UNINDEXED, tokenize='unicode61');
+        ")?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversations (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,13 +135,6 @@ impl Database {
                 ON messages(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_dag_conv
                 ON dag_nodes(conversation_id, level);
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-                USING fts5(
-                    content,
-                    role UNINDEXED,
-                    tokenize='porter unicode61'
-                );
         ")?;
         Ok(())
     }
@@ -393,20 +394,22 @@ impl Database {
 
     pub fn search_messages(&self, conv_id: i64, query: &str) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
         let conn = self.conn.lock().unwrap();
-        let safe = Self::fts_escape(query);
-        if safe.is_empty() {
+        if query.is_empty() {
             return Ok(Vec::new());
         }
+        // FTS5 MATCH doesn't support mixed CJK/English reliably with the
+        // bundled tokenizers (verified: English-only works, CJK+English fails).
+        // Use LIKE as a universal fallback.  FTS5 table is retained for
+        // future tokenizer upgrades (e.g. jieba, ICU).
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.role, snippet(messages_fts, 0, '<b>', '</b>', '…', 32),
-                    m.token_count
-             FROM messages_fts
-             JOIN messages m ON m.id = messages_fts.rowid
-             WHERE messages_fts MATCH ?1 AND m.conversation_id = ?2
-             ORDER BY rank
+            "SELECT id, role, substr(content, 1, 500), token_count
+             FROM messages
+             WHERE conversation_id = ?1 AND content LIKE ?2 ESCAPE '\\'
+             ORDER BY id ASC
              LIMIT 20",
         )?;
-        let rows = stmt.query_map(rusqlite::params![safe, conv_id], |row| {
+        let rows = stmt.query_map(rusqlite::params![conv_id, pattern], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -497,6 +500,25 @@ mod tests {
         assert!(path.exists());
         // Cleanup: drop db to close connection
         drop(db);
+    }
+
+    #[test]
+    fn fts5_match_works_through_rusqlite() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        // Pure English text with default tokenizer
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE te USING fts5(content);
+             INSERT INTO te VALUES ('hello world Gartner test');
+             CREATE VIRTUAL TABLE tc USING fts5(content);
+             INSERT INTO tc VALUES ('一份来自Gartner的2026年报告');"
+        ).unwrap();
+        let e1: i64 = conn.query_row("SELECT count(*) FROM te WHERE te MATCH 'Gartner'", [], |r| r.get(0)).unwrap();
+        let c1: i64 = conn.query_row("SELECT count(*) FROM tc WHERE tc MATCH 'Gartner'", [], |r| r.get(0)).unwrap();
+        let c2: i64 = conn.query_row("SELECT count(*) FROM tc WHERE content LIKE '%Gartner%'", [], |r| r.get(0)).unwrap();
+        println!("  English MATCH: {e1}, CJK MATCH: {c1}, CJK LIKE: {c2}");
+        assert_eq!(e1, 1, "English text MATCH must work");
+        assert_eq!(c2, 1, "CJK LIKE must work");
     }
 
     #[tokio::test]
