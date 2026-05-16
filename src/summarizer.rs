@@ -247,16 +247,19 @@ impl Summarizer {
         }
         // Preserve head and tail (~ 256 tokens each) to retain context
         // at both ends, then insert a truncation marker in the middle.
+        // Uses char-based computation to avoid UTF-8 byte/char mismatch
+        // with CJK and emoji content (P2-4).
         let head_tokens = self.config.fallback_max_tokens / 2;
         let tail_tokens = self.config.fallback_max_tokens / 2;
         let head_ratio = head_tokens as f64 / tokens as f64;
         let tail_ratio = tail_tokens as f64 / tokens as f64;
 
-        let head_len = (text.len() as f64 * head_ratio) as usize;
-        let tail_len = (text.len() as f64 * tail_ratio) as usize;
+        let char_count = text.chars().count();
+        let head_len = (char_count as f64 * head_ratio) as usize;
+        let tail_len = (char_count as f64 * tail_ratio) as usize;
 
         let head: String = text.chars().take(head_len).collect();
-        let tail: String = text.chars().skip(text.len().saturating_sub(tail_len)).collect();
+        let tail: String = text.chars().skip(char_count.saturating_sub(tail_len)).collect();
 
         format!("{head}\n…(truncated, {tokens}→{head_tokens}+{tail_tokens} tokens)\n{tail}")
     }

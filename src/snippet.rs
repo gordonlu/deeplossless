@@ -24,16 +24,29 @@ pub struct Snippet {
     pub snippet_type: SnippetType,
     /// The exact original text (e.g. "port 8080", "src/main.rs:42").
     pub content: String,
-    /// Source node ID this was extracted from.
+    /// Source node ID this was extracted from (empty if unbound).
     pub source_node_id: String,
+    /// Importance score [0.0–1.0] for ranking. Higher = more critical.
+    /// Defaults to 0.5 for most snippets; code blocks and errors get 0.8.
+    pub importance: f32,
 }
 
 // ── Extraction ─────────────────────────────────────────────────────────
 
 /// Extract snippets from a text block.  Called before LLM summarization
 /// so critical values survive compression losslessly.
+///
+/// `source_node_id` is bound to each snippet for traceability (P2-3).
+/// Token-budget truncation (P2-1): long code blocks are truncated by
+/// token count rather than hard line limit.
+/// Importance scores (P2-2): code blocks and errors get 0.8, others 0.5.
 pub fn extract(text: &str) -> Vec<Snippet> {
-    let mut snippets = Vec::new();
+    extract_with_source(text, "")
+}
+
+/// Like `extract` but binds every snippet to `source_node_id`.
+pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
+    let mut snippets = vec![];
 
     // 1. Code blocks (```...```)
     let mut in_code = false;
@@ -47,11 +60,14 @@ pub fn extract(text: &str) -> Vec<Snippet> {
                     .take(i - code_start - 1)
                     .collect::<Vec<_>>()
                     .join("\n");
-                if !block.is_empty() && block.len() < 2000 {
+                if !block.is_empty() {
+                    // Token-budget truncation: cap at ~200 tokens
+                    let truncated = token_truncate(&block, 200);
                     snippets.push(Snippet {
                         snippet_type: SnippetType::CodeBlock,
-                        content: block,
-                        source_node_id: String::new(),
+                        content: truncated,
+                        source_node_id: source_node_id.to_string(),
+                        importance: 0.8,
                     });
                 }
                 in_code = false;
@@ -69,7 +85,8 @@ pub fn extract(text: &str) -> Vec<Snippet> {
             snippets.push(Snippet {
                 snippet_type: SnippetType::FilePath,
                 content: clean.to_string(),
-                source_node_id: String::new(),
+                source_node_id: source_node_id.to_string(),
+                importance: 0.5,
             });
         }
     }
@@ -82,7 +99,8 @@ pub fn extract(text: &str) -> Vec<Snippet> {
                 snippets.push(Snippet {
                     snippet_type: SnippetType::NumericConstant,
                     content: clean.to_string(),
-                    source_node_id: String::new(),
+                    source_node_id: source_node_id.to_string(),
+                    importance: 0.5,
                 });
             }
     }
@@ -96,7 +114,8 @@ pub fn extract(text: &str) -> Vec<Snippet> {
                     snippets.push(Snippet {
                         snippet_type: SnippetType::NumericConstant,
                         content: clean.to_string(),
-                        source_node_id: String::new(),
+                        source_node_id: source_node_id.to_string(),
+                        importance: 0.5,
                     });
                 }
     }
@@ -104,10 +123,8 @@ pub fn extract(text: &str) -> Vec<Snippet> {
     // 5. Proper nouns: capitalized multi-word terms, company names, model names
     for line in text.lines() {
         let trimmed = line.trim();
-        // Skip section headers and start-of-sentence words
         if trimmed.starts_with('#') || trimmed.starts_with('-') { continue; }
         let lower = trimmed.to_lowercase();
-        // Known proper nouns that should always be preserved
         const KEY_PROPER_NOUNS: &[&str] = &[
             "Gartner", "DeepSeek", "DeepSeek-V4", "Claude Opus", "OpenAI",
             "Transformer", "DAG", "Context-ReAct", "FTS5", "SQLite",
@@ -118,7 +135,8 @@ pub fn extract(text: &str) -> Vec<Snippet> {
                     snippets.push(Snippet {
                         snippet_type: SnippetType::ProperNoun,
                         content: pn.to_string(),
-                        source_node_id: String::new(),
+                        source_node_id: source_node_id.to_string(),
+                        importance: 0.5,
                     });
                 }
         }
@@ -128,7 +146,6 @@ pub fn extract(text: &str) -> Vec<Snippet> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.contains("Error") || trimmed.contains("error") || trimmed.contains("failed") {
-            // Extract quoted content
             let mut in_quote = false;
             let mut quote_start = 0;
             for (j, ch) in trimmed.char_indices() {
@@ -139,7 +156,8 @@ pub fn extract(text: &str) -> Vec<Snippet> {
                             snippets.push(Snippet {
                                 snippet_type: SnippetType::ErrorMessage,
                                 content: segment.to_string(),
-                                source_node_id: String::new(),
+                                source_node_id: source_node_id.to_string(),
+                                importance: 0.8,
                             });
                         }
                         in_quote = false;
@@ -152,13 +170,33 @@ pub fn extract(text: &str) -> Vec<Snippet> {
         }
     }
 
-    // Dedup by content
-    snippets.sort_by(|a, b| a.content.cmp(&b.content));
+    // Dedup by content, keep highest importance
+    snippets.sort_by(|a, b| a.content.cmp(&b.content).then(
+        a.importance.partial_cmp(&b.importance).unwrap_or(std::cmp::Ordering::Equal)
+    ));
     snippets.dedup_by(|a, b| a.content == b.content);
 
-    // Limit to 20 snippets per extraction
-    snippets.truncate(20);
+    // Token-budget truncation: keep snippets up to ~500 tokens total
+    let max_tokens = 500;
+    let mut used = 0;
+    snippets.retain(|s| {
+        let tc = crate::tokenizer::count(&s.content);
+        if used + tc > max_tokens { return false; }
+        used += tc;
+        true
+    });
+
     snippets
+}
+
+/// Truncate text to approximately `max_tokens` tokens.
+fn token_truncate(text: &str, max_tokens: usize) -> String {
+    let tc = crate::tokenizer::count(text);
+    if tc <= max_tokens { return text.to_string(); }
+    let ratio = max_tokens as f64 / tc as f64;
+    let char_len = text.chars().count();
+    let new_len = (char_len as f64 * ratio) as usize;
+    text.chars().take(new_len).collect()
 }
 
 fn looks_like_path(s: &str) -> bool {

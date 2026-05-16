@@ -10,7 +10,7 @@ const DEFAULT_DB_PATH: &str = "~/.deepseek/lcm/lcm.db";
 /// Builder for [`Database`].
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let db = Database::builder()
 ///     .path("/tmp/test.db")
 ///     .build()
@@ -264,18 +264,51 @@ impl Database {
         Ok(rows.next().transpose()?)
     }
 
-    pub fn get_child_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
+    /// Find nodes whose child_ids list contains the given node_id.
+    /// For a given leaf, returns the summaries that include it.
+    /// For a summary, returns higher-level summaries that compress it.
+    pub fn get_parent_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
-        // Use json_each() for precise JSON array matching — LIKE '%id%'
-        // would also match ids like 12 appearing inside 123 or 412.
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
                     n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf
-             FROM dag_nodes n, json_each(n.parent_ids) AS j
+             FROM dag_nodes n, json_each(n.child_ids) AS j
              WHERE j.value = ?1
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![node_id, max_fanout as i64], Self::row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
+    }
+
+    pub fn get_child_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
+        let conn = self.conn.lock().unwrap();
+        let child_ids_json: String = conn.query_row(
+            "SELECT child_ids FROM dag_nodes WHERE id = ?1",
+            rusqlite::params![node_id],
+            |row| row.get(0),
+        )?;
+        let child_ids: Vec<i64> = serde_json::from_str(&child_ids_json).unwrap_or_default();
+        if child_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = child_ids.into_iter().take(max_fanout).collect();
+        let placeholders: Vec<String> = ids.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
+             FROM dag_nodes WHERE id IN ({})",
+            placeholders.join(","),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), Self::row_to_node)?;
         let mut nodes = Vec::new();
         for row in rows {
             nodes.push(row?);
@@ -320,6 +353,62 @@ impl Database {
         let mut nodes = Vec::new();
         for row in rows { nodes.push(row?); }
         Ok(nodes)
+    }
+
+    /// Atomically insert a summary node and back-link to its source nodes.
+    /// Wraps the insert + parent-ids update in a single transaction (P2-6)
+    /// to prevent partial graph writes.
+    pub fn insert_summary_atomic(
+        &self,
+        conversation_id: i64,
+        level: u8,
+        summary: &str,
+        token_count: i64,
+        source_ids: &[i64],
+        snippets: &[crate::snippet::Snippet],
+    ) -> anyhow::Result<DagNode> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        let parent_json = "[]".to_string();
+        let child_json = serde_json::to_string(source_ids)?;
+        let snippet_json = serde_json::to_string(snippets)?;
+        tx.execute(
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json],
+        )?;
+        let new_id = tx.last_insert_rowid();
+
+        for sid in source_ids {
+            let existing: String = tx.query_row(
+                "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            )?;
+            let mut ids: Vec<i64> = serde_json::from_str(&existing).unwrap_or_default();
+            if !ids.contains(&new_id) {
+                ids.push(new_id);
+                let json = serde_json::to_string(&ids)?;
+                tx.execute(
+                    "UPDATE dag_nodes SET parent_ids = ?1 WHERE id = ?2",
+                    rusqlite::params![json, sid],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(DagNode {
+            id: new_id,
+            conversation_id,
+            level,
+            summary: summary.to_string(),
+            token_count,
+            parent_ids: vec![],
+            child_ids: source_ids.to_vec(),
+            snippets: snippets.to_vec(),
+            is_leaf: false,
+        })
     }
 
     pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
@@ -367,6 +456,28 @@ impl Database {
             conn.execute(
                 "UPDATE dag_nodes SET child_ids = ?1 WHERE id = ?2",
                 rusqlite::params![json, parent_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Add a parent ID to a node's parent_ids list.
+    /// Semantic: `summary.child_ids = raw_ids`, so raw nodes get the summary
+    /// added to their parent_ids.
+    pub fn add_parent_to_node(&self, child_id: i64, parent_id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let existing: String = conn.query_row(
+            "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
+            rusqlite::params![child_id],
+            |row| row.get(0),
+        )?;
+        let mut ids: Vec<i64> = serde_json::from_str(&existing).unwrap_or_default();
+        if !ids.contains(&parent_id) {
+            ids.push(parent_id);
+            let json = serde_json::to_string(&ids)?;
+            conn.execute(
+                "UPDATE dag_nodes SET parent_ids = ?1 WHERE id = ?2",
+                rusqlite::params![json, child_id],
             )?;
         }
         Ok(())

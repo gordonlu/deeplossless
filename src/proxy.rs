@@ -11,11 +11,7 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
-use crate::compactor::{CompactCommand, CompactEvent};
 use crate::AppState;
-
-/// Max context window for threshold calculations.
-const CONTEXT_WINDOW: usize = 1_000_000;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -55,84 +51,16 @@ async fn chat_completions(
 
     let model = crate::session::model_name(&req_body);
     let streaming = crate::session::is_streaming(&req_body);
-    let messages = req_body["messages"].clone();
-    let msgs_arr = messages.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
 
-    // Resolve conversation via fingerprint
-    let fp = crate::session::fingerprint(msgs_arr, 3);
-    let conv_id = match state.db.find_or_create_conversation(&fp, model) {
-        Ok(id) => id,
+    // Run the chat pipeline (fingerprint → store → compact → assemble → inject)
+    let pipeline = crate::pipeline::ChatPipeline::new(&state);
+    let injected_body = match pipeline.process(model, &req_body).await {
+        Ok(out) => out.injected_body,
         Err(e) => {
-            warn!("failed to resolve conversation: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+            warn!("pipeline error: {e}, falling back to passthrough");
+            req_body.clone()
         }
     };
-
-    // Store messages and create DAG leaf nodes asynchronously
-    let db = state.db.clone();
-    let dag = state.dag.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = db.store_messages(conv_id, &messages) {
-            warn!("failed to store messages: {e}");
-            return;
-        }
-        // Create a DAG leaf for each user/assistant message
-        if let Some(arr) = messages.as_array() {
-            for msg in arr {
-                let role = msg["role"].as_str().unwrap_or("");
-                if role == "user" || role == "assistant" {
-                    let tc = crate::tokenizer::count_content(msg) as i64
-                        + crate::tokenizer::MESSAGE_OVERHEAD_TOKENS as i64;
-                    // Use first 200 chars as leaf summary
-                    let summary = msg["content"].to_string().chars().take(200).collect::<String>();
-                    if let Err(e) = dag.insert_leaf(conv_id, &summary, tc) {
-                        tracing::warn!(target: "deeplossless", "failed to create DAG leaf: {e}");
-                    }
-                }
-            }
-        }
-    });
-
-    // Trigger async compaction review (soft threshold)
-    {
-        let mut compactor = state.compactor.lock().await;
-        let _ = compactor
-            .command(CompactCommand::ReviewAndCompact {
-                conv_id,
-                context_window: CONTEXT_WINDOW,
-            })
-            .await;
-        // Drain and log any resulting events
-        for event in compactor.drain_events() {
-            match event {
-                CompactEvent::GroupCompressed { tokens_saved, .. } => {
-                    tracing::debug!(target: "deeplossless", conv_id, tokens_saved, "compaction completed");
-                }
-                CompactEvent::BelowThreshold => {}
-                CompactEvent::Error { message } => {
-                    tracing::warn!(target: "deeplossless", conv_id, error = %message, "compaction error");
-                }
-            }
-        }
-    }
-
-    // Assemble DAG context and inject into ALL system messages.
-    // DAG failures never block the request — the proxy falls back
-    // to a plain passthrough if context assembly fails.
-    let mut injected = req_body.clone();
-    if let Ok(dag_ctx) = state.dag.assemble_context(conv_id, 2000) {
-        if !dag_ctx.is_empty() {
-            let ctx_text = render_dag_context(&dag_ctx);
-            if let Some(arr) = injected["messages"].as_array_mut() {
-                for msg in arr.iter_mut().filter(|m| m["role"] == "system") {
-                    let existing = msg["content"].as_str().unwrap_or("");
-                    msg["content"] = json!(format!("{}\n\n<lcm_context>\n{}\n</lcm_context>", existing, ctx_text));
-                }
-            }
-        }
-    } else {
-        tracing::debug!(target: "deeplossless", conv_id, "DAG context assembly failed, running without injection");
-    }
 
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
@@ -141,7 +69,7 @@ async fn chat_completions(
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
-        .json(&injected)
+        .json(&injected_body)
         .send()
         .await
     {
@@ -194,69 +122,11 @@ async fn chat_completions(
     }
 }
 
-/// Render DAG context nodes into a structured, actionable context panel.
-/// Each node shows its summary, snippets, and available operations.
 /// Get the cached API key, or "unset" if none has been provided yet.
 /// The compactor will fall back to Level 3 (deterministic) if the key
 /// is "unset".
 fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
     key.lock().unwrap().clone().unwrap_or_else(|| "unset".to_string())
-}
-
-fn render_dag_context(nodes: &[crate::dag::DagNode]) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    let _ = writeln!(out, "<lcm_context>");
-
-    // Collect for range-based operations
-    let ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
-
-    for node in nodes {
-        let header = if node.is_leaf {
-            format!("[msg {}] {} ({} tok)", node.id, node.summary, node.token_count)
-        } else {
-            format!(
-                "[summary {}] L{} — {} ({} tok, {} parents)",
-                node.id,
-                node.level,
-                node.summary,
-                node.token_count,
-                node.parent_ids.len()
-            )
-        };
-        let _ = writeln!(out, "  {header}");
-
-        // Snippets
-        for s in &node.snippets {
-            let label = match s.snippet_type {
-                crate::snippet::SnippetType::CodeBlock => "code",
-                crate::snippet::SnippetType::FilePath => "path",
-                crate::snippet::SnippetType::NumericConstant => "num",
-                crate::snippet::SnippetType::ErrorMessage => "err",
-                crate::snippet::SnippetType::ProperNoun => "ref",
-            };
-            let _ = writeln!(out, "    ├ {label}: {}", s.content);
-        }
-
-        // Available actions for this node
-        if node.level > 0 {
-            let _ = writeln!(out, "    └ /lcm/rollback {id}", id = node.id);
-        }
-    }
-
-    // Range operations at the bottom
-    if ids.len() >= 2 {
-        let first = ids[0];
-        let last = ids[ids.len() - 1];
-        let _ = writeln!(out);
-        let _ = writeln!(out, "  Operations:");
-        let _ = writeln!(out, "    /lcm/compress conv_id={cid} from={first} to={last}", cid = nodes[0].conversation_id);
-        let _ = writeln!(out, "    /lcm/delete conv_id={cid} id=<node_id>", cid = nodes[0].conversation_id);
-        let _ = writeln!(out, "    /lcm/rollback conv_id={cid} id=<summary_id>", cid = nodes[0].conversation_id);
-    }
-
-    let _ = writeln!(out, "</lcm_context>");
-    out
 }
 
 // ── LCM retrieval endpoints ────────────────────────────────────────────

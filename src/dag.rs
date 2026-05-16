@@ -129,6 +129,13 @@ impl DagEngine {
         self.db.get_child_nodes(node_id, self.config.max_fanout)
     }
 
+    /// Return the parent nodes of a node (nodes whose child_ids include this node).
+    /// For a leaf, this returns the summaries that compress it.
+    /// For a summary, this returns higher-level summaries that compress it.
+    pub fn get_parents(&self, node_id: i64) -> anyhow::Result<Vec<DagNode>> {
+        self.db.get_parent_nodes(node_id, self.config.max_fanout)
+    }
+
     pub fn get_active_tip(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         self.db.get_tip_node(conv_id)
     }
@@ -155,26 +162,23 @@ impl DagEngine {
     pub fn compress_group_with_snippets(
         &self,
         conv_id: i64,
-        parent_ids: &[i64],
+        source_ids: &[i64],
         summary: &str,
         token_count: i64,
         level: u8,
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
-        let new_node = self.db.insert_dag_node_full(
+        // Atomic: insert summary node + back-link to sources in one transaction (P2-6)
+        // Invariant: summary.child_ids = source_ids (raw nodes being summarized)
+        //            each source's parent_ids includes the new summary node
+        self.db.insert_summary_atomic(
             conv_id,
             level.min(self.config.max_level),
             summary,
             token_count,
-            parent_ids,
-            &[],
+            source_ids,
             snippets,
-            false,
-        )?;
-        for pid in parent_ids {
-            self.db.add_child_to_node(*pid, new_node.id)?;
-        }
-        Ok(new_node)
+        )
     }
 
     /// Compress a group of nodes into a higher-level summary node.
@@ -195,7 +199,7 @@ impl DagEngine {
     fn compress_group_inner(
         &self,
         conv_id: i64,
-        parent_ids: &[i64],
+        source_ids: &[i64],
         summary: &str,
         token_count: i64,
         level: u8,
@@ -206,15 +210,14 @@ impl DagEngine {
             level.min(self.config.max_level),
             summary,
             token_count,
-            parent_ids,
-            &[],
+            &[],        // parent_ids: set when summarized by a higher node
+            source_ids, // child_ids: the source nodes being summarized
             snippets,
             false,
         )?;
 
-        // Back-link each parent to this new node
-        for pid in parent_ids {
-            self.db.add_child_to_node(*pid, new_node.id)?;
+        for pid in source_ids {
+            self.db.add_parent_to_node(*pid, new_node.id)?;
         }
 
         Ok(new_node)
@@ -222,8 +225,12 @@ impl DagEngine {
 
     // ── Context assembly (LCM §2.1) ────────────────────────────────────
 
-    /// Assemble the active context: recent raw messages + higher-level
-    /// summaries, staying within `token_budget` tokens.
+    /// Assemble the active context: higher-level summaries + recent raw
+    /// messages NOT already covered by those summaries, staying within
+    /// `token_budget` tokens.
+    ///
+    /// Coverage-aware: prevents double injection where a summary and the
+    /// raw messages it summarizes both appear in context.
     ///
     /// Returns nodes in display order (summaries first, then recent messages).
     pub fn assemble_context(
@@ -233,22 +240,28 @@ impl DagEngine {
     ) -> anyhow::Result<Vec<DagNode>> {
         let mut result = Vec::new();
         let mut remaining = token_budget as i64;
+        let mut covered_ids = std::collections::HashSet::new();
 
         // 1. Walk from the active tip down to collect summaries
         if let Some(tip) = self.get_active_tip(conv_id)? {
             let summaries = self.collect_summary_chain(&tip, remaining)?;
             for node in &summaries {
                 remaining -= node.token_count;
+                // Collect coverage: child_ids = raw messages this summary covers
+                for cid in &node.child_ids {
+                    covered_ids.insert(*cid);
+                }
             }
             result.extend(summaries);
         }
 
-        // 2. Append most recent raw leaves (up to budget)
+        // 2. Append most recent raw leaves NOT already covered by summaries
         let leaves = self.get_leaves(conv_id)?;
         let recent: Vec<_> = leaves
             .into_iter()
             .rev()
             .take(self.config.recent_message_count)
+            .filter(|n| !covered_ids.contains(&n.id))
             .collect();
 
         for node in recent.into_iter().rev() {
@@ -264,24 +277,28 @@ impl DagEngine {
         Ok(result)
     }
 
-    /// Walk up from a node following parent links (breadth-first, bounded).
+    /// Walk summary chain from a node upward/downward, bounded by budget.
+    /// Tracks visited node IDs to prevent recursive duplication (P2-5).
     fn collect_summary_chain(&self, start: &DagNode, budget: i64) -> anyhow::Result<Vec<DagNode>> {
         let mut nodes = Vec::new();
         let mut stack = vec![start.clone()];
-        let mut visited = 0;
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(start.id);
 
         while let Some(node) = stack.pop() {
-            visited += 1;
-            if visited > self.config.max_fanout {
+            if seen.len() > self.config.max_fanout {
                 break;
             }
             if node.level == 0 {
                 continue;
             }
             if node.token_count > budget && !node.is_leaf {
-                // Too expensive — expand children instead
                 let children = self.get_children(node.id)?;
-                stack.extend(children);
+                for child in children {
+                    if seen.insert(child.id) {
+                        stack.push(child);
+                    }
+                }
                 continue;
             }
             nodes.push(node);
@@ -308,11 +325,16 @@ impl DagEngine {
             stack.push(leaf.id);
         }
 
+        // Traverse both parent_ids (raw → summary) and child_ids (summary → raw)
+        // to handle the corrected DAG direction: summary.child_ids = raw_ids
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) { continue; }
             if let Some(node) = self.db.get_node(id)? {
-                for pid in node.parent_ids {
-                    stack.push(pid);
+                for pid in &node.parent_ids {
+                    stack.push(*pid);
+                }
+                for cid in &node.child_ids {
+                    stack.push(*cid);
                 }
             }
         }
@@ -383,45 +405,36 @@ fn html_escape(text: &str, max_chars: usize) -> String {
     out
 }
 
-/// Return true when a message content looks like a tool result.
-fn is_tool_result(content: &str) -> bool {
-    content.contains("tool_result") || content.contains("ToolResult")
-}
-
-/// Return true when a message content looks like a tool call.
-fn is_tool_use(content: &str) -> bool {
-    content.contains("tool_use") || content.contains("ToolUse")
-}
-
-/// Find safe split points in a slice of `(role, content)` pairs for
+/// Find safe split points in a slice of normalized messages for
 /// compression grouping.  Splitting at these points guarantees that:
 ///
-/// - No `tool_use` is separated from its corresponding `tool_result`
+/// - No tool call is separated from its corresponding tool result
 /// - Group boundaries fall at clean turn boundaries
 ///
-/// Returns indices (into `pairs`) that are *safe* split positions
+/// Uses `NormalizedMessage` role-based detection instead of fragile
+/// content heuristics, supporting OpenAI/DeepSeek/Claude schemas.
+///
+/// Returns indices (into `messages`) that are *safe* split positions
 /// (everything before the index can be compressed as a complete unit).
-pub fn safe_split_points(pairs: &[(String, String)]) -> Vec<usize> {
+pub fn safe_split_points(messages: &[crate::session::NormalizedMessage]) -> Vec<usize> {
     // First pass: mark indices that are inside a tool chain
-    let mut inside_tool_chain = vec![false; pairs.len()];
-    for i in 0..pairs.len() {
-        if pairs[i].0 == "assistant" && is_tool_use(&pairs[i].1) {
+    let mut inside_tool_chain = vec![false; messages.len()];
+    for i in 0..messages.len() {
+        if crate::session::is_tool_call(&messages[i]) {
             inside_tool_chain[i] = true;
             let mut j = i + 1;
-            while j < pairs.len() && pairs[j].0 == "user" && is_tool_result(&pairs[j].1) {
+            while j < messages.len() && crate::session::is_tool_result(&messages[j]) {
                 inside_tool_chain[j] = true;
                 j += 1;
             }
-            // Also mark the next non-tool user message if it's clearly
-            // a continuation (starts the next turn)
         }
     }
 
     // Second pass: user messages that are NOT inside a tool chain are safe splits
     let mut safe = Vec::new();
     safe.push(0); // always safe before the first message
-    for i in 0..pairs.len() {
-        if pairs[i].0 == "user" && !inside_tool_chain[i] {
+    for i in 0..messages.len() {
+        if messages[i].role == "user" && !inside_tool_chain[i] {
             safe.push(i);
         }
     }
@@ -498,10 +511,17 @@ mod tests {
         assert_eq!(summary.level, 1);
         assert!(!summary.is_leaf);
 
-        // Parents should be back-linked
-        let children_a = engine.get_children(a.id).unwrap();
-        assert_eq!(children_a.len(), 1);
-        assert_eq!(children_a[0].id, summary.id);
+        // Invariant: summary.child_ids = source_ids
+        let summary_children = engine.get_children(summary.id).unwrap();
+        assert_eq!(summary_children.len(), 2);
+        assert!(summary_children.iter().any(|n| n.id == a.id));
+        assert!(summary_children.iter().any(|n| n.id == b.id));
+
+        // Invariant: source nodes' parent_ids includes the summary
+        let node_a = engine.get_node(a.id).unwrap().unwrap();
+        assert!(node_a.parent_ids.contains(&summary.id));
+        let node_b = engine.get_node(b.id).unwrap().unwrap();
+        assert!(node_b.parent_ids.contains(&summary.id));
     }
 
     #[test]
@@ -569,32 +589,53 @@ mod tests {
 
     // ── safe_split_points tests ────────────────────────────────────────
 
+    use crate::session::NormalizedMessage;
+
+    fn simple_msg(role: &str, text: &str) -> NormalizedMessage {
+        NormalizedMessage {
+            role: role.to_string(),
+            content: text.to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }
+    }
+
     #[test]
     fn safe_split_simple_turns() {
-        let pairs = vec![
-            ("user".into(), "hello".into()),
-            ("assistant".into(), "hi".into()),
-            ("user".into(), "what is rust?".into()),
-            ("assistant".into(), "a language".into()),
+        let msgs = vec![
+            simple_msg("user", "hello"),
+            simple_msg("assistant", "hi"),
+            simple_msg("user", "what is rust?"),
+            simple_msg("assistant", "a language"),
         ];
-        let points = safe_split_points(&pairs);
-        // Should split before each user message: index 0 and 2
+        let points = safe_split_points(&msgs);
         assert!(points.contains(&0), "should split at start");
         assert!(points.contains(&2), "should split before second user msg");
     }
 
     #[test]
     fn safe_split_keeps_tool_pairs_together() {
-        let pairs = vec![
-            ("user".into(), "read src/main.rs".into()),
-            ("assistant".into(), "tool_use: read_file".into()),
-            ("user".into(), "tool_result: pub fn main()".into()),
-            ("user".into(), "now fix it".into()),
+        let msgs = vec![
+            simple_msg("user", "read src/main.rs"),
+            NormalizedMessage {
+                role: "assistant".into(),
+                content: "".into(),
+                tool_calls: vec![crate::session::NormalizedToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                tool_call_id: None,
+            },
+            NormalizedMessage {
+                role: "tool".into(),
+                content: "pub fn main()".into(),
+                tool_calls: vec![],
+                tool_call_id: Some("call_1".into()),
+            },
+            simple_msg("user", "now fix it"),
         ];
-        let points = safe_split_points(&pairs);
-        // 0: before first user ✓
-        // after tool_use (index 1), fast-forward past tool_result (index 2)
-        // → safe at index 3 (after the tool chain)
+        let points = safe_split_points(&msgs);
         assert!(points.contains(&0), "should split at message 0");
         assert!(!points.contains(&2), "should NOT split inside tool chain");
         assert!(points.contains(&3), "should split after tool chain");
@@ -604,5 +645,28 @@ mod tests {
     fn safe_split_empty() {
         let points = safe_split_points(&[]);
         assert_eq!(points, vec![0], "index 0 is always safe");
+    }
+
+    #[test]
+    fn safe_split_claude_tool_use() {
+        let msgs = vec![
+            simple_msg("user", "list files"),
+            NormalizedMessage {
+                role: "assistant".into(),
+                content: r#"{"type": "tool_use", "name": "bash", "input": "ls"}"#.into(),
+                tool_calls: vec![crate::session::NormalizedToolCall {
+                    id: "toolu_1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"input": "ls"}"#.into(),
+                }],
+                tool_call_id: None,
+            },
+            simple_msg("user", "tool_result: file1.rs"),
+            simple_msg("user", "now edit it"),
+        ];
+        let points = safe_split_points(&msgs);
+        assert!(points.contains(&0));
+        assert!(!points.contains(&2), "should NOT split inside tool chain");
+        assert!(points.contains(&3), "should split after tool chain");
     }
 }

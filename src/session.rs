@@ -1,3 +1,85 @@
+/// Normalized message: a universal representation that works across
+/// OpenAI / DeepSeek / Claude tool schemas.
+///
+/// Tool calls are extracted from their schema-specific locations into
+/// a unified `Vec<NormalizedToolCall>` so downstream logic (e.g.
+/// `safe_split_points`) can reason about tool chains by role alone,
+/// without fragile content heuristics.
+#[derive(Debug, Clone)]
+pub struct NormalizedMessage {
+    pub role: String,
+    pub content: String,
+    /// Unified tool calls extracted from any schema variant.
+    pub tool_calls: Vec<NormalizedToolCall>,
+    /// tool_call_id for tool result messages.
+    pub tool_call_id: Option<String>,
+}
+
+/// Unified tool call — extracted from assistant messages.
+#[derive(Debug, Clone)]
+pub struct NormalizedToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Normalize a raw JSON message value from any API schema.
+pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
+    let role = msg["role"].as_str().unwrap_or("unknown").to_string();
+    let content = msg["content"].to_string();
+    let tool_call_id = msg["tool_call_id"].as_str().map(|s| s.to_string());
+
+    // Extract tool calls from multiple schema variants
+    let mut tool_calls = Vec::new();
+
+    // OpenAI/DeepSeek: assistant.tool_calls[]
+    if let Some(calls) = msg["tool_calls"].as_array() {
+        for tc in calls {
+            if let (Some(id), Some(func)) = (tc["id"].as_str(), tc["function"].as_object()) {
+                tool_calls.push(NormalizedToolCall {
+                    id: id.to_string(),
+                    name: func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    arguments: func.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                });
+            }
+        }
+    }
+
+    // Claude: content blocks with type "tool_use" / "tool_result"
+    if let Some(blocks) = msg["content"].as_array() {
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("tool_use") => {
+                    if let Some(id) = block["id"].as_str() {
+                        tool_calls.push(NormalizedToolCall {
+                            id: id.to_string(),
+                            name: block["name"].as_str().unwrap_or("").to_string(),
+                            arguments: block["input"].to_string(),
+                        });
+                    }
+                }
+                Some("tool_result") => {
+                    // Content is the result text
+                }
+                _ => {}
+            }
+        }
+    }
+
+    NormalizedMessage { role, content, tool_calls, tool_call_id }
+}
+
+/// Check if a normalized message represents a tool call.
+pub fn is_tool_call(msg: &NormalizedMessage) -> bool {
+    !msg.tool_calls.is_empty() || msg.role == "assistant" && msg.content.contains("tool_use")
+}
+
+/// Check if a normalized message represents a tool result.
+pub fn is_tool_result(msg: &NormalizedMessage) -> bool {
+    msg.role == "tool" || msg.tool_call_id.is_some()
+        || msg.role == "user" && msg.content.contains("tool_result")
+}
+
 /// Generate a stable session fingerprint from a messages array.
 ///
 /// Uses the first `prefix_count` messages (typically system prompt + first
@@ -87,5 +169,66 @@ mod tests {
     fn is_streaming_false_by_default() {
         let body = json!({"model": "deepseek"});
         assert!(!is_streaming(&body));
+    }
+
+    // ── NormalizedMessage tests ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_openai_tool_call() {
+        let raw = json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_123",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\": \"main.rs\"}"
+                }
+            }]
+        });
+        let msg = normalize_message(&raw);
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].name, "read_file");
+        assert!(is_tool_call(&msg));
+    }
+
+    #[test]
+    fn normalize_tool_result_by_role() {
+        let raw = json!({
+            "role": "tool",
+            "content": "file content",
+            "tool_call_id": "call_123"
+        });
+        let msg = normalize_message(&raw);
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
+        assert!(is_tool_result(&msg));
+    }
+
+    #[test]
+    fn normalize_plain_user_message() {
+        let raw = json!({"role": "user", "content": "hello"});
+        let msg = normalize_message(&raw);
+        assert_eq!(msg.role, "user");
+        assert!(msg.tool_calls.is_empty());
+        assert!(msg.tool_call_id.is_none());
+        assert!(!is_tool_call(&msg));
+        assert!(!is_tool_result(&msg));
+    }
+
+    #[test]
+    fn normalize_claude_tool_use() {
+        let raw = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Let me check"},
+                {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": "ls"}
+            ]
+        });
+        let msg = normalize_message(&raw);
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].name, "bash");
+        assert!(is_tool_call(&msg));
     }
 }

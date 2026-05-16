@@ -90,17 +90,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Graceful shutdown: wait for SIGTERM/SIGINT (Ctrl+C), then
+    // Graceful shutdown: wait for SIGINT (Ctrl+C), then
     // drain pending requests with a 15-second timeout.
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            let ctrl_c = tokio::signal::ctrl_c();
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .ok();
-            tokio::select! {
-                _ = ctrl_c => {},
-                _ = async { if let Some(ref mut s) = term { s.recv().await; } } => {},
-            }
+            tokio::signal::ctrl_c().await.ok();
             tracing::info!("shutdown signal received, draining requests…");
         })
         .await?;

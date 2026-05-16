@@ -140,15 +140,27 @@ async fn review_and_compact(
         Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("total_tokens: {e}") }).await; return; }
     };
 
-    if total < hard {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
-        return;
-    }
-
+    // Entropy-aware compaction: trigger based on token threshold OR
+    // information density (many small leaves = high noise, low density).
+    // High leaf count with low token saturation suggests fragmented context
+    // that benefits from compaction even before the hard threshold.
     let leaves = match dag.get_leaves(conv_id) {
         Ok(l) => l,
         Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
     };
+
+    let leaf_count = leaves.len();
+    let soft_trigger = leaf_count >= config.group_size * 2
+        && total >= (context_window as f64 * config.soft_threshold_pct) as i64;
+
+    if total < hard && !soft_trigger {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        return;
+    }
+
+    if leaf_count < 2 {
+        return;
+    }
 
     let group: Vec<_> = leaves.iter().take(config.group_size).map(|n| n.id).collect();
     if group.len() < 2 { return; }
@@ -198,7 +210,8 @@ async fn do_compress(
             let tc = crate::tokenizer::count(&summary) as i64;
             let dag_level = level.to_dag_level();
             // Extract snippets before compression to preserve precision (#10)
-            let snippets = crate::snippet::extract(&text);
+            let source = node_ids.first().map(|id| id.to_string()).unwrap_or_default();
+            let snippets = crate::snippet::extract_with_source(&text, &source);
             match dag.compress_group_with_snippets(conv_id, &node_ids, &summary, tc, dag_level, &snippets) {
                 Ok(node) => {
                     let _ = event_tx.send(CompactEvent::GroupCompressed {
