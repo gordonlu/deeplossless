@@ -6,9 +6,11 @@ use crate::db::Database;
 
 /// In-memory snapshot of a conversation's DAG, used for batch-loaded
 /// context assembly (avoids N+1 DB roundtrips).
+#[allow(dead_code)]
 struct DagGraph {
     nodes: HashMap<i64, DagNode>,
     children: HashMap<i64, Vec<i64>>,
+    #[allow(dead_code)]
     parents: HashMap<i64, Vec<i64>>,
 }
 
@@ -1354,7 +1356,7 @@ mod tests {
         let (db, conv_id) = setup_db();
         let engine = DagEngine::builder().max_level(3).build(db);
 
-        let a = engine.insert_leaf(conv_id, "unique leaf", 5).unwrap();
+        let _a = engine.insert_leaf(conv_id, "unique leaf", 5).unwrap();
 
         // Non-existing summary should not be found
         let result = engine.find_similar_node("never seen before text", &[]).unwrap();
@@ -1383,7 +1385,7 @@ mod tests {
         let (db, conv_id) = setup_db();
         let engine = DagEngine::builder().max_level(3).build(db.clone());
 
-        let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
+        let _a = engine.insert_leaf(conv_id, "A", 5).unwrap();
         // Insert a node that references a non-existent child
         db.insert_dag_node(conv_id, 1, "orphan summary", 10, &[], &[99999], false).unwrap();
 
