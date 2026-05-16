@@ -5,6 +5,19 @@ use std::sync::Mutex;
 
 use crate::dag::DagNode;
 
+/// Result from unified search across messages, summaries, and snippets.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnifiedSearchResult {
+    pub id: i64,
+    /// `"message"`, `"summary"`, or `"snippet"`.
+    pub source: String,
+    /// Role (for messages) or level (for summaries/snippets).
+    pub label: String,
+    /// Matching excerpt (up to 500 chars).
+    pub excerpt: String,
+    pub token_count: i64,
+}
+
 const DEFAULT_DB_PATH: &str = "~/.deepseek/lcm/lcm.db";
 
 /// Builder for [`Database`].
@@ -101,6 +114,14 @@ impl Database {
              USING fts5(content, role UNINDEXED, tokenize='unicode61');
         ")?;
 
+        // Snippets FTS5 index for precision-critical value retrieval.
+        // DROP first to avoid stale shadow-table state.
+        conn.execute_batch("DROP TABLE IF EXISTS snippets_fts;").ok();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE snippets_fts
+             USING fts5(content, source_type UNINDEXED, node_id UNINDEXED, tokenize='unicode61');
+        ")?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversations (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,14 +149,86 @@ impl Database {
                 child_ids       TEXT NOT NULL DEFAULT '[]',
                 snippets        TEXT NOT NULL DEFAULT '[]',
                 is_leaf         INTEGER NOT NULL DEFAULT 1,
+                deleted         INTEGER NOT NULL DEFAULT 0,
+                deleted_at      TEXT,
+                semantic_hash   TEXT NOT NULL DEFAULT '',
                 created_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            CREATE INDEX IF NOT EXISTS idx_messages_conv
-                ON messages(conversation_id);
-            CREATE INDEX IF NOT EXISTS idx_dag_conv
-                ON dag_nodes(conversation_id, level);
+            -- Cross-conversation semantic dedup index (v0.3)
+            CREATE TABLE IF NOT EXISTS semantic_index (
+                hash            TEXT NOT NULL,
+                node_id         INTEGER NOT NULL REFERENCES dag_nodes(id),
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+                summary_preview TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (hash, node_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_semantic_hash
+                ON semantic_index(hash);
+
+            -- Provenance tracing: per-sentence source attribution (v0.4)
+            CREATE TABLE IF NOT EXISTS provenance (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                summary_node_id INTEGER NOT NULL REFERENCES dag_nodes(id),
+                source_node_id  INTEGER NOT NULL REFERENCES dag_nodes(id),
+                sentence_offset INTEGER NOT NULL DEFAULT 0,
+                sentence_length INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_provenance_summary
+                ON provenance(summary_node_id);
+            CREATE INDEX IF NOT EXISTS idx_provenance_source
+                ON provenance(source_node_id);
         ")?;
+
+        // Graceful migration: add soft-delete columns if upgrading from earlier schema.
+        // SQLite has no ADD COLUMN IF NOT EXISTS; we use PRAGMA table_info.
+        let has_deleted: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'deleted'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        let has_deleted_at: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'deleted_at'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+
+        if !has_deleted {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !has_deleted_at {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN deleted_at TEXT;")?;
+        }
+
+        // v0.3: semantic hash for cross-conversation dedup
+        let has_semantic_hash: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'semantic_hash'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_semantic_hash {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT '';")?;
+        }
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conv
+                 ON messages(conversation_id);
+             CREATE INDEX IF NOT EXISTS idx_dag_conv
+                 ON dag_nodes(conversation_id, level);
+             CREATE TABLE IF NOT EXISTS dag_edges (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 from_id     INTEGER NOT NULL REFERENCES dag_nodes(id),
+                 to_id       INTEGER NOT NULL REFERENCES dag_nodes(id),
+                 kind        TEXT NOT NULL DEFAULT 'summarizes',
+                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE INDEX IF NOT EXISTS idx_edges_from ON dag_edges(from_id);
+             CREATE INDEX IF NOT EXISTS idx_edges_to ON dag_edges(to_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+                 ON dag_edges(from_id, to_id, kind);"
+        )?;
         Ok(())
     }
 
@@ -235,12 +328,22 @@ impl Database {
         let parent_json = serde_json::to_string(parent_ids)?;
         let child_json = serde_json::to_string(child_ids)?;
         let snippet_json = serde_json::to_string(snippets)?;
+        let hash = Self::semantic_hash(summary, snippets);
         conn.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32],
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32, hash],
         )?;
         let id = conn.last_insert_rowid();
+
+        // Mirror as typed edges for the semantic graph (P3 Graph Model)
+        for child in child_ids {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, 'summarizes')",
+                rusqlite::params![id, child],
+            );
+        }
+
         Ok(DagNode {
             id,
             conversation_id,
@@ -251,14 +354,16 @@ impl Database {
             child_ids: child_ids.to_vec(),
             snippets: snippets.to_vec(),
             is_leaf,
+            deleted: false,
+            semantic_hash: Self::semantic_hash(summary, snippets),
         })
     }
 
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
-             FROM dag_nodes WHERE id = ?1",
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+             FROM dag_nodes WHERE id = ?1 AND deleted = 0",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
         Ok(rows.next().transpose()?)
@@ -271,9 +376,9 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
-                    n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf
+                    n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf, n.deleted
              FROM dag_nodes n, json_each(n.child_ids) AS j
-             WHERE j.value = ?1
+             WHERE j.value = ?1 AND n.deleted = 0
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![node_id, max_fanout as i64], Self::row_to_node)?;
@@ -287,7 +392,7 @@ impl Database {
     pub fn get_child_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let child_ids_json: String = conn.query_row(
-            "SELECT child_ids FROM dag_nodes WHERE id = ?1",
+            "SELECT child_ids FROM dag_nodes WHERE id = ?1 AND deleted = 0",
             rusqlite::params![node_id],
             |row| row.get(0),
         )?;
@@ -300,8 +405,8 @@ impl Database {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
-             FROM dag_nodes WHERE id IN ({})",
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+             FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
             placeholders.join(","),
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -319,8 +424,8 @@ impl Database {
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
-             FROM dag_nodes WHERE conversation_id = ?1 AND level > 0
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+             FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
              ORDER BY level DESC, id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -330,11 +435,11 @@ impl Database {
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
              FROM dag_nodes
              WHERE conversation_id = ?1 AND level = (
-                 SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0
-             )
+                 SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
+             ) AND deleted = 0
              ORDER BY id DESC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -346,8 +451,8 @@ impl Database {
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
-             FROM dag_nodes WHERE conversation_id = ?1 ORDER BY id ASC",
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+             FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
         let mut nodes = Vec::new();
@@ -373,12 +478,53 @@ impl Database {
         let parent_json = "[]".to_string();
         let child_json = serde_json::to_string(source_ids)?;
         let snippet_json = serde_json::to_string(snippets)?;
+        let hash = Self::semantic_hash(summary, snippets);
         tx.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
-            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json],
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, hash],
         )?;
         let new_id = tx.last_insert_rowid();
+
+        // Mirror as typed edges (P3 Graph Model)
+        for sid in source_ids {
+            let _ = tx.execute(
+                "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, 'summarizes')",
+                rusqlite::params![new_id, sid],
+            );
+        }
+
+        // Index snippets in FTS5 for independent retrieval (P3 Summary Storage)
+        for snippet in snippets {
+            let stype = match snippet.snippet_type {
+                crate::snippet::SnippetType::CodeBlock => "code",
+                crate::snippet::SnippetType::FilePath => "path",
+                crate::snippet::SnippetType::NumericConstant => "num",
+                crate::snippet::SnippetType::ErrorMessage => "err",
+                crate::snippet::SnippetType::ProperNoun => "ref",
+            };
+            let _ = tx.execute(
+                "INSERT INTO snippets_fts (content, source_type, node_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![snippet.content, stype, new_id],
+            );
+        }
+
+        // Index in cross-conversation semantic dedup table (v0.3)
+        let preview: String = summary.chars().take(100).collect();
+        let _ = tx.execute(
+            "INSERT OR IGNORE INTO semantic_index (hash, node_id, conversation_id, summary_preview)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![hash, new_id, conversation_id, preview],
+        );
+
+        // Record provenance: each source node contributed to this summary (v0.4)
+        for (i, sid) in source_ids.iter().enumerate() {
+            let _ = tx.execute(
+                "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![new_id, sid, i as i32],
+            );
+        }
 
         for sid in source_ids {
             let existing: String = tx.query_row(
@@ -408,10 +554,25 @@ impl Database {
             child_ids: source_ids.to_vec(),
             snippets: snippets.to_vec(),
             is_leaf: false,
+            deleted: false,
+            semantic_hash: Self::semantic_hash(summary, snippets),
         })
     }
 
+    /// Soft-delete a DAG node (set deleted=1, timestamp). The node is
+    /// excluded from context assembly but raw data in `messages` is intact.
+    /// Garbage collection can later hard-delete fully orphaned soft-deleted nodes.
     pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE dag_nodes SET deleted = 1, deleted_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Hard-delete a node (used by GC for fully unreachable ghosts).
+    pub fn purge_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM dag_nodes WHERE id = ?1", rusqlite::params![node_id])?;
         Ok(())
@@ -420,8 +581,8 @@ impl Database {
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf
-             FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+             FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -483,6 +644,83 @@ impl Database {
         Ok(())
     }
 
+    // ── Edge operations (typed semantic graph) ─────────────────────────
+
+    /// Insert a typed edge between two nodes.  Returns the edge ID.
+    /// Ignores duplicate (from_id, to_id, kind) tuples (UNIQUE constraint).
+    pub fn insert_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
+            rusqlite::params![from_id, to_id, kind],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get all outgoing edges from a node.
+    pub fn get_edges_from(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, to_id, kind FROM dag_edges WHERE from_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Get all incoming edges to a node.
+    pub fn get_edges_to(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, from_id, kind FROM dag_edges WHERE to_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Check whether a path exists from `from` to `to` (BFS, limited depth).
+    /// Used for cycle detection before inserting an edge.
+    pub fn has_path(&self, from_id: i64, to_id: i64, max_depth: usize) -> anyhow::Result<bool> {
+        if from_id == to_id {
+            return Ok(true);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = vec![from_id];
+        visited.insert(from_id);
+
+        let mut stmt = conn.prepare("SELECT to_id FROM dag_edges WHERE from_id = ?1")?;
+        let mut depth = 0;
+
+        while !queue.is_empty() && depth < max_depth {
+            let mut next = Vec::new();
+            for node_id in &queue {
+                let rows = stmt.query_map(rusqlite::params![node_id], |row| row.get::<_, i64>(0))?;
+                for row in rows {
+                    let target = row?;
+                    if target == to_id {
+                        return Ok(true);
+                    }
+                    if visited.insert(target) {
+                        next.push(target);
+                    }
+                }
+            }
+            queue = next;
+            depth += 1;
+        }
+        Ok(false)
+    }
+
+    // ── Search ──────────────────────────────────────────────────────────
+
     /// Search messages in a conversation using FTS5 full-text search.
     /// Returns `(id, role, snippet, token_count)` ranked by relevance.
     /// Get raw message content in a range of message IDs.
@@ -535,6 +773,139 @@ impl Database {
         Ok(results)
     }
 
+    /// Unified search across messages, summaries, and snippets.
+    /// Returns results tagged with source type for the retrieval layer.
+    pub fn search_unified(
+        &self,
+        conv_id: i64,
+        query: &str,
+    ) -> anyhow::Result<Vec<UnifiedSearchResult>> {
+        let conn = self.conn.lock().unwrap();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+
+        // UNION of three independent searches:
+        //   1. messages.content (raw conversation)
+        //   2. dag_nodes.summary (compressed summaries)
+        //   3. dag_nodes.snippets (precision-critical values)
+        let sql = "
+            SELECT id, 'message' AS source, role AS label,
+                   substr(content, 1, 500) AS excerpt, token_count
+            FROM messages
+            WHERE conversation_id = ?1 AND content LIKE ?2 ESCAPE '\\'
+
+            UNION ALL
+
+            SELECT id, 'summary' AS source, CAST(level AS TEXT) AS label,
+                   substr(summary, 1, 500) AS excerpt, token_count
+            FROM dag_nodes
+            WHERE conversation_id = ?1 AND summary LIKE ?2 ESCAPE '\\' AND deleted = 0
+
+            UNION ALL
+
+            SELECT id, 'snippet' AS source, CAST(level AS TEXT) AS label,
+                   substr(snippets, 1, 500) AS excerpt, token_count
+            FROM dag_nodes
+            WHERE conversation_id = ?1 AND snippets LIKE ?2 ESCAPE '\\' AND deleted = 0
+
+            UNION ALL
+
+            SELECT node_id AS id, 'snippet' AS source, source_type AS label,
+                   substr(content, 1, 500) AS excerpt,
+                   NULL AS token_count
+            FROM snippets_fts
+            WHERE content LIKE ?2 ESCAPE '\\'
+
+            ORDER BY id DESC
+            LIMIT 30
+        ";
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, pattern], |row| {
+            Ok(UnifiedSearchResult {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                label: row.get(2)?,
+                excerpt: row.get(3)?,
+                token_count: row.get(4)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Semantic dedup (v0.3) ─────────────────────────────────────────
+
+    /// Find nodes with the same semantic hash across ALL conversations.
+    /// Returns (hash, node_id, conversation_id, summary_preview).
+    pub fn find_similar_by_hash(&self, hash: &str) -> anyhow::Result<Vec<(String, i64, i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, node_id, conversation_id, summary_preview
+             FROM semantic_index WHERE hash = ?1 LIMIT 10",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![hash], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Index a node in the semantic_index for cross-conversation lookup.
+    pub fn index_semantic(&self, hash: &str, node_id: i64, conv_id: i64, preview: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO semantic_index (hash, node_id, conversation_id, summary_preview)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![hash, node_id, conv_id, preview],
+        )?;
+        Ok(())
+    }
+
+    /// Record provenance: which source node contributed to a summary.
+    /// For now, stores the full source range. Future: per-sentence offsets.
+    pub fn record_provenance(
+        &self,
+        summary_node_id: i64,
+        source_node_id: i64,
+        offset: i32,
+        length: i32,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![summary_node_id, source_node_id, offset, length],
+        )?;
+        Ok(())
+    }
+
+    /// Get provenance records for a summary node.
+    pub fn get_provenance(&self, summary_node_id: i64) -> anyhow::Result<Vec<(i64, i32, i32)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_node_id, sentence_offset, sentence_length
+             FROM provenance WHERE summary_node_id = ?1 ORDER BY sentence_offset",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![summary_node_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
     /// Strip JSON markup from content so FTS5 indexes only the plain text.
 /// Content can be either a plain string or a JSON array of content blocks.
 fn strip_json_markup(content: &str) -> String {
@@ -557,6 +928,29 @@ fn strip_json_markup(content: &str) -> String {
     content.to_string()
 }
 
+/// Compute a semantic fingerprint for a node: SHA-256 of summary text
+/// concatenated with snippet contents, then truncated to 16 hex chars.
+/// Equal hashes mean the summary content is semantically identical
+/// (or close enough for dedup), enabling cross-conversation reuse.
+pub fn semantic_hash(summary: &str, snippets: &[crate::snippet::Snippet]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(summary.as_bytes());
+    for s in snippets {
+        hasher.update(s.content.as_bytes());
+        let label = match s.snippet_type {
+            crate::snippet::SnippetType::CodeBlock => "code",
+            crate::snippet::SnippetType::FilePath => "path",
+            crate::snippet::SnippetType::NumericConstant => "num",
+            crate::snippet::SnippetType::ErrorMessage => "err",
+            crate::snippet::SnippetType::ProperNoun => "ref",
+        };
+        hasher.update(label.as_bytes());
+    }
+    let result = hasher.finalize();
+    hex::encode(&result[..8]) // 16 hex chars
+}
+
 /// Escape a user query for FTS5 MATCH syntax.
 /// FTS5 special chars: ^ * " ( ) + - ~ ` `
 pub fn fts_escape(query: &str) -> String {
@@ -577,6 +971,8 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let child_str: String = row.get(6)?;
         let snippet_str: String = row.get(7)?;
         let is_leaf_int: i32 = row.get(8)?;
+        let deleted_int: i32 = row.get(9)?;
+        let semantic_hash: String = row.get(10)?;
         Ok(DagNode {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -587,6 +983,8 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
             child_ids: serde_json::from_str(&child_str).unwrap_or_default(),
             snippets: serde_json::from_str(&snippet_str).unwrap_or_default(),
             is_leaf: is_leaf_int != 0,
+            deleted: deleted_int != 0,
+            semantic_hash,
         })
     }
 }
@@ -779,5 +1177,60 @@ mod tests {
 
         // Checkpoint should succeed
         assert!(db.wal_checkpoint().is_ok());
+    }
+
+    // ── P3: Unified search ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_unified_finds_messages_summaries_and_snippets() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("search_unified.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let messages = json!([
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hi there"}
+        ]);
+        let conv_id = db.create_and_store("test", &messages).unwrap();
+
+        // Insert a DAG node with a summary and snippets
+        let snippets = vec![
+            crate::snippet::Snippet {
+                snippet_type: crate::snippet::SnippetType::FilePath,
+                content: "src/main.rs".to_string(),
+                importance: 1.0,
+                source_node_id: String::new(),
+            },
+            crate::snippet::Snippet {
+                snippet_type: crate::snippet::SnippetType::NumericConstant,
+                content: "8080".to_string(),
+                importance: 0.9,
+                source_node_id: String::new(),
+            },
+        ];
+        db.insert_dag_node_full(conv_id, 1, "fixed port binding error", 15, &[], &[], &snippets, false).unwrap();
+
+        // Search for "port" — should find the summary
+        let results = db.search_unified(conv_id, "port").unwrap();
+        assert!(!results.is_empty(), "should find summary containing 'port'");
+        let has_summary = results.iter().any(|r| r.source == "summary");
+        assert!(has_summary, "should include summary results");
+
+        // Search for ".rs" — should find the snippet
+        let results = db.search_unified(conv_id, ".rs").unwrap();
+        let has_snippet = results.iter().any(|r| r.source == "snippet");
+        assert!(has_snippet, "should include snippet results");
+
+        // Search for "hello" — should find the message
+        let results = db.search_unified(conv_id, "hello").unwrap();
+        let has_message = results.iter().any(|r| r.source == "message");
+        assert!(has_message, "should include message results");
+
+        // Search for nonexistent string
+        let empty = db.search_unified(conv_id, "zzz_nonexistent").unwrap();
+        assert!(empty.is_empty(), "should find nothing");
     }
 }

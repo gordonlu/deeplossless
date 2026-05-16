@@ -90,6 +90,7 @@ async fn proxy_non_streaming_round_trip() {
         dag,
         compactor,
         client: reqwest::Client::new(),
+        summarizer_model: "deepseek-v4-flash".into(),
     };
 
     let app = deeplossless::proxy::routes().with_state(state);

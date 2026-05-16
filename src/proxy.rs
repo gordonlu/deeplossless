@@ -20,6 +20,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
+        .route("/v1/lcm/similar/{hash}", get(lcm_similar))
+        .route("/v1/lcm/trace/{node_id}", get(lcm_trace))
+        .route("/v1/lcm/health/{conv_id}", get(lcm_dag_health))
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
         .route("/v1/lcm/rollback", post(lcm_rollback))
@@ -129,6 +132,21 @@ fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
     key.lock().unwrap().clone().unwrap_or_else(|| "unset".to_string())
 }
 
+/// Verify that a request to a Context-ReAct endpoint carries a valid
+/// Authorization header matching the known API key.  This prevents
+/// arbitrary clients from manipulating the DAG.
+fn ctx_react_auth_ok(headers: &HeaderMap, api_key: &std::sync::Mutex<Option<String>>) -> bool {
+    let expected = get_cached_key(api_key);
+    if expected == "unset" {
+        return true; // no key configured yet — allow (first request populates it)
+    }
+    let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let bearer = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "));
+    bearer == Some(&expected)
+}
+
 // ── LCM retrieval endpoints ────────────────────────────────────────────
 
 async fn lcm_grep(
@@ -137,10 +155,11 @@ async fn lcm_grep(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
-    match state.db.search_messages(conv_id, query) {
+    match state.db.search_unified(conv_id, query) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
             "query": query,
+            "total": results.len(),
             "matches": results,
         }))
         .into_response(),
@@ -189,6 +208,64 @@ async fn lcm_snippets(
     }
 }
 
+async fn lcm_dag_health(
+    State(state): State<AppState>,
+    Path(conv_id): Path<i64>,
+) -> Response {
+    match state.dag.validate_dag(conv_id) {
+        Ok(issues) => {
+            let healthy = issues.is_empty();
+            Json(json!({
+                "conversation_id": conv_id,
+                "healthy": healthy,
+                "issues": issues,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("validation error: {e}")).into_response(),
+    }
+}
+
+async fn lcm_similar(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Response {
+    match state.db.find_similar_by_hash(&hash) {
+        Ok(results) => Json(json!({
+            "hash": hash,
+            "matches": results.iter().map(|(h, nid, cid, preview)| json!({
+                "hash": h,
+                "node_id": nid,
+                "conversation_id": cid,
+                "preview": preview,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {e}")).into_response(),
+    }
+}
+
+async fn lcm_trace(
+    State(state): State<AppState>,
+    Path(node_id): Path<i64>,
+) -> Response {
+    match state.db.get_provenance(node_id) {
+        Ok(rows) => {
+            let sources: Vec<Value> = rows.iter().map(|(sid, off, len)| json!({
+                "source_node_id": sid,
+                "offset": off,
+                "length": len,
+            })).collect();
+            Json(json!({
+                "summary_node_id": node_id,
+                "sources": sources,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("provenance error: {e}")).into_response(),
+    }
+}
+
 async fn lcm_status(
     State(state): State<AppState>,
     Path(conv_id): Path<i64>,
@@ -228,8 +305,12 @@ struct LcmIdOp {
 /// the conversation via a follow-up message.
 async fn lcm_compress(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(op): Json<LcmRangeOp>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized: Context-ReAct requires Authorization header").into_response();
+    }
     // Try DAG leaves first, then fall back to raw messages
     let content: Vec<String> = match state.dag.get_leaves(op.conv_id) {
         Ok(leaves) if leaves.len() >= 2 => leaves.iter()
@@ -251,7 +332,7 @@ async fn lcm_compress(
 
     let summarizer = match crate::summarizer::Summarizer::builder()
         .api_key(&get_cached_key(&state.api_key))
-        .model("deepseek-v4-flash")
+        .model(&state.summarizer_model())
         .upstream(&state.upstream)
         .build()
     {
@@ -285,8 +366,12 @@ async fn lcm_compress(
 /// table and can be recovered via lcm_expand.
 async fn lcm_delete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(op): Json<LcmIdOp>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     match state.dag.db().delete_dag_node(op.id) {
         Ok(_) => Json(json!({"deleted": op.id})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")).into_response(),
@@ -298,8 +383,12 @@ async fn lcm_delete(
 /// summary text and its children, which it can use as a checkpoint.
 async fn lcm_rollback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(op): Json<LcmIdOp>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     let node = match state.dag.get_node(op.id) {
         Ok(Some(n)) => n,
         Ok(None) => return (StatusCode::NOT_FOUND, "node not found").into_response(),

@@ -58,10 +58,21 @@ pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
                         });
                     }
                 }
-                Some("tool_result") => {
-                    // Content is the result text
-                }
+                Some("tool_result") => {}
                 _ => {}
+            }
+        }
+    }
+
+    // Gemini: parts[].functionCall / parts[].functionResponse
+    if let Some(parts) = msg["parts"].as_array() {
+        for part in parts {
+            if let Some(fc) = part["functionCall"].as_object() {
+                tool_calls.push(NormalizedToolCall {
+                    id: fc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    name: fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    arguments: fc.get("args").map(|v| v.to_string()).unwrap_or_default(),
+                });
             }
         }
     }
@@ -71,13 +82,17 @@ pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
 
 /// Check if a normalized message represents a tool call.
 pub fn is_tool_call(msg: &NormalizedMessage) -> bool {
-    !msg.tool_calls.is_empty() || msg.role == "assistant" && msg.content.contains("tool_use")
+    !msg.tool_calls.is_empty()
+        || msg.role == "assistant" && msg.content.contains("tool_use")
+        || msg.role == "model" && msg.content.contains("functionCall")
 }
 
 /// Check if a normalized message represents a tool result.
 pub fn is_tool_result(msg: &NormalizedMessage) -> bool {
     msg.role == "tool" || msg.tool_call_id.is_some()
         || msg.role == "user" && msg.content.contains("tool_result")
+        || msg.role == "function"
+        || msg.role == "tool" && msg.content.contains("functionResponse")
 }
 
 /// Generate a stable session fingerprint from a messages array.
@@ -230,5 +245,34 @@ mod tests {
         assert_eq!(msg.tool_calls.len(), 1);
         assert_eq!(msg.tool_calls[0].name, "bash");
         assert!(is_tool_call(&msg));
+    }
+
+    #[test]
+    fn normalize_gemini_function_call() {
+        let raw = json!({
+            "role": "model",
+            "parts": [
+                {"text": "I'll look that up"},
+                {"functionCall": {"name": "get_weather", "args": {"location": "NYC"}}}
+            ]
+        });
+        let msg = normalize_message(&raw);
+        assert_eq!(msg.role, "model");
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].name, "get_weather");
+        assert!(is_tool_call(&msg));
+    }
+
+    #[test]
+    fn normalize_gemini_function_response() {
+        let raw = json!({
+            "role": "function",
+            "parts": [
+                {"functionResponse": {"name": "get_weather", "response": {"temp": 22}}}
+            ]
+        });
+        let msg = normalize_message(&raw);
+        assert_eq!(msg.role, "function");
+        assert!(is_tool_result(&msg));
     }
 }

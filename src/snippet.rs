@@ -92,8 +92,13 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
     }
 
     // 3. Numeric constants (standalone numbers, port numbers, status codes)
+    // Unit-aware: skip numbers mixed with letters (e.g., "500ms", "3KB", "10x")
     for word in text.split_whitespace() {
-        let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        let clean = word.trim_matches(|c: char| c.is_ascii_punctuation() && c != '.');
+        let has_digit = clean.chars().any(|c| c.is_ascii_digit());
+        let has_letter = clean.chars().any(|c| c.is_ascii_alphabetic());
+        // Skip if the word contains both digits and letters (unit-laden)
+        if has_digit && has_letter { continue; }
         if let Ok(n) = clean.parse::<i64>()
             && n > 9 && n < 1_000_000 {
                 snippets.push(Snippet {
@@ -270,7 +275,12 @@ mod tests {
     fn extract_500ms_not_just_500() {
         let text = "latency over 500ms is unacceptable";
         let snippets = extract(text);
-        assert!(snippets.iter().any(|s| s.content == "500"), "should extract 500");
+        // Unit-laden numbers (500ms) should NOT be extracted as bare numerics
+        assert!(!snippets.iter().any(|s| s.content == "500"), "should NOT extract 500ms as numeric 500");
+        // But standalone numbers still work
+        let text2 = "the port is 8080";
+        let snippets2 = extract(text2);
+        assert!(snippets2.iter().any(|s| s.content == "8080"), "should extract standalone 8080");
     }
 
     #[test]

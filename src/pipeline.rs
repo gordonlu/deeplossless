@@ -104,6 +104,8 @@ impl ChatPipeline {
         // Store messages and create DAG leaf nodes (async, non-blocking)
         let db = self.db.clone();
         let dag = self.dag.clone();
+        let overhead = dag.config().token_overhead;
+        let correction = dag.config().token_correction_factor;
         let msgs = messages.clone();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = db.store_messages(conv_id, &msgs) {
@@ -114,8 +116,8 @@ impl ChatPipeline {
                 for msg in arr {
                     let role = msg["role"].as_str().unwrap_or("");
                     if role == "user" || role == "assistant" {
-                        let tc = crate::tokenizer::count_content(msg) as i64
-                            + crate::tokenizer::MESSAGE_OVERHEAD_TOKENS as i64;
+                        let raw_tokens = crate::tokenizer::count_content_raw(msg) + overhead;
+                        let tc = crate::tokenizer::correct(raw_tokens, correction) as i64;
                         let summary = msg["content"].to_string().chars().take(200).collect::<String>();
                         if let Err(e) = dag.insert_leaf(conv_id, &summary, tc) {
                             tracing::warn!(target: "deeplossless::pipeline", "failed to create DAG leaf: {e}");
@@ -162,13 +164,15 @@ impl ChatPipeline {
 
     /// Inject `<lcm_context>` block only into the first system message
     /// to avoid prompt drift from repeated injection.
+    /// `ctx_text` is the pre-rendered block from `render_dag_context`,
+    /// which already includes the `<lcm_context>`...`</lcm_context>` tags.
     fn inject_context(body: &mut serde_json::Value, ctx_text: &str) {
         if let Some(arr) = body["messages"].as_array_mut() {
             for msg in arr.iter_mut() {
                 if msg["role"] == "system" {
                     let existing = msg["content"].as_str().unwrap_or("");
                     msg["content"] = serde_json::json!(
-                        format!("{}\n\n<lcm_context>\n{}\n</lcm_context>", existing, ctx_text)
+                        format!("{}\n\n{}", existing, ctx_text)
                     );
                     break;
                 }

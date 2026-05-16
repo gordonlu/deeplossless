@@ -29,6 +29,10 @@ struct Cli {
     /// Authorization header if not provided here).
     #[arg(long, env = "DEEPSEEK_API_KEY")]
     api_key: Option<String>,
+
+    /// Model used for background summarization (Level 1 & 2 LLM calls).
+    #[arg(long, default_value = "deepseek-v4-pro", env = "SUMMARIZER_MODEL")]
+    summarizer_model: String,
 }
 
 #[tokio::main]
@@ -61,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         summarizer: deeplossless::summarizer::SummarizerConfig {
             api_key: initial_api_key.clone().unwrap_or_default(),
             upstream: upstream.clone(),
+            model: cli.summarizer_model.clone(),
             ..Default::default()
         },
         ..Default::default()
@@ -77,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         compactor,
         client: reqwest::Client::builder()
             .build()?,
+        summarizer_model: cli.summarizer_model,
     };
 
     let app = deeplossless::proxy::routes()

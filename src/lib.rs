@@ -17,6 +17,9 @@
 //! ```
 //!
 //! Edge direction: **raw → summary** (summarization flows from sources upward).
+//! Each node has at most one parent summary, making the structure a **hierarchical
+//! forest** (not a general DAG). Future work may introduce shared-node DAG for
+//! overlapping summary windows (§P3 Graph Model).
 //!
 //! - `get_children(node)` returns the nodes in `node.child_ids` (forward lookup)
 //! - `get_parents(node)` returns nodes whose `child_ids` contains `node.id`
@@ -85,4 +88,12 @@ pub struct AppState {
     pub dag: Arc<dag::DagEngine>,
     pub compactor: Arc<Mutex<compactor::Compactor>>,
     pub client: reqwest::Client,
+    /// Model used for background summarization (configurable via CLI/env).
+    pub summarizer_model: String,
+}
+
+impl AppState {
+    pub fn summarizer_model(&self) -> &str {
+        &self.summarizer_model
+    }
 }
