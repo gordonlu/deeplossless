@@ -4,3 +4,5 @@
 *.db-shm
 .env
 AGENTS.md
+.claude/
+CLAUDE.md
