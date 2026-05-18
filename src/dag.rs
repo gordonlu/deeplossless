@@ -27,6 +27,8 @@ pub enum EdgeKind {
     ForksFrom,
     /// Semantic reuse/dedup link.
     Reuses,
+    /// Tool execution link: assistant → tool_call → tool_result chain.
+    Executes,
 }
 
 impl EdgeKind {
@@ -36,6 +38,7 @@ impl EdgeKind {
             Self::Refines => "refines",
             Self::ForksFrom => "forks_from",
             Self::Reuses => "reuses",
+            Self::Executes => "executes",
         }
     }
 
@@ -45,6 +48,7 @@ impl EdgeKind {
             "refines" => Some(Self::Refines),
             "forks_from" => Some(Self::ForksFrom),
             "reuses" => Some(Self::Reuses),
+            "executes" => Some(Self::Executes),
             _ => None,
         }
     }
@@ -603,8 +607,19 @@ impl DagEngine {
             .filter(|n| !covered_ids.contains(&n.id))
             .collect();
 
+        // Delta compression: skip leaves with high content overlap to summaries already in result
+        let summary_texts: Vec<String> = result.iter()
+            .filter(|n| n.level > 0)
+            .map(|n| n.summary.clone())
+            .collect();
+        let summary_refs: Vec<&str> = summary_texts.iter().map(|s| s.as_str()).collect();
+
         for node in recent.into_iter().rev() {
             if !injected_ids.insert(node.id) {
+                continue;
+            }
+            // Skip if leaf content is largely covered by an included summary
+            if !summary_refs.is_empty() && content_overlap(&node.summary, &summary_refs) > 0.7 {
                 continue;
             }
             let tc = node.token_count;
@@ -1077,6 +1092,30 @@ fn format_summary_text(summary: &str, snippets: &[crate::snippet::Snippet]) -> S
         let snippet_texts: Vec<&str> = snippets.iter().map(|s| s.content.as_str()).collect();
         format!("{} {}", summary, snippet_texts.join(" "))
     }
+}
+
+/// Compute content overlap between a leaf and a set of summary texts.
+/// Returns 0.0 (no overlap) to 1.0 (fully contained). Uses trigram Jaccard.
+fn content_overlap(leaf: &str, summaries: &[&str]) -> f64 {
+    if summaries.is_empty() || leaf.len() < 10 {
+        return 0.0;
+    }
+    let leaf_bytes = leaf.as_bytes();
+    let leaf_trigrams: std::collections::HashSet<[u8; 3]> = leaf_bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+    if leaf_trigrams.is_empty() {
+        return 0.0;
+    }
+    let mut best = 0.0;
+    for summary in summaries {
+        let s_bytes = summary.as_bytes();
+        let s_trigrams: std::collections::HashSet<[u8; 3]> = s_bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+        let intersection = leaf_trigrams.intersection(&s_trigrams).count();
+        let overlap = intersection as f64 / leaf_trigrams.len() as f64;
+        if overlap > best {
+            best = overlap;
+        }
+    }
+    best
 }
 
 /// Split text into sentences by `.`, `。`, `\n`, `!`, `?` boundaries.

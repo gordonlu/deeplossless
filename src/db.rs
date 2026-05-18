@@ -284,7 +284,19 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_edges_from ON dag_edges(from_id);
              CREATE INDEX IF NOT EXISTS idx_edges_to ON dag_edges(to_id);
              CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
-                 ON dag_edges(from_id, to_id, kind);"
+                 ON dag_edges(from_id, to_id, kind);
+
+            -- Event sourcing: append-only event log for DAG mutations (v0.6)
+            CREATE TABLE IF NOT EXISTS dag_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type  TEXT NOT NULL,
+                node_id     INTEGER,
+                conv_id     INTEGER NOT NULL REFERENCES conversations(id),
+                payload     TEXT NOT NULL DEFAULT '{}',
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_conv
+                ON dag_events(conv_id);"
         )?;
         Ok(())
     }
@@ -603,6 +615,12 @@ impl Database {
             }
         }
 
+        // Record event for audit trail
+        let _ = tx.execute(
+            "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES ('compress', ?1, ?2, '{}')",
+            rusqlite::params![new_id, conversation_id],
+        );
+
         tx.commit()?;
         Ok(DagNode {
             id: new_id,
@@ -631,6 +649,30 @@ impl Database {
         Ok(())
     }
 
+    /// Append an event to the DAG event log for audit and rollback.
+    pub fn record_event(&self, event_type: &str, node_id: i64, conv_id: i64, payload: &str) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap();
+        conn.execute(
+            "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event_type, node_id, conv_id, payload],
+        )?;
+        Ok(())
+    }
+
+    /// Get event log for a conversation, ordered by time.
+    pub fn get_events(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, Option<i64>, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT event_type, node_id, payload FROM dag_events WHERE conv_id = ?1 ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
     /// Soft-delete a DAG node (set deleted=1, timestamp). The node is
     /// excluded from context assembly but raw data in `messages` is intact.
     /// Garbage collection can later hard-delete fully orphaned soft-deleted nodes.
@@ -640,6 +682,8 @@ impl Database {
             "UPDATE dag_nodes SET deleted = 1, deleted_at = datetime('now') WHERE id = ?1",
             rusqlite::params![node_id],
         )?;
+        // Record event for audit trail
+        let _ = self.record_event("delete", node_id, -1, "{}");
         Ok(())
     }
 
