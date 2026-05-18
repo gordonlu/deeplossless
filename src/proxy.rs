@@ -11,7 +11,13 @@ use futures::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
+use crate::metrics;
 use crate::AppState;
+
+/// Uniform JSON error envelope: `{"error": {"code": "...", "message": "..."}}`
+fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
+    (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
+}
 
 /// Readiness probe: checks DB connectivity, upstream reachability,
 /// and compactor liveness. Returns 200 with status JSON, or 503 if
@@ -69,6 +75,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/rollback", post(lcm_rollback))
         .route("/health", get(lcm_health))
         .route("/v1/health", get(lcm_health))
+        .route("/metrics", get(metrics::handle_metrics))
 }
 
 async fn chat_completions(
@@ -91,7 +98,7 @@ async fn chat_completions(
 
     let req_body: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")).into_response(),
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", format!("invalid JSON: {e}")),
     };
 
     let model = crate::session::model_name(&req_body);
@@ -119,7 +126,10 @@ async fn chat_completions(
         .await
     {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
+        Err(e) => {
+            metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
+        }
     };
 
     let status = resp.status();
@@ -162,7 +172,10 @@ async fn chat_completions(
                 response.headers_mut().insert("content-type", content_type);
                 response
             }
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
+            Err(e) => {
+                metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
+            }
         }
     }
 }
@@ -211,7 +224,7 @@ async fn lcm_grep(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
     match state.db.search_unified(conv_id, query) {
@@ -223,7 +236,7 @@ async fn lcm_grep(
         }))
         .into_response(),
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {e}")).into_response()
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}"))
         }
     }
 }
@@ -234,7 +247,7 @@ async fn lcm_expand(
     Path(node_id): Path<i64>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    // Expand a summary node to its children (original messages)
     match state.dag.get_children(node_id) {
         Ok(children) => {
@@ -247,7 +260,7 @@ async fn lcm_expand(
             .into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("expand error: {e}")).into_response()
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "EXPAND_ERROR", format!("expand error: {e}"))
         }
     }
 }
@@ -258,7 +271,7 @@ async fn lcm_snippets(
     Path(node_id): Path<i64>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    match state.dag.get_node(node_id) {
         Ok(Some(node)) => {
             Json(serde_json::json!({
@@ -268,8 +281,8 @@ async fn lcm_snippets(
             }))
             .into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "node not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}")).into_response(),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     }
 }
 
@@ -280,7 +293,7 @@ async fn lcm_global_search(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.dag.search_cross_session(query, limit) {
@@ -292,7 +305,7 @@ async fn lcm_global_search(
             })).collect();
             Json(json!({ "results": items })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {e}")).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
     }
 }
 
@@ -302,7 +315,7 @@ async fn lcm_dag_health(
     Path(conv_id): Path<i64>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    match state.dag.validate_dag(conv_id) {
         Ok(issues) => {
             let healthy = issues.is_empty();
@@ -313,7 +326,7 @@ async fn lcm_dag_health(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("validation error: {e}")).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "VALIDATION_ERROR", format!("validation error: {e}")),
     }
 }
 
@@ -323,7 +336,7 @@ async fn lcm_similar(
     Path(hash): Path<String>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    match state.db.find_similar_by_hash(&hash) {
         Ok(results) => Json(json!({
             "hash": hash,
@@ -335,7 +348,7 @@ async fn lcm_similar(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("search error: {e}")).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
     }
 }
 
@@ -345,7 +358,7 @@ async fn lcm_trace(
     Path(node_id): Path<i64>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    match state.db.get_provenance_with_excerpts(node_id) {
         Ok(rows) => {
             let sources: Vec<Value> = rows.iter().map(|(sid, off, len, excerpt)| json!({
@@ -360,7 +373,7 @@ async fn lcm_trace(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("provenance error: {e}")).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PROVENANCE_ERROR", format!("provenance error: {e}")),
     }
 }
 
@@ -370,7 +383,7 @@ async fn lcm_status(
     Path(conv_id): Path<i64>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let leaves = state.dag.get_leaves(conv_id).unwrap_or_default();
     let tip = state.dag.get_active_tip(conv_id).ok().flatten();
@@ -411,7 +424,7 @@ async fn lcm_compress(
     Json(op): Json<LcmRangeOp>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized: Context-ReAct requires Authorization header").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "Context-ReAct requires Authorization header");
     }
     // Try DAG leaves first, then fall back to raw messages
     let content: Vec<String> = match state.dag.get_leaves(op.conv_id) {
@@ -426,7 +439,7 @@ async fn lcm_compress(
             let raw = db.get_messages_in_range(op.conv_id, op.from, op.to);
             match raw {
                 Ok(msgs) if msgs.len() >= 2 => msgs,
-                _ => return (StatusCode::BAD_REQUEST, String::from("need at least 2 messages to compress")).into_response(),
+                _ => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "need at least 2 messages to compress"),
             }
         }
     };
@@ -439,7 +452,7 @@ async fn lcm_compress(
         .build()
     {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("summarizer: {e}")).into_response(),
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "SUMMARIZER_ERROR", format!("summarizer: {e}")),
     };
 
     match summarizer.summarize_escalate(&text).await {
@@ -456,10 +469,10 @@ async fn lcm_compress(
                     "snippets": node.snippets,
                 }))
                 .into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("compress: {e}")).into_response(),
+                Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "COMPRESS_ERROR", format!("compress: {e}")),
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("summarize: {e}")).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SUMMARIZE_ERROR", format!("summarize: {e}")),
     }
 }
 
@@ -472,11 +485,11 @@ async fn lcm_delete(
     Json(op): Json<LcmIdOp>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     match state.dag.db().delete_dag_node(op.id) {
         Ok(_) => Json(json!({"deleted": op.id})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DELETE_ERROR", format!("delete: {e}")),
     }
 }
 
@@ -489,12 +502,12 @@ async fn lcm_rollback(
     Json(op): Json<LcmIdOp>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let node = match state.dag.get_node(op.id) {
         Ok(Some(n)) => n,
-        Ok(None) => return (StatusCode::NOT_FOUND, "node not found").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}")).into_response(),
+        Ok(None) => return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     };
     let children = state.dag.get_children(op.id).unwrap_or_default();
     Json(json!({

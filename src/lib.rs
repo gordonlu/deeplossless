@@ -67,6 +67,7 @@ pub mod compactor;
 pub mod dag;
 pub mod db;
 pub mod embeddings;
+pub mod metrics;
 pub mod pipeline;
 pub mod proxy;
 pub mod session;

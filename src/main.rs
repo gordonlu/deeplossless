@@ -14,15 +14,21 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use deeplossless::AppState;
 
-/// Global fixed-window rate limiter: 100 requests per second.
+/// Rate limiter state (written once at startup, read on every request).
 static RATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RATE_MAX: AtomicU64 = AtomicU64::new(100);
 
 async fn rate_limit_mw(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    let max = RATE_MAX.load(Ordering::Relaxed);
+    if max == 0 {
+        return Ok(next.run(req).await);
+    }
     let prev = RATE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if prev >= 100 {
+    if prev >= max {
+        deeplossless::metrics::RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     Ok(next.run(req).await)
@@ -61,6 +67,10 @@ struct Cli {
     /// Model used for background summarization (Level 1 & 2 LLM calls).
     #[arg(long, default_value = "deepseek-v4-pro", env = "SUMMARIZER_MODEL")]
     summarizer_model: String,
+
+    /// Max requests per second (0 to disable rate limiting).
+    #[arg(long, default_value = "100", env = "RATE_LIMIT")]
+    rate_limit: u64,
 }
 
 #[tokio::main]
@@ -116,7 +126,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Reset rate counter every second
-    {
+    RATE_MAX.store(cli.rate_limit, Ordering::Relaxed);
+    if cli.rate_limit > 0 {
         tokio::spawn(async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -127,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = deeplossless::proxy::routes()
         .with_state(state)
+        .layer(axum::middleware::from_fn(deeplossless::metrics::middleware))
         .layer(CatchPanicLayer::new())
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn(rate_limit_mw))
