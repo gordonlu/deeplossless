@@ -1132,6 +1132,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -1371,5 +1372,117 @@ mod tests {
         // Search for nonexistent string
         let empty = db.search_unified(conv_id, "zzz_nonexistent").unwrap();
         assert!(empty.is_empty(), "should find nothing");
+    }
+
+    // ── Phase 1: Semantic Foundation integration ───────────────────────
+
+    #[tokio::test]
+    async fn phase1_retrieval_scored_context_assembly() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_ctx.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([
+            {"role": "user", "content": "what is rust programming language"},
+            {"role": "assistant", "content": "Rust is a systems language focused on safety"},
+            {"role": "user", "content": "how do I install cargo"},
+            {"role": "assistant", "content": "Install via rustup: curl https://sh.rustup.rs | sh"}
+        ])).unwrap();
+
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
+
+        let l1 = engine.insert_leaf(conv_id, "what is rust", 10).unwrap();
+        let l2 = engine.insert_leaf(conv_id, "Rust is a systems language", 15).unwrap();
+        let l3 = engine.insert_leaf(conv_id, "how do I install cargo", 10).unwrap();
+        let l4 = engine.insert_leaf(conv_id, "curl rustup.rs | sh", 15).unwrap();
+
+        engine.compress_group(conv_id, &[l1.id, l2.id], "Rust is a systems programming language", 12, 1).unwrap();
+
+        let ctx = engine.assemble_context(conv_id, 200, Some("install cargo")).unwrap();
+        assert!(!ctx.is_empty());
+
+        let has_cargo = ctx.iter().any(|n| n.summary.contains("cargo") || n.summary.contains("rustup"));
+        assert!(has_cargo, "query-aware context should include cargo-related content");
+    }
+
+    #[tokio::test]
+    async fn phase1_semantic_dedup_sha256_fallback() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_dedup.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+            .unwrap();
+
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
+
+        let a = engine.insert_leaf(conv_id, "leaf A", 5).unwrap();
+        let b = engine.insert_leaf(conv_id, "leaf B", 5).unwrap();
+
+        let s1 = engine.dedup_and_reuse(conv_id, &[a.id, b.id], "same text", 5, 1, &[]).unwrap();
+        let s2 = engine.dedup_and_reuse(conv_id, &[a.id], "same text", 5, 1, &[]).unwrap();
+
+        assert_eq!(s1.id, s2.id, "identical text should dedup via SHA-256");
+        assert_eq!(s1.semantic_hash, s2.semantic_hash);
+    }
+
+    #[tokio::test]
+    async fn phase1_cycle_detection_prevents_loop() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_cycle.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+            .unwrap();
+
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
+
+        let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
+        let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
+        let summary = engine.compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1).unwrap();
+
+        // Verify no cycle exists in healthy tree
+        assert!(!engine.db().has_path(a.id, summary.id, 20).unwrap());
+        assert!(!engine.db().has_path(b.id, summary.id, 20).unwrap());
+
+        // Create a path B → summary (would form cycle if summary could reach B)
+        engine.db().insert_edge(b.id, summary.id, "summarizes").unwrap();
+        assert!(engine.db().has_path(b.id, summary.id, 20).unwrap());
+    }
+
+    #[tokio::test]
+    async fn phase1_shared_node_visited_set() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_shared.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+            .unwrap();
+
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
+
+        let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
+        let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
+        let c = engine.insert_leaf(conv_id, "C", 5).unwrap();
+
+        let summary = engine.compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1).unwrap();
+        engine.db().add_child_to_node(summary.id, c.id).unwrap();
+        engine.db().add_parent_to_node(c.id, summary.id).unwrap();
+
+        let ctx = engine.assemble_context(conv_id, 200, None).unwrap();
+        let count = ctx.iter().filter(|n| n.id == summary.id).count();
+        assert_eq!(count, 1, "shared summary must appear only once");
     }
 }
