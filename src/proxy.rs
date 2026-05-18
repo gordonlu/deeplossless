@@ -354,7 +354,7 @@ async fn lcm_compress(
 
     let summarizer = match crate::summarizer::Summarizer::builder()
         .api_key(&get_cached_key(&state.api_key))
-        .model(&state.summarizer_model())
+        .model(state.summarizer_model())
         .upstream(&state.upstream)
         .build()
     {

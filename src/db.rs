@@ -920,8 +920,8 @@ impl Database {
                 ORDER BY score
                 LIMIT 30
             ";
-            if let Ok(mut stmt) = conn.prepare(sql) {
-                if let Ok(rows) = stmt.query_map(
+            if let Ok(mut stmt) = conn.prepare(sql)
+                && let Ok(rows) = stmt.query_map(
                     rusqlite::params![fts_query, conv_id],
                     |row| {
                         Ok(UnifiedSearchResult {
@@ -933,12 +933,12 @@ impl Database {
                             bm25_score: row.get::<_, Option<f64>>(5)?.map(|s| -s),
                         })
                     },
-                ) {
-                    let mut results: Vec<UnifiedSearchResult> = rows.filter_map(|r| r.ok()).collect();
-                    if !results.is_empty() {
-                        results.sort_by(|a, b| a.bm25_score.partial_cmp(&b.bm25_score).unwrap_or(std::cmp::Ordering::Equal));
-                        return Ok(results);
-                    }
+                )
+            {
+                let mut results: Vec<UnifiedSearchResult> = rows.filter_map(|r| r.ok()).collect();
+                if !results.is_empty() {
+                    results.sort_by(|a, b| a.bm25_score.partial_cmp(&b.bm25_score).unwrap_or(std::cmp::Ordering::Equal));
+                    return Ok(results);
                 }
             }
         }
@@ -1064,10 +1064,10 @@ impl Database {
                 continue;
             }
             let sim = cosine_similarity(query_vec, &floats);
-            if sim >= min_similarity {
-                if best.map_or(true, |(_, s)| sim > s) {
-                    best = Some((nid, sim));
-                }
+            if sim >= min_similarity
+                && best.is_none_or(|(_, s)| sim > s)
+            {
+                best = Some((nid, sim));
             }
         }
         Ok(best)

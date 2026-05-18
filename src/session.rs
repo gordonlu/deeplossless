@@ -90,9 +90,8 @@ pub fn is_tool_call(msg: &NormalizedMessage) -> bool {
 /// Check if a normalized message represents a tool result.
 pub fn is_tool_result(msg: &NormalizedMessage) -> bool {
     msg.role == "tool" || msg.tool_call_id.is_some()
-        || msg.role == "user" && msg.content.contains("tool_result")
         || msg.role == "function"
-        || msg.role == "tool" && msg.content.contains("functionResponse")
+        || (msg.role == "user" && msg.content.contains("tool_result"))
 }
 
 /// Generate a stable session fingerprint from a messages array.

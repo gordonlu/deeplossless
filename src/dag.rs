@@ -42,6 +42,7 @@ impl EdgeKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "summarizes" => Some(Self::Summarizes),
@@ -325,10 +326,10 @@ impl DagEngine {
                     break;
                 }
             }
-            if !found {
-                if let Some((sid, _)) = source_texts.first() {
-                    spans.push((*sid, 0, 0));
-                }
+            if !found
+                && let Some((sid, _)) = source_texts.first()
+            {
+                spans.push((*sid, 0, 0));
             }
         }
         self.db.store_provenance_spans(summary_node.id, &spans)
@@ -632,19 +633,19 @@ impl DagEngine {
         }
 
         // 3. If query provided, boost with scored retrieval results
-        if let Some(q) = query {
-            if let Ok(search_results) = self.db.search_unified(conv_id, q) {
-                for sr in search_results.iter().take(5) {
-                    if injected_ids.contains(&sr.id) {
-                        continue;
-                    }
-                    if let Ok(Some(node)) = self.db.get_node(sr.id) {
-                        let tc = node.token_count;
-                        if tc <= remaining {
-                            injected_ids.insert(node.id);
-                            result.push(node);
-                            remaining -= tc;
-                        }
+        if let Some(q) = query
+            && let Ok(search_results) = self.db.search_unified(conv_id, q)
+        {
+            for sr in search_results.iter().take(5) {
+                if injected_ids.contains(&sr.id) {
+                    continue;
+                }
+                if let Ok(Some(node)) = self.db.get_node(sr.id) {
+                    let tc = node.token_count;
+                    if tc <= remaining {
+                        injected_ids.insert(node.id);
+                        result.push(node);
+                        remaining -= tc;
                     }
                 }
             }
@@ -945,13 +946,13 @@ impl DagEngine {
 
             // 3. Level ordering
             for cid in &node.child_ids {
-                if let Some(child) = node_map.get(cid) {
-                    if node.level < child.level {
-                        issues.push(format!(
-                            "level-order: node {} (L{}) child {} (L{}) — parent level must be >= child",
-                            node.id, node.level, cid, child.level
-                        ));
-                    }
+                if let Some(child) = node_map.get(cid)
+                    && node.level < child.level
+                {
+                    issues.push(format!(
+                        "level-order: node {} (L{}) child {} (L{}) — parent level must be >= child",
+                        node.id, node.level, cid, child.level
+                    ));
                 }
             }
 

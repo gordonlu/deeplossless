@@ -38,10 +38,8 @@ impl TokenizerConfig {
 /// Claude models would map to `claude_20250219` (custom).
 /// OpenAI models map to `o200k_base` (GPT-4o) or `cl100k_base`.
 pub fn model_to_encoding_name(model: &str) -> &'static str {
-    if model.starts_with("deepseek") {
+    if model.starts_with("deepseek") || model.starts_with("claude") {
         "deepseek_v3"
-    } else if model.starts_with("claude") {
-        "deepseek_v3" // Claude tokenizer not bundled; fallback
     } else if model.starts_with("gpt-4o") || model.starts_with("o1") || model.starts_with("o3") {
         "o200k_base"
     } else if model.starts_with("gpt-4") || model.starts_with("gpt-3") {
@@ -154,7 +152,7 @@ pub fn count_message(value: &serde_json::Value, overhead: usize) -> usize {
     let content_tokens = count_content(value);
     let tool_token = if value.get("tool_call_id").is_some() { 5 } else { 0 };
     let tool_calls_tokens = if let Some(arr) = value["tool_calls"].as_array() {
-        arr.iter().map(|tc| count_content(tc)).sum::<usize>()
+        arr.iter().map(count_content).sum::<usize>()
     } else {
         0
     };
