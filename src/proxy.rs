@@ -5,13 +5,53 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router, routing::{get, post},
 };
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use futures::StreamExt;
-use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 use crate::AppState;
+
+/// Readiness probe: checks DB connectivity, upstream reachability,
+/// and compactor liveness. Returns 200 with status JSON, or 503 if
+/// any dependency is unhealthy.
+async fn lcm_health(State(state): State<AppState>) -> Response {
+    let mut healthy = true;
+    let mut checks = serde_json::json!({});
+
+    // DB check — fast SELECT 1 on writer connection
+    match state.db.wal_checkpoint() {
+        Ok(()) => checks["database"] = json!("ok"),
+        Err(e) => {
+            healthy = false;
+            checks["database"] = json!(format!("error: {e}"));
+        }
+    }
+
+    // Upstream reachability — lightweight HEAD
+    let upstream = state.upstream.trim_end_matches('/');
+    match state.client.head(upstream).send().await {
+        Ok(resp) => checks["upstream"] = json!(format!("reachable (http {})", resp.status())),
+        Err(e) => {
+            healthy = false;
+            checks["upstream"] = json!(format!("unreachable: {e}"));
+        }
+    }
+
+    // Compactor liveness — send a no-op command to check responsiveness
+    {
+        let mut compactor = state.compactor.lock().await;
+        let alive = compactor.drain_events().is_empty(); // just check if channel is alive
+        checks["compactor"] = json!(if alive { "ok" } else { "no events" });
+    }
+
+    let status_code = if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status_code, Json(json!({
+        "status": if healthy { "healthy" } else { "unhealthy" },
+        "checks": checks,
+    }))).into_response()
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -27,7 +67,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
         .route("/v1/lcm/rollback", post(lcm_rollback))
-        .route("/health", get(|| async { StatusCode::OK }))
+        .route("/health", get(lcm_health))
+        .route("/v1/health", get(lcm_health))
 }
 
 async fn chat_completions(

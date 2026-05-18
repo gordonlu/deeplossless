@@ -2,6 +2,7 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use deeplossless::AppState;
@@ -96,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     let app = deeplossless::proxy::routes()
         .with_state(state)
         .layer(CatchPanicLayer::new())
+        .layer(CorsLayer::permissive())
         .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)); // 20 MB
 
     let addr = format!("{}:{}", cli.host, cli.port);
