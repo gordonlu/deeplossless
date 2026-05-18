@@ -182,6 +182,17 @@ impl Database {
                 ON provenance(summary_node_id);
             CREATE INDEX IF NOT EXISTS idx_provenance_source
                 ON provenance(source_node_id);
+
+            -- Embedding vectors for semantic similarity dedup (v0.5)
+            CREATE TABLE IF NOT EXISTS embeddings (
+                node_id     INTEGER PRIMARY KEY REFERENCES dag_nodes(id),
+                vector      BLOB NOT NULL,
+                model       TEXT NOT NULL DEFAULT 'deepseek-embed',
+                dimensions  INTEGER NOT NULL DEFAULT 1536,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model
+                ON embeddings(model);
         ")?;
 
         // Graceful migration: add soft-delete columns if upgrading from earlier schema.
@@ -893,6 +904,72 @@ impl Database {
             .join(" ")
     }
 
+    // ── Embedding vector storage (v0.5) ───────────────────────────────
+
+    /// Store an embedding vector for a DAG node.
+    pub fn store_embedding(&self, node_id: i64, vector: &[f32], model: &str, dims: i32) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (node_id, vector, model, dimensions) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![node_id, bytes, model, dims],
+        )?;
+        Ok(())
+    }
+
+    /// Get the embedding vector for a node.
+    pub fn get_embedding(&self, node_id: i64) -> anyhow::Result<Option<Vec<f32>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT vector, dimensions FROM embeddings WHERE node_id = ?1")?;
+        let mut rows = stmt.query_map(rusqlite::params![node_id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
+        })?;
+        if let Some(row) = rows.next() {
+            let (bytes, dims) = row?;
+            let floats: Vec<f32> = bytes.chunks(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if floats.len() == dims as usize {
+                return Ok(Some(floats));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find the nearest neighbor node by cosine similarity.
+    /// Returns (node_id, similarity) if similarity >= min_similarity.
+    pub fn find_nearest_embedding(
+        &self,
+        query_vec: &[f32],
+        min_similarity: f32,
+    ) -> anyhow::Result<Option<(i64, f32)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, vector, dimensions FROM embeddings WHERE model = 'deepseek-embed'"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i32>(2)?))
+        })?;
+
+        let mut best: Option<(i64, f32)> = None;
+        for row in rows {
+            let (nid, bytes, dims) = row?;
+            let floats: Vec<f32> = bytes.chunks(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if floats.len() != dims as usize || floats.len() != query_vec.len() {
+                continue;
+            }
+            let sim = cosine_similarity(query_vec, &floats);
+            if sim >= min_similarity {
+                if best.map_or(true, |(_, s)| sim > s) {
+                    best = Some((nid, sim));
+                }
+            }
+        }
+        Ok(best)
+    }
+
     // ── Semantic dedup (v0.3) ─────────────────────────────────────────
 
     /// Find nodes with the same semantic hash across ALL conversations.
@@ -1041,6 +1118,14 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
             semantic_hash,
         })
     }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let (dot, na, nb) = a.iter().zip(b.iter())
+        .fold((0.0f32, 0.0f32, 0.0f32), |(d, na, nb), (x, y)| {
+            (d + x * y, na + x * x, nb + y * y)
+        });
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt() * nb.sqrt()) }
 }
 
 #[cfg(test)]
