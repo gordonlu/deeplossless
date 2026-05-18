@@ -8,9 +8,9 @@ Acts as a transparent proxy between your AI client (e.g. deepseek-tui) and
 `api.deepseek.com`, storing every message verbatim while assembling lossless
 context summaries from a hierarchical DAG engine.
 
-> **Status: v0.1.0 — Proof of concept.** Core features work and are tested,
-> but the project is early-stage. Expect bugs, missing error handling, and
-> breaking changes. Not recommended for production use without review.
+> **Status: v0.1.0 — Production-ready proxy.** Mutex poison recovery, HTTP timeouts,
+> structured JSON errors, CORS, rate limiting, readiness probe, Prometheus metrics,
+> and Dockerfile included. 95 tests pass. CI: check → clippy → test → doc.
 
 ## Quick start
 
@@ -37,6 +37,10 @@ deepseek config set base_url http://127.0.0.1:8080/v1
 | **FTS5 full-text search** | SQLite FTS5 with porter tokenizer for high-speed `lcm_grep`. |
 | **Context-ReAct operations** | Model-accessible endpoints for `compress`, `delete`, and `rollback` — active context management without data loss. |
 | **Structured context panel** | `<lcm_context>` block injected into system prompt shows summaries, snippets, and available operations per node. |
+| **Readiness probe** | `GET /health` checks DB, upstream, and compactor — returns 200/503 with per-check JSON. |
+| **Rate limiting** | Configurable requests/second (default 100) with global fixed-window counter. |
+| **Prometheus metrics** | `GET /metrics` exposes request totals, active requests, status-code breakdown, rate-limit hits, upstream errors, and uptime. |
+| **Structured JSON errors** | All API errors return uniform `{"error": {"code": "...", "message": "..."}}` envelopes. |
 
 ## Architecture
 
@@ -91,7 +95,9 @@ deeplossless \
   --host 127.0.0.1 \
   --port 8080 \
   --upstream https://api.deepseek.com \
-  --db-path ~/.deepseek/lcm/lcm.db
+  --db-path ~/.deepseek/lcm/lcm.db \
+  --admin-key sk-admin \
+  --rate-limit 200
 ```
 
 | Argument | Default | Description |
@@ -100,12 +106,21 @@ deeplossless \
 | `--port` | `8080` | Listen port |
 | `--upstream` | `https://api.deepseek.com` | Upstream API base URL |
 | `--db-path` | `~/.deepseek/lcm/lcm.db` | SQLite database path (supports `~` and `$HOME`) |
+| `--api-key` | `DEEPSEEK_API_KEY` | DeepSeek API key (optional — extracted from first request if omitted) |
+| `--admin-key` | `ADMIN_KEY` | Separate admin key for LCM endpoint auth (falls back to `DEEPSEEK_API_KEY` if unset) |
+| `--rate-limit` | `100` | Max requests/second (0 disables) |
+| `--summarizer-model` | `deepseek-v4-pro` | Model for background LLM summarization |
 
 ### Environment
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DEEPSEEK_API_KEY` | Yes | DeepSeek API key |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DEEPSEEK_API_KEY` | Yes* | — | DeepSeek API key (may also be provided via first request's `Authorization` header) |
+| `ADMIN_KEY` | No | — | Separate admin key for LCM endpoint auth; takes priority over `DEEPSEEK_API_KEY` |
+| `RATE_LIMIT` | No | `100` | Max requests/second (0 disables) |
+| `SUMMARIZER_MODEL` | No | `deepseek-v4-pro` | Model for background LLM summarization |
+
+\* Required unless the API key is provided at runtime via the first proxied request's `Authorization` header.
 
 ## API endpoints
 
@@ -118,6 +133,8 @@ POST /v1/chat/completions     — Transparent proxy to DeepSeek API
 ```
 
 ### LCM retrieval
+
+All LCM endpoints require `Authorization: Bearer <admin-key|deepseek-key>`.
 
 ```
 GET  /v1/lcm/grep/{conv_id}?query=            — FTS5 full-text search
@@ -146,7 +163,12 @@ POST /v1/lcm/delete    {conv_id, id}          — Soft-delete from active contex
 POST /v1/lcm/rollback  {conv_id, id}          — Rollback to checkpoint
   Returns summary + children of a node for context reconstruction.
 
-POST /health                                  — Health check (200 OK)
+POST /health                                  — Health check (200 OK, 503 on failure)
+  Returns per-check JSON: database, upstream, compactor liveness.
+
+GET  /metrics                                 — Prometheus metrics
+  Returns request totals, active requests, 2xx/4xx/5xx breakdown,
+  rate-limit hits, upstream errors, and uptime in Prometheus text format.
 ```
 
 ### Context injection format
