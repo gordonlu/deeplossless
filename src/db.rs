@@ -1096,6 +1096,30 @@ impl Database {
         Ok(results)
     }
 
+    /// Search across all conversations for nodes matching a query.
+    /// Uses FTS5 on summaries + semantic_index for cross-session retrieval.
+    pub fn search_cross_session(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let conn = self.read_conn();
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT n.id, n.conversation_id, n.summary
+             FROM dag_nodes n
+             WHERE n.summary LIKE ?1 ESCAPE '\\' AND n.deleted = 0 AND n.level > 0
+             ORDER BY n.access_count DESC, n.id DESC
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
     /// Index a node in the semantic_index for cross-conversation lookup.
     pub fn index_semantic(&self, hash: &str, node_id: i64, conv_id: i64, preview: &str) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap();

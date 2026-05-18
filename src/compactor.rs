@@ -9,6 +9,9 @@ use crate::summarizer::{Summarizer, SummarizerConfig};
 pub enum CompactCommand {
     CompressGroup { conv_id: i64, node_ids: Vec<i64> },
     ReviewAndCompact { conv_id: i64, context_window: usize },
+    /// Incremental sliding-window compaction: compress oldest leaves
+    /// when count exceeds window_size, keeping recent ones uncompressed.
+    SlideAndCompact { conv_id: i64, window_size: usize, context_window: usize },
     Shutdown,
 }
 
@@ -140,6 +143,98 @@ fn novelty_score(texts: &[&str]) -> f64 {
     if pairs == 0 { 1.0 } else { total_dist / pairs as f64 }
 }
 
+/// AST-aware code compression: preserve function/type signatures, trim bodies.
+/// Reduces token count while keeping semantic structure for the summarizer.
+fn compress_code_blocks(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_code = false;
+    let mut code_buf = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_code {
+                // Compress the code block
+                let compressed = compress_code(&code_buf);
+                result.push_str("```\n");
+                result.push_str(&compressed);
+                result.push_str("\n```\n");
+                code_buf.clear();
+                in_code = false;
+            } else {
+                result.push_str(line);
+                result.push('\n');
+                in_code = true;
+            }
+        } else if in_code {
+            code_buf.push_str(line);
+            code_buf.push('\n');
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    // Unclosed code block
+    if !code_buf.is_empty() {
+        result.push_str(&code_buf);
+    }
+    result
+}
+
+/// Compress code by keeping signatures + first line of body, trimming the rest.
+fn compress_code(code: &str) -> String {
+    let mut out = String::new();
+    let mut skip_until_close = false;
+    let mut indent_depth: usize = 0;
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push('\n');
+            continue;
+        }
+
+        // Track brace depth
+        let opens = trimmed.matches('{').count();
+        let closes = trimmed.matches('}').count();
+        indent_depth = indent_depth.saturating_add(opens).saturating_sub(closes);
+
+        // Keep structural lines fully
+        let is_structural = trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ")
+            || trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ")
+            || trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ")
+            || trimmed.starts_with("impl ") || trimmed.starts_with("use ")
+            || trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ")
+            || trimmed.starts_with("const ") || trimmed.starts_with("type ")
+            || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ")
+            || trimmed.starts_with("class ") || trimmed.starts_with("def ")
+            || trimmed.starts_with("func ") || trimmed.starts_with("import ");
+
+        if is_structural {
+            out.push_str(line);
+            out.push('\n');
+            skip_until_close = opens > 0;
+        } else if skip_until_close {
+            if closes > 0 && indent_depth <= 1 {
+                skip_until_close = false;
+                out.push_str("    // ...\n");
+            }
+        } else if indent_depth > 0 {
+            // First line inside a block: keep it as hint
+            if !skip_until_close {
+                out.push_str(line);
+                out.push('\n');
+                skip_until_close = true;
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 async fn compact_worker(
     mut cmd_rx: mpsc::Receiver<CompactCommand>,
     event_tx: mpsc::Sender<CompactEvent>,
@@ -155,6 +250,9 @@ async fn compact_worker(
             }
             CompactCommand::CompressGroup { conv_id, node_ids } => {
                 compress_group(conv_id, node_ids, &dag, &summarizer, &event_tx).await;
+            }
+            CompactCommand::SlideAndCompact { conv_id, window_size, context_window } => {
+                slide_and_compact(conv_id, window_size, context_window, &dag, &summarizer, &event_tx).await;
             }
         }
     }
@@ -234,6 +332,50 @@ async fn compress_group(
     do_compress(conv_id, node_ids, text, old_tc, dag, summarizer, event_tx).await;
 }
 
+/// Sliding-window incremental compaction: when uncompressed leaves exceed
+/// window_size, compact the oldest half. Keeps recent leaves visible.
+async fn slide_and_compact(
+    conv_id: i64,
+    window_size: usize,
+    context_window: usize,
+    dag: &DagEngine,
+    summarizer: &Summarizer,
+    event_tx: &mpsc::Sender<CompactEvent>,
+) {
+    let leaves = match dag.get_leaves(conv_id) {
+        Ok(l) => l,
+        Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
+    };
+
+    if leaves.len() <= window_size {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        return;
+    }
+
+    let total = dag.total_tokens(conv_id).unwrap_or(0);
+    let hard_limit = (context_window as f64 * 0.95) as i64;
+    if total < hard_limit && leaves.len() < window_size * 2 {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        return;
+    }
+
+    // Compact the oldest half of leaves outside the window
+    let compact_count = (leaves.len() - window_size).min(8);
+    let oldest: Vec<i64> = leaves.iter().take(compact_count).map(|n| n.id).collect();
+    if oldest.len() < 2 {
+        return;
+    }
+
+    let text = leaves.iter()
+        .take(compact_count)
+        .map(|n| n.summary.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let old_tc: i64 = leaves.iter().take(compact_count).map(|n| n.token_count).sum();
+
+    do_compress(conv_id, oldest, text, old_tc, dag, summarizer, event_tx).await;
+}
+
 async fn do_compress(
     conv_id: i64,
     node_ids: Vec<i64>,
@@ -243,7 +385,8 @@ async fn do_compress(
     summarizer: &Summarizer,
     event_tx: &mpsc::Sender<CompactEvent>,
 ) {
-    match summarizer.summarize_escalate(&text).await {
+    let compressed_text = compress_code_blocks(&text);
+    match summarizer.summarize_escalate(&compressed_text).await {
         Ok((summary, level)) => {
             let tc = crate::tokenizer::count(&summary) as i64;
             let dag_level = level.to_dag_level();

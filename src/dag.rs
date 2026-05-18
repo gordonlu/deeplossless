@@ -771,6 +771,11 @@ impl DagEngine {
         self.db.get_provenance_with_excerpts(node_id)
     }
 
+    /// Search across all sessions for semantically relevant nodes.
+    pub fn search_cross_session(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        self.db.search_cross_session(query, limit)
+    }
+
     /// Topological sort of summary nodes reachable from `start`.
     /// Uses Kahn's algorithm with a min-heap (by level DESC, then id ASC)
     /// for deterministic ordering.  Guarantees parents appear before children.
