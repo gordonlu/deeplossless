@@ -1522,7 +1522,7 @@ mod tests {
         for (n1, n2) in order1.iter().zip(order2.iter()) {
             assert_eq!(n1.id, n2.id);
         }
-        assert!(order1.len() >= 1);
+        assert!(!order1.is_empty());
     }
 
     #[test]
