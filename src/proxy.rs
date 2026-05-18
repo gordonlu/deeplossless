@@ -37,7 +37,7 @@ async fn chat_completions(
 ) -> Response {
     // Extract API key from Authorization header on first request
     {
-        let mut key = state.api_key.lock().unwrap();
+        let mut key = state.api_key.lock().expect("api key lock poisoned");
         if key.is_none()
             && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
             && let Some(bearer) = auth.strip_prefix("Bearer ")
@@ -86,7 +86,7 @@ async fn chat_completions(
         .headers()
         .get("content-type")
         .cloned()
-        .unwrap_or_else(|| "application/json".parse().unwrap());
+        .unwrap_or_else(|| "application/json".parse().expect("static header parse"));
 
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -110,8 +110,8 @@ async fn chat_completions(
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
         response.headers_mut().insert("content-type", content_type);
-        response.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
-        response.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
+        response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
+        response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
         response
     } else {
         match resp.bytes().await {
@@ -130,7 +130,7 @@ async fn chat_completions(
 /// The compactor will fall back to Level 3 (deterministic) if the key
 /// is "unset".
 fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
-    key.lock().unwrap().clone().unwrap_or_else(|| "unset".to_string())
+    key.lock().expect("api key lock poisoned").clone().unwrap_or_else(|| "unset".to_string())
 }
 
 /// Verify that a request to a Context-ReAct endpoint carries a valid
@@ -152,9 +152,13 @@ fn ctx_react_auth_ok(headers: &HeaderMap, api_key: &std::sync::Mutex<Option<Stri
 
 async fn lcm_grep(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(conv_id): Path<i64>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
     match state.db.search_unified(conv_id, query) {
         Ok(results) => Json(json!({
@@ -172,9 +176,12 @@ async fn lcm_grep(
 
 async fn lcm_expand(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(node_id): Path<i64>,
 ) -> Response {
-    // Expand a summary node to its children (original messages)
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }    // Expand a summary node to its children (original messages)
     match state.dag.get_children(node_id) {
         Ok(children) => {
             let node = state.dag.get_node(node_id).ok().flatten();
@@ -193,9 +200,12 @@ async fn lcm_expand(
 
 async fn lcm_snippets(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(node_id): Path<i64>,
 ) -> Response {
-    match state.dag.get_node(node_id) {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }    match state.dag.get_node(node_id) {
         Ok(Some(node)) => {
             Json(serde_json::json!({
                 "node_id": node_id,
@@ -212,9 +222,12 @@ async fn lcm_snippets(
 /// Cross-session semantic search across all conversations.
 async fn lcm_global_search(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.dag.search_cross_session(query, limit) {
         Ok(results) => {
@@ -231,9 +244,12 @@ async fn lcm_global_search(
 
 async fn lcm_dag_health(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(conv_id): Path<i64>,
 ) -> Response {
-    match state.dag.validate_dag(conv_id) {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }    match state.dag.validate_dag(conv_id) {
         Ok(issues) => {
             let healthy = issues.is_empty();
             Json(json!({
@@ -249,9 +265,12 @@ async fn lcm_dag_health(
 
 async fn lcm_similar(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Response {
-    match state.db.find_similar_by_hash(&hash) {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }    match state.db.find_similar_by_hash(&hash) {
         Ok(results) => Json(json!({
             "hash": hash,
             "matches": results.iter().map(|(h, nid, cid, preview)| json!({
@@ -268,9 +287,12 @@ async fn lcm_similar(
 
 async fn lcm_trace(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(node_id): Path<i64>,
 ) -> Response {
-    match state.db.get_provenance_with_excerpts(node_id) {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }    match state.db.get_provenance_with_excerpts(node_id) {
         Ok(rows) => {
             let sources: Vec<Value> = rows.iter().map(|(sid, off, len, excerpt)| json!({
                 "source_node_id": sid,
@@ -290,8 +312,12 @@ async fn lcm_trace(
 
 async fn lcm_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(conv_id): Path<i64>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state.api_key) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     let leaves = state.dag.get_leaves(conv_id).unwrap_or_default();
     let tip = state.dag.get_active_tip(conv_id).ok().flatten();
     let total = state.dag.total_tokens(conv_id).unwrap_or(0);

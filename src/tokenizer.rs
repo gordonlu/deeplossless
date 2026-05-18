@@ -56,7 +56,7 @@ static ENCODINGS: Mutex<Option<HashMap<String, &'static CoreBpe>>> = Mutex::new(
 /// Get or load a tiktoken encoding by name, with graceful fallback.
 /// Falls back to `cl100k_base` on load failure instead of panicking.
 pub fn get_encoding(name: &str) -> &'static CoreBpe {
-    let mut guard = ENCODINGS.lock().unwrap();
+    let mut guard = ENCODINGS.lock().expect("tokenizer encoding lock poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
 
     if let Some(enc) = map.get(name) {
@@ -113,7 +113,7 @@ fn count_content_inner(value: &serde_json::Value, enc: &str) -> usize {
             // "text"/"content"/"arguments"/"input" fields from objects.
             arr.iter().map(|item| {
                 if item.is_string() {
-                    bpe.count(item.as_str().unwrap())
+                    bpe.count(item.as_str().unwrap_or_default())
                 } else if let Some(obj) = item.as_object() {
                     let mut total = 0;
                     if let Some(v) = obj.get("text").or_else(|| obj.get("content")) {
