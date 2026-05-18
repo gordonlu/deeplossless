@@ -776,7 +776,7 @@ impl Database {
     }
 
     /// Unified search across messages, summaries, and snippets.
-    /// Returns results tagged with source type for the retrieval layer.
+    /// Uses FTS5 MATCH + bm25() for English queries, LIKE fallback for CJK.
     pub fn search_unified(
         &self,
         conv_id: i64,
@@ -786,12 +786,50 @@ impl Database {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+
         let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
 
-        // UNION of three independent searches:
-        //   1. messages.content (raw conversation)
-        //   2. dag_nodes.summary (compressed summaries)
-        //   3. dag_nodes.snippets (precision-critical values)
+        // Try FTS5 MATCH first (supports BM25 scoring, works for English).
+        // FTS5 unicode61 tokenizer fails on mixed CJK/English — detect and fall back.
+        let has_cjk = query.chars().any(|c| c as u32 > 0x2E80);
+        let use_fts5 = !has_cjk;
+
+        if use_fts5 {
+            let fts_query = Self::fts5_query(query);
+            let sql = "
+                SELECT messages_fts.rowid AS id, 'message' AS source, role AS label,
+                       substr(messages.content, 1, 500) AS excerpt,
+                       messages.token_count, bm25(messages_fts, 0.0, 1.0, 0.5) AS score
+                FROM messages_fts
+                JOIN messages ON messages.id = messages_fts.rowid
+                WHERE messages_fts MATCH ?1 AND messages.conversation_id = ?2
+                ORDER BY score
+                LIMIT 30
+            ";
+            if let Ok(mut stmt) = conn.prepare(sql) {
+                if let Ok(rows) = stmt.query_map(
+                    rusqlite::params![fts_query, conv_id],
+                    |row| {
+                        Ok(UnifiedSearchResult {
+                            id: row.get(0)?,
+                            source: row.get(1)?,
+                            label: row.get(2)?,
+                            excerpt: row.get(3)?,
+                            token_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                            bm25_score: row.get::<_, Option<f64>>(5)?.map(|s| -s),
+                        })
+                    },
+                ) {
+                    let mut results: Vec<UnifiedSearchResult> = rows.filter_map(|r| r.ok()).collect();
+                    if !results.is_empty() {
+                        results.sort_by(|a, b| a.bm25_score.partial_cmp(&b.bm25_score).unwrap_or(std::cmp::Ordering::Equal));
+                        return Ok(results);
+                    }
+                }
+            }
+        }
+
+        // LIKE fallback for CJK or empty FTS5 results
         let sql = "
             SELECT id, 'message' AS source, role AS label,
                    substr(content, 1, 500) AS excerpt, token_count
@@ -831,7 +869,7 @@ impl Database {
                 source: row.get(1)?,
                 label: row.get(2)?,
                 excerpt: row.get(3)?,
-                token_count: row.get(4)?,
+                token_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 bm25_score: None,
             })
         })?;
@@ -840,6 +878,19 @@ impl Database {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// Build a safe FTS5 query string from user input.
+    /// Wraps each word in quotes for phrase matching.
+    fn fts5_query(query: &str) -> String {
+        let escaped = Self::fts_escape(query);
+        if escaped.is_empty() {
+            return "*".to_string();
+        }
+        escaped.split_whitespace()
+            .map(|w| format!("\"{}\"", w.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     // ── Semantic dedup (v0.3) ─────────────────────────────────────────
