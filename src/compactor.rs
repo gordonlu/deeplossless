@@ -106,6 +106,40 @@ impl Compactor {
     pub fn config(&self) -> &CompactorConfig { &self.config }
 }
 
+/// Compute novelty score for a set of messages relative to each other.
+/// Returns 0.0 (all redundant) to 1.0 (all novel).
+/// Uses trigram Jaccard distance: low overlap = high novelty.
+fn novelty_score(texts: &[&str]) -> f64 {
+    if texts.len() < 2 {
+        return 1.0;
+    }
+    let mut all_trigrams: Vec<std::collections::HashSet<[u8; 3]>> = Vec::new();
+    for text in texts {
+        let bytes = text.as_bytes();
+        let trigrams: std::collections::HashSet<[u8; 3]> = bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+        if !trigrams.is_empty() {
+            all_trigrams.push(trigrams);
+        }
+    }
+    if all_trigrams.len() < 2 {
+        return 1.0;
+    }
+    // Average pairwise Jaccard distance
+    let mut total_dist = 0.0;
+    let mut pairs = 0;
+    for i in 0..all_trigrams.len() {
+        for j in i+1..all_trigrams.len() {
+            let intersection = all_trigrams[i].intersection(&all_trigrams[j]).count();
+            let union = all_trigrams[i].union(&all_trigrams[j]).count();
+            if union > 0 {
+                total_dist += 1.0 - (intersection as f64 / union as f64);
+                pairs += 1;
+            }
+        }
+    }
+    if pairs == 0 { 1.0 } else { total_dist / pairs as f64 }
+}
+
 async fn compact_worker(
     mut cmd_rx: mpsc::Receiver<CompactCommand>,
     event_tx: mpsc::Sender<CompactEvent>,
@@ -134,31 +168,35 @@ async fn review_and_compact(
     config: &CompactorConfig,
     event_tx: &mpsc::Sender<CompactEvent>,
 ) {
-    let hard = (context_window as f64 * config.hard_threshold_pct) as i64;
     let total = match dag.total_tokens(conv_id) {
         Ok(t) => t,
         Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("total_tokens: {e}") }).await; return; }
     };
 
-    // Entropy-aware compaction: trigger based on token threshold OR
-    // information density (many small leaves = high noise, low density).
-    // High leaf count with low token saturation suggests fragmented context
-    // that benefits from compaction even before the hard threshold.
     let leaves = match dag.get_leaves(conv_id) {
         Ok(l) => l,
         Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
     };
 
     let leaf_count = leaves.len();
-    let soft_trigger = leaf_count >= config.group_size * 2
-        && total >= (context_window as f64 * config.soft_threshold_pct) as i64;
-
-    if total < hard && !soft_trigger {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+    if leaf_count < 2 {
         return;
     }
 
-    if leaf_count < 2 {
+    // Entropy-aware threshold adjustment: novel content gets preserved,
+    // redundant content gets compacted more aggressively.
+    let texts: Vec<&str> = leaves.iter().take(config.group_size).map(|n| n.summary.as_str()).collect();
+    let novelty = novelty_score(&texts);
+    let adj_soft = if novelty > 0.7 { 0.90 } else if novelty < 0.3 { 0.60 } else { config.soft_threshold_pct };
+    let adj_hard = if novelty > 0.7 { 0.98 } else if novelty < 0.3 { 0.85 } else { config.hard_threshold_pct };
+
+    let soft = (context_window as f64 * adj_soft) as i64;
+    let hard_limit = (context_window as f64 * adj_hard) as i64;
+
+    let soft_trigger = leaf_count >= config.group_size * 2 && total >= soft;
+
+    if total < hard_limit && !soft_trigger {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
         return;
     }
 
@@ -303,5 +341,25 @@ mod tests {
             Some(CompactEvent::BelowThreshold) => {}
             other => panic!("expected BelowThreshold, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn novelty_detects_redundant_vs_unique() {
+        let redundant = vec!["hello world foo bar", "hello world foo baz", "hello world bar baz"];
+        let unique = vec!["quantum computing advances", "my cat ate breakfast", "RFC 9457 error format"];
+        let r_score = novelty_score(&redundant);
+        let u_score = novelty_score(&unique);
+        assert!(u_score > r_score, "unique texts should have higher novelty: u={u_score} vs r={r_score}");
+        assert!(r_score < 0.5, "redundant texts should have low novelty, got {r_score}");
+    }
+
+    #[test]
+    fn novelty_single_text_is_one() {
+        assert_eq!(novelty_score(&["hello"]), 1.0);
+    }
+
+    #[test]
+    fn novelty_empty_is_one() {
+        assert_eq!(novelty_score(&[]), 1.0);
     }
 }

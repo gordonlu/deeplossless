@@ -251,6 +251,24 @@ impl Database {
             conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT '';")?;
         }
 
+        // v0.5: access tracking for memory scoring
+        let has_access_count: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'access_count'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_access_count {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        let has_last_accessed: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'last_accessed_at'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_last_accessed {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN last_accessed_at TEXT;")?;
+        }
+
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_conv
                  ON messages(conversation_id);
@@ -369,7 +387,7 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         conn.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32, hash],
         )?;
@@ -395,13 +413,15 @@ impl Database {
             is_leaf,
             deleted: false,
             semantic_hash: Self::semantic_hash(summary, snippets),
+            access_count: 0,
+            last_accessed_at: None,
         })
     }
 
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
              FROM dag_nodes WHERE id = ?1 AND deleted = 0",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
@@ -415,7 +435,8 @@ impl Database {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
-                    n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf, n.deleted
+                    n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf, n.deleted,
+                    n.semantic_hash, n.access_count, n.last_accessed_at
              FROM dag_nodes n, json_each(n.child_ids) AS j
              WHERE j.value = ?1 AND n.deleted = 0
              LIMIT ?2",
@@ -444,7 +465,7 @@ impl Database {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
              FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
             placeholders.join(","),
         );
@@ -463,7 +484,7 @@ impl Database {
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
              FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
              ORDER BY level DESC, id DESC LIMIT 1",
         )?;
@@ -474,7 +495,7 @@ impl Database {
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
              FROM dag_nodes
              WHERE conversation_id = ?1 AND level = (
                  SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
@@ -490,7 +511,7 @@ impl Database {
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
              FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -519,7 +540,7 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         tx.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
             rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, hash],
         )?;
@@ -595,7 +616,19 @@ impl Database {
             is_leaf: false,
             deleted: false,
             semantic_hash: Self::semantic_hash(summary, snippets),
+            access_count: 0,
+            last_accessed_at: None,
         })
+    }
+
+    /// Increment access count and update last_accessed_at for memory scoring.
+    pub fn touch_node(&self, node_id: i64) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap();
+        conn.execute(
+            "UPDATE dag_nodes SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![node_id],
+        )?;
+        Ok(())
     }
 
     /// Soft-delete a DAG node (set deleted=1, timestamp). The node is
@@ -620,7 +653,7 @@ impl Database {
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
              FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0
              ORDER BY id ASC",
         )?;
@@ -1174,6 +1207,8 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let is_leaf_int: i32 = row.get(8)?;
         let deleted_int: i32 = row.get(9)?;
         let semantic_hash: String = row.get(10)?;
+        let access_count: i64 = row.get(11).unwrap_or(0);
+        let last_accessed_at: Option<String> = row.get(12).ok().flatten();
         Ok(DagNode {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -1186,6 +1221,8 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
             is_leaf: is_leaf_int != 0,
             deleted: deleted_int != 0,
             semantic_hash,
+            access_count,
+            last_accessed_at,
         })
     }
 }

@@ -140,6 +140,10 @@ pub struct DagNode {
     pub deleted: bool,
     /// SHA-256 hash of normalized summary text for cross-conversation dedup (v0.3).
     pub semantic_hash: String,
+    /// How many times this node was selected for context assembly.
+    pub access_count: i64,
+    /// ISO-8601 timestamp of last context assembly inclusion.
+    pub last_accessed_at: Option<String>,
 }
 
 // ── Engine ─────────────────────────────────────────────────────────────
@@ -631,7 +635,33 @@ impl DagEngine {
             }
         }
 
+        // Record access for memory scoring (best-effort)
+        for node in &result {
+            if let Err(e) = self.db.touch_node(node.id) {
+                tracing::warn!(target: "deeplossless::dag", error = %e, node_id = node.id, "touch_node failed");
+            }
+        }
+
         Ok(result)
+    }
+
+    /// Compute a memory score for a node: combines recency, frequency, and importance.
+    /// Higher = more valuable for long-term retention. 0.0–1.0.
+    pub fn compute_memory_score(&self, node: &DagNode) -> f64 {
+        // Recency: never accessed = 0.5; recently accessed = higher
+        let recency = match &node.last_accessed_at {
+            Some(_) => 0.8,  // has been accessed, actual time comparison would go here
+            None => 0.3,
+        };
+        // Frequency: log-scaled access count, max contribution at ~100 accesses
+        let freq = ((node.access_count as f64 + 1.0).ln() / 5.0).min(1.0);
+        // Importance: average snippet importance or 0.5 default
+        let imp = if node.snippets.is_empty() {
+            0.5
+        } else {
+            node.snippets.iter().map(|s| s.importance as f64).sum::<f64>() / node.snippets.len() as f64
+        };
+        (recency * 0.4 + freq * 0.3 + imp * 0.3).clamp(0.0, 1.0)
     }
 
     /// Load all DAG nodes and edges for a conversation in 1-2 queries.
