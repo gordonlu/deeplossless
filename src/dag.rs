@@ -288,7 +288,42 @@ impl DagEngine {
             self.db.purge_dag_node(node.id)?;
             return Err(e);
         }
+        // Best-effort provenance computation
+        if let Err(e) = self.compute_provenance(&node, source_ids) {
+            tracing::warn!(target: "deeplossless::dag", error = %e, "provenance computation failed");
+        }
         Ok(node)
+    }
+
+    /// Compute sentence-level provenance spans for a new summary node.
+    fn compute_provenance(&self, summary_node: &DagNode, source_ids: &[i64]) -> anyhow::Result<()> {
+        let sentences = split_sentences(&summary_node.summary);
+        if sentences.is_empty() {
+            return Ok(());
+        }
+        let mut spans = Vec::new();
+        let mut source_texts: Vec<(i64, String)> = Vec::new();
+        for sid in source_ids {
+            if let Some(node) = self.db.get_node(*sid)? {
+                source_texts.push((*sid, node.summary.clone()));
+            }
+        }
+        for (_offset, sentence) in &sentences {
+            let mut found = false;
+            for (sid, text) in &source_texts {
+                if let Some(pos) = text.find(sentence) {
+                    spans.push((*sid, pos as i32, sentence.len() as i32));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                if let Some((sid, _)) = source_texts.first() {
+                    spans.push((*sid, 0, 0));
+                }
+            }
+        }
+        self.db.store_provenance_spans(summary_node.id, &spans)
     }
 
     /// Check that adding edges from `summary` → each `source` creates no cycle.
@@ -686,6 +721,11 @@ impl DagEngine {
         Ok(nodes)
     }
 
+    /// Trace sentence-level provenance for a summary node.
+    pub fn trace_provenance(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i32, i32, String)>> {
+        self.db.get_provenance_with_excerpts(node_id)
+    }
+
     /// Topological sort of summary nodes reachable from `start`.
     /// Uses Kahn's algorithm with a min-heap (by level DESC, then id ASC)
     /// for deterministic ordering.  Guarantees parents appear before children.
@@ -1007,6 +1047,35 @@ fn format_summary_text(summary: &str, snippets: &[crate::snippet::Snippet]) -> S
         let snippet_texts: Vec<&str> = snippets.iter().map(|s| s.content.as_str()).collect();
         format!("{} {}", summary, snippet_texts.join(" "))
     }
+}
+
+/// Split text into sentences by `.`, `。`, `\n`, `!`, `?` boundaries.
+/// Returns (start_byte_offset, sentence_text) pairs.
+fn split_sentences(text: &str) -> Vec<(usize, &str)> {
+    let mut sentences = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_boundary = matches!(b, b'.' | b'\n' | b'!' | b'?');
+        let is_cjk_period = i + 2 < bytes.len()
+            && bytes[i] == 0xE3 && bytes[i+1] == 0x80 && bytes[i+2] == 0x82;
+        let boundary_end = if is_cjk_period { i + 3 } else if is_boundary { i + 1 } else { 0 };
+        if boundary_end > 0 && boundary_end > start {
+            let sent = text[start..boundary_end].trim();
+            if !sent.is_empty() {
+                sentences.push((start, sent));
+            }
+            start = boundary_end;
+        }
+    }
+    if start < text.len() {
+        let remaining = text[start..].trim();
+        if !remaining.is_empty() {
+            sentences.push((start, remaining));
+        }
+    }
+    sentences
 }
 
 #[cfg(test)]
@@ -1499,5 +1568,14 @@ mod tests {
         let issues = engine.validate_dag(conv_id).unwrap();
         assert!(!issues.is_empty(), "should detect orphan child reference");
         assert!(issues.iter().any(|i| i.contains("orphan-child")), "should report orphan-child");
+    }
+
+    #[test]
+    fn sentence_splitter_handles_english_and_cjk() {
+        let sents = split_sentences("Hello world. This is Rust.\nNew line here!Right?");
+        assert!(sents.len() >= 3, "expected at least 3 sentences, got {}", sents.len());
+
+        let sents_cjk = split_sentences("你好世界。这是Rust。\n新行");
+        assert!(sents_cjk.len() >= 2, "expected at least 2 CJK sentences, got {}", sents_cjk.len());
     }
 }

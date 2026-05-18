@@ -1063,6 +1063,50 @@ impl Database {
         Ok(results)
     }
 
+    /// Store sentence-level provenance spans for a summary node.
+    pub fn store_provenance_spans(
+        &self,
+        summary_node_id: i64,
+        spans: &[(i64, i32, i32)],
+    ) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap();
+        for (source_node_id, offset, length) in spans {
+            conn.execute(
+                "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![summary_node_id, source_node_id, offset, length],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get provenance with source excerpts for a summary node.
+    pub fn get_provenance_with_excerpts(
+        &self,
+        summary_node_id: i64,
+    ) -> anyhow::Result<Vec<(i64, i32, i32, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT p.source_node_id, p.sentence_offset, p.sentence_length,
+                    substr(n.summary, 1, 200)
+             FROM provenance p
+             JOIN dag_nodes n ON n.id = p.source_node_id
+             WHERE p.summary_node_id = ?1
+             ORDER BY p.sentence_offset"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![summary_node_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
     /// Strip JSON markup from content so FTS5 indexes only the plain text.
 /// Content can be either a plain string or a JSON array of content blocks.
 fn strip_json_markup(content: &str) -> String {
@@ -1510,5 +1554,100 @@ mod tests {
         let ctx = engine.assemble_context(conv_id, 200, None).unwrap();
         let count = ctx.iter().filter(|n| n.id == summary.id).count();
         assert_eq!(count, 1, "shared summary must appear only once");
+    }
+
+    // ── Phase 2: Concurrency ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn phase2_concurrent_reads_do_not_block() {
+        use std::time::Instant;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase2_conc.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([
+            {"role": "user", "content": "hello"}
+        ])).unwrap();
+
+        for i in 0..100 {
+            db.insert_dag_node(conv_id, 0, &format!("node {i}"), 5, &[], &[], true).unwrap();
+        }
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let db = db.clone();
+            let h = tokio::task::spawn_blocking(move || {
+                for _ in 0..20 {
+                    let _ = db.get_all_dag_nodes(conv_id);
+                }
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs() < 5, "concurrent reads took too long: {elapsed:?}");
+    }
+
+    // ── Phase 2: Provenance + Hierarchical rendering ──────────────────
+
+    #[tokio::test]
+    async fn phase2_provenance_spans_persist() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase2_prov.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+            .unwrap();
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
+
+        let l1 = engine.insert_leaf(conv_id, "Rust is fast. It has zero-cost abstractions.", 10).unwrap();
+        let l2 = engine.insert_leaf(conv_id, "Memory safety is key.", 5).unwrap();
+
+        let summary = engine.compress_group(
+            conv_id, &[l1.id, l2.id],
+            "Rust is fast. Memory safety is key.",
+            8, 1,
+        ).unwrap();
+
+        let prov = db.get_provenance(summary.id).unwrap();
+        assert!(!prov.is_empty(), "provenance records should be created");
+        let has_real_spans = prov.iter().any(|(_sid, _off, len)| *len > 0);
+        assert!(has_real_spans, "should have real provenance span, got: {prov:?}");
+    }
+
+    #[tokio::test]
+    async fn phase2_hierarchical_render_has_three_tiers() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase2_render.db"))
+            .build()
+            .await
+            .unwrap());
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+            .unwrap();
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
+
+        let l1 = engine.insert_leaf(conv_id, "hello", 5).unwrap();
+        let l2 = engine.insert_leaf(conv_id, "world", 5).unwrap();
+        engine.compress_group(conv_id, &[l1.id, l2.id], "hello world summary", 8, 1).unwrap();
+        // Add a 3rd leaf not covered by the summary
+        engine.insert_leaf(conv_id, "extra message", 5).unwrap();
+
+        let ctx = engine.assemble_context(conv_id, 200, None).unwrap();
+        let rendered = crate::pipeline::render_dag_context(&ctx);
+
+        assert!(rendered.contains("── Summaries ──"), "should have summaries tier");
+        assert!(rendered.contains("── Recent Messages ──"), "should have recent messages tier");
+        assert!(rendered.contains("← sources:"), "should show source provenance");
     }
 }

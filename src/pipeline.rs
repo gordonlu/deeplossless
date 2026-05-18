@@ -16,30 +16,46 @@ pub struct PipelineOutput {
 }
 
 /// Render DAG context nodes into a structured, actionable context panel.
-/// Each node shows its summary, snippets, and available operations.
+/// Three-tier layout: Summaries (by level DESC) → Snippets (by importance) → Recent Messages.
 pub fn render_dag_context(nodes: &[DagNode]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "<lcm_context>");
 
-    let ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
+    let summaries: Vec<&DagNode> = nodes.iter().filter(|n| n.level > 0).collect();
+    let mut leaves: Vec<&DagNode> = nodes.iter().filter(|n| n.is_leaf).collect();
+    leaves.sort_by_key(|n| n.id);
+    let all_snippets: Vec<&crate::snippet::Snippet> = nodes.iter()
+        .flat_map(|n| n.snippets.iter())
+        .collect();
 
-    for node in nodes {
-        let header = if node.is_leaf {
-            format!("[msg {}] {} ({} tok)", node.id, node.summary, node.token_count)
-        } else {
-            format!(
-                "[summary {}] L{} — {} ({} tok, {} parents)",
-                node.id,
-                node.level,
-                node.summary,
-                node.token_count,
-                node.parent_ids.len()
-            )
-        };
-        let _ = writeln!(out, "  {header}");
+    // ── Tier 1: Summaries (highest level first) ──
+    if !summaries.is_empty() {
+        let _ = writeln!(out, "  ── Summaries ──");
+        let mut sorted: Vec<&DagNode> = summaries.clone();
+        sorted.sort_by_key(|n| (std::cmp::Reverse(n.level), n.id));
+        for node in &sorted {
+            let _ = writeln!(
+                out,
+                "  [summary {}] L{} {} ({} tok, {} sources)",
+                node.id, node.level, node.summary, node.token_count, node.child_ids.len()
+            );
+            if !node.child_ids.is_empty() {
+                let src_ids: Vec<String> = node.child_ids.iter().map(|id| format!("msg_{id}")).collect();
+                let _ = writeln!(out, "    ← sources: {}", src_ids.join(", "));
+            }
+        }
+        if !leaves.is_empty() || !all_snippets.is_empty() {
+            let _ = writeln!(out);
+        }
+    }
 
-        for s in &node.snippets {
+    // ── Tier 2: Snippets (by importance) ──
+    if !all_snippets.is_empty() {
+        let _ = writeln!(out, "  ── Snippets ──");
+        let mut sorted: Vec<&crate::snippet::Snippet> = all_snippets.clone();
+        sorted.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+        for s in sorted.iter().take(8) {
             let label = match s.snippet_type {
                 crate::snippet::SnippetType::CodeBlock => "code",
                 crate::snippet::SnippetType::FilePath => "path",
@@ -47,22 +63,24 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
                 crate::snippet::SnippetType::ErrorMessage => "err",
                 crate::snippet::SnippetType::ProperNoun => "ref",
             };
-            let _ = writeln!(out, "    ├ {label}: {}", s.content);
+            if s.source_node_id.is_empty() {
+                let _ = writeln!(out, "  [{label}] {}", s.content);
+            } else {
+                let _ = writeln!(out, "  [{label}] {} (src: msg_{})", s.content, s.source_node_id);
+            }
         }
-
-        if node.level > 0 {
-            let _ = writeln!(out, "    └ /lcm/rollback {id}", id = node.id);
+        if !leaves.is_empty() {
+            let _ = writeln!(out);
         }
     }
 
-    if ids.len() >= 2 {
-        let first = ids[0];
-        let last = ids[ids.len() - 1];
-        let _ = writeln!(out);
-        let _ = writeln!(out, "  Operations:");
-        let _ = writeln!(out, "    /lcm/compress conv_id={cid} from={first} to={last}", cid = nodes[0].conversation_id);
-        let _ = writeln!(out, "    /lcm/delete conv_id={cid} id=<node_id>", cid = nodes[0].conversation_id);
-        let _ = writeln!(out, "    /lcm/rollback conv_id={cid} id=<summary_id>", cid = nodes[0].conversation_id);
+    // ── Tier 3: Recent messages ──
+    if !leaves.is_empty() {
+        let _ = writeln!(out, "  ── Recent Messages ──");
+        for node in &leaves {
+            let truncated: String = node.summary.chars().take(80).collect();
+            let _ = writeln!(out, "  [msg {}] {} ({} tok)", node.id, truncated, node.token_count);
+        }
     }
 
     let _ = writeln!(out, "</lcm_context>");

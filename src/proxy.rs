@@ -249,12 +249,13 @@ async fn lcm_trace(
     State(state): State<AppState>,
     Path(node_id): Path<i64>,
 ) -> Response {
-    match state.db.get_provenance(node_id) {
+    match state.db.get_provenance_with_excerpts(node_id) {
         Ok(rows) => {
-            let sources: Vec<Value> = rows.iter().map(|(sid, off, len)| json!({
+            let sources: Vec<Value> = rows.iter().map(|(sid, off, len, excerpt)| json!({
                 "source_node_id": sid,
                 "offset": off,
                 "length": len,
+                "excerpt": excerpt,
             })).collect();
             Json(json!({
                 "summary_node_id": node_id,
