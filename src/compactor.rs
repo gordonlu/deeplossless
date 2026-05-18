@@ -268,17 +268,17 @@ async fn review_and_compact(
 ) {
     let total = match dag.total_tokens(conv_id) {
         Ok(t) => t,
-        Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("total_tokens: {e}") }).await; return; }
+        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("total_tokens: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
     };
 
     let leaves = match dag.get_leaves(conv_id) {
         Ok(l) => l,
-        Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
+        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
     };
 
     let leaf_count = leaves.len();
     if leaf_count < 2 {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
@@ -295,13 +295,13 @@ async fn review_and_compact(
     let soft_trigger = leaf_count >= config.group_size * 2 && total >= soft;
 
     if total < hard_limit && !soft_trigger {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
     let group: Vec<_> = leaves.iter().take(config.group_size).map(|n| n.id).collect();
     if group.len() < 2 {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
@@ -325,11 +325,11 @@ async fn compress_group(
 ) {
     let leaves = match dag.get_leaves(conv_id) {
         Ok(l) => l,
-        Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
+        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
     };
     let nodes: Vec<&DagNode> = leaves.iter().filter(|n| node_ids.contains(&n.id)).collect();
     if nodes.len() < 2 {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
@@ -351,18 +351,18 @@ async fn slide_and_compact(
 ) {
     let leaves = match dag.get_leaves(conv_id) {
         Ok(l) => l,
-        Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
+        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
     };
 
     if leaves.len() <= window_size {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
     let total = dag.total_tokens(conv_id).unwrap_or(0);
     let hard_limit = (context_window as f64 * 0.95) as i64;
     if total < hard_limit && leaves.len() < window_size * 2 {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
@@ -370,7 +370,7 @@ async fn slide_and_compact(
     let compact_count = (leaves.len() - window_size).min(8);
     let oldest: Vec<i64> = leaves.iter().take(compact_count).map(|n| n.id).collect();
     if oldest.len() < 2 {
-        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
@@ -403,20 +403,26 @@ async fn do_compress(
             let snippets = crate::snippet::extract_with_source(&text, &source);
             match dag.compress_group_with_snippets(conv_id, &node_ids, &summary, tc, dag_level, &snippets) {
                 Ok(node) => {
-                    let _ = event_tx.send(CompactEvent::GroupCompressed {
+                    if event_tx.send(CompactEvent::GroupCompressed {
                         conv_id,
                         new_node_id: node.id,
                         level: node.level,
                         tokens_saved: old_tc - tc,
-                    }).await;
+                    }).await.is_err() {
+                        tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+                    }
                 }
                 Err(e) => {
-                    let _ = event_tx.send(CompactEvent::Error { message: format!("compress_group: {e}") }).await;
+                    if event_tx.send(CompactEvent::Error { message: format!("compress_group: {e}") }).await.is_err() {
+                        tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+                    }
                 }
             }
         }
         Err(e) => {
-            let _ = event_tx.send(CompactEvent::Error { message: format!("summarize: {e}") }).await;
+            if event_tx.send(CompactEvent::Error { message: format!("summarize: {e}") }).await.is_err() {
+                tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+            }
         }
     }
 }

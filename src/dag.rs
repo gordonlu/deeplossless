@@ -402,7 +402,9 @@ impl DagEngine {
         // replace with Refines edges since this is a merge (summary→summary),
         // not a compression (summary→raw).
         for sid in source_ids {
-            let _ = self.db.insert_edge(node.id, *sid, "refines");
+            if let Err(e) = self.db.insert_edge(node.id, *sid, "refines") {
+                tracing::warn!(target: "deeplossless::dag", "merge_nodes insert_edge failed: {e}");
+            }
         }
 
         // Back-link source nodes to this merged node
@@ -460,7 +462,9 @@ impl DagEngine {
             // Cross-conversation: create Reuses edges but do NOT modify
             // parent_ids (back-links stay within the owning conversation).
             for sid in source_ids {
-                let _ = self.db.insert_edge(existing.id, *sid, "reuses");
+                if let Err(e) = self.db.insert_edge(existing.id, *sid, "reuses") {
+                    tracing::warn!(target: "deeplossless::dag", "dedup insert_edge failed: {e}");
+                }
                 if existing.conversation_id == conv_id {
                     self.db.add_parent_to_node(*sid, existing.id)?;
                 }
@@ -481,7 +485,9 @@ impl DagEngine {
                 if let Some(vec) = result {
                     let model = &embedder.config.model;
                     let dims = embedder.config.dimensions as i32;
-                    let _ = self.db.store_embedding(node.id, &vec, model, dims);
+                    if let Err(e) = self.db.store_embedding(node.id, &vec, model, dims) {
+                        tracing::warn!(target: "deeplossless::dag", "store_embedding failed: {e}");
+                    }
                 }
             }
         }

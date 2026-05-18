@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         dag,
         compactor,
         client: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()?,
         summarizer_model: cli.summarizer_model,
     };

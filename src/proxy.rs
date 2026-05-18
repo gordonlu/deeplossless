@@ -37,7 +37,7 @@ async fn chat_completions(
 ) -> Response {
     // Extract API key from Authorization header on first request
     {
-        let mut key = state.api_key.lock().expect("api key lock poisoned");
+        let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
         if key.is_none()
             && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
             && let Some(bearer) = auth.strip_prefix("Bearer ")
@@ -130,7 +130,7 @@ async fn chat_completions(
 /// The compactor will fall back to Level 3 (deterministic) if the key
 /// is "unset".
 fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
-    key.lock().expect("api key lock poisoned").clone().unwrap_or_else(|| "unset".to_string())
+    key.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "unset".to_string())
 }
 
 /// Verify that a request to a Context-ReAct endpoint carries a valid
@@ -139,7 +139,7 @@ fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
 /// allows all (safe for localhost-only deployments).
 fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
     // Prefer explicit admin_key
-    let admin = state.admin_key.lock().expect("admin key lock poisoned");
+    let admin = state.admin_key.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref admin_key) = *admin {
         return check_bearer(headers, admin_key);
     }

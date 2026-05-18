@@ -62,6 +62,7 @@ impl EmbeddingClient {
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .await
             .ok()?;

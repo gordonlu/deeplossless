@@ -56,7 +56,7 @@ static ENCODINGS: Mutex<Option<HashMap<String, &'static CoreBpe>>> = Mutex::new(
 /// Get or load a tiktoken encoding by name, with graceful fallback.
 /// Falls back to `cl100k_base` on load failure instead of panicking.
 pub fn get_encoding(name: &str) -> &'static CoreBpe {
-    let mut guard = ENCODINGS.lock().expect("tokenizer encoding lock poisoned");
+    let mut guard = ENCODINGS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
 
     if let Some(enc) = map.get(name) {

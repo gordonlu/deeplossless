@@ -120,20 +120,20 @@ impl Database {
     /// Round-robin dispatch to the next read connection.
     fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         let idx = self.write_count.load(Ordering::Relaxed) as usize % self.read_pool.len();
-        self.read_pool[idx].lock().expect("read pool lock poisoned")
+        self.read_pool[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Run a WAL checkpoint to prevent the WAL file from growing
     /// indefinitely under sustained write load.  Call periodically
     /// (e.g. every N store_messages calls).
     pub fn wal_checkpoint(&self) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // FTS5 virtual table.  DROP + CREATE in separate calls to avoid
         // residual shadow-table state from a prior interrupted migration.
         conn.execute_batch("DROP TABLE IF EXISTS messages_fts;").ok();
@@ -303,7 +303,7 @@ impl Database {
 
     /// Find a conversation by session fingerprint, or create one.
     pub fn find_or_create_conversation(&self, fingerprint: &str, model: &str) -> anyhow::Result<i64> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Try to find existing conversation
         let existing: Option<i64> = conn
             .query_row(
@@ -325,7 +325,7 @@ impl Database {
 
     /// Persist a request's `messages` array into an existing conversation.
     pub fn store_messages(&self, conv_id: i64, messages: &serde_json::Value) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
         if let Some(arr) = messages.as_array() {
@@ -342,10 +342,12 @@ impl Database {
                 )?;
                 let msg_id = tx.last_insert_rowid();
                 // Mirror into FTS5 index
-                let _ = tx.execute(
+                if let Err(e) = tx.execute(
                     "INSERT INTO messages_fts (rowid, content, role) VALUES (?1, ?2, ?3)",
                     rusqlite::params![msg_id, plain, role],
-                );
+                ) {
+                    tracing::warn!(target: "deeplossless::db", "fts5 index insert failed: {e}");
+                }
             }
         }
 
@@ -393,7 +395,7 @@ impl Database {
         snippets: &[crate::snippet::Snippet],
         is_leaf: bool,
     ) -> anyhow::Result<DagNode> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let parent_json = serde_json::to_string(parent_ids)?;
         let child_json = serde_json::to_string(child_ids)?;
         let snippet_json = serde_json::to_string(snippets)?;
@@ -407,10 +409,12 @@ impl Database {
 
         // Mirror as typed edges for the semantic graph (P3 Graph Model)
         for child in child_ids {
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, 'summarizes')",
                 rusqlite::params![id, child],
-            );
+            ) {
+                tracing::warn!(target: "deeplossless::db", "edge insert failed: {e}");
+            }
         }
 
         Ok(DagNode {
@@ -544,7 +548,7 @@ impl Database {
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
         let parent_json = "[]".to_string();
@@ -560,10 +564,12 @@ impl Database {
 
         // Mirror as typed edges (P3 Graph Model)
         for sid in source_ids {
-            let _ = tx.execute(
+            if let Err(e) = tx.execute(
                 "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, 'summarizes')",
                 rusqlite::params![new_id, sid],
-            );
+            ) {
+                tracing::warn!(target: "deeplossless::db", "edge insert in atomic failed: {e}");
+            }
         }
 
         // Index snippets in FTS5 for independent retrieval (P3 Summary Storage)
@@ -575,27 +581,33 @@ impl Database {
                 crate::snippet::SnippetType::ErrorMessage => "err",
                 crate::snippet::SnippetType::ProperNoun => "ref",
             };
-            let _ = tx.execute(
+            if let Err(e) = tx.execute(
                 "INSERT INTO snippets_fts (content, source_type, node_id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![snippet.content, stype, new_id],
-            );
+            ) {
+                tracing::warn!(target: "deeplossless::db", "snippets fts5 insert failed: {e}");
+            }
         }
 
         // Index in cross-conversation semantic dedup table (v0.3)
         let preview: String = summary.chars().take(100).collect();
-        let _ = tx.execute(
+        if let Err(e) = tx.execute(
             "INSERT OR IGNORE INTO semantic_index (hash, node_id, conversation_id, summary_preview)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![hash, new_id, conversation_id, preview],
-        );
+        ) {
+            tracing::warn!(target: "deeplossless::db", "semantic index insert failed: {e}");
+        }
 
         // Record provenance: each source node contributed to this summary (v0.4)
         for (i, sid) in source_ids.iter().enumerate() {
-            let _ = tx.execute(
+            if let Err(e) = tx.execute(
                 "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
                  VALUES (?1, ?2, ?3, 0)",
                 rusqlite::params![new_id, sid, i as i32],
-            );
+            ) {
+                tracing::warn!(target: "deeplossless::db", "provenance insert failed: {e}");
+            }
         }
 
         for sid in source_ids {
@@ -616,10 +628,12 @@ impl Database {
         }
 
         // Record event for audit trail
-        let _ = tx.execute(
+        if let Err(e) = tx.execute(
             "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES ('compress', ?1, ?2, '{}')",
             rusqlite::params![new_id, conversation_id],
-        );
+        ) {
+            tracing::warn!(target: "deeplossless::db", "event log insert failed: {e}");
+        }
 
         tx.commit()?;
         Ok(DagNode {
@@ -641,7 +655,7 @@ impl Database {
 
     /// Increment access count and update last_accessed_at for memory scoring.
     pub fn touch_node(&self, node_id: i64) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE dag_nodes SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id = ?1",
             rusqlite::params![node_id],
@@ -651,7 +665,7 @@ impl Database {
 
     /// Append an event to the DAG event log for audit and rollback.
     pub fn record_event(&self, event_type: &str, node_id: i64, conv_id: i64, payload: &str) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![event_type, node_id, conv_id, payload],
@@ -679,20 +693,22 @@ impl Database {
     pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
         // Writer lock scope (release before record_event to avoid deadlock)
         {
-            let conn = self.writer.lock().expect("writer lock poisoned");
+            let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "UPDATE dag_nodes SET deleted = 1, deleted_at = datetime('now') WHERE id = ?1",
                 rusqlite::params![node_id],
             )?;
         }
         // Record event for audit trail (needs its own writer lock)
-        let _ = self.record_event("delete", node_id, -1, "{}");
+        if let Err(e) = self.record_event("delete", node_id, -1, "{}") {
+            tracing::warn!(target: "deeplossless::db", "delete event log failed: {e}");
+        }
         Ok(())
     }
 
     /// Hard-delete a node (used by GC for fully unreachable ghosts).
     pub fn purge_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM dag_nodes WHERE id = ?1", rusqlite::params![node_id])?;
         Ok(())
     }
@@ -723,7 +739,7 @@ impl Database {
     }
 
     pub fn add_child_to_node(&self, parent_id: i64, child_id: i64) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let existing: String = conn.query_row(
             "SELECT child_ids FROM dag_nodes WHERE id = ?1",
             rusqlite::params![parent_id],
@@ -745,7 +761,7 @@ impl Database {
     /// Semantic: `summary.child_ids = raw_ids`, so raw nodes get the summary
     /// added to their parent_ids.
     pub fn add_parent_to_node(&self, child_id: i64, parent_id: i64) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let existing: String = conn.query_row(
             "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
             rusqlite::params![child_id],
@@ -768,7 +784,7 @@ impl Database {
     /// Insert a typed edge between two nodes.  Returns the edge ID.
     /// Ignores duplicate (from_id, to_id, kind) tuples (UNIQUE constraint).
     pub fn insert_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
             rusqlite::params![from_id, to_id, kind],
@@ -1014,7 +1030,7 @@ impl Database {
 
     /// Store an embedding vector for a DAG node.
     pub fn store_embedding(&self, node_id: i64, vector: &[f32], model: &str, dims: i32) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         conn.execute(
             "INSERT OR REPLACE INTO embeddings (node_id, vector, model, dimensions) VALUES (?1, ?2, ?3, ?4)",
@@ -1125,7 +1141,7 @@ impl Database {
 
     /// Index a node in the semantic_index for cross-conversation lookup.
     pub fn index_semantic(&self, hash: &str, node_id: i64, conv_id: i64, preview: &str) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR IGNORE INTO semantic_index (hash, node_id, conversation_id, summary_preview)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1143,7 +1159,7 @@ impl Database {
         offset: i32,
         length: i32,
     ) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1173,7 +1189,7 @@ impl Database {
         summary_node_id: i64,
         spans: &[(i64, i32, i32)],
     ) -> anyhow::Result<()> {
-        let conn = self.writer.lock().expect("writer lock poisoned");
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         for (source_node_id, offset, length) in spans {
             conn.execute(
                 "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
