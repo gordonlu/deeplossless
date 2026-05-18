@@ -15,11 +15,13 @@ context summaries from a hierarchical DAG engine.
 ## Quick start
 
 ```bash
-# Install
-cargo install deeplossless
+# Build from source
+git clone https://github.com/gordonlu/deeplossless.git
+cd deeplossless
+cargo build --release
 
 # Run
-DEEPSEEK_API_KEY=sk-... deeplossless
+DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
 
 # Point deepseek-tui (or any OpenAI-compatible client) to the proxy:
 deepseek config set base_url http://127.0.0.1:8080/v1
