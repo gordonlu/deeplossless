@@ -462,6 +462,10 @@ impl DagEngine {
     /// messages NOT already covered by those summaries, staying within
     /// `token_budget` tokens.
     ///
+    /// When `query` is provided, retrieval-scored results augment the
+    /// context with query-relevant nodes that might not be in the
+    /// summary chain or recent leaves.
+    ///
     /// Coverage-aware: prevents double injection where a summary and the
     /// raw messages it summarizes both appear in context.
     ///
@@ -470,6 +474,7 @@ impl DagEngine {
         &self,
         conv_id: i64,
         token_budget: usize,
+        query: Option<&str>,
     ) -> anyhow::Result<Vec<DagNode>> {
         // Batch-load all nodes and edges for this conversation (P4 Performance)
         let graph = self.load_graph(conv_id)?;
@@ -510,6 +515,25 @@ impl DagEngine {
                 remaining -= tc;
             } else {
                 break;
+            }
+        }
+
+        // 3. If query provided, boost with scored retrieval results
+        if let Some(q) = query {
+            if let Ok(search_results) = self.db.search_unified(conv_id, q) {
+                let seen_ids: HashSet<i64> = result.iter().map(|n| n.id).collect();
+                for sr in search_results.iter().take(5) {
+                    if seen_ids.contains(&sr.id) {
+                        continue;
+                    }
+                    if let Ok(Some(node)) = self.db.get_node(sr.id) {
+                        let tc = node.token_count;
+                        if tc <= remaining {
+                            result.push(node);
+                            remaining -= tc;
+                        }
+                    }
+                }
             }
         }
 
@@ -1073,7 +1097,7 @@ mod tests {
             .compress_group(conv_id, &ids, "summary of first 8", 15, 1)
             .unwrap();
 
-        let context = engine.assemble_context(conv_id, 100).unwrap();
+        let context = engine.assemble_context(conv_id, 100, None).unwrap();
         assert!(!context.is_empty(), "should assemble at least some nodes");
         // Total should be ≤ 100 tokens
         let total: i64 = context.iter().map(|n| n.token_count).sum();

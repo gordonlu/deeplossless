@@ -150,7 +150,10 @@ impl ChatPipeline {
 
         // Assemble DAG context and inject into system messages
         let mut injected = req_body.clone();
-        if let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000) {
+        let query = req_body["messages"].as_array()
+            .and_then(|arr| arr.iter().rev().find(|m| m["role"] == "user"))
+            .and_then(|m| m["content"].as_str());
+        if let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query) {
             if !dag_ctx.is_empty() {
                 let ctx_text = render_dag_context(&dag_ctx);
                 Self::inject_context(&mut injected, &ctx_text);
