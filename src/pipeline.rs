@@ -54,7 +54,11 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
     if !all_snippets.is_empty() {
         let _ = writeln!(out, "  ── Snippets ──");
         let mut sorted: Vec<&crate::snippet::Snippet> = all_snippets.clone();
-        sorted.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.frequency.cmp(&b.frequency))
+                .then(b.content.len().cmp(&a.content.len()))
+        });
         for s in sorted.iter().take(8) {
             let label = match s.snippet_type {
                 crate::snippet::SnippetType::CodeBlock => "code",

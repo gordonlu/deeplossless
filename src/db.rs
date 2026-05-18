@@ -387,7 +387,7 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         conn.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at)
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32, hash],
         )?;
@@ -540,7 +540,7 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         tx.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at)
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
             rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, hash],
         )?;
@@ -1450,12 +1450,14 @@ mod tests {
                 content: "src/main.rs".to_string(),
                 importance: 1.0,
                 source_node_id: String::new(),
+                frequency: 0,
             },
             crate::snippet::Snippet {
                 snippet_type: crate::snippet::SnippetType::NumericConstant,
                 content: "8080".to_string(),
                 importance: 0.9,
                 source_node_id: String::new(),
+                frequency: 0,
             },
         ];
         db.insert_dag_node_full(conv_id, 1, "fixed port binding error", 15, &[], &[], &snippets, false).unwrap();

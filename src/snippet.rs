@@ -29,6 +29,34 @@ pub struct Snippet {
     /// Importance score [0.0–1.0] for ranking. Higher = more critical.
     /// Defaults to 0.5 for most snippets; code blocks and errors get 0.8.
     pub importance: f32,
+    /// How many times this snippet value has appeared across conversations.
+    /// Higher = more likely to be noise (common values). Lower = rare, keep.
+    pub frequency: u32,
+}
+
+/// Rank snippets by combined score: importance descending, then frequency ascending
+/// (rare values rank higher than common ones), then content length descending.
+/// Returns top-K results.
+pub fn rank_snippets(snippets: &[Snippet], top_k: usize) -> Vec<&Snippet> {
+    let mut sorted: Vec<&Snippet> = snippets.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.frequency.cmp(&b.frequency)) // lower freq = rarer = higher rank
+            .then(b.content.len().cmp(&a.content.len())) // longer = more info
+    });
+    sorted.truncate(top_k);
+    sorted
+}
+
+/// Base importance by snippet type.
+pub fn type_base_importance(st: &SnippetType) -> f32 {
+    match st {
+        SnippetType::CodeBlock => 0.9,
+        SnippetType::ErrorMessage => 0.85,
+        SnippetType::FilePath => 0.6,
+        SnippetType::NumericConstant => 0.4,
+        SnippetType::ProperNoun => 0.3,
+    }
 }
 
 // ── Extraction ─────────────────────────────────────────────────────────
@@ -70,7 +98,8 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                             snippet_type: SnippetType::CodeBlock,
                             content: truncated,
                             source_node_id: source_node_id.to_string(),
-                            importance: 0.8,
+                            frequency: 0,
+                        importance: 0.8,
                         });
                     } else {
                         for elem in structural {
@@ -78,7 +107,8 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                                 snippet_type: SnippetType::CodeBlock,
                                 content: elem,
                                 source_node_id: source_node_id.to_string(),
-                                importance: 0.85,
+                                frequency: 0,
+                        importance: 0.85,
                             });
                         }
                     }
@@ -100,7 +130,8 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                 snippet_type: SnippetType::FilePath,
                 content: clean.to_string(),
                 source_node_id: source_node_id.to_string(),
-                importance: 0.5,
+                frequency: 0,
+                        importance: 0.5,
             });
         }
     }
@@ -119,7 +150,8 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                     snippet_type: SnippetType::NumericConstant,
                     content: clean.to_string(),
                     source_node_id: source_node_id.to_string(),
-                    importance: 0.5,
+                    frequency: 0,
+                        importance: 0.5,
                 });
             }
     }
@@ -134,6 +166,7 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                         snippet_type: SnippetType::NumericConstant,
                         content: clean.to_string(),
                         source_node_id: source_node_id.to_string(),
+                        frequency: 0,
                         importance: 0.5,
                     });
                 }
@@ -155,6 +188,7 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                         snippet_type: SnippetType::ProperNoun,
                         content: pn.to_string(),
                         source_node_id: source_node_id.to_string(),
+                        frequency: 0,
                         importance: 0.5,
                     });
                 }
@@ -176,7 +210,8 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                                 snippet_type: SnippetType::ErrorMessage,
                                 content: segment.to_string(),
                                 source_node_id: source_node_id.to_string(),
-                                importance: 0.8,
+                                frequency: 0,
+                        importance: 0.8,
                             });
                         }
                         in_quote = false;
