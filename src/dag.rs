@@ -292,13 +292,16 @@ impl DagEngine {
     }
 
     /// Check that adding edges from `summary` → each `source` creates no cycle.
-    fn check_no_cycle(&self, _summary: &DagNode, _sources: &[i64]) -> anyhow::Result<()> {
-        // Cycle detection runs at edge-insert time via has_path in db.rs.
-        // This is a double-check layer: after all edges are inserted,
-        // verify no source can reach back to the summary.
-        // For a tree-like hierarchy, this is trivially satisfied since
-        // edges always point from higher level to lower level.
-        // When merge_nodes is implemented, this check becomes critical.
+    /// For each source, verify no path exists from source back to summary.
+    fn check_no_cycle(&self, summary: &DagNode, sources: &[i64]) -> anyhow::Result<()> {
+        for source_id in sources {
+            if self.db.has_path(*source_id, summary.id, 50)? {
+                return Err(anyhow::anyhow!(
+                    "cycle detected: path from source {} back to summary {}",
+                    source_id, summary.id
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -409,12 +412,20 @@ impl DagEngine {
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
         if let Some(existing) = self.find_similar_node(summary, snippets)? {
-            // Reuse: link the existing node to this conversation
+            // Reuse: link the existing node to this conversation's sources.
+            // Cross-conversation: create Reuses edges but do NOT modify
+            // parent_ids (back-links stay within the owning conversation).
             for sid in source_ids {
-                self.db.add_parent_to_node(*sid, existing.id)?;
                 let _ = self.db.insert_edge(existing.id, *sid, "reuses");
+                if existing.conversation_id == conv_id {
+                    self.db.add_parent_to_node(*sid, existing.id)?;
+                }
             }
-            tracing::debug!(target: "deeplossless::dag", node_id = existing.id, "semantic dedup: reused existing node");
+            tracing::debug!(target: "deeplossless::dag",
+                node_id = existing.id,
+                existing_conv = existing.conversation_id,
+                current_conv = conv_id,
+                "semantic dedup: reused node");
             return Ok(existing);
         }
         // No match: create new, then store embedding for future dedup
@@ -523,17 +534,21 @@ impl DagEngine {
         let mut result = Vec::new();
         let mut remaining = token_budget as i64;
         let mut covered_ids = HashSet::new();
+        let mut injected_ids = HashSet::new();
 
         // 1. Walk from the active tip down to collect summaries
         if let Some(tip) = self.get_active_tip(conv_id)? {
             let summaries = self.collect_summary_chain_cached(&graph, &tip, remaining)?;
-            for node in &summaries {
+            for node in summaries {
+                if !injected_ids.insert(node.id) {
+                    continue;
+                }
                 remaining -= node.token_count;
                 for cid in &node.child_ids {
                     covered_ids.insert(*cid);
                 }
+                result.push(node);
             }
-            result.extend(summaries);
         }
 
         // 2. Append most recent raw leaves NOT already covered by summaries
@@ -550,6 +565,9 @@ impl DagEngine {
             .collect();
 
         for node in recent.into_iter().rev() {
+            if !injected_ids.insert(node.id) {
+                continue;
+            }
             let tc = node.token_count;
             if tc <= remaining {
                 result.push(node);
@@ -562,14 +580,14 @@ impl DagEngine {
         // 3. If query provided, boost with scored retrieval results
         if let Some(q) = query {
             if let Ok(search_results) = self.db.search_unified(conv_id, q) {
-                let seen_ids: HashSet<i64> = result.iter().map(|n| n.id).collect();
                 for sr in search_results.iter().take(5) {
-                    if seen_ids.contains(&sr.id) {
+                    if injected_ids.contains(&sr.id) {
                         continue;
                     }
                     if let Ok(Some(node)) = self.db.get_node(sr.id) {
                         let tc = node.token_count;
                         if tc <= remaining {
+                            injected_ids.insert(node.id);
                             result.push(node);
                             remaining -= tc;
                         }
@@ -735,6 +753,9 @@ impl DagEngine {
     /// Collect unreachable ("ghost") nodes via mark-sweep from all active
     /// tips. Returns IDs of ghost nodes removed, or `dry_run=true` to
     /// just report without deleting.
+    ///
+    /// Shared nodes (those with incoming edges from other conversations)
+    /// are protected from deletion even if unreachable within this conversation.
     pub fn collect_garbage(&self, conv_id: i64, dry_run: bool) -> anyhow::Result<Vec<i64>> {
         let mut reachable = std::collections::HashSet::new();
         let mut stack = Vec::new();
@@ -746,8 +767,6 @@ impl DagEngine {
             stack.push(leaf.id);
         }
 
-        // Traverse both parent_ids (raw → summary) and child_ids (summary → raw)
-        // to handle the corrected DAG direction: summary.child_ids = raw_ids
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) { continue; }
             if let Some(node) = self.db.get_node(id)? {
@@ -757,6 +776,9 @@ impl DagEngine {
                 for cid in &node.child_ids {
                     stack.push(*cid);
                 }
+                for (_, to_id, _kind) in self.db.get_edges_from(id)? {
+                    stack.push(to_id);
+                }
             }
         }
 
@@ -764,7 +786,18 @@ impl DagEngine {
         let mut ghosts = Vec::new();
         for node in all_nodes {
             if !reachable.contains(&node.id) {
-                ghosts.push(node.id);
+                // Protect shared nodes: if referenced from another conversation, keep
+                let incoming = self.db.get_edges_to(node.id).unwrap_or_default();
+                let has_external_ref = incoming.iter().any(|(from_id, _, _)| {
+                    self.db.get_node(*from_id)
+                        .ok()
+                        .flatten()
+                        .map(|n| n.conversation_id != conv_id)
+                        .unwrap_or(false)
+                });
+                if !has_external_ref {
+                    ghosts.push(node.id);
+                }
             }
         }
 
