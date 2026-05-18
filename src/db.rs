@@ -62,11 +62,14 @@ impl DatabaseBuilder {
 
 /// Lossless SQLite store for conversations, messages, and DAG summaries.
 ///
-/// All operations go through a single `Mutex<Connection>` (WAL mode) so
-/// writes are serialised — the compaction thread submits new nodes via
-/// an mpsc channel to the main request handler, which is the sole writer.
+/// Read operations go through a connection pool (round-robin dispatch).
+/// Writes go through a dedicated writer connection serialised by a Mutex.
+/// WAL mode ensures writes don't block reads.
+const READ_POOL_SIZE: usize = 3;
+
 pub struct Database {
-    conn: Mutex<Connection>,
+    read_pool: Vec<Mutex<Connection>>,
+    writer: Mutex<Connection>,
     write_count: AtomicU64,
 }
 
@@ -85,29 +88,52 @@ impl Database {
         if let Some(parent) = Path::new(&expanded).parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let conn = Connection::open(&expanded)?;
-        conn.execute_batch(
+        // Open writer connection
+        let writer = Connection::open(&expanded)?;
+        writer.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;",
         )?;
 
-        let db = Self { conn: Mutex::new(conn), write_count: AtomicU64::new(0) };
+        // Open read pool connections (same WAL file, safe concurrent access)
+        let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
+        for _ in 0..READ_POOL_SIZE {
+            let rconn = Connection::open(&expanded)?;
+            rconn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA busy_timeout=5000;",
+            )?;
+            read_pool.push(Mutex::new(rconn));
+        }
+
+        let db = Self {
+            read_pool,
+            writer: Mutex::new(writer),
+            write_count: AtomicU64::new(0),
+        };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Round-robin dispatch to the next read connection.
+    fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let idx = self.write_count.load(Ordering::Relaxed) as usize % self.read_pool.len();
+        self.read_pool[idx].lock().unwrap()
     }
 
     /// Run a WAL checkpoint to prevent the WAL file from growing
     /// indefinitely under sustained write load.  Call periodically
     /// (e.g. every N store_messages calls).
     pub fn wal_checkpoint(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         // FTS5 virtual table.  DROP + CREATE in separate calls to avoid
         // residual shadow-table state from a prior interrupted migration.
         conn.execute_batch("DROP TABLE IF EXISTS messages_fts;").ok();
@@ -247,7 +273,7 @@ impl Database {
 
     /// Find a conversation by session fingerprint, or create one.
     pub fn find_or_create_conversation(&self, fingerprint: &str, model: &str) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         // Try to find existing conversation
         let existing: Option<i64> = conn
             .query_row(
@@ -269,7 +295,7 @@ impl Database {
 
     /// Persist a request's `messages` array into an existing conversation.
     pub fn store_messages(&self, conv_id: i64, messages: &serde_json::Value) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
 
         if let Some(arr) = messages.as_array() {
@@ -337,7 +363,7 @@ impl Database {
         snippets: &[crate::snippet::Snippet],
         is_leaf: bool,
     ) -> anyhow::Result<DagNode> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         let parent_json = serde_json::to_string(parent_ids)?;
         let child_json = serde_json::to_string(child_ids)?;
         let snippet_json = serde_json::to_string(snippets)?;
@@ -373,7 +399,7 @@ impl Database {
     }
 
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
              FROM dag_nodes WHERE id = ?1 AND deleted = 0",
@@ -386,7 +412,7 @@ impl Database {
     /// For a given leaf, returns the summaries that include it.
     /// For a summary, returns higher-level summaries that compress it.
     pub fn get_parent_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
                     n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf, n.deleted
@@ -403,7 +429,7 @@ impl Database {
     }
 
     pub fn get_child_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let child_ids_json: String = conn.query_row(
             "SELECT child_ids FROM dag_nodes WHERE id = ?1 AND deleted = 0",
             rusqlite::params![node_id],
@@ -435,7 +461,7 @@ impl Database {
     }
 
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
              FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
@@ -446,7 +472,7 @@ impl Database {
     }
 
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
              FROM dag_nodes
@@ -462,7 +488,7 @@ impl Database {
     }
 
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
              FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0 ORDER BY id ASC",
@@ -485,7 +511,7 @@ impl Database {
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
 
         let parent_json = "[]".to_string();
@@ -576,7 +602,7 @@ impl Database {
     /// excluded from context assembly but raw data in `messages` is intact.
     /// Garbage collection can later hard-delete fully orphaned soft-deleted nodes.
     pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         conn.execute(
             "UPDATE dag_nodes SET deleted = 1, deleted_at = datetime('now') WHERE id = ?1",
             rusqlite::params![node_id],
@@ -586,13 +612,13 @@ impl Database {
 
     /// Hard-delete a node (used by GC for fully unreachable ghosts).
     pub fn purge_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         conn.execute("DELETE FROM dag_nodes WHERE id = ?1", rusqlite::params![node_id])?;
         Ok(())
     }
 
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash
              FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0
@@ -607,7 +633,7 @@ impl Database {
     }
 
     pub fn total_conversation_tokens(&self, conv_id: i64) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let total: i64 = conn.query_row(
             "SELECT COALESCE(SUM(token_count), 0) FROM messages WHERE conversation_id = ?1",
             rusqlite::params![conv_id],
@@ -617,7 +643,7 @@ impl Database {
     }
 
     pub fn add_child_to_node(&self, parent_id: i64, child_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         let existing: String = conn.query_row(
             "SELECT child_ids FROM dag_nodes WHERE id = ?1",
             rusqlite::params![parent_id],
@@ -639,7 +665,7 @@ impl Database {
     /// Semantic: `summary.child_ids = raw_ids`, so raw nodes get the summary
     /// added to their parent_ids.
     pub fn add_parent_to_node(&self, child_id: i64, parent_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         let existing: String = conn.query_row(
             "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
             rusqlite::params![child_id],
@@ -662,7 +688,7 @@ impl Database {
     /// Insert a typed edge between two nodes.  Returns the edge ID.
     /// Ignores duplicate (from_id, to_id, kind) tuples (UNIQUE constraint).
     pub fn insert_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO dag_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
             rusqlite::params![from_id, to_id, kind],
@@ -672,7 +698,7 @@ impl Database {
 
     /// Get all outgoing edges from a node.
     pub fn get_edges_from(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, to_id, kind FROM dag_edges WHERE from_id = ?1 ORDER BY id",
         )?;
@@ -686,7 +712,7 @@ impl Database {
 
     /// Get all incoming edges to a node.
     pub fn get_edges_to(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, from_id, kind FROM dag_edges WHERE to_id = ?1 ORDER BY id",
         )?;
@@ -704,7 +730,7 @@ impl Database {
         if from_id == to_id {
             return Ok(true);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut visited = std::collections::HashSet::new();
         let mut queue = vec![from_id];
         visited.insert(from_id);
@@ -738,7 +764,7 @@ impl Database {
     /// Returns `(id, role, snippet, token_count)` ranked by relevance.
     /// Get raw message content in a range of message IDs.
     pub fn get_messages_in_range(&self, conv_id: i64, from_id: i64, to_id: i64) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT content FROM messages
              WHERE conversation_id = ?1 AND id BETWEEN ?2 AND ?3
@@ -755,7 +781,7 @@ impl Database {
     }
 
     pub fn search_messages(&self, conv_id: i64, query: &str) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -793,7 +819,7 @@ impl Database {
         conv_id: i64,
         query: &str,
     ) -> anyhow::Result<Vec<UnifiedSearchResult>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -908,7 +934,7 @@ impl Database {
 
     /// Store an embedding vector for a DAG node.
     pub fn store_embedding(&self, node_id: i64, vector: &[f32], model: &str, dims: i32) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         conn.execute(
             "INSERT OR REPLACE INTO embeddings (node_id, vector, model, dimensions) VALUES (?1, ?2, ?3, ?4)",
@@ -919,7 +945,7 @@ impl Database {
 
     /// Get the embedding vector for a node.
     pub fn get_embedding(&self, node_id: i64) -> anyhow::Result<Option<Vec<f32>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare("SELECT vector, dimensions FROM embeddings WHERE node_id = ?1")?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
@@ -943,7 +969,7 @@ impl Database {
         query_vec: &[f32],
         min_similarity: f32,
     ) -> anyhow::Result<Option<(i64, f32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT node_id, vector, dimensions FROM embeddings WHERE model = 'deepseek-embed'"
         )?;
@@ -975,7 +1001,7 @@ impl Database {
     /// Find nodes with the same semantic hash across ALL conversations.
     /// Returns (hash, node_id, conversation_id, summary_preview).
     pub fn find_similar_by_hash(&self, hash: &str) -> anyhow::Result<Vec<(String, i64, i64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT hash, node_id, conversation_id, summary_preview
              FROM semantic_index WHERE hash = ?1 LIMIT 10",
@@ -995,7 +1021,7 @@ impl Database {
 
     /// Index a node in the semantic_index for cross-conversation lookup.
     pub fn index_semantic(&self, hash: &str, node_id: i64, conv_id: i64, preview: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO semantic_index (hash, node_id, conversation_id, summary_preview)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1013,7 +1039,7 @@ impl Database {
         offset: i32,
         length: i32,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.writer.lock().unwrap();
         conn.execute(
             "INSERT INTO provenance (summary_node_id, source_node_id, sentence_offset, sentence_length)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1024,7 +1050,7 @@ impl Database {
 
     /// Get provenance records for a summary node.
     pub fn get_provenance(&self, summary_node_id: i64) -> anyhow::Result<Vec<(i64, i32, i32)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT source_node_id, sentence_offset, sentence_length
              FROM provenance WHERE summary_node_id = ?1 ORDER BY sentence_offset",
@@ -1188,7 +1214,7 @@ mod tests {
         assert!(conv_id > 0, "expected valid conversation ID");
 
         // Verify data was written
-        let conn = db.conn.lock().unwrap();
+        let conn = db.writer.lock().unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
