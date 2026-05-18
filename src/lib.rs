@@ -85,6 +85,10 @@ pub struct AppState {
     /// `None` until the first request arrives. The compactor/spawner reads this
     /// for background summarization calls.
     pub api_key: Arc<StdMutex<Option<String>>>,
+    /// Separate admin key for LCM endpoint authentication. If set, takes
+    /// priority over `api_key` for LCM auth. If unset, LCM falls back to
+    /// `api_key` for backward compatibility.
+    pub admin_key: Arc<StdMutex<Option<String>>>,
     pub db: Arc<db::Database>,
     pub dag: Arc<dag::DagEngine>,
     pub compactor: Arc<Mutex<compactor::Compactor>>,

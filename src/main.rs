@@ -30,6 +30,12 @@ struct Cli {
     #[arg(long, env = "DEEPSEEK_API_KEY")]
     api_key: Option<String>,
 
+    /// Separate admin key for LCM endpoint authentication. Takes priority
+    /// over DEEPSEEK_API_KEY for LCM auth. If unset, LCM falls back to
+    /// the DeepSeek key for backward compatibility.
+    #[arg(long, env = "ADMIN_KEY")]
+    admin_key: Option<String>,
+
     /// Model used for background summarization (Level 1 & 2 LLM calls).
     #[arg(long, default_value = "deepseek-v4-pro", env = "SUMMARIZER_MODEL")]
     summarizer_model: String,
@@ -77,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         upstream: cli.upstream,
         api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
+        admin_key: Arc::new(std::sync::Mutex::new(cli.admin_key)),
         db,
         dag,
         compactor,

@@ -134,18 +134,31 @@ fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
 }
 
 /// Verify that a request to a Context-ReAct endpoint carries a valid
-/// Authorization header matching the known API key.  This prevents
-/// arbitrary clients from manipulating the DAG.
-fn ctx_react_auth_ok(headers: &HeaderMap, api_key: &std::sync::Mutex<Option<String>>) -> bool {
-    let expected = get_cached_key(api_key);
-    if expected == "unset" {
-        return true; // no key configured yet — allow (first request populates it)
+/// Authorization header. Checks `admin_key` first, then falls back to
+/// `api_key` for backward compatibility. If no key is configured at all,
+/// allows all (safe for localhost-only deployments).
+fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
+    // Prefer explicit admin_key
+    let admin = state.admin_key.lock().expect("admin key lock poisoned");
+    if let Some(ref admin_key) = *admin {
+        return check_bearer(headers, admin_key);
     }
+    drop(admin);
+
+    // Fall back to api_key (backward compat)
+    let expected = get_cached_key(&state.api_key);
+    if expected == "unset" {
+        return true;
+    }
+    check_bearer(headers, &expected)
+}
+
+fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
     let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
     };
     let bearer = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "));
-    bearer == Some(&expected)
+    bearer == Some(expected)
 }
 
 // ── LCM retrieval endpoints ────────────────────────────────────────────
@@ -156,7 +169,7 @@ async fn lcm_grep(
     Path(conv_id): Path<i64>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
@@ -179,7 +192,7 @@ async fn lcm_expand(
     headers: HeaderMap,
     Path(node_id): Path<i64>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }    // Expand a summary node to its children (original messages)
     match state.dag.get_children(node_id) {
@@ -203,7 +216,7 @@ async fn lcm_snippets(
     headers: HeaderMap,
     Path(node_id): Path<i64>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }    match state.dag.get_node(node_id) {
         Ok(Some(node)) => {
@@ -225,7 +238,7 @@ async fn lcm_global_search(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -247,7 +260,7 @@ async fn lcm_dag_health(
     headers: HeaderMap,
     Path(conv_id): Path<i64>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }    match state.dag.validate_dag(conv_id) {
         Ok(issues) => {
@@ -268,7 +281,7 @@ async fn lcm_similar(
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }    match state.db.find_similar_by_hash(&hash) {
         Ok(results) => Json(json!({
@@ -290,7 +303,7 @@ async fn lcm_trace(
     headers: HeaderMap,
     Path(node_id): Path<i64>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }    match state.db.get_provenance_with_excerpts(node_id) {
         Ok(rows) => {
@@ -315,7 +328,7 @@ async fn lcm_status(
     headers: HeaderMap,
     Path(conv_id): Path<i64>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let leaves = state.dag.get_leaves(conv_id).unwrap_or_default();
@@ -356,7 +369,7 @@ async fn lcm_compress(
     headers: HeaderMap,
     Json(op): Json<LcmRangeOp>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized: Context-ReAct requires Authorization header").into_response();
     }
     // Try DAG leaves first, then fall back to raw messages
@@ -417,7 +430,7 @@ async fn lcm_delete(
     headers: HeaderMap,
     Json(op): Json<LcmIdOp>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     match state.dag.db().delete_dag_node(op.id) {
@@ -434,7 +447,7 @@ async fn lcm_rollback(
     headers: HeaderMap,
     Json(op): Json<LcmIdOp>,
 ) -> Response {
-    if !ctx_react_auth_ok(&headers, &state.api_key) {
+    if !ctx_react_auth_ok(&headers, &state) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let node = match state.dag.get_node(op.id) {
