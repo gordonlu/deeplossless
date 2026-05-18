@@ -75,7 +75,7 @@ fn bench_dag_context_assembly(c: &mut Criterion) {
     }
 
     c.bench_function("dag/assemble_1k_leaves", |b| {
-        b.iter(|| dag.assemble_context(black_box(conv_id), black_box(10000)).unwrap())
+        b.iter(|| dag.assemble_context(black_box(conv_id), black_box(10000), None).unwrap())
     });
 }
 

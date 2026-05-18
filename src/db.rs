@@ -677,12 +677,15 @@ impl Database {
     /// excluded from context assembly but raw data in `messages` is intact.
     /// Garbage collection can later hard-delete fully orphaned soft-deleted nodes.
     pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
-        let conn = self.writer.lock().unwrap();
-        conn.execute(
-            "UPDATE dag_nodes SET deleted = 1, deleted_at = datetime('now') WHERE id = ?1",
-            rusqlite::params![node_id],
-        )?;
-        // Record event for audit trail
+        // Writer lock scope (release before record_event to avoid deadlock)
+        {
+            let conn = self.writer.lock().unwrap();
+            conn.execute(
+                "UPDATE dag_nodes SET deleted = 1, deleted_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![node_id],
+            )?;
+        }
+        // Record event for audit trail (needs its own writer lock)
         let _ = self.record_event("delete", node_id, -1, "{}");
         Ok(())
     }
@@ -1573,8 +1576,8 @@ mod tests {
 
         let l1 = engine.insert_leaf(conv_id, "what is rust", 10).unwrap();
         let l2 = engine.insert_leaf(conv_id, "Rust is a systems language", 15).unwrap();
-        let l3 = engine.insert_leaf(conv_id, "how do I install cargo", 10).unwrap();
-        let l4 = engine.insert_leaf(conv_id, "curl rustup.rs | sh", 15).unwrap();
+        let _l3 = engine.insert_leaf(conv_id, "how do I install cargo", 10).unwrap();
+        let _l4 = engine.insert_leaf(conv_id, "curl rustup.rs | sh", 15).unwrap();
 
         engine.compress_group(conv_id, &[l1.id, l2.id], "Rust is a systems programming language", 12, 1).unwrap();
 

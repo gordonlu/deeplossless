@@ -278,6 +278,7 @@ async fn review_and_compact(
 
     let leaf_count = leaves.len();
     if leaf_count < 2 {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
         return;
     }
 
@@ -299,7 +300,10 @@ async fn review_and_compact(
     }
 
     let group: Vec<_> = leaves.iter().take(config.group_size).map(|n| n.id).collect();
-    if group.len() < 2 { return; }
+    if group.len() < 2 {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        return;
+    }
 
     let text = leaves.iter()
         .take(config.group_size)
@@ -324,7 +328,10 @@ async fn compress_group(
         Err(e) => { let _ = event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await; return; }
     };
     let nodes: Vec<&DagNode> = leaves.iter().filter(|n| node_ids.contains(&n.id)).collect();
-    if nodes.len() < 2 { return; }
+    if nodes.len() < 2 {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
+        return;
+    }
 
     let text = nodes.iter().map(|n| n.summary.as_str()).collect::<Vec<_>>().join("\n---\n");
     let old_tc: i64 = nodes.iter().map(|n| n.token_count).sum();
@@ -363,6 +370,7 @@ async fn slide_and_compact(
     let compact_count = (leaves.len() - window_size).min(8);
     let oldest: Vec<i64> = leaves.iter().take(compact_count).map(|n| n.id).collect();
     if oldest.len() < 2 {
+        let _ = event_tx.send(CompactEvent::BelowThreshold).await;
         return;
     }
 
