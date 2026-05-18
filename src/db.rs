@@ -16,6 +16,8 @@ pub struct UnifiedSearchResult {
     /// Matching excerpt (up to 500 chars).
     pub excerpt: String,
     pub token_count: i64,
+    /// BM25 relevance score from FTS5, None for LIKE-fallback results.
+    pub bm25_score: Option<f64>,
 }
 
 const DEFAULT_DB_PATH: &str = "~/.deepseek/lcm/lcm.db";
@@ -830,6 +832,7 @@ impl Database {
                 label: row.get(2)?,
                 excerpt: row.get(3)?,
                 token_count: row.get(4)?,
+                bm25_score: None,
             })
         })?;
         let mut results = Vec::new();
