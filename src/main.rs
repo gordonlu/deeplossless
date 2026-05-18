@@ -1,11 +1,32 @@
+use axum::{
+    http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
+    extract::Request,
+};
 use clap::Parser;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use deeplossless::AppState;
+
+/// Global fixed-window rate limiter: 100 requests per second.
+static RATE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+async fn rate_limit_mw(
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let prev = RATE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev >= 100 {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(req).await)
+}
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Lossless Context Management proxy for DeepSeek API")]
@@ -94,10 +115,21 @@ async fn main() -> anyhow::Result<()> {
         summarizer_model: cli.summarizer_model,
     };
 
+    // Reset rate counter every second
+    {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                RATE_COUNT.store(0, Ordering::Relaxed);
+            }
+        });
+    }
+
     let app = deeplossless::proxy::routes()
         .with_state(state)
         .layer(CatchPanicLayer::new())
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(rate_limit_mw))
         .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)); // 20 MB
 
     let addr = format!("{}:{}", cli.host, cli.port);
