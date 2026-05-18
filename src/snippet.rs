@@ -48,9 +48,10 @@ pub fn extract(text: &str) -> Vec<Snippet> {
 pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
     let mut snippets = vec![];
 
-    // 1. Code blocks (```...```)
+    // 1. Code blocks (```...```) with AST-aware structural extraction
     let mut in_code = false;
     let mut code_start = 0;
+    let mut code_lang = "";
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
@@ -61,18 +62,31 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !block.is_empty() {
-                    // Token-budget truncation: cap at ~200 tokens
-                    let truncated = token_truncate(&block, 200);
-                    snippets.push(Snippet {
-                        snippet_type: SnippetType::CodeBlock,
-                        content: truncated,
-                        source_node_id: source_node_id.to_string(),
-                        importance: 0.8,
-                    });
+                    // Extract structural elements from code
+                    let structural = extract_code_structure(&block, code_lang);
+                    if structural.is_empty() {
+                        let truncated = token_truncate(&block, 200);
+                        snippets.push(Snippet {
+                            snippet_type: SnippetType::CodeBlock,
+                            content: truncated,
+                            source_node_id: source_node_id.to_string(),
+                            importance: 0.8,
+                        });
+                    } else {
+                        for elem in structural {
+                            snippets.push(Snippet {
+                                snippet_type: SnippetType::CodeBlock,
+                                content: elem,
+                                source_node_id: source_node_id.to_string(),
+                                importance: 0.85,
+                            });
+                        }
+                    }
                 }
                 in_code = false;
             } else {
                 code_start = i;
+                code_lang = trimmed.trim_start_matches('`').trim();
                 in_code = true;
             }
         }
@@ -204,6 +218,89 @@ fn token_truncate(text: &str, max_tokens: usize) -> String {
     text.chars().take(new_len).collect()
 }
 
+/// Extract structural code elements (functions, types, imports) from code text.
+/// Uses line-based heuristics that work across Rust, Python, Go, TypeScript.
+fn extract_code_structure(code: &str, lang: &str) -> Vec<String> {
+    let mut elements = Vec::new();
+    let is_rust = lang.contains("rust") || lang.is_empty();
+    let is_py = lang.contains("python") || lang.contains("py");
+    let is_go = lang.contains("go") || lang.contains("golang");
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Rust: fn, struct, enum, trait, impl, use, const, mod, type
+        if is_rust {
+            if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ") {
+                let sig = trimmed.trim_start_matches("pub ").trim_start_matches("async ");
+                elements.push(truncate_to_line(sig, 120));
+            }
+            if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+                elements.push(truncate_to_line(trimmed.trim_start_matches("pub "), 120));
+            }
+            if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+                elements.push(truncate_to_line(trimmed.trim_start_matches("pub "), 120));
+            }
+            if trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ") {
+                elements.push(truncate_to_line(trimmed.trim_start_matches("pub "), 120));
+            }
+            if trimmed.starts_with("impl ") {
+                elements.push(truncate_to_line(trimmed, 120));
+            }
+            if trimmed.starts_with("use ") && !trimmed.starts_with("use std::") {
+                elements.push(trimmed.to_string());
+            }
+            if trimmed.starts_with("const ") || trimmed.starts_with("pub const ") {
+                elements.push(truncate_to_line(trimmed, 80));
+            }
+            if trimmed.starts_with("type ") && !trimmed.contains('<') {
+                elements.push(truncate_to_line(trimmed, 80));
+            }
+            if (trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ")) && !trimmed.contains('{') {
+                elements.push(truncate_to_line(trimmed, 60));
+            }
+        }
+
+        // Python: def, class, import, from X import
+        if is_py {
+            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                elements.push(truncate_to_line(trimmed, 120));
+            }
+            if trimmed.starts_with("class ") {
+                elements.push(truncate_to_line(trimmed, 120));
+            }
+            if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
+                elements.push(trimmed.to_string());
+            }
+        }
+
+        // Go: func, type, import, const, var
+        if is_go {
+            if trimmed.starts_with("func ") {
+                elements.push(truncate_to_line(trimmed, 120));
+            }
+            if trimmed.starts_with("type ") && !trimmed.contains(' ') {
+                elements.push(truncate_to_line(trimmed, 120));
+            }
+            if trimmed.starts_with("import ") {
+                elements.push(trimmed.to_string());
+            }
+        }
+    }
+
+    // Cap at 10 elements
+    elements.truncate(10);
+    elements
+}
+
+fn truncate_to_line(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars { s.to_string() } else { format!("{}…", &s[..max_chars-1]) }
+}
+
 fn looks_like_path(s: &str) -> bool {
     if s.contains("//") || s.starts_with("http") { return false; }
     let has_sep = s.contains('/') || s.contains('\\');
@@ -296,5 +393,34 @@ mod tests {
         let text = "count is 3";
         let snippets = extract(text);
         assert!(!snippets.iter().any(|s| s.content == "3"), "small numbers are noise");
+    }
+
+    #[test]
+    fn extract_code_structure_rust_functions() {
+        let code = "fn main() {\n    let x = 42;\n}\n\npub fn process(data: &[u8]) -> Result<()> {\n    Ok(())\n}\n";
+        let elems = extract_code_structure(code, "rust");
+        assert!(elems.iter().any(|e| e.contains("fn main")), "should extract fn main, got: {elems:?}");
+        assert!(elems.iter().any(|e| e.contains("fn process")), "should extract fn process, got: {elems:?}");
+    }
+
+    #[test]
+    fn extract_code_structure_rust_types() {
+        let code = "struct Point {\n    x: f64,\n    y: f64,\n}\n\nenum Color { Red, Green, Blue }\n\nimpl Point {\n    fn new() -> Self { Point { x: 0.0, y: 0.0 } }\n}";
+        let elems = extract_code_structure(code, "rust");
+        assert!(elems.iter().any(|e| e.contains("struct Point")), "should extract struct");
+        assert!(elems.iter().any(|e| e.contains("enum Color")), "should extract enum");
+        assert!(elems.iter().any(|e| e.contains("impl Point")), "should extract impl");
+    }
+
+    #[test]
+    fn extract_ast_code_block_in_text() {
+        let text = "Here is the fix:\n```rust\nfn main() {\n    println!(\"hello\");\n}\npub struct Config { debug: bool }\n```";
+        let snippets = extract(text);
+        let code_snippets: Vec<_> = snippets.iter().filter(|s| s.snippet_type == SnippetType::CodeBlock).collect();
+        assert!(!code_snippets.is_empty(), "should extract code snippets");
+        // Should have extracted structural elements rather than raw block
+        let has_fn = code_snippets.iter().any(|s| s.content.contains("fn main"));
+        let has_struct = code_snippets.iter().any(|s| s.content.contains("struct Config"));
+        assert!(has_fn || has_struct, "should extract structural elements, got: {code_snippets:?}");
     }
 }
