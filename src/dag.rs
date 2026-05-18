@@ -93,6 +93,9 @@ pub struct DagConfig {
 
     /// Per-message JSON framing overhead (role + structure). Default: 12.
     pub token_overhead: usize,
+
+    /// Embedding API key for semantic similarity. Empty = SHA-256 fallback only.
+    pub embedding_api_key: String,
 }
 
 impl Default for DagConfig {
@@ -100,12 +103,13 @@ impl Default for DagConfig {
         Self {
             soft_threshold_ratio: 0.80,
             hard_threshold_ratio: 0.95,
-            max_level: 0, // 0 = dynamic based on leaf count
+            max_level: 0,
             max_fanout: 100,
             max_expand_depth: 10,
             recent_message_count: 20,
             token_correction_factor: 1.0,
             token_overhead: 12,
+            embedding_api_key: String::new(),
         }
     }
 }
@@ -170,9 +174,20 @@ impl DagEngineBuilder {
     }
 
     pub fn build(self, db: Arc<Database>) -> DagEngine {
+        let embedder = if self.config.embedding_api_key.is_empty() {
+            None
+        } else {
+            Some(crate::embeddings::EmbeddingClient::new(
+                crate::embeddings::EmbeddingConfig {
+                    api_key: self.config.embedding_api_key.clone(),
+                    ..Default::default()
+                }
+            ))
+        };
         DagEngine {
             db,
             config: self.config,
+            embedder,
         }
     }
 }
@@ -182,6 +197,7 @@ impl DagEngineBuilder {
 pub struct DagEngine {
     db: Arc<Database>,
     config: DagConfig,
+    embedder: Option<crate::embeddings::EmbeddingClient>,
 }
 
 impl DagEngine {
@@ -350,14 +366,27 @@ impl DagEngine {
         Ok(node)
     }
 
-    /// Cross-conversation semantic dedup: check if a node with the same
-    /// semantic hash already exists. If found, return it; otherwise
-    /// return None so the caller can create a new node.
+    /// Cross-conversation semantic dedup: check for an existing node with
+    /// similar semantics. Uses embeddings when available; falls back to SHA-256.
     pub fn find_similar_node(
         &self,
         summary: &str,
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<Option<DagNode>> {
+        // Try embedding-based similarity first
+        if let Some(ref embedder) = self.embedder {
+            let text = format_summary_text(summary, snippets);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let result = handle.block_on(async { embedder.embed(&text).await });
+                if let Some(vec) = result {
+                    if let Some((node_id, _sim)) = self.db.find_nearest_embedding(&vec, 0.92)? {
+                        return self.db.get_node(node_id);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        // Fall back to SHA-256 exact match
         let hash = dag_semantic_hash(summary, snippets);
         let matches = self.db.find_similar_by_hash(&hash)?;
         if let Some((_hash, node_id, _conv_id, _preview)) = matches.first() {
@@ -388,8 +417,20 @@ impl DagEngine {
             tracing::debug!(target: "deeplossless::dag", node_id = existing.id, "semantic dedup: reused existing node");
             return Ok(existing);
         }
-        // No match: create new
-        self.compress_group_with_snippets(conv_id, source_ids, summary, token_count, level, snippets)
+        // No match: create new, then store embedding for future dedup
+        let node = self.compress_group_with_snippets(conv_id, source_ids, summary, token_count, level, snippets)?;
+        if let Some(ref embedder) = self.embedder {
+            let text = format_summary_text(summary, snippets);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let result = handle.block_on(async { embedder.embed(&text).await });
+                if let Some(vec) = result {
+                    let model = &embedder.config.model;
+                    let dims = embedder.config.dimensions as i32;
+                    let _ = self.db.store_embedding(node.id, &vec, model, dims);
+                }
+            }
+        }
+        Ok(node)
     }
 
     /// Compute the set of leaf IDs covered by a node, recursively.
@@ -924,6 +965,15 @@ fn dag_semantic_hash(summary: &str, snippets: &[crate::snippet::Snippet]) -> Str
         hasher.update(s.content.as_bytes());
     }
     hex::encode(&hasher.finalize()[..8])
+}
+
+fn format_summary_text(summary: &str, snippets: &[crate::snippet::Snippet]) -> String {
+    if snippets.is_empty() {
+        summary.to_string()
+    } else {
+        let snippet_texts: Vec<&str> = snippets.iter().map(|s| s.content.as_str()).collect();
+        format!("{} {}", summary, snippet_texts.join(" "))
+    }
 }
 
 #[cfg(test)]
