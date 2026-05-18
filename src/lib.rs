@@ -17,9 +17,9 @@
 //! ```
 //!
 //! Edge direction: **raw → summary** (summarization flows from sources upward).
-//! Each node has at most one parent summary, making the structure a **hierarchical
-//! forest** (not a general DAG). Future work may introduce shared-node DAG for
-//! overlapping summary windows (§P3 Graph Model).
+//! Nodes may have multiple parents via `Refines` and `Reuses` edges, forming a
+//! true DAG. Cross-conversation sharing is enabled when embedding similarity
+//! exceeds threshold, creating `Reuses` edges across conversation boundaries.
 //!
 //! - `get_children(node)` returns the nodes in `node.child_ids` (forward lookup)
 //! - `get_parents(node)` returns nodes whose `child_ids` contains `node.id`
