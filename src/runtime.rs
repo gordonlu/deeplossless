@@ -22,6 +22,8 @@ pub enum RuntimeProfile {
     Exploratory,
     /// Maximum model autonomy. Full reasoning, speculative paths.
     Autonomous,
+    /// User-defined strategy. Parameters are set directly on RuntimeStrategy.
+    Custom,
 }
 
 impl RuntimeProfile {
@@ -31,6 +33,7 @@ impl RuntimeProfile {
             Self::Efficient => "efficient",
             Self::Exploratory => "exploratory",
             Self::Autonomous => "autonomous",
+            Self::Custom => "custom",
         }
     }
 
@@ -40,6 +43,7 @@ impl RuntimeProfile {
             "efficient" => Some(Self::Efficient),
             "exploratory" | "explore" => Some(Self::Exploratory),
             "autonomous" | "auto" => Some(Self::Autonomous),
+            "custom" => Some(Self::Custom),
             _ => None,
         }
     }
@@ -73,8 +77,37 @@ pub struct RuntimeStrategy {
 }
 
 impl RuntimeStrategy {
+    /// Build a custom strategy with explicit parameters.
+    pub fn custom(
+        cache_aggressiveness: f64,
+        max_retries_per_failure: u32,
+        allow_speculative: bool,
+        context_injection_ratio: f64,
+        freeze_plans_early: bool,
+        token_budget_ratio: f64,
+    ) -> Self {
+        Self {
+            profile: RuntimeProfile::Custom,
+            cache_aggressiveness: cache_aggressiveness.clamp(0.0, 1.0),
+            max_retries_per_failure: max_retries_per_failure.min(10),
+            allow_speculative,
+            context_injection_ratio: context_injection_ratio.clamp(0.0, 1.0),
+            freeze_plans_early,
+            token_budget_ratio: token_budget_ratio.clamp(0.1, 1.0),
+        }
+    }
+
     pub fn from_profile(profile: RuntimeProfile) -> Self {
         match profile {
+            RuntimeProfile::Custom => Self {
+                profile,
+                cache_aggressiveness: 0.6,
+                max_retries_per_failure: 2,
+                allow_speculative: true,
+                context_injection_ratio: 0.5,
+                freeze_plans_early: false,
+                token_budget_ratio: 0.6,
+            },
             RuntimeProfile::Minimal => Self {
                 profile,
                 cache_aggressiveness: 1.0,
@@ -476,5 +509,21 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("grep"));
         assert!(json.contains("ReuseToolCache"));
+    }
+
+    #[test]
+    fn custom_profile_allows_arbitrary_params() {
+        let s = RuntimeStrategy::custom(0.95, 1, false, 0.15, true, 0.25);
+        assert_eq!(s.profile, RuntimeProfile::Custom);
+        assert!((s.cache_aggressiveness - 0.95).abs() < 0.01);
+        assert!((s.token_budget_ratio - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn custom_params_are_clamped() {
+        let s = RuntimeStrategy::custom(2.0, 100, true, -1.0, false, 0.0);
+        assert_eq!(s.cache_aggressiveness, 1.0);
+        assert_eq!(s.token_budget_ratio, 0.1);
+        assert_eq!(s.max_retries_per_failure, 10);
     }
 }
