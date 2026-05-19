@@ -285,6 +285,23 @@ compressing history.
 | **Failure loop prevention** | Error cycles broken by failure memory | `failure_patterns` table hit rate |
 | **Context reconstruction avoided** | Summaries reused from embedding dedup instead of re-summarized | `semantic_index` + `dedup_and_reuse` rate |
 
+### Simulated session (5-turn coding task)
+
+```
+                    Without Runtime    With Runtime    Reduction
+Token / session         1850               550            ↓70%
+Cache hit rate          0%                100%            —
+Repeated reasoning      3 rounds           1 round         ↓67%
+Rereads                 2                  0               ↓100%
+Failure loops           1                  0               ↓100%
+
+Session: "fix build error" → grep tokio → read Cargo.toml → compile fail →
+         failure memory suggests fix → apply → compile success → plan complete.
+Cache hits: grep repeated (deterministic reuse), plan continuation.
+Failure avoidance: tokio version not found → known fix from failure_patterns.
+Run: cargo test --test simulated_session -- --nocapture
+```
+
 ### Target (to be validated with real workload)
 
 ```
