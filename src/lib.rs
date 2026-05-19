@@ -68,6 +68,7 @@ pub mod dag;
 pub mod db;
 pub mod embeddings;
 pub mod execution;
+pub mod runtime;
 pub mod tool_cache;
 pub mod metrics;
 pub mod pipeline;
@@ -98,6 +99,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// Model used for background summarization (configurable via CLI/env).
     pub summarizer_model: String,
+    /// Runtime cycle tracking for policy-driven execution.
+    pub cycle: Arc<StdMutex<runtime::ExecutionCycle>>,
 }
 
 impl AppState {

@@ -123,6 +123,9 @@ async fn main() -> anyhow::Result<()> {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()?,
         summarizer_model: cli.summarizer_model,
+        cycle: Arc::new(std::sync::Mutex::new(
+            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeMode::AutonomousFix)
+        )),
     };
 
     // Reset rate counter every second
