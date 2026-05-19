@@ -317,6 +317,17 @@ impl Database {
         conn.execute_batch(crate::execution::CODE_CHANGE_MIGRATION)?;
         // v0.8: tool result cache
         conn.execute_batch(crate::tool_cache::MIGRATION)?;
+        // v0.9: multi-agent safe runtime
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS agent_active_files (
+                agent_id        TEXT NOT NULL,
+                file_path       TEXT NOT NULL,
+                operation       TEXT NOT NULL DEFAULT 'edit',
+                claimed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (agent_id, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_files
+                ON agent_active_files(file_path);")?;
         // v0.8: failure memory
         conn.execute_batch(crate::execution::FAILURE_MIGRATION)?;
         // v0.8: plan persistence
@@ -839,7 +850,11 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![conv_id, file_path, diff, symbols_json, err_before_json, err_after_json, execution_unit_id],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        // Auto-invalidate: file changed → purge stale cache entries + release claims
+        let _ = self.on_files_changed(&[file_path.to_string()]);
+        Ok(id)
     }
 
     /// Search code changes by file path, symbol, or error message.
@@ -1069,6 +1084,95 @@ impl Database {
         Ok(stmt.query_row(rusqlite::params![conv_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         }).ok())
+    }
+
+    // ── Multi-agent safe runtime (v0.9) ─────────────────────────────────
+
+    /// Claim a file for an agent. Returns Ok(()) if claim succeeds,
+    /// Err with conflicting agent_id if another agent already holds the file.
+    pub fn claim_file(&self, agent_id: &str, file_path: &str, operation: &str) -> anyhow::Result<Result<(), String>> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // Check for existing claim from another agent
+        let existing: Option<String> = conn.query_row(
+            "SELECT agent_id FROM agent_active_files WHERE file_path = ?1 AND agent_id != ?2",
+            rusqlite::params![file_path, agent_id],
+            |row| row.get(0),
+        ).ok();
+        if let Some(other_agent) = existing {
+            return Ok(Err(other_agent));
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_active_files (agent_id, file_path, operation) VALUES (?1, ?2, ?3)",
+            rusqlite::params![agent_id, file_path, operation],
+        )?;
+        Ok(Ok(()))
+    }
+
+    /// Release an agent's claim on a file.
+    pub fn release_file(&self, agent_id: &str, file_path: &str) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "DELETE FROM agent_active_files WHERE agent_id = ?1 AND file_path = ?2",
+            rusqlite::params![agent_id, file_path],
+        )?;
+        Ok(())
+    }
+
+    /// Release all claims for an agent (on disconnect/session end).
+    pub fn release_all_agent_files(&self, agent_id: &str) -> anyhow::Result<usize> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let count = conn.execute(
+            "DELETE FROM agent_active_files WHERE agent_id = ?1",
+            rusqlite::params![agent_id],
+        )?;
+        Ok(count)
+    }
+
+    /// List all file claims across all agents.
+    pub fn list_all_file_claims(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, file_path, operation FROM agent_active_files ORDER BY claimed_at"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Get files currently claimed by an agent.
+    pub fn get_agent_files(&self, agent_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT file_path, operation FROM agent_active_files WHERE agent_id = ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Cross-agent cache invalidation: when files change, invalidate affected
+    /// tool cache entries and release stale claims.
+    pub fn on_files_changed(&self, changed_files: &[String]) -> anyhow::Result<usize> {
+        // 1. Invalidate tool cache entries dependent on changed files
+        let invalidated = self.tool_cache_invalidate(changed_files)?;
+
+        // 2. Release claims on changed files (agent finished editing)
+        if !changed_files.is_empty() {
+            let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            for f in changed_files {
+                let _ = conn.execute(
+                    "DELETE FROM agent_active_files WHERE file_path = ?1",
+                    rusqlite::params![f],
+                );
+            }
+        }
+        Ok(invalidated)
     }
 
     /// Soft-delete a DAG node (set deleted=1, timestamp). The node is

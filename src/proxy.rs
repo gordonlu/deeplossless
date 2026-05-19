@@ -72,6 +72,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
+        .route("/v1/lcm/file/claim", post(lcm_file_claim))
+        .route("/v1/lcm/file/release", post(lcm_file_release))
+        .route("/v1/lcm/file/conflicts", get(lcm_file_conflicts))
         .route("/v1/lcm/health/{conv_id}", get(lcm_dag_health))
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
@@ -339,6 +342,52 @@ async fn lcm_stream_context(
     {
         Ok(resp) => resp,
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "STREAM_ERROR", format!("{e}")),
+    }
+}
+
+/// Claim a file for an agent. Returns 409 if another agent holds it.
+async fn lcm_file_claim(
+    State(state): State<AppState>,
+    Json(body): Json<HashMap<String, String>>,
+) -> Response {
+    let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
+    let operation = body.get("operation").map(|s| s.as_str()).unwrap_or("edit");
+    match state.db.claim_file(agent_id, file_path, operation) {
+        Ok(Ok(())) => Json(json!({"status": "claimed", "agent_id": agent_id, "file_path": file_path})).into_response(),
+        Ok(Err(conflict_agent)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"status": "conflict", "held_by": conflict_agent, "file_path": file_path}))
+        ).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CLAIM_ERROR", format!("{e}")),
+    }
+}
+
+/// Release an agent's claim on a file.
+async fn lcm_file_release(
+    State(state): State<AppState>,
+    Json(body): Json<HashMap<String, String>>,
+) -> Response {
+    let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
+    match state.db.release_file(agent_id, file_path) {
+        Ok(()) => Json(json!({"status": "released"})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "RELEASE_ERROR", format!("{e}")),
+    }
+}
+
+/// List all active file claims (for conflict awareness).
+async fn lcm_file_conflicts(
+    State(state): State<AppState>,
+) -> Response {
+    match state.db.list_all_file_claims() {
+        Ok(claims) => {
+            let rows: Vec<Value> = claims.iter().map(|(aid, path, op)| json!({
+                "agent_id": aid, "file_path": path, "operation": op
+            })).collect();
+            Json(json!({"conflicts": rows})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
