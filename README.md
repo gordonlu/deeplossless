@@ -41,7 +41,7 @@ deepseek config set base_url http://127.0.0.1:8080/v1
 | **Memory scoring** | Access count + recency + importance scoring with decay-based GC. Three-tier retention: critical / normal / ephemeral. |
 | **Execution units** | Agent memory atoms: `think → act → observe → reflect` cycles stored with tool chains and outcome inference. |
 | **Code diff memory** | Stores what changed (file, diff, symbols, error_before/after) not full code blocks. 95% of coding tokens are repeats. |
-| **Tree-sitter AST extraction** | Rust code parsed with tree-sitter for precise function/type/struct signature extraction. |
+| **Tree-sitter AST extraction** | 8 languages (Rust, Python, TS, JS, Java, C/C++, C#, Go) — precise function/class/type signature extraction. |
 | **Entropy-aware compaction** | Trigram novelty scoring adjusts compaction thresholds — novel content preserved, redundant content aggressively compressed. |
 | **Streaming DAG** | SSE endpoint for incremental context delivery. Sliding-window incremental compaction. |
 | **Cross-session search** | Global semantic search across conversations. Auto-merges similar nodes via embedding similarity. |
@@ -285,20 +285,17 @@ compressing history.
 | **Failure loop prevention** | Error cycles broken by failure memory | `failure_patterns` table hit rate |
 | **Context reconstruction avoided** | Summaries reused from embedding dedup instead of re-summarized | `semantic_index` + `dedup_and_reuse` rate |
 
-### Simulated session (5-turn coding task)
+### Simulated session (3 conversations, 20 turns, 8 languages)
 
 ```
                     Without Runtime    With Runtime    Reduction
-Token / session         1850               550            ↓70%
-Cache hit rate          0%                100%            —
-Repeated reasoning      3 rounds           1 round         ↓67%
-Rereads                 2                  0               ↓100%
-Failure loops           1                  0               ↓100%
+Token / session         7440              4500            ↓40%
+Cache hit rate          —                 42%             —
+Languages               Rust, Python, TS, JS, Java, C++, C#, Go
+AST extracted           26 structural elements (functions, classes, types)
 
-Session: "fix build error" → grep tokio → read Cargo.toml → compile fail →
-         failure memory suggests fix → apply → compile success → plan complete.
-Cache hits: grep repeated (deterministic reuse), plan continuation.
-Failure avoidance: tokio version not found → known fix from failure_patterns.
+Sessions: Rust build fix (8 turns), Python data pipeline (6 turns), Go API refactor (6 turns).
+Cache hits: grep reuse, read_file reuse. Failure avoidance: E0308, KeyError, import cycle.
 Run: cargo test --test simulated_session -- --nocapture
 ```
 

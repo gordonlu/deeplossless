@@ -253,70 +253,100 @@ fn token_truncate(text: &str, max_tokens: usize) -> String {
     text.chars().take(new_len).collect()
 }
 
-/// Extract structural code elements (functions, types, imports) from code text.
-/// Uses line-based heuristics that work across Rust, Python, Go, TypeScript.
-/// Tree-sitter based extraction for Rust code (precise AST boundaries).
-fn extract_rust_ast(code: &str) -> Option<Vec<String>> {
+/// Generic tree-sitter AST walker for any supported language.
+/// Walks the tree looking for declaration nodes (functions, types, imports).
+fn parse_with_tree_sitter(
+    code: &str,
+    language: &tree_sitter::Language,
+    decl_kinds: &[&str],
+    import_kinds: &[&str],
+    const_kinds: &[&str],
+) -> Option<Vec<String>> {
     let mut elements = Vec::new();
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?;
+    parser.set_language(language).ok()?;
     let tree = parser.parse(code, None)?;
     let root = tree.root_node();
     let mut seen = std::collections::HashSet::new();
 
-    // Recursively walk the AST looking for declarations
     let mut stack: Vec<tree_sitter::Node> = root.children(&mut root.walk()).collect();
     while let Some(node) = stack.pop() {
-        match node.kind() {
-            "function_item" | "function_signature_item" => {
-                let text = &code[node.start_byte()..node.end_byte()];
-                let first_line = text.lines().next().unwrap_or(text);
-                if seen.insert(first_line.to_string()) {
-                    elements.push(truncate_to_line(first_line, 120));
-                }
+        let kind = node.kind();
+        if decl_kinds.contains(&kind) || import_kinds.contains(&kind) || const_kinds.contains(&kind) {
+            let text = &code[node.start_byte()..node.end_byte()];
+            let first_line = text.lines().next().unwrap_or(text).trim();
+            if !first_line.is_empty() && seen.insert(first_line.to_string()) {
+                let max_len = if const_kinds.contains(&kind) { 80 } else { 120 };
+                elements.push(truncate_to_line(first_line, max_len));
             }
-            "struct_item" | "enum_item" | "trait_item" | "impl_item" => {
-                let text = &code[node.start_byte()..node.end_byte()];
-                let first_line = text.lines().next().unwrap_or(text);
-                if seen.insert(first_line.to_string()) {
-                    elements.push(truncate_to_line(first_line, 120));
-                }
-            }
-            "use_declaration" => {
-                let text = &code[node.start_byte()..node.end_byte()];
-                let trimmed = text.trim();
-                if !trimmed.starts_with("use std::") && seen.insert(trimmed.to_string()) {
-                    elements.push(trimmed.to_string());
-                }
-            }
-            "const_item" | "static_item" => {
-                let text = &code[node.start_byte()..node.end_byte()];
-                let first_line = text.lines().next().unwrap_or(text);
-                if seen.insert(first_line.to_string()) {
-                    elements.push(truncate_to_line(first_line, 80));
-                }
-            }
-            _ => {}
         }
-        // Push children for further traversal
         let mut children: Vec<tree_sitter::Node> = node.children(&mut node.walk()).collect();
-        children.reverse(); // maintain DFS order
+        children.reverse();
         for child in children {
             stack.push(child);
         }
     }
-
     elements.truncate(10);
     Some(elements)
 }
 
+/// Dispatch to the right tree-sitter language based on lang tag.
+fn extract_ast(code: &str, lang: &str) -> Option<Vec<String>> {
+    let l = lang.to_lowercase();
+    if l.contains("rust") || l.contains("rs") {
+        parse_with_tree_sitter(code, &tree_sitter_rust::LANGUAGE.into(),
+            &["function_item", "function_signature_item", "struct_item", "enum_item", "trait_item", "impl_item", "mod_item"],
+            &["use_declaration"],
+            &["const_item", "static_item"])
+    } else if l.contains("python") || l.contains("py") {
+        parse_with_tree_sitter(code, &tree_sitter_python::LANGUAGE.into(),
+            &["function_definition", "class_definition"],
+            &["import_statement", "import_from_statement"],
+            &[])
+    } else if l.contains("typescript") || l.contains("ts") || l.contains("tsx") {
+        parse_with_tree_sitter(code, &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &["function_declaration", "method_definition", "class_declaration", "interface_declaration", "type_alias_declaration"],
+            &["import_statement"],
+            &["lexical_declaration", "variable_declaration"])
+    } else if l.contains("javascript") || l.contains("js") || l.contains("jsx") {
+        parse_with_tree_sitter(code, &tree_sitter_javascript::LANGUAGE.into(),
+            &["function_declaration", "method_definition", "class_declaration"],
+            &["import_statement"],
+            &["lexical_declaration", "variable_declaration"])
+    } else if l.contains("java") {
+        parse_with_tree_sitter(code, &tree_sitter_java::LANGUAGE.into(),
+            &["method_declaration", "class_declaration", "interface_declaration", "enum_declaration"],
+            &["import_declaration"],
+            &["field_declaration"])
+    } else if l.contains("c++") || l.contains("cpp") || l.contains("cxx") {
+        parse_with_tree_sitter(code, &tree_sitter_c::LANGUAGE.into(),
+            &["function_definition", "class_specifier", "struct_specifier", "enum_specifier"],
+            &["preproc_include"],
+            &["declaration"])
+    } else if l.contains("c#") || l.contains("csharp") || l.contains("cs") {
+        parse_with_tree_sitter(code, &tree_sitter_c_sharp::LANGUAGE.into(),
+            &["method_declaration", "class_declaration", "interface_declaration", "struct_declaration", "enum_declaration"],
+            &["using_directive"],
+            &["field_declaration", "property_declaration"])
+    } else if l.contains("go") || l.contains("golang") {
+        parse_with_tree_sitter(code, &tree_sitter_go::LANGUAGE.into(),
+            &["function_declaration", "method_declaration", "type_declaration"],
+            &["import_declaration"],
+            &["const_declaration", "var_declaration"])
+    } else {
+        None
+    }
+}
+
+/// Extract structural code elements with tree-sitter AST parsing.
+/// Falls back to line-based heuristics if tree-sitter fails or language unsupported.
 fn extract_code_structure(code: &str, lang: &str) -> Vec<String> {
-    // Use tree-sitter for Rust
-    if (lang.contains("rust") || lang.is_empty())
-        && let Some(elements) = extract_rust_ast(code)
-            && !elements.is_empty() {
-                return elements;
-            }
+    // Try tree-sitter first
+    if let Some(elements) = extract_ast(code, lang)
+        && !elements.is_empty()
+    {
+        return elements;
+    }
     // Fall back to line-based heuristics
     let mut elements = Vec::new();
     let is_rust = lang.contains("rust") || lang.is_empty();
