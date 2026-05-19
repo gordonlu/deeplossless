@@ -149,6 +149,8 @@ pub struct DagNode {
     pub access_count: i64,
     /// ISO-8601 timestamp of last context assembly inclusion.
     pub last_accessed_at: Option<String>,
+    /// JSON reasoning chain: how this summary was produced (level, prompt, reduction).
+    pub reasoning: String,
 }
 
 // ── Engine ─────────────────────────────────────────────────────────────
@@ -301,6 +303,14 @@ impl DagEngine {
         if let Err(e) = self.compute_provenance(&node, source_ids) {
             tracing::warn!(target: "deeplossless::dag", error = %e, "provenance computation failed");
         }
+        // Store reasoning chain in the node for execution provenance
+        let reasoning = serde_json::json!({
+            "action": "compress",
+            "level": level,
+            "source_count": source_ids.len(),
+            "token_reduction": token_count,
+        });
+        let _ = self.db.update_node_reasoning(node.id, &reasoning.to_string());
         Ok(node)
     }
 

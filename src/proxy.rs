@@ -70,6 +70,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/trace/{node_id}", get(lcm_trace))
         .route("/v1/lcm/global/search", get(lcm_global_search))
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
+        .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/health/{conv_id}", get(lcm_dag_health))
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
@@ -285,6 +286,56 @@ async fn lcm_snippets(
         Ok(None) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     }
+}
+
+/// Streaming DAG context via SSE — yields summaries first, then messages incrementally.
+async fn lcm_stream_context(
+    State(state): State<AppState>,
+    Path(conv_id): Path<i64>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let budget: usize = params.get("budget").and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let q_owned: Option<String> = params.get("q").cloned();
+
+    let dag = state.dag.clone();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let q_ref = q_owned.as_deref();
+        let nodes = dag.assemble_context(conv_id, budget, q_ref)
+            .unwrap_or_default();
+
+        for (i, node) in nodes.iter().enumerate() {
+            let data = serde_json::json!({
+                "idx": i,
+                "type": if node.is_leaf { "message" } else { "summary" },
+                "id": node.id,
+                "level": if node.is_leaf { 0 } else { node.level as i32 },
+                "summary": node.summary,
+                "tokens": node.token_count,
+                "reasoning": if node.reasoning.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(node.reasoning.clone()) },
+            });
+            let payload = format!("data: {}\n\n", serde_json::to_string(&data).unwrap_or_default());
+            if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(payload))).is_err() {
+                break;
+            }
+            // Small yield to let the client process incrementally
+            tokio::task::yield_now().await;
+        }
+
+        let _ = tx.send(Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from("data: [DONE]\n\n")
+        ));
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
 }
 
 /// Execution memory search — finds similar bugs, tool chains, code edits.

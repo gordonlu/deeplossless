@@ -269,6 +269,16 @@ impl Database {
             conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN last_accessed_at TEXT;")?;
         }
 
+        // v0.7: reasoning chain for execution provenance
+        let has_reasoning: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'reasoning'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_reasoning {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN reasoning TEXT NOT NULL DEFAULT '';")?;
+        }
+
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_conv
                  ON messages(conversation_id);
@@ -437,6 +447,7 @@ impl Database {
             semantic_hash: Self::semantic_hash(summary, snippets),
             access_count: 0,
             last_accessed_at: None,
+            reasoning: String::new(),
         })
     }
 
@@ -656,7 +667,18 @@ impl Database {
             semantic_hash: Self::semantic_hash(summary, snippets),
             access_count: 0,
             last_accessed_at: None,
+            reasoning: String::new(),
         })
+    }
+
+    /// Update the reasoning chain for a node (execution provenance).
+    pub fn update_node_reasoning(&self, node_id: i64, reasoning: &str) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE dag_nodes SET reasoning = ?1 WHERE id = ?2",
+            rusqlite::params![reasoning, node_id],
+        )?;
+        Ok(())
     }
 
     /// Increment access count and update last_accessed_at for memory scoring.
@@ -1495,6 +1517,7 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let semantic_hash: String = row.get(10)?;
         let access_count: i64 = row.get(11).unwrap_or(0);
         let last_accessed_at: Option<String> = row.get(12).ok().flatten();
+        let reasoning: String = row.get(13).unwrap_or_default();
         Ok(DagNode {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -1509,6 +1532,7 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
             semantic_hash,
             access_count,
             last_accessed_at,
+            reasoning,
         })
     }
 }
