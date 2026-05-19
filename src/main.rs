@@ -71,6 +71,10 @@ struct Cli {
     /// Max requests per second (0 to disable rate limiting).
     #[arg(long, default_value = "100", env = "RATE_LIMIT")]
     rate_limit: u64,
+
+    /// Runtime profile (minimal, efficient, exploratory, autonomous, custom).
+    #[arg(long, default_value = "autonomous", env = "RUNTIME_PROFILE")]
+    runtime_profile: String,
 }
 
 #[tokio::main]
@@ -124,7 +128,17 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         summarizer_model: cli.summarizer_model,
         cycle: Arc::new(std::sync::Mutex::new(
-            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Autonomous)
+            deeplossless::runtime::ExecutionCycle::new(match cli.runtime_profile.as_str() {
+                "minimal" => deeplossless::runtime::RuntimeProfile::Minimal,
+                "efficient" => deeplossless::runtime::RuntimeProfile::Efficient,
+                "exploratory" => deeplossless::runtime::RuntimeProfile::Exploratory,
+                "autonomous" => deeplossless::runtime::RuntimeProfile::Autonomous,
+                "custom" => deeplossless::runtime::RuntimeProfile::Custom,
+                other => {
+                    tracing::warn!(target: "deeplossless", "unknown runtime profile '{other}', falling back to autonomous");
+                    deeplossless::runtime::RuntimeProfile::Autonomous
+                }
+            })
         )),
     };
 

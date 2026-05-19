@@ -153,13 +153,22 @@ pub fn group_execution_chain(
                 }
                 i = j; // advance past tool results
 
-                // Infer outcome from result
-                let outcome = if tool_result.contains("Error") || tool_result.contains("error") {
-                    ExecutionOutcome::RecoveredFailure
-                } else if tool_result.is_empty() {
-                    ExecutionOutcome::Blocked
-                } else {
-                    ExecutionOutcome::Success
+                // Infer outcome from result using structured patterns
+                let outcome = {
+                    let lower = tool_result.to_lowercase();
+                    if tool_result.contains("Error:") || tool_result.contains("error:")
+                        || tool_result.contains("error[") || tool_result.contains("Error[")
+                        || tool_result.contains("\nerror") || tool_result.starts_with("error")
+                        || lower.contains("failed:") || lower.contains("exit code")
+                        || lower.contains("timed out") || lower.contains("permission denied")
+                        || lower.contains("not found") || lower.starts_with("err:")
+                    {
+                        ExecutionOutcome::RecoveredFailure
+                    } else if tool_result.is_empty() {
+                        ExecutionOutcome::Blocked
+                    } else {
+                        ExecutionOutcome::Success
+                    }
                 };
 
                 // Get reasoning_after from the next assistant message

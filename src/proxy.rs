@@ -295,9 +295,13 @@ async fn lcm_snippets(
 /// Streaming DAG context via SSE — yields summaries first, then messages incrementally.
 async fn lcm_stream_context(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(conv_id): Path<i64>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let budget: usize = params.get("budget").and_then(|s| s.parse().ok()).unwrap_or(2000);
     let q_owned: Option<String> = params.get("q").cloned();
 
@@ -348,8 +352,12 @@ async fn lcm_stream_context(
 /// Claim a file for an agent. Returns 409 if another agent holds it.
 async fn lcm_file_claim(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
     let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
     let operation = body.get("operation").map(|s| s.as_str()).unwrap_or("edit");
@@ -366,8 +374,12 @@ async fn lcm_file_claim(
 /// Release an agent's claim on a file.
 async fn lcm_file_release(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
     let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
     match state.db.release_file(agent_id, file_path) {
@@ -379,7 +391,11 @@ async fn lcm_file_release(
 /// List all active file claims (for conflict awareness).
 async fn lcm_file_conflicts(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     match state.db.list_all_file_claims() {
         Ok(claims) => {
             let rows: Vec<Value> = claims.iter().map(|(aid, path, op)| json!({
@@ -394,7 +410,11 @@ async fn lcm_file_conflicts(
 /// Runtime metrics endpoint — exposes inference-economics counters for benchmarking.
 async fn lcm_runtime_stats(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
     let m = &cycle.metrics;
     let total_cache = m.cache_hits + m.cache_misses;
@@ -417,8 +437,12 @@ async fn lcm_runtime_stats(
 /// Execution memory search — finds similar bugs, tool chains, code edits.
 async fn lcm_execution_search(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.dag.search_execution_memory(query, limit) {

@@ -473,7 +473,7 @@ impl Database {
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE id = ?1 AND deleted = 0",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
@@ -488,7 +488,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
                     n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf, n.deleted,
-                    n.semantic_hash, n.access_count, n.last_accessed_at
+                    n.semantic_hash, n.access_count, n.last_accessed_at, n.reasoning
              FROM dag_nodes n, json_each(n.child_ids) AS j
              WHERE j.value = ?1 AND n.deleted = 0
              LIMIT ?2",
@@ -517,7 +517,7 @@ impl Database {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
             placeholders.join(","),
         );
@@ -536,7 +536,7 @@ impl Database {
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
              ORDER BY level DESC, id DESC LIMIT 1",
         )?;
@@ -547,7 +547,7 @@ impl Database {
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes
              WHERE conversation_id = ?1 AND level = (
                  SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
@@ -563,7 +563,7 @@ impl Database {
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -1179,6 +1179,15 @@ impl Database {
     /// excluded from context assembly but raw data in `messages` is intact.
     /// Garbage collection can later hard-delete fully orphaned soft-deleted nodes.
     pub fn delete_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
+        // Query conversation_id before deletion (read pool, no writer lock needed)
+        let conv_id: i64 = {
+            let conn = self.read_conn();
+            conn.query_row(
+                "SELECT conversation_id FROM dag_nodes WHERE id = ?1",
+                rusqlite::params![node_id],
+                |row| row.get(0),
+            ).unwrap_or(-1)
+        };
         // Writer lock scope (release before record_event to avoid deadlock)
         {
             let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -1188,7 +1197,7 @@ impl Database {
             )?;
         }
         // Record event for audit trail (needs its own writer lock)
-        if let Err(e) = self.record_event("delete", node_id, -1, "{}") {
+        if let Err(e) = self.record_event("delete", node_id, conv_id, "{}") {
             tracing::warn!(target: "deeplossless::db", "delete event log failed: {e}");
         }
         Ok(())
@@ -1204,7 +1213,7 @@ impl Database {
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0
              ORDER BY id ASC",
         )?;
