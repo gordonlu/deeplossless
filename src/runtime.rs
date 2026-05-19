@@ -37,6 +37,7 @@ impl RuntimeProfile {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "minimal" => Some(Self::Minimal),
@@ -297,8 +298,10 @@ pub struct ExecutionCycle {
 impl ExecutionCycle {
     pub fn new(profile: RuntimeProfile) -> Self {
         let strategy = RuntimeStrategy::from_profile(profile);
-        let mut metrics = RuntimeMetrics::default();
-        metrics.budget_remaining_pct = 1.0;
+        let metrics = RuntimeMetrics {
+            budget_remaining_pct: 1.0,
+            ..Default::default()
+        };
         Self {
             profile,
             strategy,

@@ -8,9 +8,10 @@ Acts as a transparent proxy between your AI client (e.g. deepseek-tui) and
 `api.deepseek.com`, storing every message verbatim while assembling lossless
 context summaries from a hierarchical DAG engine.
 
-> **Status: v0.1.0 — Production-ready proxy.** Mutex poison recovery, HTTP timeouts,
-> structured JSON errors, CORS, rate limiting, readiness probe, Prometheus metrics,
-> and Dockerfile included. 95 tests pass. CI: check → clippy → test → doc.
+> **Status: Inference-aware Memory Runtime.** Deterministic tool cache, failure memory,
+> plan persistence, execution provenance, advisory runtime policy with configurable profiles,
+> semantic DAG with embedding dedup, AST-aware code extraction.
+> 107 tests pass. CI: check → clippy → test → doc.
 
 ## Quick start
 
@@ -32,13 +33,20 @@ deepseek config set base_url http://127.0.0.1:8080/v1
 | Feature | Description |
 |---------|-------------|
 | **Transparent proxy** | Forwards `/v1/chat/completions` to DeepSeek API. SSE streaming pass-through. |
-| **Lossless persistence** | Every message stored verbatim in SQLite WAL-mode database. |
-| **Hierarchical DAG** | Multi-level summarization with lossless pointers. Three-level escalation (LLM → LLM aggressive → deterministic truncate). |
-| **Session tracking** | SHA-256 fingerprint over first 3 messages identifies multi-turn conversations. |
-| **Snippet extraction** | Before compression, extracts code blocks, file paths, numeric constants, percentages, proper nouns, and error messages. Preserved as structured metadata. |
-| **FTS5 full-text search** | SQLite FTS5 with porter tokenizer for high-speed `lcm_grep`. |
-| **Context-ReAct operations** | Model-accessible endpoints for `compress`, `delete`, and `rollback` — active context management without data loss. |
-| **Structured context panel** | `<lcm_context>` block injected into system prompt shows summaries, snippets, and available operations per node. |
+| **Runtime Policy** | Configurable profiles (Minimal / Efficient / Exploratory / Autonomous / Custom). Advisory decisions with confidence + estimated token savings. |
+| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation. Zero-token reuse for grep/read_file/search. |
+| **Failure Memory** | Stores failed reasoning paths (why_failed + invalidated_assumptions), not just error strings. Prevents error loop token waste. |
+| **Plan Persistence** | Execution state tracked as PlanState (goal, steps, assumptions), not plan text. Avoids repeated planning. |
+| **Semantic DAG** | True shared DAG with embedding-based dedup (cosine ≥0.85 auto-merge), BM25 retrieval scoring, sentence-level provenance spans. |
+| **Memory scoring** | Access count + recency + importance scoring with decay-based GC. Three-tier retention: critical / normal / ephemeral. |
+| **Execution units** | Agent memory atoms: `think → act → observe → reflect` cycles stored with tool chains and outcome inference. |
+| **Code diff memory** | Stores what changed (file, diff, symbols, error_before/after) not full code blocks. 95% of coding tokens are repeats. |
+| **Tree-sitter AST extraction** | Rust code parsed with tree-sitter for precise function/type/struct signature extraction. |
+| **Entropy-aware compaction** | Trigram novelty scoring adjusts compaction thresholds — novel content preserved, redundant content aggressively compressed. |
+| **Streaming DAG** | SSE endpoint for incremental context delivery. Sliding-window incremental compaction. |
+| **Cross-session search** | Global semantic search across conversations. Auto-merges similar nodes via embedding similarity. |
+| **Event sourcing** | Append-only `dag_events` log for audit trail and rollback. |
+| **FTS5 BM25 search** | Full-text search with BM25 scoring for English, LIKE fallback for CJK. |
 | **Readiness probe** | `GET /health` checks DB, upstream, and compactor — returns 200/503 with per-check JSON. |
 | **Rate limiting** | Configurable requests/second (default 100) with global fixed-window counter. |
 | **Prometheus metrics** | `GET /metrics` exposes request totals, active requests, status-code breakdown, rate-limit hits, upstream errors, and uptime. |
@@ -150,6 +158,18 @@ GET  /v1/lcm/status/{conv_id}                 — DAG health
 
 GET  /v1/lcm/snippets/{node_id}               — View snippets
   Returns precision-critical values extracted before compression.
+
+GET  /v1/lcm/trace/{node_id}                  — Sentence-level provenance
+  Returns each sentence mapped to source node with byte offsets.
+
+GET  /v1/lcm/global/search?q=&limit=           — Cross-session search
+  Searches summaries across all conversations by access count.
+
+GET  /v1/lcm/execution/search?q=&limit=        — Execution memory search
+  Finds similar tool chains, code edits, and failure patterns.
+
+GET  /v1/lcm/stream/{conv_id}?budget=&q=       — Streaming DAG context (SSE)
+  Delivers summaries first, then recent messages incrementally.
 ```
 
 ### Context-ReAct operations
@@ -172,6 +192,26 @@ GET  /metrics                                 — Prometheus metrics
   Returns request totals, active requests, 2xx/4xx/5xx breakdown,
   rate-limit hits, upstream errors, and uptime in Prometheus text format.
 ```
+
+## Runtime Profiles
+
+The runtime policy engine provides advisory optimization — cache reuse, delta injection,
+failure avoidance, context compaction. The agent/UI can accept, ignore, or override each
+recommendation.
+
+| Profile | Cache | Retries | Speculative | Context | Freeze Plans | Token Budget |
+|---------|-------|---------|-------------|---------|-------------|-------------|
+| **Minimal** | 100% | 1 | No | 20% | Yes | 30% |
+| **Efficient** | 80% | 2 | No | 50% | No | 60% |
+| **Exploratory** | 50% | 3 | Yes | 80% | No | 80% |
+| **Autonomous** | 30% | 5 | Yes | 100% | No | 95% |
+| **Custom** | user-defined | user-defined | user-defined | user-defined | user-defined | user-defined |
+
+Set via environment: `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`
+
+Custom parameters (when `RUNTIME_PROFILE=custom`):
+`RUNTIME_CACHE=0.0-1.0` `RUNTIME_RETRIES=0-10` `RUNTIME_SPECULATIVE=true|false`
+`RUNTIME_CONTEXT=0.0-1.0` `RUNTIME_FREEZE=true|false` `RUNTIME_BUDGET=0.1-1.0`
 
 ### Context injection format
 
