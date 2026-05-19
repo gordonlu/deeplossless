@@ -783,6 +783,11 @@ impl DagEngine {
         self.db.search_cross_session(query, limit)
     }
 
+    /// Search execution memory for similar bugs, tool chains, or code edits.
+    pub fn search_execution_memory(&self, query: &str, limit: usize) -> anyhow::Result<Vec<crate::execution::ExecutionUnitRef>> {
+        self.db.search_execution_memory(query, limit)
+    }
+
     /// Topological sort of summary nodes reachable from `start`.
     /// Uses Kahn's algorithm with a min-heap (by level DESC, then id ASC)
     /// for deterministic ordering.  Guarantees parents appear before children.

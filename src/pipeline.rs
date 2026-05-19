@@ -146,6 +146,26 @@ impl ChatPipeline {
                         }
                     }
                 }
+                // Group tool chains into execution units (Phase 1.5)
+                let normalized: Vec<crate::session::NormalizedMessage> = arr
+                    .iter()
+                    .map(crate::session::normalize_message)
+                    .collect();
+                let units = crate::execution::group_execution_chain(conv_id, &normalized);
+                for unit in &units {
+                    if let Err(e) = db.store_execution_unit(
+                        conv_id,
+                        &unit.reasoning_before,
+                        &unit.tool_name,
+                        &unit.tool_args,
+                        &unit.tool_result,
+                        &unit.reasoning_after,
+                        unit.outcome.as_str(),
+                        &unit.related_nodes,
+                    ) {
+                        tracing::warn!(target: "deeplossless::pipeline", "failed to store execution unit: {e}");
+                    }
+                }
             }
         });
 

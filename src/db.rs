@@ -298,6 +298,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_conv
                 ON dag_events(conv_id);"
         )?;
+
+        // v0.7: execution units — agent memory atoms
+        conn.execute_batch(crate::execution::MIGRATION)?;
+        // v0.7: code diff memory
+        conn.execute_batch(crate::execution::CODE_CHANGE_MIGRATION)?;
+
         Ok(())
     }
 
@@ -684,6 +690,199 @@ impl Database {
         })?;
         let mut results = Vec::new();
         for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    // ── Execution units (v0.7) ──────────────────────────────────────
+
+    /// Store an execution unit and return its ID.
+    pub fn store_execution_unit(
+        &self,
+        conv_id: i64,
+        reasoning_before: &str,
+        tool_name: &str,
+        tool_args: &str,
+        tool_result: &str,
+        reasoning_after: &str,
+        outcome: &str,
+        related_nodes: &[i64],
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let related_json = serde_json::to_string(related_nodes)?;
+        conn.execute(
+            "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![conv_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_json],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get execution units for a conversation, newest first.
+    pub fn get_execution_units(
+        &self,
+        conv_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::execution::ExecutionUnit>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, reasoning_before, tool_name, tool_args,
+                    tool_result, reasoning_after, outcome, related_nodes, created_at
+             FROM execution_units
+             WHERE conversation_id = ?1
+             ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            let related_str: String = row.get(8)?;
+            Ok(crate::execution::ExecutionUnit {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                reasoning_before: row.get(2)?,
+                tool_name: row.get(3)?,
+                tool_args: row.get(4)?,
+                tool_result: row.get(5)?,
+                reasoning_after: row.get(6)?,
+                outcome: crate::execution::ExecutionOutcome::from_str(
+                    &row.get::<_, String>(7)?
+                ).unwrap_or(crate::execution::ExecutionOutcome::Success),
+                related_nodes: serde_json::from_str(&related_str).unwrap_or_default(),
+                created_at: row.get(9)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Search execution units by tool name or reasoning content.
+    pub fn search_execution_units(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::execution::ExecutionUnitRef>> {
+        let conn = self.read_conn();
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT id, tool_name, outcome, reasoning_before
+             FROM execution_units
+             WHERE tool_name LIKE ?1 ESCAPE '\\'
+                OR reasoning_before LIKE ?1 ESCAPE '\\'
+                OR reasoning_after LIKE ?1 ESCAPE '\\'
+                OR tool_result LIKE ?1 ESCAPE '\\'
+             ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok(crate::execution::ExecutionUnitRef {
+                id: row.get(0)?,
+                tool_name: row.get(1)?,
+                outcome: row.get(2)?,
+                snippet: row.get::<_, String>(3)?.chars().take(80).collect(),
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Code diff memory (v0.7) ──────────────────────────────────────
+
+    /// Store a code change record.
+    pub fn store_code_change(
+        &self,
+        conv_id: i64,
+        file_path: &str,
+        diff: &str,
+        symbols: &[String],
+        error_before: &[String],
+        error_after: &[String],
+        execution_unit_id: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let symbols_json = serde_json::to_string(symbols)?;
+        let err_before_json = serde_json::to_string(error_before)?;
+        let err_after_json = serde_json::to_string(error_after)?;
+        conn.execute(
+            "INSERT INTO code_changes (conversation_id, file_path, diff, symbols_changed, error_before, error_after, execution_unit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![conv_id, file_path, diff, symbols_json, err_before_json, err_after_json, execution_unit_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Search code changes by file path, symbol, or error message.
+    pub fn search_code_changes(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, String, String, String)>> {
+        let conn = self.read_conn();
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, symbols_changed, error_before
+             FROM code_changes
+             WHERE file_path LIKE ?1 ESCAPE '\\'
+                OR symbols_changed LIKE ?1 ESCAPE '\\'
+                OR error_before LIKE ?1 ESCAPE '\\'
+             ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Execution-aware retrieval (v0.7) ─────────────────────────────
+
+    /// Search execution memory: finds similar bugs, tool chains, and code edits.
+    /// Cross-references execution_units, code_changes, and snippet FTS5.
+    pub fn search_execution_memory(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::execution::ExecutionUnitRef>> {
+        // Code changes return the most actionable results first
+        let code_results = self.search_code_changes(query, limit / 2).unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+
+        // Convert code change results to execution refs
+        let mut results: Vec<crate::execution::ExecutionUnitRef> = Vec::new();
+        for (id, file_path, symbols, errors) in &code_results {
+            if !seen.insert(*id) {
+                continue;
+            }
+            let sym: Vec<String> = serde_json::from_str(symbols).unwrap_or_default();
+            let snippet = if !sym.is_empty() {
+                format!("changed {} — {} symbols", file_path, sym.len())
+            } else if !errors.is_empty() {
+                let err: Vec<String> = serde_json::from_str(errors).unwrap_or_default();
+                format!("{} — fixed: {}", file_path, err.first().map(|s| s.as_str()).unwrap_or("?"))
+            } else {
+                file_path.clone()
+            };
+            results.push(crate::execution::ExecutionUnitRef {
+                id: *id,
+                tool_name: "code_change".to_string(),
+                outcome: "fixed".to_string(),
+                snippet,
+            });
+        }
+
+        // Then add execution unit results
+        let exec_results = self.search_execution_units(query, limit - results.len().min(limit)).unwrap_or_default();
+        for refr in exec_results {
+            if seen.insert(refr.id) {
+                results.push(refr);
+            }
+        }
+
+        results.truncate(limit);
         Ok(results)
     }
 

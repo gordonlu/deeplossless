@@ -69,6 +69,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/similar/{hash}", get(lcm_similar))
         .route("/v1/lcm/trace/{node_id}", get(lcm_trace))
         .route("/v1/lcm/global/search", get(lcm_global_search))
+        .route("/v1/lcm/execution/search", get(lcm_execution_search))
         .route("/v1/lcm/health/{conv_id}", get(lcm_dag_health))
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
@@ -283,6 +284,19 @@ async fn lcm_snippets(
         }
         Ok(None) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
+    }
+}
+
+/// Execution memory search — finds similar bugs, tool chains, code edits.
+async fn lcm_execution_search(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
+    match state.dag.search_execution_memory(query, limit) {
+        Ok(refs) => Json(json!({ "results": refs })).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("{e}")),
     }
 }
 
