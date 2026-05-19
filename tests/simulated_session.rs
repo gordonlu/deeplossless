@@ -66,6 +66,7 @@ fn apply_decision(
     }
 }
 
+#[allow(dead_code)]
 fn print_metrics(label: &str, cycle: &Mutex<deeplossless::runtime::ExecutionCycle>) {
     let c = cycle.lock().unwrap();
     let m = &c.metrics;

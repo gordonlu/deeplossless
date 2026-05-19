@@ -129,7 +129,7 @@ fn bench_fts5_insert(c: &mut Criterion) {
 // ── Runtime benchmarks (simulated coding session) ────────────────────
 
 fn bench_tool_cache_hit_rate(c: &mut Criterion) {
-    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+    let cycle = deeplossless::runtime::ExecutionCycle::new(
         deeplossless::runtime::RuntimeProfile::Efficient
     );
 
@@ -147,7 +147,7 @@ fn bench_tool_cache_hit_rate(c: &mut Criterion) {
 }
 
 fn bench_failure_avoidance(c: &mut Criterion) {
-    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+    let cycle = deeplossless::runtime::ExecutionCycle::new(
         deeplossless::runtime::RuntimeProfile::Efficient
     );
 
@@ -165,7 +165,7 @@ fn bench_failure_avoidance(c: &mut Criterion) {
 }
 
 fn bench_plan_continuation(c: &mut Criterion) {
-    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+    let cycle = deeplossless::runtime::ExecutionCycle::new(
         deeplossless::runtime::RuntimeProfile::Efficient
     );
 
