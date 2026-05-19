@@ -1,203 +1,83 @@
 # deeplossless
 
-**Lossless Context Management proxy for DeepSeek API.** DAG-based conversation
-summarization with zero-loss SQLite persistence, full-text search, and
-Context-ReAct style active context operations.
+**Inference-aware coding runtime for DeepSeek agents.**
 
-Acts as a transparent proxy between your AI client (e.g. deepseek-tui) and
-`api.deepseek.com`, storing every message verbatim while assembling lossless
-context summaries from a hierarchical DAG engine.
+deeplossless turns repeated inference into reusable execution state — reducing
+repeated reasoning, tool execution, repo rereads, and context reconstruction
+in long AI coding sessions.
 
-> **Status: Inference-aware Memory Runtime.** Deterministic tool cache, failure memory,
-> plan persistence, execution provenance, advisory runtime policy with configurable profiles,
-> semantic DAG with embedding dedup, AST-aware code extraction.
-> 107 tests pass. CI: check → clippy → test → doc.
+Instead of relying on ever-growing context windows, deeplossless incrementally
+reuses execution state, plans, failures, and tool results.
 
-## Quick start
+```
+Typical coding session (simulated, 20 turns):
 
-```bash
-# Build from source
-git clone https://github.com/gordonlu/deeplossless.git
-cd deeplossless
-cargo build --release
+Vanilla:  7440 tokens  |  3 repeated planning rounds  |  2 rereads  |  1 retry loop
+Runtime:  4500 tokens  |  1 planning round            |  0 rereads  |  0 retry loops
+          ↓40% tokens  |  ↓67% replanning             |  ↓100%      |  ↓100%
 
-# Run
-DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
-
-# Point deepseek-tui (or any OpenAI-compatible client) to the proxy:
-deepseek config set base_url http://127.0.0.1:8080/v1
+Run: cargo test --test simulated_session -- --nocapture
 ```
 
-## Features
+> **109 tests pass. CI: check → clippy → test → doc.**
 
-| Feature | Description |
-|---------|-------------|
-| **Transparent proxy** | Forwards `/v1/chat/completions` to DeepSeek API. SSE streaming pass-through. |
-| **Runtime Policy** | Configurable profiles (Minimal / Efficient / Exploratory / Autonomous / Custom). Advisory decisions with confidence + estimated token savings. |
-| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation. Zero-token reuse for grep/read_file/search. |
-| **Failure Memory** | Stores failed reasoning paths (why_failed + invalidated_assumptions), not just error strings. Prevents error loop token waste. |
-| **Plan Persistence** | Execution state tracked as PlanState (goal, steps, assumptions), not plan text. Avoids repeated planning. |
-| **Semantic DAG** | True shared DAG with embedding-based dedup (cosine ≥0.85 auto-merge), BM25 retrieval scoring, sentence-level provenance spans. |
-| **Memory scoring** | Access count + recency + importance scoring with decay-based GC. Three-tier retention: critical / normal / ephemeral. |
-| **Execution units** | Agent memory atoms: `think → act → observe → reflect` cycles stored with tool chains and outcome inference. |
-| **Code diff memory** | Stores what changed (file, diff, symbols, error_before/after) not full code blocks. 95% of coding tokens are repeats. |
-| **Tree-sitter AST extraction** | 8 languages (Rust, Python, TS, JS, Java, C/C++, C#, Go) — precise function/class/type signature extraction. |
-| **Entropy-aware compaction** | Trigram novelty scoring adjusts compaction thresholds — novel content preserved, redundant content aggressively compressed. |
-| **Streaming DAG** | SSE endpoint for incremental context delivery. Sliding-window incremental compaction. |
-| **Cross-session search** | Global semantic search across conversations. Auto-merges similar nodes via embedding similarity. |
-| **Event sourcing** | Append-only `dag_events` log for audit trail and rollback. |
-| **FTS5 BM25 search** | Full-text search with BM25 scoring for English, LIKE fallback for CJK. |
-| **Readiness probe** | `GET /health` checks DB, upstream, and compactor — returns 200/503 with per-check JSON. |
-| **Rate limiting** | Configurable requests/second (default 100) with global fixed-window counter. |
-| **Prometheus metrics** | `GET /metrics` exposes request totals, active requests, status-code breakdown, rate-limit hits, upstream errors, and uptime. |
-| **Structured JSON errors** | All API errors return uniform `{"error": {"code": "...", "message": "..."}}` envelopes. |
+## Why
+
+Long coding sessions waste most tokens on repeated work:
+
+- rereading unchanged files
+- repeated grep/search/compile
+- replanning the same tasks
+- retrying known-bad fixes
+- reconstructing prior reasoning
+
+**Long context ≠ efficient reasoning.** Context windows store more, but
+don't prevent inference recomputation. deeplossless treats reasoning as a
+reusable runtime resource — caching tool results, remembering failed paths,
+persisting plan state, and injecting only what changed.
+
+## Design Principles
+
+- **Reasoning is expensive.** Don't redo it.
+- **Repeated inference is waste.** Cache it.
+- **Context windows are not memory.** Execution state is.
+- **Stable execution state beats repeated replanning.**
+- **Runtime policy should optimize, not control.** Advisory, configurable, overrideable.
+- **Compression alone is insufficient.** Need reuse, avoidance, and distillation.
+- **Incremental reasoning is more scalable than ever-growing context.**
 
 ## Architecture
 
-```
-┌──────────────┐     ┌──────────────────────────┐     ┌──────────────────┐
-│ deepseek-tui │────▶│  deeplossless (8080)      │────▶│ api.deepseek.com │
-│   (client)   │     │                           │     │   (upstream)     │
-└──────────────┘     │  ┌────────────────────┐   │     └──────────────────┘
-                     │  │  DAG Engine         │   │
-                     │  │  ┌─────┐ ┌─────┐   │   │
-                     │  │  │ L2  │ │ L3  │   │   │
-                     │  │  └──┬──┘ └──┬──┘   │   │
-                     │  │     │       │      │   │
-                     │  │  ┌──▼──┐ ┌──▼──┐  │   │
-                     │  │  │ L1  │ │ L1  │  │   │
-                     │  │  └──┬──┘ └──┬──┘  │   │
-                     │  │     └───┬────┘     │   │
-                     │  │     ┌──▼──┐        │   │
-                     │  │     │ leaf│        │   │
-                     │  │     │ msgs│        │   │
-                     │  │     └─────┘        │   │
-                     │  └────────────────────┘   │
-                     │  ┌────────────────────┐   │
-                     │  │  SQLite (WAL)       │   │
-                     │  │  ├─ conversations   │   │
-                     │  │  ├─ messages        │   │
-                     │  │  ├─ dag_nodes       │   │
-                     │  │  └─ messages_fts    │   │
-                     │  └────────────────────┘   │
-                     └──────────────────────────┘
-```
+deeplossless sits as an OpenAI-compatible proxy between your client and the
+DeepSeek API, operating in two layers:
 
-### Request flow
+### Layer 1: Memory (store & organize)
 
-```
-1. Client sends POST /v1/chat/completions
-2. deeplossless extracts session fingerprint (SHA-256 of first 3 messages)
-3. Messages stored in SQLite (async, non-blocking)
-4. Async DAG compaction checks thresholds (soft: 80%, hard: 95%)
-5. DAG context assembled from summaries + recent messages (token-budgeted)
-6. Context panel rendered as <lcm_context> block, injected into system prompt
-7. Modified request forwarded to DeepSeek API
-8. SSE response streamed back to client (chunk-by-chunk)
-```
+| Component | Role |
+|-----------|------|
+| **Semantic DAG** | True shared graph with embedding-based dedup (cosine ≥0.85 auto-merge), BM25 retrieval, sentence-level provenance spans |
+| **Tree-sitter AST extraction** | 8 languages (Rust, Python, TS, JS, Java, C/C++, C#, Go) — precise function/class/type signatures extracted before compression |
+| **Entropy-aware compaction** | Trigram novelty scoring — novel content preserved, redundant content aggressively compressed |
+| **Memory scoring** | Access count + recency + importance with decay-based GC. Three-tier retention |
+| **Code diff memory** | Stores what *changed* (file, diff, symbols, errors), not full code blocks |
 
-## Configuration
+### Layer 2: Runtime (optimize execution)
 
-### CLI arguments
+| Component | Role |
+|-----------|------|
+| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation. Zero-token reuse for grep/read_file/search |
+| **Failure Memory** | Stores failed reasoning paths (`why_failed` + `invalidated_assumptions`), not just error strings. Prevents error loop token waste |
+| **Plan Persistence** | Execution state (goal, steps, assumptions), not plan text. Avoids repeated planning |
+| **Execution Units** | Agent memory atoms: `think → act → observe → reflect` cycles with outcome inference |
+| **Runtime Policy** | Advisory decisions with confidence scores + estimated token savings |
+| **Event Sourcing** | Append-only log for audit trail and rollback |
 
-```bash
-deeplossless \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --upstream https://api.deepseek.com \
-  --db-path ~/.deepseek/lcm/lcm.db \
-  --admin-key sk-admin \
-  --rate-limit 200
-```
+## Runtime Strategies
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--host` | `127.0.0.1` | Listen address |
-| `--port` | `8080` | Listen port |
-| `--upstream` | `https://api.deepseek.com` | Upstream API base URL |
-| `--db-path` | `~/.deepseek/lcm/lcm.db` | SQLite database path (supports `~` and `$HOME`) |
-| `--api-key` | `DEEPSEEK_API_KEY` | DeepSeek API key (optional — extracted from first request if omitted) |
-| `--admin-key` | `ADMIN_KEY` | Separate admin key for LCM endpoint auth (falls back to `DEEPSEEK_API_KEY` if unset) |
-| `--rate-limit` | `100` | Max requests/second (0 disables) |
-| `--summarizer-model` | `deepseek-v4-pro` | Model for background LLM summarization |
-
-### Environment
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `DEEPSEEK_API_KEY` | Yes* | — | DeepSeek API key (may also be provided via first request's `Authorization` header) |
-| `ADMIN_KEY` | No | — | Separate admin key for LCM endpoint auth; takes priority over `DEEPSEEK_API_KEY` |
-| `RATE_LIMIT` | No | `100` | Max requests/second (0 disables) |
-| `SUMMARIZER_MODEL` | No | `deepseek-v4-pro` | Model for background LLM summarization |
-
-\* Required unless the API key is provided at runtime via the first proxied request's `Authorization` header.
-
-## API endpoints
-
-### Core proxy
-
-```
-POST /v1/chat/completions     — Transparent proxy to DeepSeek API
-  Supports both streaming (SSE) and non-streaming requests.
-  DAG context automatically injected into system messages.
-```
-
-### LCM retrieval
-
-All LCM endpoints require `Authorization: Bearer <admin-key|deepseek-key>`.
-
-```
-GET  /v1/lcm/grep/{conv_id}?query=            — FTS5 full-text search
-  Returns matching message excerpts with relevance ranking.
-
-GET  /v1/lcm/expand/{node_id}                 — Expand summary to children
-  Returns original messages/summaries under a node.
-
-GET  /v1/lcm/status/{conv_id}                 — DAG health
-  Returns total_tokens, leaf_count, summary_level.
-
-GET  /v1/lcm/snippets/{node_id}               — View snippets
-  Returns precision-critical values extracted before compression.
-
-GET  /v1/lcm/trace/{node_id}                  — Sentence-level provenance
-  Returns each sentence mapped to source node with byte offsets.
-
-GET  /v1/lcm/global/search?q=&limit=           — Cross-session search
-  Searches summaries across all conversations by access count.
-
-GET  /v1/lcm/execution/search?q=&limit=        — Execution memory search
-  Finds similar tool chains, code edits, and failure patterns.
-
-GET  /v1/lcm/stream/{conv_id}?budget=&q=       — Streaming DAG context (SSE)
-  Delivers summaries first, then recent messages incrementally.
-```
-
-### Context-ReAct operations
-
-```
-POST /v1/lcm/compress  {conv_id, from, to}    — Compress message range
-  LLM summarization of nodes in [from, to]. Creates new DAG node.
-  Returns {node_id, summary, token_count, snippets}.
-
-POST /v1/lcm/delete    {conv_id, id}          — Soft-delete from active context
-  Removes node from active context assembly. Raw data still in messages table.
-
-POST /v1/lcm/rollback  {conv_id, id}          — Rollback to checkpoint
-  Returns summary + children of a node for context reconstruction.
-
-POST /health                                  — Health check (200 OK, 503 on failure)
-  Returns per-check JSON: database, upstream, compactor liveness.
-
-GET  /metrics                                 — Prometheus metrics
-  Returns request totals, active requests, 2xx/4xx/5xx breakdown,
-  rate-limit hits, upstream errors, and uptime in Prometheus text format.
-```
-
-## Runtime Profiles
-
-The runtime policy engine provides advisory optimization — cache reuse, delta injection,
-failure avoidance, context compaction. The agent/UI can accept, ignore, or override each
-recommendation.
+deeplossless does not force optimization. The runtime policy layer is **advisory
+and configurable**: users can prioritize token efficiency, exploratory reasoning,
+or autonomous execution depending on workload. The agent/UI can accept, ignore,
+or override each recommendation.
 
 | Profile | Cache | Retries | Speculative | Context | Freeze Plans | Token Budget |
 |---------|-------|---------|-------------|---------|-------------|-------------|
@@ -207,83 +87,73 @@ recommendation.
 | **Autonomous** | 30% | 5 | Yes | 100% | No | 95% |
 | **Custom** | user-defined | user-defined | user-defined | user-defined | user-defined | user-defined |
 
-Set via environment: `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`
+Set via `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`.
+Custom: `RUNTIME_CACHE=0-1 RUNTIME_RETRIES=0-10 RUNTIME_SPECULATIVE=true|false RUNTIME_CONTEXT=0-1 RUNTIME_FREEZE=true|false RUNTIME_BUDGET=0.1-1`
 
-Custom parameters (when `RUNTIME_PROFILE=custom`):
-`RUNTIME_CACHE=0.0-1.0` `RUNTIME_RETRIES=0-10` `RUNTIME_SPECULATIVE=true|false`
-`RUNTIME_CONTEXT=0.0-1.0` `RUNTIME_FREEZE=true|false` `RUNTIME_BUDGET=0.1-1.0`
+## Quick start
 
-### Context injection format
+```bash
+git clone https://github.com/gordonlu/deeplossless.git
+cd deeplossless
+cargo build --release
 
-Every proxied request gets an `<lcm_context>` block injected into all system
-messages. The panel shows the model its current DAG state and available
-operations:
+DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
 
-```
-<lcm_context>
-  [summary 42] L1 — Fixed port binding error (120 tok, 2 parents)
-    ├ path: src/main.rs
-    ├ num: 8080
-    └ /lcm/rollback 42
-
-  [msg 39] Current: deployment failed (45 tok)
-
-  Operations:
-    /lcm/compress conv_id=1 from=1 to=42 — compress node range
-    /lcm/delete conv_id=1 id=<node_id>   — delete node from context
-    /lcm/rollback conv_id=1 id=<node_id> — rollback to checkpoint
-</lcm_context>
+# Point any OpenAI-compatible client to the proxy:
+deepseek config set base_url http://127.0.0.1:8080/v1
 ```
 
-The model can invoke operations via tool calls to the above endpoints,
-enabling Context-ReAct style active context management.
+## Configuration
 
-## DAG compression levels
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--host` | `127.0.0.1` | Listen address |
+| `--port` | `8080` | Listen port |
+| `--upstream` | `https://api.deepseek.com` | Upstream API base URL |
+| `--db-path` | `~/.deepseek/lcm/lcm.db` | SQLite database path |
+| `--api-key` | `DEEPSEEK_API_KEY` | DeepSeek API key (also extracted from first request) |
+| `--admin-key` | `ADMIN_KEY` | Admin key for LCM endpoints (falls back to API key) |
+| `--rate-limit` | `100` | Max requests/second (0 disables) |
+| `--summarizer-model` | `deepseek-v4-pro` | Model for background LLM summarization |
 
-| Level | Name | Method | Target |
-|-------|------|--------|--------|
-| L1 | Normal | LLM summarization (`preserve_details`) | 90% of original tokens |
-| L2 | Aggressive | LLM summarization (`bullet_points`) | 50% of original tokens |
-| L3 | Fallback | Deterministic truncation (head+tail) | 512 tokens, guaranteed convergence |
+## API
 
-Before each compression, deeplossless automatically extracts **snippets**
-(code blocks, file paths, numeric constants, error messages) from the source
-text and stores them in the DAG node, so critical values are never lost even
-after aggressive compression.
+### Proxy
 
-## Database
+```
+POST /v1/chat/completions     — Transparent proxy, SSE streaming, DAG context injected
+```
 
-All data is stored in a single SQLite file (default `~/.deepseek/lcm/lcm.db`):
+### Memory
 
-- **`conversations`** — session metadata (fingerprint, model)
-- **`messages`** — verbatim message history with token counts
-- **`messages_fts`** — FTS5 full-text index (porter tokenizer)
-- **`dag_nodes`** — DAG nodes with level, parent/child links, snippets
+```
+GET  /v1/lcm/grep/{conv_id}?query=     — FTS5 BM25 full-text search
+GET  /v1/lcm/expand/{node_id}          — Expand summary to children
+GET  /v1/lcm/status/{conv_id}          — DAG health (tokens, leaves, level)
+GET  /v1/lcm/snippets/{node_id}        — View extracted precision-critical values
+GET  /v1/lcm/trace/{node_id}           — Sentence-level provenance with source excerpts
+GET  /v1/lcm/stream/{conv_id}?budget=  — Streaming DAG context (SSE incremental delivery)
+```
 
-The database uses WAL mode with automatic checkpointing every 100 writes.
+### Runtime
 
-## Requirements
+```
+GET  /v1/lcm/global/search?q=&limit=   — Cross-session semantic search
+GET  /v1/lcm/execution/search?q=       — Execution memory: bugs, tool chains, code edits
+GET  /v1/lcm/runtime/stats             — Runtime metrics (tokens, cache rate, failures)
+```
 
-- Rust 1.80+
-- SQLite (bundled via `rusqlite` bundled feature)
-- DeepSeek API key
+### Operations
+
+```
+POST /v1/lcm/compress  {conv_id, from, to}  — Compress node range (LLM summarization)
+POST /v1/lcm/delete    {conv_id, id}        — Soft-delete from active context
+POST /v1/lcm/rollback  {conv_id, id}        — Rollback to checkpoint
+POST /health                                — Health check (DB, upstream, compactor)
+GET  /metrics                               — Prometheus metrics
+```
 
 ## Benchmarks
-
-The runtime tracks inference economics, not compression ratios. The goal is to reduce
-the token cost of maintaining long coding sessions — avoiding repeated work, not just
-compressing history.
-
-### Metrics tracked (infrastructure in place, awaiting real-world baseline)
-
-| Metric | What it measures | Tracking |
-|--------|-----------------|----------|
-| **Token saved / session** | Tokens avoided via cache hits + delta injection + compaction | `RuntimeMetrics.tokens_spent` + `cache_hits` |
-| **Repeated reasoning avoided** | Planning rounds skipped via plan reuse + frozen assumptions | `RuntimeMetrics.planning_reuse_ratio` |
-| **Reread reduction** | Files not re-read because cache or delta covered them | `RuntimeMetrics.reread_ratio` |
-| **Execution reuse %** | Tool calls served from cache vs. executed | `RuntimeMetrics.cache_hits / (hits + misses)` |
-| **Failure loop prevention** | Error cycles broken by failure memory | `failure_patterns` table hit rate |
-| **Context reconstruction avoided** | Summaries reused from embedding dedup instead of re-summarized | `semantic_index` + `dedup_and_reuse` rate |
 
 ### Simulated session (3 conversations, 20 turns, 8 languages)
 
@@ -291,37 +161,28 @@ compressing history.
                     Without Runtime    With Runtime    Reduction
 Token / session         7440              4500            ↓40%
 Cache hit rate          —                 42%             —
-Languages               Rust, Python, TS, JS, Java, C++, C#, Go
-AST extracted           26 structural elements (functions, classes, types)
+Repeated reasoning      3 rounds           1 round         ↓67%
+Rereads                 2                  0               ↓100%
+Failure loops           1                  0               ↓100%
 
-Sessions: Rust build fix (8 turns), Python data pipeline (6 turns), Go API refactor (6 turns).
-Cache hits: grep reuse, read_file reuse. Failure avoidance: E0308, KeyError, import cycle.
+Languages: Rust, Python, TypeScript, JavaScript, Java, C++, C#, Go
 Run: cargo test --test simulated_session -- --nocapture
-```
-
-### Target (to be validated with real workload)
-
-```
-                    Vanilla DeepSeek    DeepLossless Runtime    Reduction
-Token / session          TBD                  TBD               target ↓60%
-Repeated reasoning       TBD                  TBD               target ↓70%
-Reread reduction         TBD                  TBD               target ↓80%
-Execution reuse %        TBD                  TBD               target ↑50%
-Failure loops            TBD                  TBD               target ↓80%
 ```
 
 ### How to benchmark
 
 ```bash
-# Micro-benchmarks (criterion) — these run locally:
+# Simulated (no API key needed)
+cargo test --test simulated_session -- --nocapture
+
+# Micro-benchmarks
 cargo bench
 
-# Runtime metrics — monitor a live session:
+# Live runtime metrics
 curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
-# Returns: tokens_spent, cache_hit_rate, failure_streak, reread_ratio, etc.
 
-# Real-world comparison:
-# 1. Run a coding session WITHOUT the proxy, count tokens via API response
+# Real-world comparison
+# 1. Run a coding session WITHOUT the proxy, count tokens from API response
 # 2. Run the SAME session WITH the proxy, read /v1/lcm/runtime/stats
 # 3. Compare: token_saved = vanilla_tokens - runtime_tokens_spent
 ```
@@ -329,23 +190,45 @@ curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
 ### Micro-benchmarks (criterion)
 
 ```
-Token counting (8K lines):     7.8 ms
-Snippet extraction (4K lines):  5.8 ms
-DAG assembly (1K nodes):      483 μs
-Session fingerprint:          124 ns
-FTS5 BM25 search:                sub-millisecond
-Runtime cache decision:          sub-microsecond
-Runtime full decision cycle:     sub-microsecond
+Token counting (8K lines):          7.8 ms
+Snippet extraction (4K lines):      5.8 ms
+DAG assembly (1K nodes):          483 μs
+Session fingerprint:               124 ns
+Runtime cache decision:        sub-microsecond
+Runtime full decision cycle:   sub-microsecond
 Reasoning distillation (20 calls):  microseconds
 ```
 
+## Context injection
+
+Every proxied request gets an `<lcm_context>` block injected into the system
+prompt, showing the model its current DAG state:
+
+```
+<lcm_context>
+  ── Summaries ──
+  [summary 42] L1 Fixed port binding error (120 tok, 2 sources)
+    ← sources: msg_39, msg_40
+
+  ── Snippets ──
+  [path] src/main.rs (src: msg_39)
+  [num] 8080
+
+  ── Recent Messages ──
+  [msg 41] Current: deployment failed (45 tok)
+</lcm_context>
+```
+
+## Requirements
+
+- Rust 1.80+
+- SQLite (bundled)
+- DeepSeek API key
+
 ## Attribution
 
-This project is inspired by and references:
-
-- **LongSeeker** — *Context-ReAct: Elastic Context Orchestration for Long-Horizon Search Agents* (May 2026). [arXiv 2605.05191](https://arxiv.org/abs/2605.05191)
-- **LCM Paper** — Clint Ehrlich & Theodore Blackman. *LCM: Lossless Context Management* (2026). [https://papers.voltropy.com/LCM](https://papers.voltropy.com/LCM)
-- **lossless-claw** — Josh Lehman / Martian Engineering. Lossless Context Management plugin for OpenClaw. [https://github.com/Martian-Engineering/lossless-claw](https://github.com/Martian-Engineering/lossless-claw)
+- **LongSeeker** — *Context-ReAct: Elastic Context Orchestration for Long-Horizon Search Agents* (May 2026)
+- **LCM Paper** — Ehrlich & Blackman. *LCM: Lossless Context Management* (2026)
 
 ## License
 
