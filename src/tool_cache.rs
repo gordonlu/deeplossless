@@ -1,5 +1,73 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// In-memory L1 cache for hot tool results. Avoids SQLite round-trip for
+/// frequently repeated tool calls (grep, read_file, etc.).
+/// Limited to 128 entries, LRU-eviction on overflow.
+pub struct L1HotCache {
+    entries: RwLock<HashMap<(String, String), CacheEntry>>,
+}
+
+struct CacheEntry {
+    result: String,
+    dependent_files: Vec<String>,
+    hit_count: u32,
+}
+
+impl Default for L1HotCache {
+    fn default() -> Self {
+        Self { entries: RwLock::new(HashMap::new()) }
+    }
+}
+
+impl L1HotCache {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// Look up a cached result. Returns None on miss.
+    pub fn get(&self, tool_name: &str, args_hash: &str) -> Option<String> {
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
+        map.get(&(tool_name.to_string(), args_hash.to_string()))
+            .map(|e| e.result.clone())
+    }
+
+    /// Store a result in L1. Evicts oldest if over capacity.
+    pub fn put(&self, tool_name: &str, args_hash: &str, result: &str, dependent_files: &[String]) {
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= 128 {
+            // Evict the entry with lowest hit count
+            if let Some(key) = map.iter()
+                .min_by_key(|(_, e)| e.hit_count)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&key);
+            }
+        }
+        map.insert((tool_name.to_string(), args_hash.to_string()), CacheEntry {
+            result: result.to_string(),
+            dependent_files: dependent_files.to_vec(),
+            hit_count: 1,
+        });
+    }
+
+    /// Invalidate entries whose dependent files overlap with changed_files.
+    pub fn invalidate(&self, changed_files: &[String]) -> usize {
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        let changed: HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+        map.retain(|_, e| !e.dependent_files.iter().any(|f| changed.contains(f.as_str())));
+        before - map.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
 
 /// Tools that benefit most from caching — deterministic, expensive, frequently repeated.
 const CACHEABLE_TOOLS: &[&str] = &[

@@ -65,12 +65,13 @@ impl DatabaseBuilder {
 /// Read operations go through a connection pool (round-robin dispatch).
 /// Writes go through a dedicated writer connection serialised by a Mutex.
 /// WAL mode ensures writes don't block reads.
-const READ_POOL_SIZE: usize = 3;
+const READ_POOL_SIZE: usize = 8;
 
 pub struct Database {
     read_pool: Vec<Mutex<Connection>>,
     writer: Mutex<Connection>,
     write_count: AtomicU64,
+    tool_cache_l1: crate::tool_cache::L1HotCache,
 }
 
 /// Run a WAL checkpoint every N writes to limit WAL file growth.
@@ -112,6 +113,7 @@ impl Database {
             read_pool,
             writer: Mutex::new(writer),
             write_count: AtomicU64::new(0),
+            tool_cache_l1: crate::tool_cache::L1HotCache::default(),
         };
         db.migrate()?;
         Ok(db)
@@ -917,7 +919,12 @@ impl Database {
     // ── Tool result cache (v0.8) ──────────────────────────────────────
 
     /// Look up a cached tool result. Returns (result, hit_count) if found.
+    /// Checks L1 in-memory cache first, falls back to SQLite.
     pub fn tool_cache_get(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<(String, i64)>> {
+        // L1 hot cache check (no SQLite round-trip)
+        if let Some(result) = self.tool_cache_l1.get(tool_name, args_hash) {
+            return Ok(Some((result, 1)));
+        }
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT result, hit_count FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2"
@@ -944,6 +951,8 @@ impl Database {
         result: &str,
         dependent_files: &[String],
     ) -> anyhow::Result<()> {
+        // Populate L1 first (fast path for subsequent reads)
+        self.tool_cache_l1.put(tool_name, args_hash, result, dependent_files);
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let files_json = serde_json::to_string(dependent_files)?;
         conn.execute(
@@ -959,6 +968,8 @@ impl Database {
         if changed_files.is_empty() {
             return Ok(0);
         }
+        // Invalidate L1 first
+        self.tool_cache_l1.invalidate(changed_files);
         let conn = self.read_conn();
         // Find all cached entries
         let mut stmt = conn.prepare("SELECT id, dependent_files FROM tool_cache")?;
