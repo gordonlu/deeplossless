@@ -330,13 +330,16 @@ async fn lcm_stream_context(
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-    Response::builder()
+    match axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("x-accel-buffering", "no")
         .body(axum::body::Body::from_stream(stream))
-        .unwrap()
+    {
+        Ok(resp) => resp,
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "STREAM_ERROR", format!("{e}")),
+    }
 }
 
 /// Runtime metrics endpoint — exposes inference-economics counters for benchmarking.
