@@ -270,25 +270,40 @@ The database uses WAL mode with automatic checkpointing every 100 writes.
 
 ## Benchmarks
 
+The runtime tracks inference economics, not compression ratios. The goal is to reduce
+the token cost of maintaining long coding sessions — avoiding repeated work, not just
+compressing history.
+
+### Metrics tracked (infrastructure in place, awaiting real-world baseline)
+
+| Metric | What it measures | Tracking |
+|--------|-----------------|----------|
+| **Token saved / session** | Tokens avoided via cache hits + delta injection + compaction | `RuntimeMetrics.tokens_spent` + `cache_hits` |
+| **Repeated reasoning avoided** | Planning rounds skipped via plan reuse + frozen assumptions | `RuntimeMetrics.planning_reuse_ratio` |
+| **Reread reduction** | Files not re-read because cache or delta covered them | `RuntimeMetrics.reread_ratio` |
+| **Execution reuse %** | Tool calls served from cache vs. executed | `RuntimeMetrics.cache_hits / (hits + misses)` |
+| **Failure loop prevention** | Error cycles broken by failure memory | `failure_patterns` table hit rate |
+| **Context reconstruction avoided** | Summaries reused from embedding dedup instead of re-summarized | `semantic_index` + `dedup_and_reuse` rate |
+
+### Target (to be validated with real workload)
+
 ```
-📐  DAG Compression
-     Original: 740 tokens → Compressed: 335 tokens (2.2×)
-     Snippets preserved: 7 critical values extracted
-     Compression levels: L1 (LLM detailed) → L2 (LLM bullet) → L3 (deterministic)
+                    Vanilla DeepSeek    DeepLossless Runtime    Reduction
+Token / session          TBD                  TBD               target ↓60%
+Repeated reasoning       TBD                  TBD               target ↓70%
+Reread reduction         TBD                  TBD               target ↓80%
+Execution reuse %        TBD                  TBD               target ↑50%
+Failure loops            TBD                  TBD               target ↓80%
+```
 
-🔍  FTS5 Full-Text Search
-     Porter tokenizer with Unicode61 support
-     Sub-millisecond query latency
+### Micro-benchmarks (criterion)
 
-⚡  Processing (criterion benchmarks)
-     Token counting (8K lines):     7.8 ms
-     Snippet extraction (4K lines):  5.8 ms
-     DAG assembly (1K nodes):      483 μs
-     Session fingerprint:          124 ns
-
-💾  KV Cache Safe
-     Context injection:          system prompt only (never touches messages)
-     Memory:                     messages stored verbatim in SQLite
+```
+Token counting (8K lines):     7.8 ms
+Snippet extraction (4K lines):  5.8 ms
+DAG assembly (1K nodes):      483 μs
+Session fingerprint:          124 ns
+FTS5 BM25 search:                sub-millisecond
 ```
 
 ## Attribution
