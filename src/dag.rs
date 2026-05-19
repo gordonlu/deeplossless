@@ -488,6 +488,14 @@ impl DagEngine {
                     if let Err(e) = self.db.store_embedding(node.id, &vec, model, dims) {
                         tracing::warn!(target: "deeplossless::dag", "store_embedding failed: {e}");
                     }
+                    // Auto-merge: find similar nodes across sessions
+                    if let Ok(Some((similar_id, _sim))) = self.db.find_nearest_embedding(&vec, 0.85)
+                        && similar_id != node.id {
+                            let _ = self.db.insert_edge(similar_id, node.id, "reuses");
+                            tracing::debug!(target: "deeplossless::dag",
+                                node_id = node.id, similar = similar_id,
+                                "auto-merged across sessions");
+                        }
                 }
             }
         }
@@ -909,6 +917,40 @@ impl DagEngine {
             }
         }
         Ok(ghosts)
+    }
+
+    /// Score-driven GC: soft-deletes low-value nodes based on memory scores.
+    /// Ephemeral tier (score < 0.3) is deleted first. Critical tier (≥ 0.7)
+    /// is never deleted. Returns count of nodes deleted.
+    pub fn gc_by_score(&self, conv_id: i64, max_to_delete: usize) -> anyhow::Result<usize> {
+        let all_nodes = self.db.get_all_dag_nodes(conv_id)?;
+        let mut scored: Vec<(&DagNode, f64)> = all_nodes.iter()
+            .filter(|n| !n.is_leaf) // never delete raw leaves
+            .map(|n| (n, self.compute_memory_score(n)))
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut deleted = 0;
+        for (node, score) in &scored {
+            if deleted >= max_to_delete {
+                break;
+            }
+            if *score >= 0.7 {
+                break; // critical tier, stop deleting
+            }
+            // Protect shared nodes
+            let incoming = self.db.get_edges_to(node.id).unwrap_or_default();
+            let has_external = incoming.iter().any(|(from_id, _, _)| {
+                self.db.get_node(*from_id).ok().flatten()
+                    .map(|n| n.conversation_id != conv_id).unwrap_or(false)
+            });
+            if has_external {
+                continue;
+            }
+            self.db.delete_dag_node(node.id)?;
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 
     // ── DAG validation (P0 consistency) ─────────────────────────────────

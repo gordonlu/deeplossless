@@ -255,7 +255,69 @@ fn token_truncate(text: &str, max_tokens: usize) -> String {
 
 /// Extract structural code elements (functions, types, imports) from code text.
 /// Uses line-based heuristics that work across Rust, Python, Go, TypeScript.
+/// Tree-sitter based extraction for Rust code (precise AST boundaries).
+fn extract_rust_ast(code: &str) -> Option<Vec<String>> {
+    let mut elements = Vec::new();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(code, None)?;
+    let root = tree.root_node();
+    let mut seen = std::collections::HashSet::new();
+
+    // Recursively walk the AST looking for declarations
+    let mut stack: Vec<tree_sitter::Node> = root.children(&mut root.walk()).collect();
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_item" | "function_signature_item" => {
+                let text = &code[node.start_byte()..node.end_byte()];
+                let first_line = text.lines().next().unwrap_or(text);
+                if seen.insert(first_line.to_string()) {
+                    elements.push(truncate_to_line(first_line, 120));
+                }
+            }
+            "struct_item" | "enum_item" | "trait_item" | "impl_item" => {
+                let text = &code[node.start_byte()..node.end_byte()];
+                let first_line = text.lines().next().unwrap_or(text);
+                if seen.insert(first_line.to_string()) {
+                    elements.push(truncate_to_line(first_line, 120));
+                }
+            }
+            "use_declaration" => {
+                let text = &code[node.start_byte()..node.end_byte()];
+                let trimmed = text.trim();
+                if !trimmed.starts_with("use std::") && seen.insert(trimmed.to_string()) {
+                    elements.push(trimmed.to_string());
+                }
+            }
+            "const_item" | "static_item" => {
+                let text = &code[node.start_byte()..node.end_byte()];
+                let first_line = text.lines().next().unwrap_or(text);
+                if seen.insert(first_line.to_string()) {
+                    elements.push(truncate_to_line(first_line, 80));
+                }
+            }
+            _ => {}
+        }
+        // Push children for further traversal
+        let mut children: Vec<tree_sitter::Node> = node.children(&mut node.walk()).collect();
+        children.reverse(); // maintain DFS order
+        for child in children {
+            stack.push(child);
+        }
+    }
+
+    elements.truncate(10);
+    Some(elements)
+}
+
 fn extract_code_structure(code: &str, lang: &str) -> Vec<String> {
+    // Use tree-sitter for Rust
+    if (lang.contains("rust") || lang.is_empty())
+        && let Some(elements) = extract_rust_ast(code)
+            && !elements.is_empty() {
+                return elements;
+            }
+    // Fall back to line-based heuristics
     let mut elements = Vec::new();
     let is_rust = lang.contains("rust") || lang.is_empty();
     let is_py = lang.contains("python") || lang.contains("py");

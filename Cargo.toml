@@ -43,6 +43,10 @@ shellexpand = "3"
 sha2 = "0.10"
 hex = "0.4"
 
+# AST parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
