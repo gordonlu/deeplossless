@@ -296,6 +296,22 @@ Execution reuse %        TBD                  TBD               target ↑50%
 Failure loops            TBD                  TBD               target ↓80%
 ```
 
+### How to benchmark
+
+```bash
+# Micro-benchmarks (criterion) — these run locally:
+cargo bench
+
+# Runtime metrics — monitor a live session:
+curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
+# Returns: tokens_spent, cache_hit_rate, failure_streak, reread_ratio, etc.
+
+# Real-world comparison:
+# 1. Run a coding session WITHOUT the proxy, count tokens via API response
+# 2. Run the SAME session WITH the proxy, read /v1/lcm/runtime/stats
+# 3. Compare: token_saved = vanilla_tokens - runtime_tokens_spent
+```
+
 ### Micro-benchmarks (criterion)
 
 ```
@@ -304,6 +320,9 @@ Snippet extraction (4K lines):  5.8 ms
 DAG assembly (1K nodes):      483 μs
 Session fingerprint:          124 ns
 FTS5 BM25 search:                sub-millisecond
+Runtime cache decision:          sub-microsecond
+Runtime full decision cycle:     sub-microsecond
+Reasoning distillation (20 calls):  microseconds
 ```
 
 ## Attribution

@@ -71,6 +71,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/global/search", get(lcm_global_search))
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
+        .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
         .route("/v1/lcm/health/{conv_id}", get(lcm_dag_health))
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
@@ -336,6 +337,29 @@ async fn lcm_stream_context(
         .header("x-accel-buffering", "no")
         .body(axum::body::Body::from_stream(stream))
         .unwrap()
+}
+
+/// Runtime metrics endpoint — exposes inference-economics counters for benchmarking.
+async fn lcm_runtime_stats(
+    State(state): State<AppState>,
+) -> Response {
+    let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
+    let m = &cycle.metrics;
+    let total_cache = m.cache_hits + m.cache_misses;
+    Json(json!({
+        "profile": cycle.profile.as_str(),
+        "tokens_spent": m.tokens_spent,
+        "cache_hits": m.cache_hits,
+        "cache_misses": m.cache_misses,
+        "cache_hit_rate": if total_cache > 0 { (m.cache_hits as f64 / total_cache as f64 * 100.0).round() / 100.0 } else { 0.0 },
+        "repeated_failures": m.repeated_failures,
+        "failure_streak": m.failure_streak,
+        "reread_ratio": m.reread_ratio,
+        "planning_reuse_ratio": m.planning_reuse_ratio,
+        "budget_remaining_pct": m.budget_remaining_pct,
+        "decisions_count": cycle.decisions.len(),
+        "recent_decisions": &cycle.decisions.iter().rev().take(5).collect::<Vec<_>>(),
+    })).into_response()
 }
 
 /// Execution memory search — finds similar bugs, tool chains, code edits.

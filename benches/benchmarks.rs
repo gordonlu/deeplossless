@@ -126,6 +126,114 @@ fn bench_fts5_insert(c: &mut Criterion) {
     });
 }
 
+// ── Runtime benchmarks (simulated coding session) ────────────────────
+
+fn bench_tool_cache_hit_rate(c: &mut Criterion) {
+    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+        deeplossless::runtime::RuntimeProfile::Efficient
+    );
+
+    c.bench_function("runtime/cache_hit_decision", |b| {
+        b.iter(|| {
+            let d = deeplossless::runtime::RuntimePolicy::decide(
+                &cycle,
+                Some(("grep", 42, 500)),
+                None,
+                None,
+            );
+            black_box(d)
+        })
+    });
+}
+
+fn bench_failure_avoidance(c: &mut Criterion) {
+    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+        deeplossless::runtime::RuntimeProfile::Efficient
+    );
+
+    c.bench_function("runtime/failure_retry_decision", |b| {
+        b.iter(|| {
+            let d = deeplossless::runtime::RuntimePolicy::decide(
+                &cycle,
+                None,
+                Some(("sqlite deadlock", "use WAL mode + reader pool")),
+                None,
+            );
+            black_box(d)
+        })
+    });
+}
+
+fn bench_plan_continuation(c: &mut Criterion) {
+    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+        deeplossless::runtime::RuntimeProfile::Efficient
+    );
+
+    c.bench_function("runtime/plan_continue_decision", |b| {
+        b.iter(|| {
+            let d = deeplossless::runtime::RuntimePolicy::decide(
+                &cycle,
+                None,
+                None,
+                Some((1, "fix build error", 3)),
+            );
+            black_box(d)
+        })
+    });
+}
+
+fn bench_full_decision_cycle(c: &mut Criterion) {
+    let mut cycle = deeplossless::runtime::ExecutionCycle::new(
+        deeplossless::runtime::RuntimeProfile::Efficient
+    );
+    // Simulate state: some failures, some cache
+    cycle.metrics.cache_hits = 5;
+    cycle.metrics.cache_misses = 2;
+    cycle.metrics.failure_streak = 1;
+    cycle.metrics.budget_remaining_pct = 0.75;
+
+    c.bench_function("runtime/full_decision_cycle", |b| {
+        b.iter(|| {
+            // Simulate a full cycle: check cache, check failures, check plan, fall through
+            let d1 = deeplossless::runtime::RuntimePolicy::decide(
+                &cycle,
+                Some(("grep", 1, 300)),
+                None,
+                Some((1, "task", 2)),
+            );
+            let d2 = deeplossless::runtime::RuntimePolicy::decide(
+                &cycle,
+                None,
+                Some(("deadlock", "use reader pool")),
+                None,
+            );
+            let d3 = deeplossless::runtime::RuntimePolicy::decide(
+                &cycle,
+                None,
+                None,
+                None,
+            );
+            black_box((d1, d2, d3))
+        })
+    });
+}
+
+fn bench_reasoning_distillation(c: &mut Criterion) {
+    let seq: Vec<(String, String, String)> = (0..20).map(|i| {
+        if i % 3 == 0 {
+            ("grep".into(), "pattern".into(), format!("Error: no match {i}"))
+        } else if i == 19 {
+            ("compile".into(), "".into(), "Success: build passes".into())
+        } else {
+            ("read_file".into(), format!("src/mod{i}.rs"), "fn main() {}".into())
+        }
+    }).collect();
+
+    c.bench_function("runtime/distill_20_tool_calls", |b| {
+        b.iter(|| deeplossless::runtime::ExecutionCompactor::distill(black_box(&seq)))
+    });
+}
+
 criterion_group!(benches,
     bench_token_count,
     bench_snippet_extraction,
@@ -134,5 +242,10 @@ criterion_group!(benches,
     bench_snippet_preservation,
     bench_dag_gc,
     bench_fts5_insert,
+    bench_tool_cache_hit_rate,
+    bench_failure_avoidance,
+    bench_plan_continuation,
+    bench_full_decision_cycle,
+    bench_reasoning_distillation,
 );
 criterion_main!(benches);
