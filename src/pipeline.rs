@@ -197,7 +197,19 @@ impl ChatPipeline {
             .and_then(|m| m["content"].as_str());
         if let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query) {
             if !dag_ctx.is_empty() {
-                let ctx_text = render_dag_context(&dag_ctx);
+                let mut ctx_text = render_dag_context(&dag_ctx);
+                // Append active file conflicts so agents can avoid stepping on each other
+                if let Ok(claims) = self.db.list_all_file_claims()
+                    && !claims.is_empty() {
+                        // Replace closing tag, add conflicts, re-add closing tag
+                        ctx_text = ctx_text.trim_end_matches("</lcm_context>\n").to_string();
+                        use std::fmt::Write;
+                        let _ = writeln!(ctx_text, "  ── Active File Claims ──");
+                        for (agent, path, op) in &claims {
+                            let _ = writeln!(ctx_text, "  [{agent}] {op}: {path}");
+                        }
+                        let _ = writeln!(ctx_text, "</lcm_context>");
+                    }
                 Self::inject_context(&mut injected, &ctx_text);
             }
         } else {
