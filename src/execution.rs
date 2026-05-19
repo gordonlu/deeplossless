@@ -257,3 +257,105 @@ pub const CODE_CHANGE_MIGRATION: &str = "
         ON code_changes(file_path);
     CREATE INDEX IF NOT EXISTS idx_code_change_symbols
         ON code_changes(symbols_changed);";
+
+// ── Failure Memory (v0.8) ────────────────────────────────────────────
+
+/// A recorded failure pattern — not just the error, but the reasoning path
+/// that led to it. The real cost is the failed reasoning, not the error itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailurePattern {
+    pub id: i64,
+    pub conversation_id: i64,
+
+    /// Error signature: normalized error message / symptom.
+    pub signature: String,
+
+    /// What fix was attempted.
+    pub attempted_fix: String,
+
+    /// Why the fix didn't work — the critical field.
+    /// E.g., "Adding async mutex failed because SQLite connection still shared globally."
+    pub why_failed: String,
+
+    /// Assumptions that turned out to be wrong.
+    pub invalidated_assumptions: Vec<String>,
+
+    /// Files involved in the failure.
+    pub related_files: Vec<String>,
+
+    /// Link to the execution unit that recorded this failure.
+    pub execution_unit_id: Option<i64>,
+
+    pub created_at: String,
+}
+
+/// SQL migration for failure_patterns table.
+pub const FAILURE_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS failure_patterns (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id         INTEGER NOT NULL REFERENCES conversations(id),
+        signature               TEXT NOT NULL,
+        attempted_fix           TEXT NOT NULL DEFAULT '',
+        why_failed              TEXT NOT NULL DEFAULT '',
+        invalidated_assumptions TEXT NOT NULL DEFAULT '[]',
+        related_files           TEXT NOT NULL DEFAULT '[]',
+        execution_unit_id       INTEGER REFERENCES execution_units(id),
+        created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_failure_sig
+        ON failure_patterns(signature);
+    CREATE INDEX IF NOT EXISTS idx_failure_conv
+        ON failure_patterns(conversation_id);";
+
+// ── Plan Persistence (v0.8) ──────────────────────────────────────────
+
+/// Execution state for a plan — not the plan text, but the machine-readable
+/// state that tracks what's done, what's blocked, and what assumptions hold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanState {
+    pub id: i64,
+    pub conversation_id: i64,
+
+    /// The goal this plan is working toward.
+    pub goal: String,
+
+    /// Steps awaiting execution (ordered).
+    pub pending_steps: Vec<String>,
+
+    /// Steps that completed successfully.
+    pub completed_steps: Vec<String>,
+
+    /// Steps blocked by external conditions (compile error, missing dep, etc.).
+    pub blocked_steps: Vec<String>,
+
+    /// Steps invalidated by intervening changes.
+    pub invalidated_steps: Vec<String>,
+
+    /// Assumptions at plan creation time. Critical — these are what get
+    /// re-validated on plan reactivation.
+    pub assumptions: Vec<String>,
+
+    /// Whether this plan is still the active plan for the conversation.
+    pub is_active: bool,
+
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// SQL migration for plan_states table.
+pub const PLAN_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS plan_states (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id     INTEGER NOT NULL REFERENCES conversations(id),
+        goal                TEXT NOT NULL DEFAULT '',
+        pending_steps       TEXT NOT NULL DEFAULT '[]',
+        completed_steps     TEXT NOT NULL DEFAULT '[]',
+        blocked_steps       TEXT NOT NULL DEFAULT '[]',
+        invalidated_steps   TEXT NOT NULL DEFAULT '[]',
+        assumptions         TEXT NOT NULL DEFAULT '[]',
+        is_active           INTEGER NOT NULL DEFAULT 1,
+        created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_conv
+        ON plan_states(conversation_id);";

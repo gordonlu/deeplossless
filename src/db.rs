@@ -313,6 +313,12 @@ impl Database {
         conn.execute_batch(crate::execution::MIGRATION)?;
         // v0.7: code diff memory
         conn.execute_batch(crate::execution::CODE_CHANGE_MIGRATION)?;
+        // v0.8: tool result cache
+        conn.execute_batch(crate::tool_cache::MIGRATION)?;
+        // v0.8: failure memory
+        conn.execute_batch(crate::execution::FAILURE_MIGRATION)?;
+        // v0.8: plan persistence
+        conn.execute_batch(crate::execution::PLAN_MIGRATION)?;
 
         Ok(())
     }
@@ -906,6 +912,152 @@ impl Database {
 
         results.truncate(limit);
         Ok(results)
+    }
+
+    // ── Tool result cache (v0.8) ──────────────────────────────────────
+
+    /// Look up a cached tool result. Returns (result, hit_count) if found.
+    pub fn tool_cache_get(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<(String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT result, hit_count FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2"
+        )?;
+        let result = stmt.query_row(rusqlite::params![tool_name, args_hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).ok();
+        if let Some((_res, _)) = &result {
+            // Bump hit count
+            let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = w.execute(
+                "UPDATE tool_cache SET hit_count = hit_count + 1 WHERE tool_name = ?1 AND args_hash = ?2",
+                rusqlite::params![tool_name, args_hash],
+            );
+        }
+        Ok(result)
+    }
+
+    /// Store a tool result in cache.
+    pub fn tool_cache_put(
+        &self,
+        tool_name: &str,
+        args_hash: &str,
+        result: &str,
+        dependent_files: &[String],
+    ) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let files_json = serde_json::to_string(dependent_files)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO tool_cache (tool_name, args_hash, result, dependent_files) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![tool_name, args_hash, result, files_json],
+        )?;
+        Ok(())
+    }
+
+    /// Invalidate cache entries whose dependent files overlap with changed_files.
+    /// Returns count of invalidated entries.
+    pub fn tool_cache_invalidate(&self, changed_files: &[String]) -> anyhow::Result<usize> {
+        if changed_files.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.read_conn();
+        // Find all cached entries
+        let mut stmt = conn.prepare("SELECT id, dependent_files FROM tool_cache")?;
+        let rows: Vec<(i64, String)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+        drop(conn);
+
+        let changed_set: std::collections::HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+        let mut invalidated = 0;
+        let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, files_json) in &rows {
+            let deps: Vec<String> = serde_json::from_str(files_json).unwrap_or_default();
+            if deps.iter().any(|f| changed_set.contains(f.as_str())) {
+                w.execute("DELETE FROM tool_cache WHERE id = ?1", rusqlite::params![id])?;
+                invalidated += 1;
+            }
+        }
+        Ok(invalidated)
+    }
+
+    // ── Failure memory (v0.8) ─────────────────────────────────────────
+
+    /// Store a failure pattern. Returns ID.
+    pub fn store_failure_pattern(
+        &self,
+        conv_id: i64,
+        signature: &str,
+        attempted_fix: &str,
+        why_failed: &str,
+        assumptions: &[String],
+        related_files: &[String],
+        execution_unit_id: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let assump_json = serde_json::to_string(assumptions)?;
+        let files_json = serde_json::to_string(related_files)?;
+        conn.execute(
+            "INSERT INTO failure_patterns (conversation_id, signature, attempted_fix, why_failed, invalidated_assumptions, related_files, execution_unit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![conv_id, signature, attempted_fix, why_failed, assump_json, files_json, execution_unit_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Search failure patterns by signature or related files.
+    pub fn search_failure_patterns(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(i64, String, String)>> {
+        let conn = self.read_conn();
+        let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+        let mut stmt = conn.prepare(
+            "SELECT id, signature, why_failed FROM failure_patterns
+             WHERE signature LIKE ?1 ESCAPE '\\' OR why_failed LIKE ?1 ESCAPE '\\'
+             ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    // ── Plan persistence (v0.8) ───────────────────────────────────────
+
+    /// Store a new plan state. Deactivates previous active plans for the conversation.
+    pub fn store_plan_state(
+        &self,
+        conv_id: i64,
+        goal: &str,
+        pending: &[String],
+        assumptions: &[String],
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // Deactivate previous plans
+        conn.execute("UPDATE plan_states SET is_active = 0, updated_at = datetime('now') WHERE conversation_id = ?1 AND is_active = 1",
+            rusqlite::params![conv_id])?;
+        let pending_json = serde_json::to_string(pending)?;
+        let assump_json = serde_json::to_string(assumptions)?;
+        conn.execute(
+            "INSERT INTO plan_states (conversation_id, goal, pending_steps, assumptions, is_active)
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            rusqlite::params![conv_id, goal, pending_json, assump_json],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the active plan state for a conversation.
+    pub fn get_active_plan(&self, conv_id: i64) -> anyhow::Result<Option<(i64, String, String, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, goal, pending_steps, assumptions FROM plan_states
+             WHERE conversation_id = ?1 AND is_active = 1 ORDER BY id DESC LIMIT 1"
+        )?;
+        Ok(stmt.query_row(rusqlite::params![conv_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        }).ok())
     }
 
     /// Soft-delete a DAG node (set deleted=1, timestamp). The node is

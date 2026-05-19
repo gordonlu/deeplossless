@@ -1163,6 +1163,22 @@ fn format_summary_text(summary: &str, snippets: &[crate::snippet::Snippet]) -> S
     }
 }
 
+#[allow(dead_code)]
+/// Execution relevance of a file path: how much it matters for inference.
+/// Returns 0.0 (noise like README) to 1.0 (critical like Cargo.toml).
+fn execution_relevance(file_path: &str) -> f64 {
+    let p = file_path.to_lowercase();
+    if p.contains("cargo.toml") || p.contains("cargo.lock") { return 1.0; }
+    if p.contains("package.json") || p.contains("go.mod") { return 1.0; }
+    if p.contains("pyproject.toml") || p.contains("requirements") { return 1.0; }
+    if p.ends_with(".rs") || p.ends_with(".py") || p.ends_with(".go") || p.ends_with(".ts") { return 0.9; }
+    if p.contains("src/") || p.contains("lib/") { return 0.85; }
+    if p.ends_with(".toml") || p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".json") { return 0.7; }
+    if p.contains("test") { return 0.6; }
+    if p.ends_with(".md") || p.ends_with(".txt") { return 0.2; }
+    0.5
+}
+
 /// Compute content overlap between a leaf and a set of summary texts.
 /// Returns 0.0 (no overlap) to 1.0 (fully contained). Uses trigram Jaccard.
 fn content_overlap(leaf: &str, summaries: &[&str]) -> f64 {
