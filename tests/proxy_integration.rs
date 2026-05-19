@@ -93,7 +93,7 @@ async fn proxy_non_streaming_round_trip() {
         client: reqwest::Client::new(),
         summarizer_model: "deepseek-v4-flash".into(),
         cycle: std::sync::Arc::new(std::sync::Mutex::new(
-            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeMode::FastIteration)
+            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Minimal)
         )),
     };
 

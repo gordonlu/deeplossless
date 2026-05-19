@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         summarizer_model: cli.summarizer_model,
         cycle: Arc::new(std::sync::Mutex::new(
-            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeMode::AutonomousFix)
+            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Autonomous)
         )),
     };
 
