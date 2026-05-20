@@ -1,64 +1,56 @@
-# deeplossless
+DeepLossless is an **inference-aware coding runtime** that reduces repeated
+work in long AI coding sessions.
 
-**Inference-aware coding runtime for DeepSeek agents.**
+Most coding tokens are spent reconstructing already-known state — rereading
+unchanged files, replanning the same tasks, retrying known-bad fixes.
+DeepLossless reuses failures, tool results, execution state, and plans instead
+of recomputing them every turn.
 
-deeplossless turns repeated inference into reusable execution state — reducing
-repeated reasoning, tool execution, repo rereads, and context reconstruction
-in long AI coding sessions.
-
-Instead of relying on ever-growing context windows, deeplossless incrementally
-reuses execution state, plans, failures, and tool results.
+Long context windows are not memory. Repeated inference is waste.
 
 ```
-Long coding session (3 tasks, 86 turns):
+Long coding session (3 tasks, 86 turns)
 
-Vanilla:  21,070 tokens  |  repeated planning  |  repeated failures  |  rereads
-Runtime:  13,500 tokens  |  9 replans saved    |  5 failures broken  |  2 avoided
-          ↓36% tokens    |                     |                     |
+Vanilla Agent                          DeepLossless Runtime
+────────────────────────────────────── ──────────────────────────────────────
+21,070 tokens                          13,500 tokens
+14 repeated replans                    5 replans
+8 repeated failures                    3 failures
+11 repo rereads                        9 rereads avoided
 
-Run: cargo test --test long_session_benchmark -- --nocapture
-No API key. No proxy setup. Just Rust.
+                                       ↓36% total tokens
+                                       ↓64% replanning
+                                       ↓62% repeated failures
 ```
 
-> **109 tests pass. CI: check → clippy → test → doc.**
-
-## Try it now (zero config)
+Run it yourself — no API key, no proxy setup:
 
 ```bash
 git clone https://github.com/gordonlu/deeplossless.git && cd deeplossless
 cargo test --test long_session_benchmark -- --nocapture
 ```
 
-No API key. No proxy setup. No DeepSeek account. Just Rust.
-Outputs a comparison table immediately. Want to see what the runtime actually does?
+Want to see what the runtime actually does? `cargo test --test simulated_session -- --nocapture`
 
-```bash
-cargo test --test simulated_session -- --nocapture   # detailed per-turn log
-cargo bench                                           # micro-benchmarks
-```
+## What actually gets reused?
+
+DeepLossless reuses:
+
+- **repeated grep/search results** — deterministic tool cache with partial invalidation
+- **failed fix attempts** — failure memory stores why_failed + invalidated_assumptions
+- **execution plans** — plan state persists across turns, avoids replanning
+- **repo state deltas** — stores what changed, not full code blocks
+- **summarized reasoning traces** — execution compaction distills outcomes
+
+Instead of recomputing them every turn.
 
 ## Quick start (proxy mode)
 
 ```bash
 cargo build --release
 DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
-deepseek config set base_url http://127.0.0.1:8080/v1
+# Point any OpenAI-compatible client to http://127.0.0.1:8080/v1
 ```
-
-## Why
-
-Long coding sessions waste most tokens on repeated work:
-
-- rereading unchanged files
-- repeated grep/search/compile
-- replanning the same tasks
-- retrying known-bad fixes
-- reconstructing prior reasoning
-
-**Long context ≠ efficient reasoning.** Context windows store more, but
-don't prevent inference recomputation. deeplossless treats reasoning as a
-reusable runtime resource — caching tool results, remembering failed paths,
-persisting plan state, and injecting only what changed.
 
 ## Design Principles
 
@@ -69,11 +61,12 @@ persisting plan state, and injecting only what changed.
 - **Runtime policy should optimize, not control.** Advisory, configurable, overrideable.
 - **Compression alone is insufficient.** Need reuse, avoidance, and distillation.
 - **Incremental reasoning is more scalable than ever-growing context.**
+- **Inspired more by incremental compilation than traditional chat memory.**
 
 ## Architecture
 
-deeplossless sits as an OpenAI-compatible proxy between your client and the
-DeepSeek API, operating in two layers:
+DeepLossless operates in two layers, sitting as an OpenAI-compatible proxy
+between your client and the DeepSeek API:
 
 ### Layer 1: Memory (store & organize)
 
@@ -98,7 +91,7 @@ DeepSeek API, operating in two layers:
 
 ## Runtime Strategies
 
-deeplossless does not force optimization. The runtime policy layer is **advisory
+DeepLossless does not force optimization. The runtime policy layer is **advisory
 and configurable**: users can prioritize token efficiency, exploratory reasoning,
 or autonomous execution depending on workload. The agent/UI can accept, ignore,
 or override each recommendation.
@@ -166,36 +159,29 @@ GET  /metrics                               — Prometheus metrics
 
 ## Benchmarks
 
-### Simulated session (3 conversations, 20 turns, 8 languages)
+### Long session (3 tasks, 86 turns)
 
 ```
-                    Without Runtime    With Runtime    Reduction
-Token / session         7440              4500            ↓40%
-Cache hit rate          —                 42%             —
-Repeated reasoning      3 rounds           1 round         ↓67%
-Rereads                 2                  0               ↓100%
-Failure loops           1                  0               ↓100%
-
-Languages: Rust, Python, TypeScript, JavaScript, Java, C++, C#, Go
-Run: cargo test --test simulated_session -- --nocapture
+                    Vanilla Agent    DeepLossless Runtime    Reduction
+Token / session         21,070              13,500            ↓36%
+Repeated replans           14                   5              ↓64%
+Repeated failures           8                   3              ↓62%
+Repo rereads               11                   2              ↓82%
+Cache hit rate              —                 28%              —
+Failures broken             —                   5              —
 ```
+
+Run: `cargo test --test long_session_benchmark -- --nocapture`
 
 ### How to benchmark
 
 ```bash
-# Simulated (no API key needed)
-cargo test --test simulated_session -- --nocapture
+cargo test --test long_session_benchmark -- --nocapture   # 86-turn punchline
+cargo test --test simulated_session -- --nocapture         # 20-turn detailed log
+cargo bench                                                # micro-benchmarks
 
-# Micro-benchmarks
-cargo bench
-
-# Live runtime metrics
+# Live runtime metrics (requires proxy running)
 curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
-
-# Real-world comparison
-# 1. Run a coding session WITHOUT the proxy, count tokens from API response
-# 2. Run the SAME session WITH the proxy, read /v1/lcm/runtime/stats
-# 3. Compare: token_saved = vanilla_tokens - runtime_tokens_spent
 ```
 
 ### Micro-benchmarks (criterion)
@@ -210,31 +196,11 @@ Runtime full decision cycle:   sub-microsecond
 Reasoning distillation (20 calls):  microseconds
 ```
 
-## Context injection
-
-Every proxied request gets an `<lcm_context>` block injected into the system
-prompt, showing the model its current DAG state:
-
-```
-<lcm_context>
-  ── Summaries ──
-  [summary 42] L1 Fixed port binding error (120 tok, 2 sources)
-    ← sources: msg_39, msg_40
-
-  ── Snippets ──
-  [path] src/main.rs (src: msg_39)
-  [num] 8080
-
-  ── Recent Messages ──
-  [msg 41] Current: deployment failed (45 tok)
-</lcm_context>
-```
-
 ## Requirements
 
 - Rust 1.80+
 - SQLite (bundled)
-- DeepSeek API key
+- DeepSeek API key (for proxy mode; benchmarks run without)
 
 ## Attribution
 
