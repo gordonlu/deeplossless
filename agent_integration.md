@@ -47,16 +47,14 @@ without any extra work by the agent:
 
 These features have HTTP endpoints. Agents can call them in a lightweight hook layer.
 
-| Feature | Endpoint | When to call |
-|---------|----------|--------------|
-| Tool cache lookup | `GET /v1/lcm/cache?tool=&args=` | Before executing a tool |
-| Tool cache store | `POST /v1/lcm/cache/put` | After executing a tool |
-| Failure pattern store | `POST /v1/lcm/failure` | After a fix fails |
+| Feature | Mechanism | Agent-side work |
+|---------|-----------|-----------------|
+| Tool cache | **Automatic** — pipeline extracts from message history | None — agent just sends normal tool_use/tool_result |
+| Failure detection | **Automatic** — pipeline detects errors in tool results | None — but can augment with `POST /v1/lcm/failure` |
+| Execution units | **Automatic** — pipeline groups tool chains | None |
 | Plan store | `POST /v1/lcm/plan` | After creating a plan |
 | Plan read | `GET /v1/lcm/plan/{conv_id}` | To resume a plan |
-
-All endpoints use JSON. Tool args are normalized via SHA-256 hash
-to produce deterministic cache keys regardless of argument order.
+| File claim | `POST /v1/lcm/file/claim` | Before editing a file (multi-agent safety) |
 
 ---
 
@@ -71,29 +69,22 @@ deeplossless (proxy)
 Upstream LLM API (DeepSeek / OpenAI)
 ```
 
-Optional hook layer (~10 lines per hook):
+Optional hooks (only for plan + file safety):
 
 ```python
-def before_tool(tool, args):
-    r = requests.get("http://127.0.0.1:8080/v1/lcm/cache",
-                      params={"tool": tool, "args": json.dumps(args)})
-    if r.json().get("hit"):
-        return r.json()["result"]  # skip execution
-
-def after_tool(tool, args, result, files):
-    requests.post("http://127.0.0.1:8080/v1/lcm/cache/put", json={
-        "tool": tool, "args": json.dumps(args),
-        "result": result, "files": json.dumps(files)})
-
-def after_failure(sig, fix, why, files):
-    requests.post("http://127.0.0.1:8080/v1/lcm/failure", json={
-        "signature": sig, "attempted_fix": fix,
-        "why_failed": why, "files": json.dumps(files)})
-
+# Plan persistence (optional, plan reuse improves over long sessions)
 def after_plan(goal, steps, assumptions):
     requests.post("http://127.0.0.1:8080/v1/lcm/plan", json={
         "goal": goal, "steps": json.dumps(steps),
         "assumptions": json.dumps(assumptions)})
+
+# Multi-agent safety (optional, only needed with multiple concurrent agents)
+def before_edit(file_path):
+    r = requests.post("http://127.0.0.1:8080/v1/lcm/file/claim", json={
+        "agent_id": os.getenv("AGENT_ID", "main"),
+        "file_path": file_path})
+    if r.status_code == 409:
+        print(f"WARNING: {file_path} held by {r.json()['held_by']}")
 ```
 
 ---
