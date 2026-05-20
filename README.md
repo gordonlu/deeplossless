@@ -161,6 +161,40 @@ POST /health                                — Health check (DB, upstream, comp
 GET  /metrics                               — Prometheus metrics
 ```
 
+## Session Report
+
+Generate a shareable recap of what the runtime saved in your session:
+
+```bash
+curl http://127.0.0.1:8080/v1/lcm/runtime/report?label=fix+build&turns=50
+```
+
+Outputs markdown that you can paste directly into GitHub issues, tweets, or chat:
+
+```markdown
+# deeplossless session report: fix build
+
+**50 turns** · **180s duration** · **42% cache reuse**
+
+## Execution Reuse
+| Cache hits | 21 |
+| Failure loops broken | 3 |
+| Plans resumed | 2 |
+
+## Inference Economics
+| Estimated tokens avoided | ~8,400 |
+| Tokens spent | 12,500 |
+
+## Most Reused
+- **grep** — 14x
+- **Cargo.toml** — 8x
+
+## Highlights
+- Runtime reuse kicked in repeatedly.
+- Stopped 3 potential failure loops.
+- Prevented 21 redundant tool calls.
+```
+
 ## Benchmarks
 
 ### Scope and methodology

@@ -933,6 +933,20 @@ impl Database {
 
     // ── Tool result cache (v0.8) ──────────────────────────────────────
 
+    /// Get top N most-hit tool cache entries for the session report.
+    pub fn top_tool_cache_entries(&self, limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT tool_name, hit_count FROM tool_cache WHERE hit_count > 0 ORDER BY hit_count DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
     /// Look up a cached tool result. Returns (result, hit_count) if found.
     /// Checks L1 in-memory cache first, falls back to SQLite.
     pub fn tool_cache_get(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<(String, i64)>> {

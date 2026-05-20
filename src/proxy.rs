@@ -72,6 +72,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
+        .route("/v1/lcm/runtime/report", get(lcm_runtime_report))
         .route("/v1/lcm/file/claim", post(lcm_file_claim))
         .route("/v1/lcm/file/release", post(lcm_file_release))
         .route("/v1/lcm/file/conflicts", get(lcm_file_conflicts))
@@ -405,6 +406,33 @@ async fn lcm_file_conflicts(
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
+}
+
+/// Generate a shareable session report (markdown).
+async fn lcm_runtime_report(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let label = params.get("label").map(|s| s.as_str()).unwrap_or("coding session");
+    let turns: usize = params.get("turns").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Query top reused tools/files from the database
+    let top_reused = state.db.top_tool_cache_entries(8)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, count)| (name, count as u64))
+        .collect::<Vec<_>>();
+
+    let duration: u64 = params.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
+    let report = crate::runtime::generate_report(&cycle, label, turns, &top_reused, duration);
+    drop(cycle);
+
+    // Return as raw markdown for easy copy-paste
+    let mut response = Response::new(axum::body::Body::from(report));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert("content-type", "text/markdown; charset=utf-8".parse().expect("static header"));
+    response
 }
 
 /// Runtime metrics endpoint — exposes inference-economics counters for benchmarking.
