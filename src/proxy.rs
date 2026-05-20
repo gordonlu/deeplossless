@@ -72,6 +72,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
+        .route("/v1/lcm/runtime/debug-dump", get(lcm_debug_dump))
         .route("/v1/lcm/runtime/report", get(lcm_runtime_report))
         .route("/v1/lcm/cache/put", post(lcm_cache_put))
         .route("/v1/lcm/cache", get(lcm_cache_get))
@@ -508,6 +509,50 @@ async fn lcm_plan_get(
         Ok(None) => Json(json!({"active_plan": null})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
+}
+
+/// Debug dump for GitHub issues. Strips user content — only counters, hashes, and structure.
+async fn lcm_debug_dump(
+    State(state): State<AppState>,
+) -> Response {
+    let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
+    let m = &cycle.metrics;
+
+    // Cache stats (no content, just key counts)
+    let cache_entry_count = state.db.top_tool_cache_entries(999).unwrap_or_default().len();
+    let (total_nodes, total_convs, total_embeddings, active_plan_count, event_count) =
+        state.db.debug_counts().unwrap_or((-1, -1, -1, -1, -1));
+    let failure_count: i64 = state.db.search_failure_patterns("error", 9999)
+        .map(|r| r.len() as i64).unwrap_or(-1);
+
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "profile": cycle.profile.as_str(),
+        "metrics": {
+            "tokens_spent": m.tokens_spent,
+            "cache_hits": m.cache_hits,
+            "cache_misses": m.cache_misses,
+            "cache_hit_rate": if m.cache_hits + m.cache_misses > 0 {
+                format!("{:.0}%", m.cache_hits as f64 / (m.cache_hits + m.cache_misses) as f64 * 100.0)
+            } else { "N/A".into() },
+            "repeated_failures": m.repeated_failures,
+            "failure_streak": m.failure_streak,
+            "reread_ratio": m.reread_ratio,
+            "planning_reuse_ratio": m.planning_reuse_ratio,
+            "budget_remaining_pct": m.budget_remaining_pct,
+            "decisions_count": cycle.decisions.len(),
+        },
+        "storage": {
+            "cache_entries": cache_entry_count,
+            "dag_nodes": total_nodes,
+            "conversations": total_convs,
+            "embeddings": total_embeddings,
+            "failure_patterns": failure_count,
+            "active_plans": active_plan_count,
+            "dag_events": event_count,
+        },
+        "decisions_tail": cycle.decisions.iter().rev().take(10).collect::<Vec<_>>(),
+    })).into_response()
 }
 
 /// Generate a shareable session report (markdown).

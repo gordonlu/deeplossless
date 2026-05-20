@@ -165,6 +165,21 @@ impl ChatPipeline {
                     ) {
                         tracing::warn!(target: "deeplossless::pipeline", "failed to store execution unit: {e}");
                     }
+                    // Auto-record failures from tool results
+                    if unit.outcome != crate::execution::ExecutionOutcome::Success
+                        && !unit.tool_result.is_empty() {
+                        let sig: String = unit.tool_result.chars().take(120).collect();
+                        let _ = db.store_failure_pattern(
+                            conv_id, &sig,
+                            "", // no fix known yet — agent will discover it
+                            &unit.tool_result,
+                            &[], &[],
+                            None,
+                        );
+                        tracing::info!(target: "deeplossless::pipeline",
+                            conv_id, tool = %unit.tool_name,
+                            "auto-recorded failure pattern");
+                    }
                 }
             }
         });

@@ -933,6 +933,17 @@ impl Database {
 
     // ── Tool result cache (v0.8) ──────────────────────────────────────
 
+    /// Summary counts for debug dump — no user content exposed.
+    pub fn debug_counts(&self) -> anyhow::Result<(i64, i64, i64, i64, i64)> {
+        let conn = self.read_conn();
+        let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM dag_nodes WHERE deleted=0", [], |r| r.get(0))?;
+        let convs: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
+        let embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
+        let plans: i64 = conn.query_row("SELECT COUNT(*) FROM plan_states WHERE is_active=1", [], |r| r.get(0))?;
+        let events: i64 = conn.query_row("SELECT COUNT(*) FROM dag_events", [], |r| r.get(0))?;
+        Ok((nodes, convs, embeddings, plans, events))
+    }
+
     /// Collect per-conversation metrics for the session report.
     pub fn collect_session_metrics(&self, conv_id: i64) -> anyhow::Result<(i64, i64, i64, i64)> {
         // leaf_count, summary_count, total_tokens, failure_count
