@@ -165,13 +165,28 @@ impl ChatPipeline {
                     ) {
                         tracing::warn!(target: "deeplossless::pipeline", "failed to store execution unit: {e}");
                     }
+                    // Auto-populate tool cache from message history.
+                    // Agent doesn't need hooks — proxy sees tool_use→tool_result pairs.
+                    if crate::tool_cache::is_cacheable(&unit.tool_name)
+                        && !unit.tool_result.is_empty() {
+                        let (_name, args_hash) = crate::tool_cache::cache_key(
+                            &unit.tool_name, &unit.tool_args);
+                        let dependent_files = crate::tool_cache::extract_dependent_files(
+                            &unit.tool_name, &unit.tool_args);
+                        if let Err(e) = db.tool_cache_put(
+                            &unit.tool_name, &args_hash,
+                            &unit.tool_result, &dependent_files,
+                        ) {
+                            tracing::warn!(target: "deeplossless::pipeline", "failed to cache tool result: {e}");
+                        }
+                    }
                     // Auto-record failures from tool results
                     if unit.outcome != crate::execution::ExecutionOutcome::Success
                         && !unit.tool_result.is_empty() {
                         let sig: String = unit.tool_result.chars().take(120).collect();
                         let _ = db.store_failure_pattern(
                             conv_id, &sig,
-                            "", // no fix known yet — agent will discover it
+                            "",
                             &unit.tool_result,
                             &[], &[],
                             None,
