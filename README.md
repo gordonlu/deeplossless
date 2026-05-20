@@ -10,13 +10,14 @@ Instead of relying on ever-growing context windows, deeplossless incrementally
 reuses execution state, plans, failures, and tool results.
 
 ```
-Typical coding session (simulated, 20 turns):
+Long coding session (3 tasks, 86 turns):
 
-Vanilla:  7440 tokens  |  3 repeated planning rounds  |  2 rereads  |  1 retry loop
-Runtime:  4500 tokens  |  1 planning round            |  0 rereads  |  0 retry loops
-          ↓40% tokens  |  ↓67% replanning             |  ↓100%      |  ↓100%
+Vanilla:  21,070 tokens  |  repeated planning  |  repeated failures  |  rereads
+Runtime:  13,500 tokens  |  9 replans saved    |  5 failures broken  |  2 avoided
+          ↓36% tokens    |                     |                     |
 
-Run: cargo test --test simulated_session -- --nocapture
+Run: cargo test --test long_session_benchmark -- --nocapture
+No API key. No proxy setup. Just Rust.
 ```
 
 > **109 tests pass. CI: check → clippy → test → doc.**
