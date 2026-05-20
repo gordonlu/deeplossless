@@ -73,6 +73,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
         .route("/v1/lcm/runtime/report", get(lcm_runtime_report))
+        .route("/v1/lcm/cache/put", post(lcm_cache_put))
+        .route("/v1/lcm/cache", get(lcm_cache_get))
+        .route("/v1/lcm/failure", post(lcm_failure_put))
+        .route("/v1/lcm/plan", post(lcm_plan_put))
+        .route("/v1/lcm/plan/{conv_id}", get(lcm_plan_get))
         .route("/v1/lcm/file/claim", post(lcm_file_claim))
         .route("/v1/lcm/file/release", post(lcm_file_release))
         .route("/v1/lcm/file/conflicts", get(lcm_file_conflicts))
@@ -405,6 +410,103 @@ async fn lcm_file_conflicts(
             Json(json!({"conflicts": rows})).into_response()
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// Store a tool result in cache. Agent calls this after executing a tool.
+async fn lcm_cache_put(
+    State(state): State<AppState>,
+    Json(body): Json<HashMap<String, String>>,
+) -> Response {
+    let tool = body.get("tool").map(|s| s.as_str()).unwrap_or("");
+    let args = body.get("args").map(|s| s.as_str()).unwrap_or("");
+    let result = body.get("result").map(|s| s.as_str()).unwrap_or("");
+    let files: Vec<String> = body.get("files")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let (_name, hash) = crate::tool_cache::cache_key(tool, args);
+    if tool.is_empty() || hash.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
+    }
+    match state.db.tool_cache_put(tool, &hash, result, &files) {
+        Ok(()) => Json(json!({"status": "cached", "tool": tool})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
+    }
+}
+
+/// Look up a cached tool result. Agent calls this before executing a tool.
+async fn lcm_cache_get(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let tool = params.get("tool").map(|s| s.as_str()).unwrap_or("");
+    let args = params.get("args").map(|s| s.as_str()).unwrap_or("");
+
+    let (_name, hash) = crate::tool_cache::cache_key(tool, args);
+    if tool.is_empty() || hash.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
+    }
+    match state.db.tool_cache_get(tool, &hash) {
+        Ok(Some((result, hits))) => Json(json!({"hit": true, "result": result, "hit_count": hits})).into_response(),
+        Ok(None) => Json(json!({"hit": false})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
+    }
+}
+
+/// Store a failure pattern. Agent calls this after a fix fails.
+async fn lcm_failure_put(
+    State(state): State<AppState>,
+    Json(body): Json<HashMap<String, serde_json::Value>>,
+) -> Response {
+    let conv_id: i64 = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(1);
+    let sig = body.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+    let fix = body.get("attempted_fix").and_then(|v| v.as_str()).unwrap_or("");
+    let why = body.get("why_failed").and_then(|v| v.as_str()).unwrap_or("");
+    let assumptions: Vec<String> = body.get("assumptions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let files: Vec<String> = body.get("files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+
+    if sig.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "signature required"); }
+    match state.db.store_failure_pattern(conv_id, sig, fix, why, &assumptions, &files, None) {
+        Ok(id) => Json(json!({"status": "stored", "id": id})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "FAILURE_ERROR", format!("{e}")),
+    }
+}
+
+/// Store an execution plan. Agent calls this after creating a plan.
+async fn lcm_plan_put(
+    State(state): State<AppState>,
+    Json(body): Json<HashMap<String, serde_json::Value>>,
+) -> Response {
+    let conv_id: i64 = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(1);
+    let goal = body.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+    let steps: Vec<String> = body.get("steps")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let assumptions: Vec<String> = body.get("assumptions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+
+    if goal.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "goal required"); }
+    match state.db.store_plan_state(conv_id, goal, &steps, &assumptions) {
+        Ok(id) => Json(json!({"status": "stored", "id": id})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
+    }
+}
+
+/// Get the active plan for a conversation.
+async fn lcm_plan_get(
+    State(state): State<AppState>,
+    Path(conv_id): Path<i64>,
+) -> Response {
+    match state.db.get_active_plan(conv_id) {
+        Ok(Some((id, goal, pending, assumptions))) => Json(json!({
+            "id": id, "goal": goal,
+            "pending_steps": pending,
+            "assumptions": assumptions,
+        })).into_response(),
+        Ok(None) => Json(json!({"active_plan": null})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
 }
 
