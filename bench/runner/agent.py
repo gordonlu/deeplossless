@@ -43,9 +43,12 @@ class DeterministicAgent:
 
         # Runtime state (simulating DeepLossless when enabled)
         self._tool_cache: Dict[str, ToolResult] = {}
+        self._cache_timestamps: Dict[str, int] = {}  # key -> turn number when cached
+        self._edited_files: set = set()
         self._failure_memory: Dict[str, str] = {}
         self._plan_cache: Optional[dict] = None
         self._read_history: set = set()
+        self._turn: int = 0
 
         # Load initial files
         self._load_repo()
@@ -69,11 +72,24 @@ class DeterministicAgent:
                     self.state.file_contents[rel] = fh.read()
 
     def _runtime_cache_get(self, tool: str, args: str) -> Optional[ToolResult]:
-        """Simulate DeepLossless tool cache lookup."""
+        """Simulate DeepLossless tool cache lookup. Tracks stale cache hits."""
         if not self.enable_runtime:
             return None
         key = f"{tool}:{args}"
-        return self._tool_cache.get(key)
+        result = self._tool_cache.get(key)
+        if result is not None:
+            # Check if this cache entry might be stale (file edited after caching)
+            cached_at = self._cache_timestamps.get(key, 0)
+            for edited_file in self._edited_files:
+                if edited_file in args or edited_file in key:
+                    # The argument mentions an edited file — this is a stale cache hit
+                    # Only if the edit happened AFTER the cache was populated
+                    self.metrics.stale_cache_hits += 1
+                    self.metrics.record_event("stale_cache_hit", tool, saved=0,
+                                              detail=f"STALE: {args[:50]} (edited after cache)")
+                    # In production, we'd skip this. For benchmark, return stale to measure impact.
+                    break
+        return result
 
     def _runtime_cache_put(self, tool: str, args: str, result: ToolResult):
         """Simulate DeepLossless tool cache store."""
@@ -81,6 +97,7 @@ class DeterministicAgent:
             return
         key = f"{tool}:{args}"
         self._tool_cache[key] = result
+        self._cache_timestamps[key] = self._turn
 
     def _runtime_failure_check(self, error_msg: str) -> Optional[str]:
         """Simulate DeepLossless failure memory lookup."""
@@ -149,6 +166,7 @@ class DeterministicAgent:
         t0 = time.time()
 
         for turn in range(max_turns):
+            self._turn = turn
             if self.state.solved:
                 break
 
@@ -203,11 +221,13 @@ class DeterministicAgent:
                                 self.state.file_contents[edit['file']] = content.replace(
                                     edit['old'], edit['new'])
 
-                            # Runtime: invalidate cache for changed file
+                            # Runtime: track edited file + invalidate cache entries
                             if self.enable_runtime:
+                                self._edited_files.add(edit['file'])
                                 for key in list(self._tool_cache.keys()):
                                     if edit['file'] in key:
                                         del self._tool_cache[key]
+                                        self._cache_timestamps.pop(key, None)
 
                 elif "test" in step.lower():
                     result = self._execute_tool("run_tests", "")

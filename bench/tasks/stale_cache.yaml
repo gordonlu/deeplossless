@@ -1,0 +1,43 @@
+name: "stale_cache_corruption"
+description: "Tests that runtime does NOT reuse stale results after config changes. Negative benchmark."
+repo: "config"  # reuses config drift repo
+error_patterns:
+  - "DATABASE_URL"
+  - "DB_URL"
+  - "APP_PORT"
+  - "PORT"
+  - "RETRY_COUNT"
+relevant_files:
+  - "app.py"
+  - ".env"
+  - "test_app.py"
+plan_steps:
+  - "grep for DATABASE_URL"
+  - "read app.py"
+  - "read .env to check correct config"
+  - "edit app.py: fix DATABASE_URL → DB_URL"
+  - "read app.py again to verify edit"
+  - "grep for DATABASE_URL again (should be gone)"
+  - "grep for APP_PORT"
+  - "edit app.py: fix APP_PORT"
+  - "grep for APP_PORT again"
+  - "run tests"
+edits:
+  - step: 4
+    file: "app.py"
+    old: 'DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://localhost:5432/mydb")'
+    new: 'DATABASE_URL = os.environ.get("DB_URL", "postgres://localhost:5432/mydb")'
+  - step: 8
+    file: "app.py"
+    old: 'APP_PORT = int(os.environ.get("APP_PORT", "8080"))'
+    new: 'APP_PORT = int(os.environ.get("PORT", "8080"))'
+
+# EXPECTED: After step 4 edit, grep for "DATABASE_URL" should NOT return the old cached result.
+# The cache for grep "DATABASE_URL" should have been invalidated because app.py changed.
+# If the runtime reuses the old grep result, the agent will think DATABASE_URL still exists
+# and skip the fix → test fails.
+#
+# This is a NEGATIVE benchmark: a correct runtime should have LOW cache hit rate
+# for searches after edits to the same file.
+#
+# Key metric: stale_cache_hits should be 0. If > 0, cache invalidation is broken.

@@ -25,12 +25,21 @@ class BenchmarkMetrics:
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
-    # Runtime reuse
+    # Tool-level reuse
     cache_hits: int = 0
     cache_misses: int = 0
     rereads: int = 0
     replans: int = 0
     repeated_failures: int = 0
+
+    # Reasoning reuse (deeper than tool cache)
+    repeated_thought_similarity: float = 0.0   # how similar are consecutive think() outputs
+    same_search_ratio: float = 0.0             # fraction of searches that repeat previous search
+    plan_reconstruction_rate: float = 0.0      # how often the plan is rebuilt from scratch
+    same_failure_retries: int = 0              # retries of the same failure pattern
+    stale_cache_hits: int = 0                  # cache hits that may be stale (file changed since)
+    incorrect_reuse_count: int = 0             # reuse that led to wrong result
+
     successful_completion: bool = False
 
     # Timing
@@ -68,6 +77,10 @@ class BenchmarkMetrics:
             "rereads": self.rereads,
             "replans": self.replans,
             "repeated_failures": self.repeated_failures,
+            "same_failure_retries": self.same_failure_retries,
+            "plan_reconstruction_rate": round(self.plan_reconstruction_rate, 3),
+            "stale_cache_hits": self.stale_cache_hits,
+            "incorrect_reuse_count": self.incorrect_reuse_count,
             "wall_time_ms": round(self.wall_time_ms, 1),
             "successful": self.successful_completion,
             "events": len(self.events),

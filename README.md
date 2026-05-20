@@ -159,6 +159,36 @@ GET  /metrics                               — Prometheus metrics
 
 ## Benchmarks
 
+### Scope and methodology
+
+Current benchmarks use a **deterministic local agent loop** to isolate runtime-level
+reuse effects (cache reuse, reread avoidance, failure memory, plan persistence)
+from model variance. Real-world reductions with external LLMs are expected to be
+**lower but follow similar trends**.
+
+We are measuring inference economics, not coding ability. The primary metric is
+**how much repeated work the runtime prevents** — not how fast the agent solves
+the task.
+
+The next phase will introduce a **semi-real benchmark** with real LLM `think()`
+calls and deterministic tool execution, isolating the reasoning reuse layer
+from model behavior.
+
+### Inference redundancy benchmark (4 tasks, simulated repos)
+
+```
+                    Baseline tokens    Runtime tokens    Reduction
+Dependency mismatch      11,602             2,626           ↓77%
+Symbol rename             5,105             1,120           ↓78%
+Config drift              9,583             2,225           ↓77%
+Misleading error          7,074             1,092           ↓85%
+──────────────────────────────────────────────────────────
+TOTAL                    33,364             7,063           ↓79%
+Cache hits: baseline 0, runtime 205. Rereads avoided: 96.
+```
+
+Run: `python3 bench/run.py`
+
 ### Long session (3 tasks, 86 turns)
 
 ```
