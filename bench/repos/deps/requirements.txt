@@ -1,0 +1,4 @@
+fasthttp==0.2.1
+trio==0.25.0
+async-timeout==4.0.3
+old-db-driver==0.1.0

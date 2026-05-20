@@ -1,0 +1,38 @@
+name: "dependency_mismatch"
+description: "Layered dependency bugs — fixing one exposes another"
+repo: "deps"
+error_patterns:
+  - "old_db_driver"
+  - "fasthttp"
+  - "async-timeout"
+  - "TimeoutError"
+  - "cannot import"
+relevant_files:
+  - "server.py"
+  - "config.py"
+  - "requirements.txt"
+  - "test_server.py"
+plan_steps:
+  - "grep for error pattern old_db_driver"
+  - "read server.py to understand the code"
+  - "read requirements.txt to check dependencies"
+  - "edit requirements.txt: remove old-db-driver"
+  - "edit server.py: fix fasthttp import"
+  - "run tests to verify"
+  - "grep for remaining async-timeout usage"
+  - "edit server.py: replace async-timeout with asyncio.timeout"
+  - "read server.py to verify all fixes"
+  - "run tests to confirm"
+edits:
+  - step: 4
+    file: "requirements.txt"
+    old: "old-db-driver==0.1.0"
+    new: "new-db-driver==2.0.0"
+  - step: 5
+    file: "server.py"
+    old: "from fasthttp import Response"
+    new: "from fasthttp import HTTPResponse as Response"
+  - step: 8
+    file: "server.py"
+    old: "import async_timeout"
+    new: "# removed deprecated async_timeout"

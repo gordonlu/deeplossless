@@ -1,0 +1,38 @@
+name: "configuration_drift"
+description: "Config keys renamed — only partially updated across repo"
+repo: "config"
+error_patterns:
+  - "DATABASE_URL"
+  - "DB_URL"
+  - "APP_PORT"
+  - "PORT"
+  - "RETRY_COUNT"
+  - "MAX_RETRIES"
+  - "KeyError"
+relevant_files:
+  - "app.py"
+  - ".env"
+  - "test_app.py"
+plan_steps:
+  - "grep for DATABASE_URL to find stale config keys"
+  - "read .env to check correct config keys"
+  - "read app.py for stale references"
+  - "edit app.py: DATABASE_URL -> get from DB_URL env"
+  - "grep for APP_PORT to find remaining stale keys"
+  - "edit app.py: APP_PORT -> get from PORT env"
+  - "grep for RETRY_COUNT"
+  - "edit app.py: RETRY_COUNT -> MAX_RETRIES"
+  - "run tests to confirm all config keys updated"
+edits:
+  - step: 4
+    file: "app.py"
+    old: 'DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://localhost:5432/mydb")'
+    new: 'DATABASE_URL = os.environ.get("DB_URL", "postgres://localhost:5432/mydb")'
+  - step: 6
+    file: "app.py"
+    old: 'APP_PORT = int(os.environ.get("APP_PORT", "8080"))'
+    new: 'APP_PORT = int(os.environ.get("PORT", "8080"))'
+  - step: 8
+    file: "app.py"
+    old: 'RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))'
+    new: 'RETRY_COUNT = int(os.environ.get("MAX_RETRIES", "3"))'

@@ -1,0 +1,38 @@
+name: "partial_symbol_rename"
+description: "Symbol rename across files — stale references in tests and main"
+repo: "symbol"
+error_patterns:
+  - "UserService"
+  - "AccountService"
+  - "cannot import"
+  - "ImportError"
+relevant_files:
+  - "user_service.py"
+  - "main.py"
+  - "test_users.py"
+plan_steps:
+  - "grep for UserService to find stale references"
+  - "read user_service.py to check correct name"
+  - "read main.py for stale imports"
+  - "edit main.py: fix import from UserService to AccountService"
+  - "read test_users.py for stale references"
+  - "edit test_users.py: fix all UserService references"
+  - "grep again to verify no remaining UserService"
+  - "run tests to confirm"
+edits:
+  - step: 4
+    file: "main.py"
+    old: "from user_service import UserService"
+    new: "from user_service import AccountService"
+  - step: 4
+    file: "main.py"
+    old: "service = UserService()"
+    new: "service = AccountService()"
+  - step: 6
+    file: "test_users.py"
+    old: "from user_service import UserService"
+    new: "from user_service import AccountService"
+  - step: 6
+    file: "test_users.py"
+    old: "service = UserService()"
+    new: "service = AccountService()"

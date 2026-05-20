@@ -1,0 +1,27 @@
+name: "misleading_error"
+description: "Timeout error masks missing config file — agent retries wrong fixes"
+repo: "misleading"
+error_patterns:
+  - "TimeoutError"
+  - "FileNotFoundError"
+  - "config.json"
+  - "Connection timeout"
+relevant_files:
+  - "router.py"
+  - "handler.py"
+  - "config.json"
+  - "test_router.py"
+plan_steps:
+  - "grep for TimeoutError to find the error"
+  - "read router.py to understand error handling"
+  - "read handler.py to see error propagation"
+  - "grep for config to check config file location"
+  - "read config.json to verify it exists"
+  - "edit router.py: change CONFIG_PATH to correct location"
+  - "edit handler.py: fix misleading error message"
+  - "run tests to confirm"
+edits:
+  - step: 6
+    file: "router.py"
+    old: 'CONFIG_PATH = "/etc/app/config.json"'
+    new: 'CONFIG_PATH = "./config.json"'
