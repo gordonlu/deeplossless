@@ -103,7 +103,7 @@ async fn comprehensive_simulated_session() {
     // Turn A1: grep for dependency
     add_leaf(&dag, conv_a, "grep serde_json Cargo.toml", 8);
     db.tool_cache_put("grep", "serde_json Cargo.toml", "line 8: serde_json = \"1.0\"", &["Cargo.toml".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), Some(("grep", 0, 500)), None, None,
     );
     apply_decision(&cycle, d.action, 500, 0);
@@ -113,7 +113,7 @@ async fn comprehensive_simulated_session() {
     // Turn A2: read Cargo.toml (cache miss — first read)
     add_leaf(&dag, conv_a, "read_file Cargo.toml — dependencies list", 15);
     db.tool_cache_put("read_file", "Cargo.toml", "[dependencies]\nserde = \"1\"\nserde_json = \"1\"\ntokio = { version = \"1\", features = [\"full\"] }", &["Cargo.toml".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 300, 300);
@@ -121,7 +121,7 @@ async fn comprehensive_simulated_session() {
     println!("  A2  read Cargo.toml        → no cache yet, 300 tok");
 
     // Turn A3: grep again — HIT
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), Some(("grep", 0, 480)), None, None,
     );
     apply_decision(&cycle, d.action, 480, 0);
@@ -146,7 +146,7 @@ async fn comprehensive_simulated_session() {
     // Turn A5: symbol_search — cache miss, different tool
     add_leaf(&dag, conv_a, "symbol_search 'process_data' → found in src/lib.rs:42", 8);
     db.tool_cache_put("symbol_search", "process_data", "src/lib.rs:42 pub fn process_data(input: &str) -> String", &["src/lib.rs".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 250, 250);
@@ -154,7 +154,7 @@ async fn comprehensive_simulated_session() {
     println!("  A5  symbol_search          → cache miss, 250 tok");
 
     // Turn A6: failure memory suggests fix
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None,
         Some(("E0308 mismatched types", "add .to_string() or use &str consistently")),
         None,
@@ -180,7 +180,7 @@ async fn comprehensive_simulated_session() {
         &["fix remaining type warnings".into(), "add unit tests".into(), "run clippy".into()],
         &["project uses Rust edition 2024".into()]).unwrap();
     {
-        let d = deeplossless::runtime::RuntimePolicy::decide(
+        let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
             &cycle.lock().unwrap(), None, None,
             Some((1, "complete Rust refactor", 3)),
         );
@@ -196,7 +196,7 @@ async fn comprehensive_simulated_session() {
     // B1: grep for column_name (REPEAT of similar dep pattern — cross-session)
     add_leaf(&dag, conv_b, "grep 'column_name' pipeline.py", 8);
     db.tool_cache_put("grep", "column_name pipeline.py", "col_name = df['column_name']  # KeyError if missing", &["pipeline.py".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), Some(("grep", 0, 500)), None, None,
     );
     apply_decision(&cycle, d.action, 500, 0);
@@ -206,7 +206,7 @@ async fn comprehensive_simulated_session() {
     // B2: read pipeline.py
     add_leaf(&dag, conv_b, "read_file pipeline.py — 200 lines, data processing logic", 20);
     db.tool_cache_put("read_file", "pipeline.py", "def process(df):\n    col = df['column_name']\n    return df.groupby('col').sum()", &["pipeline.py".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 400, 400);
@@ -230,7 +230,7 @@ async fn comprehensive_simulated_session() {
     println!("  B3  diagnostics → KeyError → failure pattern stored, 350 tok");
 
     // B4: grep again — HIT
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), Some(("grep", 0, 480)), None, None,
     );
     apply_decision(&cycle, d.action, 480, 0);
@@ -240,7 +240,7 @@ async fn comprehensive_simulated_session() {
     // B5: symbol_search for defensive patterns — cache MISS (new query)
     add_leaf(&dag, conv_b, "symbol_search df.columns → found 3 usages in pipeline.py", 8);
     db.tool_cache_put("symbol_search", "df.columns", "pipeline.py:12 df.columns\npipeline.py:34 df.columns\npipeline.py:67 df.columns", &["pipeline.py".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 250, 250);
@@ -266,7 +266,7 @@ async fn comprehensive_simulated_session() {
     // C1: grep for chi import (cache MISS)
     add_leaf(&dag, conv_c, "grep 'chi' go.mod main.go", 8);
     db.tool_cache_put("grep", "chi go.mod main.go", "main.go:8: r := chi.NewRouter()", &["go.mod".into(), "main.go".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 500, 500);
@@ -276,7 +276,7 @@ async fn comprehensive_simulated_session() {
     // C2: read go.mod — CACHE MISS
     add_leaf(&dag, conv_c, "read_file go.mod → module example.com/api, go 1.21, require chi v5", 15);
     db.tool_cache_put("read_file", "go.mod", "module example.com/api\ngo 1.21\nrequire github.com/go-chi/chi/v5 v5.0.12", &["go.mod".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 300, 300);
@@ -284,7 +284,7 @@ async fn comprehensive_simulated_session() {
     println!("  C2  read go.mod            → first read, 300 tok");
 
     // C3: grep go.mod again — CACHE HIT
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), Some(("grep", 0, 480)), None, None,
     );
     apply_decision(&cycle, d.action, 480, 0);
@@ -309,7 +309,7 @@ async fn comprehensive_simulated_session() {
     // C5: read_file handlers/auth.go — CACHE HIT (pre-loaded from C2 read pattern)
     // In real usage, read_file of go.mod ≠ handlers/auth.go, so this is a MISS
     db.tool_cache_put("read_file", "handlers/auth.go", "package handlers\nimport \"example.com/api/models\"\nfunc Login(w http.ResponseWriter, r *http.Request) {}", &["handlers/auth.go".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 350, 350);
@@ -319,7 +319,7 @@ async fn comprehensive_simulated_session() {
     // C6: list_files to understand project structure — CACHE MISS
     add_leaf(&dag, conv_c, "list_files src/ → main.go, handlers/, models/, go.mod, go.sum", 6);
     db.tool_cache_put("list_files", "src/", "main.go\nhandlers/auth.go\nhandlers/middleware.go\nmodels/user.go\nmodels/session.go", &["src/".into()]).unwrap();
-    let d = deeplossless::runtime::RuntimePolicy::decide(
+    let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
         &cycle.lock().unwrap(), None, None, None,
     );
     apply_decision(&cycle, d.action, 200, 200);

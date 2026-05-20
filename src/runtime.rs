@@ -1,10 +1,41 @@
-//! Inference-aware Memory Runtime — optimizes inference economics, not agent behavior.
+//! # Pluggable Runtime Policy Engine
 //!
-//! Core philosophy: we are memory/runtime middleware, not an agent framework.
-//! The runtime provides advisory optimization — cache reuse, delta injection,
-//! failure avoidance, context compaction. It does NOT override model intent.
+//! **Zero infrastructure dependencies.** No SQLite, no HTTP, no DeepSeek API,
+//! no OpenAI schema. Just pure Rust types.
 //!
-//! Key boundary: `RuntimeDecision` is advisory. Agents/UIs accept, ignore, or override.
+//! This module can be embedded in any AI coding client — desktop app, IDE
+//! plugin, CLI tool, or proxy middleware. The engine takes [`RuntimeState`]
+//! and returns [`RuntimeDecision`].
+//!
+//! ## Architecture
+//!
+//! ```text
+//!                    ┌─────────────────────────┐
+//!  RuntimeState ────►│   RuntimePolicy::decide │────► RuntimeDecision
+//!  (input)           └─────────────────────────┘      (output)
+//!
+//!                    ┌──────────────┐
+//!  Profile ─────────►│  Strategy    │────► thresholds
+//!  (user choice)     │  (internal)  │      cache_aggressiveness
+//!                    └──────────────┘      token_budget_ratio ...
+//! ```
+//!
+//! ## Key boundary
+//!
+//! [`RuntimeDecision`] is **advisory**. Agents/UIs accept, ignore, or override.
+//! We are middleware, not an agent framework. We do not control the model —
+//! we optimize the economics of its execution.
+//!
+//! ## Integration
+//!
+//! ```ignore
+//! // In any AI coding runtime:
+//! use deeplossless::runtime::{ExecutionCycle, RuntimePolicy, RuntimeProfile};
+//!
+//! let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
+//! let decision = RuntimePolicy::decide(&cycle, cache_hit, failure_hint, plan_hint);
+//! // Agent decides whether to accept decision.action
+//! ```
 
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +178,56 @@ impl RuntimeStrategy {
             },
         }
     }
+}
+
+// ── Runtime State (input to the policy engine) ──────────────────────
+
+/// Complete input for the runtime policy engine.
+/// Captures everything the engine needs to produce a decision.
+/// Zero infrastructure dependencies — just data.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeState {
+    pub profile: RuntimeProfile,
+    pub metrics: RuntimeMetrics,
+
+    /// Tool cache hit for the current tool call, if any.
+    pub cache_hit: Option<CacheHit>,
+
+    /// Known failure pattern matching the current context, if any.
+    pub failure_hint: Option<FailureHint>,
+
+    /// Active plan with pending steps, if any.
+    pub plan_hint: Option<PlanHint>,
+
+    /// Files changed since last cycle.
+    pub context_delta: Vec<String>,
+}
+
+/// A detected tool cache hit.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheHit {
+    pub tool_name: String,
+    pub cache_id: i64,
+    pub estimated_token_saving: u64,
+}
+
+/// A matching failure pattern.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailureHint {
+    /// The error signature.
+    pub signature: String,
+    /// The known fix (may be empty).
+    pub suggested_fix: String,
+    /// Why the previous attempt failed.
+    pub why_failed: String,
+}
+
+/// An active plan with pending steps.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanHint {
+    pub plan_id: i64,
+    pub goal: String,
+    pub pending_step_count: usize,
 }
 
 // ── Runtime Action ────────────────────────────────────────────────────
@@ -356,44 +437,63 @@ impl ExecutionCycle {
 pub struct RuntimePolicy;
 
 impl RuntimePolicy {
-    /// Produce an advisory decision based on current state.
-    /// This is a recommendation, not a command.
-    pub fn decide(
-        cycle: &ExecutionCycle,
-        has_tool_cache_hit: Option<(&str, i64, u64)>, // (tool_name, cache_id, estimated_save)
-        has_recent_failure: Option<(&str, &str)>,     // (signature, fix)
-        has_active_plan: Option<(i64, &str, usize)>,  // (plan_id, goal, pending_count)
-    ) -> RuntimeDecision {
+    /// Primary API: produce an advisory decision from a complete [`RuntimeState`].
+    /// This is the pure function — no side effects, no infrastructure.
+    pub fn decide(state: &RuntimeState) -> RuntimeDecision {
         // Rule 1: Tool cache hit with sufficient confidence
-        if let Some((tool_name, cache_id, estimated_save)) = has_tool_cache_hit {
-            let confidence = cycle.strategy.cache_aggressiveness;
+        if let Some(ref hit) = state.cache_hit {
+            let confidence = RuntimeStrategy::from_profile(state.profile).cache_aggressiveness;
             if confidence > 0.3 {
-                return RuntimeDecision::cache_hit(tool_name, cache_id, estimated_save);
+                return RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving);
             }
         }
 
         // Rule 2: Failure with known fix
-        if let Some((_sig, fix)) = has_recent_failure
-            && !fix.is_empty()
-            && cycle.metrics.failure_streak < cycle.strategy.max_retries_per_failure
+        if let Some(ref fh) = state.failure_hint
+            && !fh.suggested_fix.is_empty()
+            && state.metrics.failure_streak < RuntimeStrategy::from_profile(state.profile).max_retries_per_failure
         {
-            return RuntimeDecision::retry_with_fix(0, fix);
+            return RuntimeDecision::retry_with_fix(0, &fh.suggested_fix);
         }
 
         // Rule 3: Active plan with pending steps
-        if let Some((_plan_id, _goal, pending_count)) = has_active_plan
-            && pending_count > 0
+        if let Some(ref ph) = state.plan_hint
+            && ph.pending_step_count > 0
         {
-            return RuntimeDecision::continue_plan(0, "");
+            return RuntimeDecision::continue_plan(0, &ph.goal);
         }
 
         // Rule 4: Token budget critical
-        if cycle.metrics.is_token_critical() {
+        if state.metrics.is_token_critical() {
             return RuntimeDecision::compact_and_proceed();
         }
 
         // Rule 5: No optimization applies — model's turn
         RuntimeDecision::delegate("no applicable optimization")
+    }
+
+    /// Legacy convenience method. Prefer `decide(&RuntimeState)`.
+    pub fn decide_from_parts(
+        cycle: &ExecutionCycle,
+        has_tool_cache_hit: Option<(&str, i64, u64)>,
+        has_recent_failure: Option<(&str, &str)>,
+        has_active_plan: Option<(i64, &str, usize)>,
+    ) -> RuntimeDecision {
+        let state = RuntimeState {
+            profile: cycle.profile,
+            metrics: cycle.metrics.clone(),
+            cache_hit: has_tool_cache_hit.map(|(tool_name, cache_id, estimated_token_saving)| {
+                CacheHit { tool_name: tool_name.to_string(), cache_id, estimated_token_saving }
+            }),
+            failure_hint: has_recent_failure.map(|(signature, suggested_fix)| {
+                FailureHint { signature: signature.to_string(), suggested_fix: suggested_fix.to_string(), why_failed: String::new() }
+            }),
+            plan_hint: has_active_plan.map(|(plan_id, goal, pending_step_count)| {
+                PlanHint { plan_id, goal: goal.to_string(), pending_step_count }
+            }),
+            context_delta: cycle.context_delta.clone(),
+        };
+        Self::decide(&state)
     }
 }
 
@@ -464,33 +564,41 @@ mod tests {
         assert!(s.freeze_plans_early);
     }
 
+    fn make_state(profile: RuntimeProfile, cache: Option<(&str, i64, u64)>, failure: Option<(&str, &str)>, plan: Option<(i64, &str, usize)>) -> RuntimeState {
+        let mut metrics = RuntimeMetrics::default();
+        metrics.budget_remaining_pct = 1.0;
+        RuntimeState {
+            profile,
+            metrics,
+            cache_hit: cache.map(|(t, id, save)| CacheHit { tool_name: t.to_string(), cache_id: id, estimated_token_saving: save }),
+            failure_hint: failure.map(|(sig, fix)| FailureHint { signature: sig.to_string(), suggested_fix: fix.to_string(), why_failed: String::new() }),
+            plan_hint: plan.map(|(id, goal, count)| PlanHint { plan_id: id, goal: goal.to_string(), pending_step_count: count }),
+            context_delta: vec![],
+        }
+    }
+
     #[test]
     fn cache_hit_confidence_scales_with_strategy() {
-        let aggressive = ExecutionCycle::new(RuntimeProfile::Minimal);
-        let relaxed = ExecutionCycle::new(RuntimeProfile::Autonomous);
-
-        // Minimal profile: high confidence on cache hit
-        let d1 = RuntimePolicy::decide(&aggressive, Some(("grep", 42, 500)), None, None);
+        let s_min = RuntimeState { profile: RuntimeProfile::Minimal, ..make_state(RuntimeProfile::Minimal, None, None, None) };
+        let s_auto = RuntimeState { profile: RuntimeProfile::Autonomous, ..make_state(RuntimeProfile::Autonomous, None, None, None) };
+        let d1 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_min });
         assert!(d1.confidence > 0.8, "minimal should be confident about cache");
-
-        // Autonomous profile: lower confidence on same cache hit
-        let d2 = RuntimePolicy::decide(&relaxed, Some(("grep", 42, 500)), None, None);
+        let d2 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_auto });
         assert!(d2.confidence < d1.confidence, "autonomous should be less aggressive about cache");
     }
 
     #[test]
     fn empty_state_delegates_to_model() {
-        let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
-        let d = RuntimePolicy::decide(&cycle, None, None, None);
+        let d = RuntimePolicy::decide(&make_state(RuntimeProfile::Efficient, None, None, None));
         assert!(matches!(d.action, RuntimeAction::DelegateToModel));
         assert_eq!(d.confidence, 0.0);
     }
 
     #[test]
     fn token_critical_triggers_compact() {
-        let mut cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
-        cycle.metrics.budget_remaining_pct = 0.10;
-        let d = RuntimePolicy::decide(&cycle, None, None, None);
+        let mut state = make_state(RuntimeProfile::Efficient, None, None, None);
+        state.metrics.budget_remaining_pct = 0.10;
+        let d = RuntimePolicy::decide(&state);
         assert!(matches!(d.action, RuntimeAction::CompactAndProceed));
     }
 
