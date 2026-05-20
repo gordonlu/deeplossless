@@ -96,9 +96,17 @@ fn bench_cache_decay() {
     for turn in 0..200 {
         let file = files[turn % 3];
         let pattern = format!("bug_{}", turn % 10);
+        // Introduce cache misses: every 7th access uses a new pattern
+        let lookup_pattern = if turn % 7 == 0 {
+            format!("new_query_{}", turn)
+        } else {
+            pattern.clone()
+        };
+        // Put the known pattern
         let _ = db.tool_cache_put("grep", &pattern,
             &format!("{file}:{}: {pattern}", turn * 10), &[file.to_string()]);
-        let hit = db.tool_cache_get("grep", &pattern).unwrap();
+        // Try to get — may be a known pattern (hit) or new query (miss)
+        let hit = db.tool_cache_get("grep", &lookup_pattern).unwrap();
         if hit.is_some() { total_hits += 1; } else { total_misses += 1; }
         if turn % 20 == 0 && turn > 0 {
             let _ = db.on_files_changed(&[file.to_string()]);
@@ -230,15 +238,18 @@ fn bench_efficiency_ratio() {
     let overhead = (runtime_ms - baseline_ms).max(0.0);
     let ratio = efficiency_ratio(tokens_saved, overhead);
 
-    println!("  ║  Baseline:    {baseline_tokens} tokens in {baseline_ms:.0}ms           ║");
+    let overhead_us = ((runtime_ms - baseline_ms).max(0.0) * 1000.0) as u64;
+    let overhead_label = if overhead_us == 0 { "<1μs".to_string() } else { format!("{overhead_us}μs") };
+    let ratio = if overhead_us > 0 {
+        format!("{:.0}", tokens_saved as f64 / overhead_us as f64 * 1000.0)
+    } else { format!("{tokens_saved} (no measurable overhead)") };
+    println!("  ║  Baseline:    {baseline_tokens} tokens in {baseline_ms:.0}ms          ║");
     println!("  ║  Runtime:     {runtime_tokens} tokens in {runtime_ms:.0}ms           ║");
     println!("  ║  Saved:       {tokens_saved} tokens                       ║");
-    println!("  ║  Overhead:    {overhead:.1}ms                             ║");
-    println!("  ║  Cache hits:  {hits}/{sessions}                                ║");
-    println!("  ║  Efficiency:  {ratio:.1} tokens saved / ms overhead ║");
+    println!("  ║  Overhead:    {overhead_label}                              ║");
+    println!("  ║  Cache hits:  {hits}/{sessions}  ({:.0}% reuse)         ║", hits as f64 / sessions as f64 * 100.0);
+    println!("  ║  Efficiency:  {ratio} tok/ms overhead               ║");
     println!("  ╚══════════════════════════════════════════════════════╝");
-    // If runtime is faster than baseline (overhead ≤ 0), it's a net win.
-    // If slower, must save >1 token per ms of overhead.
-    assert!(overhead <= 0.0 || ratio > 1.0,
-        "Runtime overhead ({overhead:.1}ms) not worth token savings ({tokens_saved} tokens, {ratio:.1} tok/ms)");
+    // Runtime overhead must be worth the token savings.
+    if overhead > 0.0 { assert!(efficiency_ratio(tokens_saved, overhead) > 1.0, "Overhead not justified"); }
 }
