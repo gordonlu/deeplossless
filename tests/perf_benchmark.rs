@@ -156,7 +156,7 @@ fn bench_long_session_degradation() {
             step, assemble_us, cache_us, ctx.len());
     }
     println!("  ╚══════════════════════════════════════════════════════╝");
-    assert!(true);
+    
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -225,10 +225,10 @@ fn bench_efficiency_ratio() {
     let mut hits: u64 = 0;
     for t in 0..sessions {
         let pattern = format!("bug_{}", t % 20);
-        if let Some(_) = db_r.tool_cache_get("grep", &pattern).unwrap() {
+        if db_r.tool_cache_get("grep", &pattern).unwrap().is_some() {
             hits += 1;
         } else {
-            let _ = db_r.tool_cache_put("grep", &pattern, &format!("found"), &[files[t % 5].to_string()]);
+            let _ = db_r.tool_cache_put("grep", &pattern, "found", &[files[t % 5].to_string()]);
             dag_r.insert_leaf(conv_r, &format!("grep {pattern}"), 10).unwrap();
             runtime_tokens += 500;
         }
@@ -236,7 +236,7 @@ fn bench_efficiency_ratio() {
     let runtime_ms = start_r.elapsed().as_millis() as f64;
     let tokens_saved = baseline_tokens.saturating_sub(runtime_tokens);
     let overhead = (runtime_ms - baseline_ms).max(0.0);
-    let ratio = efficiency_ratio(tokens_saved, overhead);
+    let _ratio = efficiency_ratio(tokens_saved, overhead);
 
     let overhead_us = ((runtime_ms - baseline_ms).max(0.0) * 1000.0) as u64;
     let overhead_label = if overhead_us == 0 { "<1μs".to_string() } else { format!("{overhead_us}μs") };
