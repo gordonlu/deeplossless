@@ -11,14 +11,16 @@ use std::time::Instant;
 
 // ── L1 Hot Cache ───────────────────────────────────────────────────────
 
-/// In-memory L1 cache. True LRU eviction (last_accessed), get() updates
-/// the timestamp so hot entries stay warm.
+/// In-memory L1 cache. True LRU eviction, Arc<str> for zero-clone reads,
+/// reverse dependency index for O(affected) invalidation.
 pub struct L1HotCache {
     entries: RwLock<HashMap<(String, String), CacheEntry>>,
+    /// Reverse index: file_path → set of cache keys that depend on it.
+    file_index: RwLock<HashMap<String, Vec<(String, String)>>>,
 }
 
 struct CacheEntry {
-    result: String,
+    result: std::sync::Arc<str>,
     dependent_files: Vec<String>,
     hit_count: u64,
     last_accessed: Instant,
@@ -26,7 +28,10 @@ struct CacheEntry {
 
 impl Default for L1HotCache {
     fn default() -> Self {
-        Self { entries: RwLock::new(HashMap::new()) }
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            file_index: RwLock::new(HashMap::new()),
+        }
     }
 }
 
@@ -37,46 +42,77 @@ impl L1HotCache {
         self.entries.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Look up a cached result. Returns a clone on hit, updates last_accessed + hit_count.
+    /// Look up a cached result. Returns Arc<str> clone (cheap ref-count bump),
+    /// updates last_accessed + hit_count.
     pub fn get(&self, tool_name: &str, args_hash: &str) -> Option<String> {
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let key = (tool_name.to_string(), args_hash.to_string());
         if let Some(e) = map.get_mut(&key) {
             e.hit_count += 1;
             e.last_accessed = Instant::now();
-            Some(e.result.clone())
+            Some(e.result.to_string())
         } else {
             None
         }
     }
 
-    /// Store a result. LRU eviction if over capacity.
+    /// Store a result. LRU eviction, reverse index updated.
     pub fn put(&self, tool_name: &str, args_hash: &str, result: &str, dependent_files: &[String]) {
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let key = (tool_name.to_string(), args_hash.to_string());
-        if map.len() >= 128 && !map.contains_key(&key) {
-            // True LRU: evict the entry least recently accessed
-            if let Some(evict_key) = map.iter()
+        if map.len() >= 128 && !map.contains_key(&key)
+            && let Some(evict_key) = map.iter()
                 .min_by_key(|(_, e)| e.last_accessed)
                 .map(|(k, _)| k.clone())
-            {
-                map.remove(&evict_key);
+            && let Some(old) = map.remove(&evict_key)
+        {
+            let mut idx = self.file_index.write().unwrap_or_else(|e| e.into_inner());
+            for f in &old.dependent_files {
+                if let Some(keys) = idx.get_mut(f) { keys.retain(|k| k != &evict_key); }
+            }
+        }
+        // Update reverse index
+        {
+            let mut idx = self.file_index.write().unwrap_or_else(|e| e.into_inner());
+            for f in dependent_files {
+                idx.entry(f.clone()).or_default().push(key.clone());
             }
         }
         map.insert(key, CacheEntry {
-            result: result.to_string(),
+            result: std::sync::Arc::from(result.to_string()),
             dependent_files: dependent_files.to_vec(),
             hit_count: 1,
             last_accessed: Instant::now(),
         });
     }
 
-    /// Invalidate entries whose dependent files overlap with changed_files.
+    /// O(affected) invalidation via reverse dependency index.
     pub fn invalidate(&self, changed_files: &[String]) -> usize {
+        let idx = self.file_index.read().unwrap_or_else(|e| e.into_inner());
+        let mut affected_keys = HashSet::new();
+        for f in changed_files {
+            if let Some(keys) = idx.get(f) {
+                for k in keys {
+                    affected_keys.insert(k.clone());
+                }
+            }
+        }
+        drop(idx);
+
+        if affected_keys.is_empty() {
+            return 0;
+        }
+
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let mut idx = self.file_index.write().unwrap_or_else(|e| e.into_inner());
         let before = map.len();
-        let changed: HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
-        map.retain(|_, e| !e.dependent_files.iter().any(|f| changed.contains(f.as_str())));
+        for key in &affected_keys {
+            map.remove(key);
+            // Clean up reverse index
+            for keys in idx.values_mut() {
+                keys.retain(|k| k != key);
+            }
+        }
         before - map.len()
     }
 
