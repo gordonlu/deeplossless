@@ -146,9 +146,24 @@ GET  /v1/lcm/stream/{conv_id}?budget=  — Streaming DAG context (SSE incrementa
 ### Runtime
 
 ```
-GET  /v1/lcm/global/search?q=&limit=   — Cross-session semantic search
-GET  /v1/lcm/execution/search?q=       — Execution memory: bugs, tool chains, code edits
-GET  /v1/lcm/runtime/stats             — Runtime metrics (tokens, cache rate, failures)
+GET  /v1/lcm/global/search?q=&limit=     — Cross-session semantic search
+GET  /v1/lcm/execution/search?q=         — Execution memory: bugs, tool chains, code edits
+GET  /v1/lcm/runtime/stats               — Runtime metrics (tokens, cache rate, failures)
+GET  /v1/lcm/runtime/report?conv_id=&format= — Session report (markdown or SVG share card)
+GET  /v1/lcm/runtime/debug-dump          — Structured dump for GitHub issues (no user content)
+```
+
+### Agent hooks
+
+```
+GET  /v1/lcm/cache?tool=&args=           — Check tool cache before execution
+POST /v1/lcm/cache/put                   — Store tool result after execution
+POST /v1/lcm/failure                     — Record failure pattern (auto-detected by pipeline)
+POST /v1/lcm/plan                        — Store execution plan
+GET  /v1/lcm/plan/{conv_id}              — Read active plan
+POST /v1/lcm/file/claim                  — Claim file ownership (409 if conflict)
+POST /v1/lcm/file/release                — Release file ownership
+GET  /v1/lcm/file/conflicts              — List active file claims
 ```
 
 ### Operations

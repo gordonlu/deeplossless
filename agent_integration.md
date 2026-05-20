@@ -10,6 +10,25 @@ exposed as HTTP endpoints.
 
 ---
 
+## Auto-failure detection
+
+The pipeline detects failures in tool execution results automatically. When a
+tool result contains error output, the runtime creates a failure pattern
+without the agent needing to call any endpoint. The agent can still augment
+failures with `POST /v1/lcm/failure` for additional context (`why_failed`,
+`invalidated_assumptions`).
+
+## Debug dump
+
+When reporting issues, run this and paste the output into the GitHub issue:
+
+```bash
+curl http://127.0.0.1:8080/v1/lcm/runtime/debug-dump | jq .
+```
+
+The dump contains only counts, hashes, and structural metadata. No message
+content, file contents, API keys, or embedding vectors are exposed.
+
 ## What happens automatically
 
 When an agent connects to deeplossless as its API proxy, the following happens
