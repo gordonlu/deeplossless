@@ -516,8 +516,14 @@ async fn lcm_runtime_report(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let label = params.get("label").map(|s| s.as_str()).unwrap_or("coding session");
+    let conv_id: Option<i64> = params.get("conv_id").and_then(|s| s.parse().ok());
     let turns: usize = params.get("turns").and_then(|s| s.parse().ok()).unwrap_or(0);
     let fmt = params.get("format").map(|s| s.as_str()).unwrap_or("md");
+
+    // Per-conversation data if conv_id provided
+    let (_leaf_count, _summary_count, total_tokens, failure_count) = conv_id
+        .and_then(|cid| state.db.collect_session_metrics(cid).ok())
+        .unwrap_or((0, 0, 0, 0));
 
     let top_reused = state.db.top_tool_cache_entries(8)
         .unwrap_or_default()
@@ -526,11 +532,17 @@ async fn lcm_runtime_report(
         .collect::<Vec<_>>();
 
     let duration: u64 = params.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // If conv_id provided, override global metrics with per-session data
+    if conv_id.is_some() {
+        cycle.metrics.tokens_spent = total_tokens as u64;
+        cycle.metrics.repeated_failures = failure_count as u64;
+        cycle.metrics.failure_streak = failure_count.min(1) as u32;
+    }
 
     if fmt == "svg" {
         let svg = crate::runtime::generate_svg_card(&cycle, label, turns, &top_reused);
-        drop(cycle);
         let mut response = Response::new(axum::body::Body::from(svg));
         *response.status_mut() = StatusCode::OK;
         response.headers_mut().insert("content-type", "image/svg+xml".parse().expect("static header"));
@@ -538,8 +550,6 @@ async fn lcm_runtime_report(
     }
 
     let report = crate::runtime::generate_report(&cycle, label, turns, &top_reused, duration);
-    drop(cycle);
-
     let mut response = Response::new(axum::body::Body::from(report));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert("content-type", "text/markdown; charset=utf-8".parse().expect("static header"));

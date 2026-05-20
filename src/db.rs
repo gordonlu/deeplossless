@@ -933,6 +933,25 @@ impl Database {
 
     // ── Tool result cache (v0.8) ──────────────────────────────────────
 
+    /// Collect per-conversation metrics for the session report.
+    pub fn collect_session_metrics(&self, conv_id: i64) -> anyhow::Result<(i64, i64, i64, i64)> {
+        // leaf_count, summary_count, total_tokens, failure_count
+        let conn = self.read_conn();
+        let leaf_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0",
+            rusqlite::params![conv_id], |r| r.get(0))?;
+        let summary_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0",
+            rusqlite::params![conv_id], |r| r.get(0))?;
+        let total_tokens: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0",
+            rusqlite::params![conv_id], |r| r.get(0))?;
+        let failure_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM failure_patterns WHERE conversation_id = ?1",
+            rusqlite::params![conv_id], |r| r.get(0))?;
+        Ok((leaf_count, summary_count, total_tokens, failure_count))
+    }
+
     /// Get top N most-hit tool cache entries for the session report.
     pub fn top_tool_cache_entries(&self, limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.read_conn();
