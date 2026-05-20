@@ -135,7 +135,7 @@ fn bench_tool_cache_hit_rate(c: &mut Criterion) {
 
     c.bench_function("runtime/cache_hit_decision", |b| {
         b.iter(|| {
-            let d = deeplossless::runtime::RuntimePolicy::decide(
+            let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
                 &cycle,
                 Some(("grep", 42, 500)),
                 None,
@@ -153,7 +153,7 @@ fn bench_failure_avoidance(c: &mut Criterion) {
 
     c.bench_function("runtime/failure_retry_decision", |b| {
         b.iter(|| {
-            let d = deeplossless::runtime::RuntimePolicy::decide(
+            let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
                 &cycle,
                 None,
                 Some(("sqlite deadlock", "use WAL mode + reader pool")),
@@ -171,7 +171,7 @@ fn bench_plan_continuation(c: &mut Criterion) {
 
     c.bench_function("runtime/plan_continue_decision", |b| {
         b.iter(|| {
-            let d = deeplossless::runtime::RuntimePolicy::decide(
+            let d = deeplossless::runtime::RuntimePolicy::decide_from_parts(
                 &cycle,
                 None,
                 None,
@@ -195,19 +195,19 @@ fn bench_full_decision_cycle(c: &mut Criterion) {
     c.bench_function("runtime/full_decision_cycle", |b| {
         b.iter(|| {
             // Simulate a full cycle: check cache, check failures, check plan, fall through
-            let d1 = deeplossless::runtime::RuntimePolicy::decide(
+            let d1 = deeplossless::runtime::RuntimePolicy::decide_from_parts(
                 &cycle,
                 Some(("grep", 1, 300)),
                 None,
                 Some((1, "task", 2)),
             );
-            let d2 = deeplossless::runtime::RuntimePolicy::decide(
+            let d2 = deeplossless::runtime::RuntimePolicy::decide_from_parts(
                 &cycle,
                 None,
                 Some(("deadlock", "use reader pool")),
                 None,
             );
-            let d3 = deeplossless::runtime::RuntimePolicy::decide(
+            let d3 = deeplossless::runtime::RuntimePolicy::decide_from_parts(
                 &cycle,
                 None,
                 None,

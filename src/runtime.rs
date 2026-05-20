@@ -565,8 +565,7 @@ mod tests {
     }
 
     fn make_state(profile: RuntimeProfile, cache: Option<(&str, i64, u64)>, failure: Option<(&str, &str)>, plan: Option<(i64, &str, usize)>) -> RuntimeState {
-        let mut metrics = RuntimeMetrics::default();
-        metrics.budget_remaining_pct = 1.0;
+        let metrics = RuntimeMetrics { budget_remaining_pct: 1.0, ..RuntimeMetrics::default() };
         RuntimeState {
             profile,
             metrics,

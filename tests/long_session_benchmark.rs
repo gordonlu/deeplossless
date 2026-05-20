@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion, clippy::too_many_arguments)]
+
 //! Long-session benchmark — simulates 3 realistic coding tasks (~100 turns)
 //! with cache hits/misses, failure patterns, plan reuse, and multi-language code.
 //! No API key required. Run: cargo test --test long_session_benchmark -- --nocapture
