@@ -22,6 +22,29 @@ No API key. No proxy setup. Just Rust.
 
 > **109 tests pass. CI: check → clippy → test → doc.**
 
+## Try it now (zero config)
+
+```bash
+git clone https://github.com/gordonlu/deeplossless.git && cd deeplossless
+cargo test --test long_session_benchmark -- --nocapture
+```
+
+No API key. No proxy setup. No DeepSeek account. Just Rust.
+Outputs a comparison table immediately. Want to see what the runtime actually does?
+
+```bash
+cargo test --test simulated_session -- --nocapture   # detailed per-turn log
+cargo bench                                           # micro-benchmarks
+```
+
+## Quick start (proxy mode)
+
+```bash
+cargo build --release
+DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
+deepseek config set base_url http://127.0.0.1:8080/v1
+```
+
 ## Why
 
 Long coding sessions waste most tokens on repeated work:
@@ -90,19 +113,6 @@ or override each recommendation.
 
 Set via `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`.
 Custom: `RUNTIME_CACHE=0-1 RUNTIME_RETRIES=0-10 RUNTIME_SPECULATIVE=true|false RUNTIME_CONTEXT=0-1 RUNTIME_FREEZE=true|false RUNTIME_BUDGET=0.1-1`
-
-## Quick start
-
-```bash
-git clone https://github.com/gordonlu/deeplossless.git
-cd deeplossless
-cargo build --release
-
-DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
-
-# Point any OpenAI-compatible client to the proxy:
-deepseek config set base_url http://127.0.0.1:8080/v1
-```
 
 ## Configuration
 
