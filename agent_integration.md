@@ -24,19 +24,20 @@ without any extra work by the agent:
 | Context injection | Three-tier `<lcm_context>` block (Summaries → Snippets → Recent) |
 | Code change auto-invalidation | Stored code changes trigger cache invalidation for affected files |
 
-## What requires explicit integration
+## What the agent can call directly
 
-These features exist as database tables and Rust APIs but do **not** yet have HTTP
-endpoints. An integration layer between your agent and the runtime is needed to
-populate them:
+These features have HTTP endpoints. Agents can call them in a lightweight hook layer.
 
-| Feature | Available via |
-|---------|---------------|
-| Tool result cache | `db.tool_cache_put()` — save before/after tool execution |
-| Failure patterns | `db.store_failure_pattern()` — record why_failed + fix |
-| Plan persistence | `db.store_plan_state()` — save execution state |
+| Feature | Endpoint | When to call |
+|---------|----------|--------------|
+| Tool cache lookup | `GET /v1/lcm/cache?tool=&args=` | Before executing a tool |
+| Tool cache store | `POST /v1/lcm/cache/put` | After executing a tool |
+| Failure pattern store | `POST /v1/lcm/failure` | After a fix fails |
+| Plan store | `POST /v1/lcm/plan` | After creating a plan |
+| Plan read | `GET /v1/lcm/plan/{conv_id}` | To resume a plan |
 
-You can implement a lightweight hook layer in ~100 lines.
+All endpoints use JSON. Tool args are normalized via SHA-256 hash
+to produce deterministic cache keys regardless of argument order.
 
 ---
 
@@ -51,18 +52,29 @@ deeplossless (proxy)
 Upstream LLM API (DeepSeek / OpenAI)
 ```
 
-Optional integration layer (recommended for maximum reuse):
+Optional hook layer (~10 lines per hook):
 
-```
-Agent
-  ↓
-┌─ before_tool(name, args)          → check tool_cache_get()
-├─ after_tool(name, args, result)   → tool_cache_put()
-├─ after_failure(error, attempted)  → store_failure_pattern()
-├─ after_plan(goal, steps)          → store_plan_state()
-└─ before_prompt(context)           → read runtime_stats
-  ↓
-deeplossless proxy
+```python
+def before_tool(tool, args):
+    r = requests.get("http://127.0.0.1:8080/v1/lcm/cache",
+                      params={"tool": tool, "args": json.dumps(args)})
+    if r.json().get("hit"):
+        return r.json()["result"]  # skip execution
+
+def after_tool(tool, args, result, files):
+    requests.post("http://127.0.0.1:8080/v1/lcm/cache/put", json={
+        "tool": tool, "args": json.dumps(args),
+        "result": result, "files": json.dumps(files)})
+
+def after_failure(sig, fix, why, files):
+    requests.post("http://127.0.0.1:8080/v1/lcm/failure", json={
+        "signature": sig, "attempted_fix": fix,
+        "why_failed": why, "files": json.dumps(files)})
+
+def after_plan(goal, steps, assumptions):
+    requests.post("http://127.0.0.1:8080/v1/lcm/plan", json={
+        "goal": goal, "steps": json.dumps(steps),
+        "assumptions": json.dumps(assumptions)})
 ```
 
 ---
@@ -197,7 +209,7 @@ plans as potentially stale (assumptions may have been invalidated).
 
 Agents using deeplossless should expect:
 
-- Tool results may be served from cache (if integration layer populates it)
+- Tool results may be served from cache (`GET /v1/lcm/cache`)
 - Execution state persists across turns (messages, DAG nodes, provenance)
 - The system prompt contains a structured `<lcm_context>` block
 - Repeated operations on unchanged files may be short-circuited
