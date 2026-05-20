@@ -562,6 +562,87 @@ pub fn generate_report(
     out
 }
 
+/// Generate an SVG share card from the same data.
+/// 1200×630px, dark theme, self-contained.
+pub fn generate_svg_card(
+    cycle: &ExecutionCycle,
+    session_label: &str,
+    turn_count: usize,
+    top_reused: &[(String, u64)],
+) -> String {
+    let m = &cycle.metrics;
+    let estimated_saved = m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
+    let total_hits = m.cache_hits + m.cache_misses;
+    let hit_pct = if total_hits > 0 { m.cache_hits as f64 / total_hits as f64 * 100.0 } else { 0.0 };
+
+    // Truncate label
+    let label: String = session_label.chars().take(40).collect();
+
+    let mut svg = String::new();
+    let c = |hex: &str| format!("\"#{hex}\""); // helper: produce `"#ff0000"` safely
+
+    svg.push_str(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color={c0}/>
+      <stop offset="100%" stop-color={c1}/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <text x="60" y="80" font-family="monospace" font-size="24" fill={grey}>deeplossless session report</text>
+  <text x="60" y="120" font-family="monospace" font-size="36" font-weight="bold" fill={white}>{label}</text>
+  <text x="60" y="160" font-family="monospace" font-size="20" fill={grey}>{turn_count} turns · {hit_pct:.0}% cache reuse</text>
+  <line x1="60" y1="190" x2="1140" y2="190" stroke={border} stroke-width="1"/>
+
+  <rect x="60" y="220" width="250" height="100" rx="8" fill={c1} stroke={border} stroke-width="1"/>
+  <text x="185" y="260" font-family="monospace" font-size="16" fill={grey} text-anchor="middle">Tokens avoided</text>
+  <text x="185" y="300" font-family="monospace" font-size="32" font-weight="bold" fill={green} text-anchor="middle">~{estimated_saved}</text>
+
+  <rect x="330" y="220" width="250" height="100" rx="8" fill={c1} stroke={border} stroke-width="1"/>
+  <text x="455" y="260" font-family="monospace" font-size="16" fill={grey} text-anchor="middle">Cache hits</text>
+  <text x="455" y="300" font-family="monospace" font-size="32" font-weight="bold" fill={blue} text-anchor="middle">{cache_hits}</text>
+
+  <rect x="600" y="220" width="250" height="100" rx="8" fill={c1} stroke={border} stroke-width="1"/>
+  <text x="725" y="260" font-family="monospace" font-size="16" fill={grey} text-anchor="middle">Failures prevented</text>
+  <text x="725" y="300" font-family="monospace" font-size="32" font-weight="bold" fill={purple} text-anchor="middle">{failures_broken}</text>
+
+  <rect x="870" y="220" width="270" height="100" rx="8" fill={c1} stroke={border} stroke-width="1"/>
+  <text x="1005" y="260" font-family="monospace" font-size="16" fill={grey} text-anchor="middle">Budget remaining</text>
+  <text x="1005" y="300" font-family="monospace" font-size="32" font-weight="bold" fill={orange} text-anchor="middle">{budget_pct:.0}%</text>
+
+  <text x="60" y="380" font-family="monospace" font-size="20" fill={white}>Most Reused</text>"##,
+        c0 = c("0d1117"), c1 = c("161b22"), grey = c("8b949e"), white = c("e6edf3"),
+        border = c("30363d"), green = c("3fb950"), blue = c("58a6ff"),
+        purple = c("d2a8ff"), orange = c("f0883e"),
+        label = label,
+        estimated_saved = estimated_saved,
+        cache_hits = m.cache_hits,
+        failures_broken = m.repeated_failures.min(m.cache_hits / 2),
+        budget_pct = m.budget_remaining_pct * 100.0,
+    ));
+
+    let mut y = 420;
+    for (label, count) in top_reused.iter().take(5) {
+        if *count > 0 {
+            svg.push_str(&format!(
+                r#"<text x="80" y="{y}" font-family="monospace" font-size="18" fill={grey}>{label}</text>
+  <text x="500" y="{y}" font-family="monospace" font-size="18" fill={blue}>{count}x</text>"#,
+                grey = c("8b949e"), blue = c("58a6ff"),
+            ));
+            y += 32;
+        }
+    }
+
+    svg.push_str(&format!(
+        r#"<text x="60" y="590" font-family="monospace" font-size="14" fill={faded}>github.com/gordonlu/deeplossless</text>
+</svg>"#,
+        faded = c("484f58"),
+    ));
+
+    svg
+}
+
 // ── Reasoning Distillation (execution compaction) ─────────────────────
 
 /// Distill execution history into compact outcome summaries.
