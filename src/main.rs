@@ -50,7 +50,7 @@ struct Cli {
     upstream: String,
 
     /// SQLite database path (supports ~/ and $HOME expansion)
-    #[arg(long, default_value = "~/.deepseek/lcm/lcm.db")]
+    #[arg(long, default_value = "~/.deeplossless/lcm.db")]
     db_path: String,
 
     /// DeepSeek API key (optional — extracted from first request's

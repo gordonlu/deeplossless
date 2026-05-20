@@ -20,7 +20,7 @@ pub struct UnifiedSearchResult {
     pub bm25_score: Option<f64>,
 }
 
-const DEFAULT_DB_PATH: &str = "~/.deepseek/lcm/lcm.db";
+const DEFAULT_DB_PATH: &str = "~/.deeplossless/lcm.db";
 
 /// Builder for [`Database`].
 ///

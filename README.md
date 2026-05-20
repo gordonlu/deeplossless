@@ -118,7 +118,7 @@ Custom: `RUNTIME_CACHE=0-1 RUNTIME_RETRIES=0-10 RUNTIME_SPECULATIVE=true|false R
 | `--host` | `127.0.0.1` | Listen address |
 | `--port` | `8080` | Listen port |
 | `--upstream` | `https://api.deepseek.com` | Upstream API base URL |
-| `--db-path` | `~/.deepseek/lcm/lcm.db` | SQLite database path |
+| `--db-path` | `~/.deeplossless/lcm.db` | SQLite database path |
 | `--api-key` | `DEEPSEEK_API_KEY` | DeepSeek API key (also extracted from first request) |
 | `--admin-key` | `ADMIN_KEY` | Admin key for LCM endpoints (falls back to API key) |
 | `--rate-limit` | `100` | Max requests/second (0 disables) |
