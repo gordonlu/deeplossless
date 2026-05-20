@@ -220,6 +220,9 @@ pub struct FailureHint {
     pub suggested_fix: String,
     /// Why the previous attempt failed.
     pub why_failed: String,
+    /// How many times this specific failure has been retried.
+    /// Used for per-pattern retry limiting, not global streak.
+    pub retry_count: u32,
 }
 
 /// An active plan with pending steps.
@@ -448,10 +451,10 @@ impl RuntimePolicy {
             }
         }
 
-        // Rule 2: Failure with known fix
+        // Rule 2: Failure with known fix (per-pattern retry limit)
         if let Some(ref fh) = state.failure_hint
             && !fh.suggested_fix.is_empty()
-            && state.metrics.failure_streak < RuntimeStrategy::from_profile(state.profile).max_retries_per_failure
+            && fh.retry_count < RuntimeStrategy::from_profile(state.profile).max_retries_per_failure
         {
             return RuntimeDecision::retry_with_fix(0, &fh.suggested_fix);
         }
@@ -486,7 +489,7 @@ impl RuntimePolicy {
                 CacheHit { tool_name: tool_name.to_string(), cache_id, estimated_token_saving }
             }),
             failure_hint: has_recent_failure.map(|(signature, suggested_fix)| {
-                FailureHint { signature: signature.to_string(), suggested_fix: suggested_fix.to_string(), why_failed: String::new() }
+                FailureHint { signature: signature.to_string(), suggested_fix: suggested_fix.to_string(), why_failed: String::new(), retry_count: 0 }
             }),
             plan_hint: has_active_plan.map(|(plan_id, goal, pending_step_count)| {
                 PlanHint { plan_id, goal: goal.to_string(), pending_step_count }
@@ -570,7 +573,7 @@ mod tests {
             profile,
             metrics,
             cache_hit: cache.map(|(t, id, save)| CacheHit { tool_name: t.to_string(), cache_id: id, estimated_token_saving: save }),
-            failure_hint: failure.map(|(sig, fix)| FailureHint { signature: sig.to_string(), suggested_fix: fix.to_string(), why_failed: String::new() }),
+            failure_hint: failure.map(|(sig, fix)| FailureHint { signature: sig.to_string(), suggested_fix: fix.to_string(), why_failed: String::new(), retry_count: 0 }),
             plan_hint: plan.map(|(id, goal, count)| PlanHint { plan_id: id, goal: goal.to_string(), pending_step_count: count }),
             context_delta: vec![],
         }

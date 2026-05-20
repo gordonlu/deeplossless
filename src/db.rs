@@ -1159,8 +1159,31 @@ impl Database {
     /// Cross-agent cache invalidation: when files change, invalidate affected
     /// tool cache entries and release stale claims.
     pub fn on_files_changed(&self, changed_files: &[String]) -> anyhow::Result<usize> {
-        // 1. Invalidate tool cache entries dependent on changed files
-        let invalidated = self.tool_cache_invalidate(changed_files)?;
+        // Expand changed files to include parent directories for broader invalidation.
+        // E.g., "src/main.rs" changed → also invalidate cache entries dependent on "src/"
+        let mut expanded = Vec::new();
+        for f in changed_files {
+            expanded.push(f.clone());
+            // Add parent directories
+            let mut path = std::path::Path::new(f);
+            while let Some(parent) = path.parent() {
+                let dir = parent.to_string_lossy().to_string();
+                if !dir.is_empty() && dir != "." {
+                    let dir_with_sep = if dir.ends_with('/') { dir.clone() } else { format!("{dir}/") };
+                    expanded.push(dir_with_sep);
+                    path = parent;
+                } else {
+                    break;
+                }
+            }
+        }
+        expanded.sort();
+        expanded.dedup();
+
+        // 1. Invalidate tool cache entries (O(affected) via reverse index)
+        let invalidated = self.tool_cache_l1.invalidate(&expanded);
+        // Also invalidate SQLite cache
+        let _ = self.tool_cache_invalidate(&expanded)?;
 
         // 2. Release claims on changed files (agent finished editing)
         if !changed_files.is_empty() {
@@ -1171,6 +1194,11 @@ impl Database {
                     rusqlite::params![f],
                 );
             }
+            // Mark active plans as stale — file changes may invalidate assumptions
+            let _ = conn.execute(
+                "UPDATE plan_states SET updated_at = datetime('now') WHERE is_active = 1",
+                [],
+            );
         }
         Ok(invalidated)
     }
@@ -1669,8 +1697,10 @@ impl Database {
     pub fn get_provenance(&self, summary_node_id: i64) -> anyhow::Result<Vec<(i64, i32, i32)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT source_node_id, sentence_offset, sentence_length
-             FROM provenance WHERE summary_node_id = ?1 ORDER BY sentence_offset",
+            "SELECT p.source_node_id, p.sentence_offset, p.sentence_length
+             FROM provenance p
+             JOIN dag_nodes n ON n.id = p.source_node_id AND n.deleted = 0
+             WHERE p.summary_node_id = ?1 ORDER BY p.sentence_offset",
         )?;
         let rows = stmt.query_map(rusqlite::params![summary_node_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
@@ -1707,7 +1737,7 @@ impl Database {
             "SELECT p.source_node_id, p.sentence_offset, p.sentence_length,
                     substr(n.summary, 1, 200)
              FROM provenance p
-             JOIN dag_nodes n ON n.id = p.source_node_id
+             JOIN dag_nodes n ON n.id = p.source_node_id AND n.deleted = 0
              WHERE p.summary_node_id = ?1
              ORDER BY p.sentence_offset"
         )?;
