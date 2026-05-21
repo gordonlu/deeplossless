@@ -39,6 +39,42 @@ impl ArtifactVersion {
     }
 }
 
+/// Section-level hash for structured files (TOML sections, Rust modules, etc.).
+/// Avoids invalidating ALL cache for a file when only one section changes.
+pub fn hash_sections(path: &str, content: &str) -> Vec<(String, String)> {
+    use sha2::{Digest, Sha256};
+
+    if path == "Cargo.toml" || path.ends_with(".toml") {
+        // TOML: hash each [section] independently
+        let mut sections = Vec::new();
+        let mut current_section = "[root]".to_string();
+        let mut current_content = String::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if !current_content.trim().is_empty() {
+                    let h = hex::encode(&Sha256::digest(current_content.as_bytes())[..8]);
+                    sections.push((current_section.clone(), h));
+                }
+                current_section = trimmed.to_string();
+                current_content = String::new();
+            } else {
+                current_content.push_str(line);
+                current_content.push('\n');
+            }
+        }
+        if !current_content.trim().is_empty() {
+            let h = hex::encode(&Sha256::digest(current_content.as_bytes())[..8]);
+            sections.push((current_section, h));
+        }
+        sections
+    } else {
+        // Default: whole-file hash
+        let h = hex::encode(&Sha256::digest(content.as_bytes())[..8]);
+        vec![(path.to_string(), h)]
+    }
+}
+
 // ── Execution Dependency ──────────────────────────────────────────────
 
 /// How an execution node depends on an artifact.
@@ -57,7 +93,7 @@ pub enum DependencyKind {
 }
 
 /// An edge from an execution to an artifact version.
-/// When the artifact changes, all dependent executions are invalidated.
+/// When the artifact changes, the edge is marked dirty (lazy invalidation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyEdge {
     /// The canonical execution key that depends on this artifact.
@@ -66,6 +102,9 @@ pub struct DependencyEdge {
     pub artifact: ArtifactVersion,
     /// How the execution used the artifact.
     pub kind: DependencyKind,
+    /// Whether this edge is stale (artifact changed since execution).
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// Reverse index: artifact path → set of execution keys that depend on it.
@@ -84,26 +123,60 @@ impl DependencyIndex {
         self.edges
             .entry(artifact.path.clone())
             .or_default()
-            .push(DependencyEdge { execution_key: exec_key.to_string(), artifact, kind });
+            .push(DependencyEdge { execution_key: exec_key.to_string(), artifact, kind, dirty: false });
+    }
+
+    /// Mark dependent executions as dirty when an artifact changes.
+    /// Returns the set of execution keys that are now dirty.
+    /// Does NOT cascade — dirty propagation is lazy (validate on next access).
+    pub fn mark_dirty(&mut self, new_version: &ArtifactVersion) -> Vec<String> {
+        let mut dirty = Vec::new();
+        if let Some(edges) = self.edges.get_mut(&new_version.path) {
+            for e in edges.iter_mut() {
+                if !e.artifact.is_same_content(new_version) {
+                    e.dirty = true;
+                    dirty.push(e.execution_key.clone());
+                }
+            }
+        }
+        dirty
+    }
+
+    /// Check if an execution key is dirty (stale). Used for lazy validation.
+    /// Returns true if any dependency of this execution has changed.
+    pub fn is_dirty(&self, exec_key: &str) -> bool {
+        self.edges.values().any(|edges| {
+            edges.iter().any(|e| e.execution_key == exec_key && e.dirty)
+        })
+    }
+
+    /// Validate (clean) an execution key — called when the execution is re-run
+    /// and produces the same result. Removes dirty flag.
+    pub fn validate(&mut self, exec_key: &str) {
+        for edges in self.edges.values_mut() {
+            for e in edges.iter_mut() {
+                if e.execution_key == exec_key {
+                    e.dirty = false;
+                }
+            }
+        }
     }
 
     /// Invalidate all executions that depend on a changed artifact.
     /// Returns the set of execution keys that should be invalidated.
-    /// `is_stale` checks if the current version differs from the recorded version.
+    /// Keeps edges for tracking but marks as stale.
     pub fn invalidate(&mut self, new_version: &ArtifactVersion) -> Vec<String> {
-        let mut invalidated = Vec::new();
-        if let Some(edges) = self.edges.get_mut(&new_version.path) {
-            // Keep only non-matching versions; remove matching ones (still valid)
-            edges.retain(|e| {
-                if e.artifact.is_same_content(new_version) {
-                    false // same content, still valid
-                } else {
-                    invalidated.push(e.execution_key.clone());
-                    true // keep for tracking but mark as invalidated
-                }
-            });
+        self.mark_dirty(new_version)
+    }
+
+    /// Compact the dependency index: remove edges that are clean and
+    /// from executions older than `max_age_versions` versions.
+    pub fn compact(&mut self, max_age_versions: usize) {
+        for edges in self.edges.values_mut() {
+            let len = edges.len();
+            edges.retain(|e| e.dirty || len <= max_age_versions);
         }
-        invalidated
+        self.edges.retain(|_, v| !v.is_empty());
     }
 
     /// Get all execution keys that depend on a given artifact path.

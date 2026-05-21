@@ -86,6 +86,42 @@ pub struct ReasoningStep {
     pub derived_from: Vec<i64>,
 }
 
+/// Normalize reasoning text to a canonical form for dedup.
+/// Collapses whitespace, lowercases, trims — similar reasoning → same hash.
+pub fn normalize_reasoning(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// Compress lineage by squashing intermediate DerivedFrom edges.
+/// A → B → C becomes A → C if B adds no new information.
+pub fn compact_lineage(
+    edges: &[(i64, i64, LineageEdge)],
+) -> Vec<(i64, i64, LineageEdge)> {
+    // Keep non-DerivedFrom edges, squash DerivedFrom chains
+    let mut result = Vec::new();
+    let mut skip: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for &(from, to, kind) in edges {
+        if kind == LineageEdge::DerivedFrom && skip.contains(&from) {
+            // Intermediate node already squashed, skip
+            continue;
+        }
+        if kind == LineageEdge::DerivedFrom {
+            skip.insert(to);
+        }
+        result.push((from, to, kind));
+    }
+    result
+}
+
 /// Compress a sequence of reasoning steps into a summary.
 /// Keeps Assumption + Failure + Resolution, drops intermediate Validation steps.
 pub fn distill_reasoning(steps: &[ReasoningStep]) -> String {
