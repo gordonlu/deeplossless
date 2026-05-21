@@ -155,9 +155,12 @@ pub fn stream_event_to_responses(event: &StreamEvent) -> String {
     use serde_json::json;
     match event {
         StreamEvent::TextDelta { text } => json!({"type": "response.output_text.delta", "delta": text}).to_string(),
-        StreamEvent::ToolCallStart { index: _, id, name: _ } => json!({"type": "response.function_call_arguments.delta", "item_id": id, "delta": ""}).to_string(),
-        StreamEvent::ToolCallArgsDelta { arguments_delta, .. } => json!({"type": "response.function_call_arguments.delta", "delta": arguments_delta}).to_string(),
-        StreamEvent::ToolCallEnd { .. } => String::new(),
+        StreamEvent::ToolCallStart { index, id, name } => json!({"type": "response.output_item.added", "item": {"id": id, "type": "function_call", "name": name}, "output_index": index}).to_string(),
+        StreamEvent::ToolCallArgsDelta { index, arguments_delta, .. } => json!({"type": "response.function_call_arguments.delta", "output_index": index, "delta": arguments_delta}).to_string(),
+        StreamEvent::ToolCallEnd { index } => json!({"type": "response.output_item.done", "output_index": index}).to_string(),
+        StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments } => json!({"type": "response.function_call_arguments.done", "item_id": call_id, "name": name, "arguments": arguments}).to_string(),
+        StreamEvent::OutputItemAdded { index, item_type } => json!({"type": "response.output_item.added", "output_index": index, "item": {"type": item_type}}).to_string(),
+        StreamEvent::OutputItemDone { index } => json!({"type": "response.output_item.done", "output_index": index}).to_string(),
         StreamEvent::Done { usage, .. } => json!({"type": "response.completed", "response": {"usage": {"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens}}}).to_string(),
         StreamEvent::Error { message, code } => json!({"type": "error", "error": {"type": "server_error", "code": code.as_deref().unwrap_or("unknown"), "message": message}}).to_string(),
         _ => String::new(),

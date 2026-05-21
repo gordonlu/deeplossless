@@ -321,6 +321,18 @@ pub enum StreamEvent {
     #[serde(rename = "message_end")]
     MessageEnd,
 
+    /// A new output item is being created (Codex-style streaming).
+    #[serde(rename = "output_item_added")]
+    OutputItemAdded { index: usize, item_type: String },
+
+    /// An output item is complete.
+    #[serde(rename = "output_item_done")]
+    OutputItemDone { index: usize },
+
+    /// Function call arguments are complete.
+    #[serde(rename = "function_call_arguments_done")]
+    FunctionCallArgumentsDone { call_id: String, name: String, arguments: String },
+
     #[serde(rename = "done")]
     Done { usage: Usage, finish_reason: String },
 

@@ -555,6 +555,15 @@ pub struct FailurePattern {
     /// Link to the execution unit that recorded this failure.
     pub execution_unit_id: Option<i64>,
 
+    /// Canonical execution key for dedup (tool + normalized args hash).
+    #[serde(default)]
+    pub execution_key: String,
+
+    /// Runtime environment fingerprint (model, provider, tool versions).
+    /// Ensures failure patterns aren't misapplied across different environments.
+    #[serde(default)]
+    pub environment_fingerprint: String,
+
     pub created_at: String,
 }
 
@@ -569,6 +578,8 @@ pub const FAILURE_MIGRATION: &str = "
         invalidated_assumptions TEXT NOT NULL DEFAULT '[]',
         related_files           TEXT NOT NULL DEFAULT '[]',
         execution_unit_id       INTEGER REFERENCES execution_units(id),
+        execution_key           TEXT NOT NULL DEFAULT '',
+        environment_fingerprint TEXT NOT NULL DEFAULT '',
         created_at              TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_failure_sig

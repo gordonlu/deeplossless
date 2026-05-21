@@ -365,6 +365,16 @@ impl Database {
                 ON agent_active_files(file_path);")?;
         // v0.8: failure memory
         conn.execute_batch(crate::execution::FAILURE_MIGRATION)?;
+        // v0.3.0: failure pattern environment fingerprint (after table creation)
+        {
+            let has_exec_key: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('failure_patterns') WHERE name='execution_key'")
+                .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+            if !has_exec_key {
+                conn.execute_batch("ALTER TABLE failure_patterns ADD COLUMN execution_key TEXT NOT NULL DEFAULT '';")?;
+                conn.execute_batch("ALTER TABLE failure_patterns ADD COLUMN environment_fingerprint TEXT NOT NULL DEFAULT '';")?;
+            }
+        }
         // v0.8: plan persistence
         conn.execute_batch(crate::execution::PLAN_MIGRATION)?;
 
@@ -1134,8 +1144,8 @@ impl Database {
         let assump_json = serde_json::to_string(assumptions)?;
         let files_json = serde_json::to_string(related_files)?;
         conn.execute(
-            "INSERT INTO failure_patterns (conversation_id, signature, attempted_fix, why_failed, invalidated_assumptions, related_files, execution_unit_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO failure_patterns (conversation_id, signature, attempted_fix, why_failed, invalidated_assumptions, related_files, execution_unit_id, execution_key, environment_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', '')",
             rusqlite::params![conv_id, signature, attempted_fix, why_failed, assump_json, files_json, execution_unit_id],
         )?;
         Ok(conn.last_insert_rowid())

@@ -129,8 +129,10 @@ impl StreamAssembler {
                 self.pending.clear();
                 vec![event]
             }
-            // Text and reasoning pass through immediately
-            StreamEvent::MessageStart { .. } | StreamEvent::TextDelta { .. } | StreamEvent::ReasoningDelta { .. } => {
+            // Pass-through events: accumulate until flush
+            StreamEvent::MessageStart { .. } | StreamEvent::TextDelta { .. } | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::OutputItemAdded { .. } | StreamEvent::OutputItemDone { .. }
+            | StreamEvent::FunctionCallArgumentsDone { .. } => {
                 self.pending.push(event.clone());
                 vec![]
             }
