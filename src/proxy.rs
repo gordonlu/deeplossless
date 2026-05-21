@@ -300,7 +300,7 @@ async fn responses(
 /// DeepSeek doesn't support response retrieval natively. Codex uses this
 /// for status polling and stream reconnection.
 async fn responses_retrieve(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(response_id): Path<String>,
 ) -> Response {
     Json(json!({
