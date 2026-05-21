@@ -74,9 +74,23 @@ OpenAI-compatible clients: point `base_url` to `http://127.0.0.1:8080/v1`.
 Codex with DeepSeek: deeplossless translates the Responses API internally.
 
 ```bash
-# Codex connects here — deeplossless translates to Chat Completions for DeepSeek
-codex config set base_url http://127.0.0.1:8080/v1
+# 1. Start deeplossless
+deeplossless --api-key sk-...
+
+# 2. Codex config (~/.codex/config.toml)
+#    model_provider = "localproxy"
+#
+#    [model_providers.localproxy]
+#    name = "deeplossless"
+#    base_url = "http://127.0.0.1:8080/v1"
+#    wire_api = "responses"
+#    env_key = "DEEPSEEK_API_KEY"
+
+# 3. Run
+codex
 ```
+
+Model names are auto-mapped: `gpt-5` → `deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.
 
 ## Design Principles
 
@@ -157,6 +171,7 @@ POST /v1/responses            — Responses API → Chat Completions (enables Co
 
 Codex uses the Responses API natively. deeplossless translates it to Chat Completions
 internally, so Codex works with DeepSeek without any Codex-side configuration.
+Model names are auto-mapped: `gpt-5*` → `deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.
 
 ### Memory
 
