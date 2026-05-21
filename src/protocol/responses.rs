@@ -169,4 +169,4 @@ pub fn stream_event_to_responses(event: &StreamEvent) -> String {
 
 use std::sync::atomic::{AtomicU64, Ordering};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-fn monotonic_id() -> String { format!("{:016x}", ID_COUNTER.fetch_add(1, Ordering::Relaxed)) }
+pub fn monotonic_id() -> String { format!("{:016x}", ID_COUNTER.fetch_add(1, Ordering::Relaxed)) }

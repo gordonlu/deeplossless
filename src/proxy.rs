@@ -12,6 +12,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 use crate::metrics;
+use crate::protocol::canonical::StreamEvent;
 use crate::AppState;
 
 /// Uniform JSON error envelope: `{"error": {"code": "...", "message": "..."}}`
@@ -164,47 +165,49 @@ async fn responses(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
         tokio::spawn(async move {
+            // Generate a stable response ID for this streaming session
+            let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
             // Send response.created first (Codex requires this)
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n")
+                axum::body::Bytes::from(format!(
+                    "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{resp_id}\"}}}}\n\n"
+                ))
             ));
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut usage_buf: Option<serde_json::Value> = None;
+            let mut completed_sent = false;
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
                         let s = String::from_utf8_lossy(&c);
                         buf.push_str(&s);
-                        // Process complete SSE lines
                         while let Some(pos) = buf.find('\n') {
                             let line = buf[..pos].trim().to_string();
                             buf = buf[pos + 1..].to_string();
                             if let Some(data_line) = line.strip_prefix("data: ") {
-                                // Accumulate usage from chunk
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
                                     && v.get("usage").is_some() {
                                         usage_buf = Some(v.clone());
                                     }
                                 if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                                    // Track if we've already sent completed
+                                    if matches!(event, StreamEvent::Done { .. }) {
+                                        completed_sent = true;
+                                    }
                                     let sse_line = crate::protocol::streaming::to_responses_sse(&event);
                                     if tx.send(Ok::<_, std::convert::Infallible>(
                                         axum::body::Bytes::from(sse_line)
-                                    )).is_err() {
-                                        break;
-                                    }
+                                    )).is_err() { break; }
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!("stream error: {e}");
-                        break;
-                    }
+                    Err(e) => { warn!("stream error: {e}"); break; }
                 }
             }
-            // Process any remaining data in buffer (last line may not end with \n)
+            // Process trailing buffer (last line without \n)
             if !buf.trim().is_empty() {
                 let data_line = buf.trim().strip_prefix("data: ").unwrap_or(&buf);
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
@@ -212,31 +215,35 @@ async fn responses(
                         usage_buf = Some(v.clone());
                     }
                 if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                    if matches!(event, StreamEvent::Done { .. }) { completed_sent = true; }
                     let sse_line = crate::protocol::streaming::to_responses_sse(&event);
-                    let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                        axum::body::Bytes::from(sse_line)
-                    ));
+                    let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line)));
                 }
             }
-            // Send final events: output_text.done → completed → [DONE]
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
-            ));
-            let final_usage = usage_buf.map(|v| serde_json::json!({
-                "type": "response.completed",
-                "response": {
-                    "usage": {
-                        "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                        "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                        "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
+            // Only send final events if completed wasn't already sent by Done event
+            if !completed_sent {
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
+                ));
+                let final_usage = usage_buf.map(|v| serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                            "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                            "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
+                        }
                     }
-                }
-            })).unwrap_or(serde_json::json!({
-                "type": "response.completed",
-                "response": {}
-            }));
+                })).unwrap_or(serde_json::json!({"type":"response.completed","response":{"id":resp_id,"object":"response","status":"completed"}}));
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from(format!("event: response.completed\ndata: {final_usage}\n\n"))
+                ));
+            }
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from(format!("event: response.completed\ndata: {final_usage}\n\ndata: [DONE]\n\n"))
+                axum::body::Bytes::from("data: [DONE]\n\n")
             ));
         });
         let mut response = Response::new(Body::from_stream(stream));
