@@ -67,6 +67,7 @@ pub mod compactor;
 pub mod dag;
 pub mod db;
 pub mod embeddings;
+pub mod artifacts;
 pub mod execution;
 pub mod runtime;
 pub mod tool_cache;

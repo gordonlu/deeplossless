@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+// ── Provenance Lineage (typed edges between execution nodes) ──────────
+
+/// Typed lineage edge — what's the relationship between two execution nodes?
+/// More specific than "parent_ids", enables replay/audit/explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineageEdge {
+    /// Node B was derived from node A (summary, compaction).
+    DerivedFrom,
+    /// Node B depends on node A's output (tool chain).
+    DependsOn,
+    /// Node B was invalidated because node A changed.
+    InvalidatedBy,
+    /// Node B's fix was suggested by failure pattern from node A.
+    SuggestedBy,
+    /// Node B corrected the error from node A.
+    CorrectedBy,
+}
+
+impl LineageEdge {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DerivedFrom => "derived_from",
+            Self::DependsOn => "depends_on",
+            Self::InvalidatedBy => "invalidated_by",
+            Self::SuggestedBy => "suggested_by",
+            Self::CorrectedBy => "corrected_by",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "derived_from" => Some(Self::DerivedFrom),
+            "depends_on" => Some(Self::DependsOn),
+            "invalidated_by" => Some(Self::InvalidatedBy),
+            "suggested_by" => Some(Self::SuggestedBy),
+            "corrected_by" => Some(Self::CorrectedBy),
+            _ => None,
+        }
+    }
+}
+
+/// SQL migration for lineage edges.
+pub const LINEAGE_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS lineage_edges (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_id     INTEGER NOT NULL,
+        to_id       INTEGER NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'depends_on',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_lineage_from ON lineage_edges(from_id);
+    CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_id);";
+
+// ── Execution Outcome ─────────────────────────────────────────────────
+
 /// Outcome of a tool execution within an agent reasoning loop.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExecutionOutcome {

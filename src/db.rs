@@ -317,6 +317,10 @@ impl Database {
         conn.execute_batch(crate::execution::CODE_CHANGE_MIGRATION)?;
         // v0.8: tool result cache
         conn.execute_batch(crate::tool_cache::MIGRATION)?;
+        // v0.9: artifact versioning + dependency edges for invalidation correctness
+        conn.execute_batch(crate::artifacts::MIGRATION)?;
+        // v0.9: provenance lineage edges
+        conn.execute_batch(crate::execution::LINEAGE_MIGRATION)?;
         // v0.9: multi-agent safe runtime
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS agent_active_files (
