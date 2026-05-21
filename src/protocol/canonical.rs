@@ -301,7 +301,7 @@ pub struct Usage {
 #[serde(tag = "type")]
 pub enum StreamEvent {
     #[serde(rename = "message_start")]
-    MessageStart { role: String },
+    MessageStart { role: String, #[serde(default)] message_id: Option<String> },
 
     #[serde(rename = "text_delta")]
     TextDelta { text: String },

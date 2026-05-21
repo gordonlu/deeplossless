@@ -130,12 +130,33 @@ fn sha256_hex(input: &str) -> String {
 }
 
 /// Normalize tool arguments for deterministic cache keys.
-/// JSON: sort keys. Plain text: trim only (case-preserving).
+/// JSON: recursively sort object keys for canonical output.
+/// Plain text: trim only (case-preserving).
 pub fn normalize_args(args: &str) -> String {
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(args) {
-        serde_json::to_string(&val).unwrap_or_else(|_| args.trim().to_string())
+        let canonical = canonicalize_json(&val);
+        serde_json::to_string(&canonical).unwrap_or_else(|_| args.trim().to_string())
     } else {
         args.trim().to_string()
+    }
+}
+
+/// Recursively sort JSON object keys for deterministic serialization.
+/// `serde_json::to_string` doesn't guarantee key order — this fixes it.
+fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_json(v)))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(entries.into_iter().collect())
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -371,6 +392,14 @@ mod tests {
     fn normalize_preserves_case_for_plain_text() {
         let a = normalize_args("Grep FooBar");
         assert!(a.contains("Grep"), "case should be preserved for non-JSON args, got '{a}'");
+    }
+
+    #[test]
+    fn canonical_json_produces_identical_args_hash() {
+        let a = normalize_args(r#"{"b":2,"a":1,"c":{"z":9,"x":7}}"#);
+        let b = normalize_args(r#"{"a":1,"c":{"x":7,"z":9},"b":2}"#);
+        assert_eq!(a, b, "different key orders should produce identical canonical form");
+        assert_eq!(sha256_hex(&a), sha256_hex(&b), "hash must be identical for canonically equal JSON");
     }
 
     #[test]
