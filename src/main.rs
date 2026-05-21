@@ -108,44 +108,31 @@ async fn run_demo() -> anyhow::Result<()> {
     let _cycle = Arc::new(StdMutex::new(
         deeplossless::runtime::ExecutionCycle::new(RuntimeProfile::Efficient)));
 
-    let mut baseline: u64 = 0;
-    let mut runtime: u64 = 0;
-    let mut cache_hits: u64 = 0;
-    let mut failures_stopped: u64 = 0;
+    // Quick smoke test — insert a conversation to verify DB/DAG work
+    let conv_id = db.create_and_store("demo", &serde_json::json!([
+        {"role":"user","content":"Hello, deeplossless!"}
+    ]))?;
+    db.tool_cache_put("grep", "hello", "src/main.rs:42: found", &["src/main.rs".to_string()])?;
+    let _ = db.tool_cache_get("grep", "hello")?;
+    dag.insert_leaf(conv_id, "greeting", 5)?;
+    dag.assemble_context(conv_id, 1000, None)?;
 
-    let tasks = [
-        ("Rust async bug", "src/handler.rs", "select!"),
-        ("SQLite refactor", "src/db.rs", "prepare"),
-        ("OAuth feature", "src/auth.rs", "token"),
-    ];
-    for (name, file, pat) in tasks {
-        let conv_id = db.create_and_store(name, &serde_json::json!([
-            {"role":"user","content":format!("Fix {file}")}
-        ]))?;
-        db.tool_cache_put("grep", pat, &format!("{file}:42: found {pat}"), &[file.to_string()])?;
-        baseline += 500; runtime += 500;
-        db.tool_cache_put("read_file", file, &format!("100 lines in {file}"), &[file.to_string()])?;
-        baseline += 400; runtime += 400;
-        if db.tool_cache_get("grep", pat)?.is_some() { cache_hits += 1; baseline += 480; }
-        db.on_files_changed(&[file.to_string()])?;
-        db.store_failure_pattern(conv_id, &format!("{pat} error"), "edit file",
-            "stale cache", &[], &[file.to_string()], None)?;
-        failures_stopped += 1; baseline += 350; runtime += 200;
-        dag.insert_leaf(conv_id, &format!("fixed {pat}"), 10)?;
-        dag.assemble_context(conv_id, 1000, None)?;
-    }
-    let pct = (1.0 - runtime as f64 / baseline as f64) * 100.0;
-    println!("\n  deeplossless v{} — demo", env!("CARGO_PKG_VERSION"));
-    println!("  ┌──────────────────────────────────────────┐");
-    println!("  │  Tokens without runtime:    {:>6}         │", baseline);
-    println!("  │  Tokens with runtime:       {:>6}         │", runtime);
-    println!("  │  Cache hits:                {:>6}         │", cache_hits);
-    println!("  │  Failures prevented:        {:>6}         │", failures_stopped);
-    println!("  │  Savings:                   {:>5.0}%        │", pct);
-    println!("  └──────────────────────────────────────────┘");
-    println!("\n  Start the proxy:  deeplossless --api-key sk-...");
-    println!("  More benchmarks:  cargo test --test long_session_benchmark\n");
-    // Clean up temp DB from demo
+    println!("\n  deeplossless v{}", env!("CARGO_PKG_VERSION"));
+    println!("  Inference-aware execution runtime for AI coding agents\n");
+    println!("  Smoke test: database OK, DAG OK, cache OK\n");
+    println!("  Features:");
+    println!("    Tool Result Cache        — deterministic reuse, partial invalidation");
+    println!("    Failure Memory           — avoids repeated failed fixes");
+    println!("    Plan Persistence         — resumable execution state");
+    println!("    Semantic DAG             — embedding dedup, BM25 search");
+    println!("    Protocol translation     — Responses API → Chat Completions");
+    println!("    Runtime Policy           — advisory cache/retry/context decisions\n");
+    println!("  Start the proxy:");
+    println!("    deeplossless --api-key sk-...");
+    println!("  Then check:");
+    println!("    curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .\n");
+    println!("  Benchmarks (no API key needed):");
+    println!("    cargo test --test long_session_benchmark -- --nocapture\n");
     let _ = std::fs::remove_file("/tmp/deeplossless_demo.db");
     Ok(())
 }
