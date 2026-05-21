@@ -7,7 +7,7 @@ license = "MIT"
 description = "Inference-aware execution runtime for long-running AI coding agents"
 repository = "https://github.com/gordonlu/deeplossless"
 readme = "README.md"
-keywords = ["ai", "agent", "runtime", "inference", "coding", "proxy", "llm"]
+keywords = ["ai", "agent", "runtime", "inference", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
