@@ -35,7 +35,7 @@ async fn rate_limit_mw(
 }
 
 #[derive(Parser)]
-#[command(name = "deeplossless", version, about = "Lossless Context Management proxy for DeepSeek API")]
+#[command(name = "deeplossless", version, about = "Inference-aware execution runtime for AI coding agents")]
 struct Cli {
     /// Listen address
     #[arg(long, default_value = "127.0.0.1")]
