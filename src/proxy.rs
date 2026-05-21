@@ -64,6 +64,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        .route("/v1/responses/{response_id}", get(responses_retrieve))
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
@@ -293,6 +294,21 @@ async fn responses(
             }
         }
     }
+}
+
+/// Responses API retrieve — returns a minimal response object since
+/// DeepSeek doesn't support response retrieval natively. Codex uses this
+/// for status polling and stream reconnection.
+async fn responses_retrieve(
+    State(state): State<AppState>,
+    Path(response_id): Path<String>,
+) -> Response {
+    Json(json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": [],
+    })).into_response()
 }
 
 async fn chat_completions(
