@@ -175,6 +175,17 @@ async fn responses(
                 ))
             ));
             tracing::debug!(target: "deeplossless::stream", "sent: response.created");
+            // Codex requires response.in_progress + output_item.added before text deltas
+            let msg_id = format!("msg_{}", crate::protocol::responses::monotonic_id());
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{}}\n\n")
+            ));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!(
+                    "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}}}\n\n"
+                ))
+            ));
+            tracing::debug!(target: "deeplossless::stream", msg_id, "sent: in_progress + output_item.added");
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -229,6 +240,11 @@ async fn responses(
             if !completed_sent {
                 let _ = tx.send(Ok::<_, std::convert::Infallible>(
                     axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
+                ));
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from(format!(
+                        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[]}}}}\n\n"
+                    ))
                 ));
                 let final_usage = usage_buf.map(|v| serde_json::json!({
                     "type": "response.completed",
