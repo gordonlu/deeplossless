@@ -55,10 +55,14 @@ DeepLossless reuses:
 
 Instead of recomputing them every turn.
 
-## Quick start (proxy mode)
+## Quick start
 
 ```bash
-cargo install deeplossless
+# Try without API key first — runs a local demo
+deeplossless demo
+
+# Proxy mode: API key is only needed because deeplossless forwards
+# requests to the upstream LLM. The runtime itself runs 100% locally.
 deeplossless --api-key sk-...
 ```
 

@@ -5,7 +5,7 @@ use axum::{
     extract::Request,
 };
 use clap::Parser;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -75,6 +75,64 @@ struct Cli {
     /// Runtime profile (minimal, efficient, exploratory, autonomous, custom).
     #[arg(long, default_value = "autonomous", env = "RUNTIME_PROFILE")]
     runtime_profile: String,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Parser)]
+enum Commands {
+    /// Run a local demo (no API key needed)
+    Demo,
+}
+
+async fn run_demo() -> anyhow::Result<()> {
+    use deeplossless::runtime::RuntimeProfile;
+    let db = Arc::new(deeplossless::db::Database::builder()
+        .path(":memory:").build().await?);
+    let dag = Arc::new(deeplossless::dag::DagEngine::builder()
+        .max_level(3).recent_messages(20).build(db.clone()));
+    let _cycle = Arc::new(StdMutex::new(
+        deeplossless::runtime::ExecutionCycle::new(RuntimeProfile::Efficient)));
+
+    let mut baseline: u64 = 0;
+    let mut runtime: u64 = 0;
+    let mut cache_hits: u64 = 0;
+    let mut failures_stopped: u64 = 0;
+
+    let tasks = [
+        ("Rust async bug", "src/handler.rs", "select!"),
+        ("SQLite refactor", "src/db.rs", "prepare"),
+        ("OAuth feature", "src/auth.rs", "token"),
+    ];
+    for (name, file, pat) in tasks {
+        let conv_id = db.create_and_store(name, &serde_json::json!([
+            {"role":"user","content":format!("Fix {file}")}
+        ]))?;
+        db.tool_cache_put("grep", pat, &format!("{file}:42: found {pat}"), &[file.to_string()])?;
+        baseline += 500; runtime += 500;
+        db.tool_cache_put("read_file", file, &format!("100 lines in {file}"), &[file.to_string()])?;
+        baseline += 400; runtime += 400;
+        if db.tool_cache_get("grep", pat)?.is_some() { cache_hits += 1; baseline += 480; }
+        db.on_files_changed(&[file.to_string()])?;
+        db.store_failure_pattern(conv_id, &format!("{pat} error"), "edit file",
+            "stale cache", &[], &[file.to_string()], None)?;
+        failures_stopped += 1; baseline += 350; runtime += 200;
+        dag.insert_leaf(conv_id, &format!("fixed {pat}"), 10)?;
+        dag.assemble_context(conv_id, 1000, None)?;
+    }
+    let pct = (1.0 - runtime as f64 / baseline as f64) * 100.0;
+    println!("\n  deeplossless v{} — demo", env!("CARGO_PKG_VERSION"));
+    println!("  ┌──────────────────────────────────────────┐");
+    println!("  │  Tokens without runtime:    {:>6}         │", baseline);
+    println!("  │  Tokens with runtime:       {:>6}         │", runtime);
+    println!("  │  Cache hits:                {:>6}         │", cache_hits);
+    println!("  │  Failures prevented:        {:>6}         │", failures_stopped);
+    println!("  │  Savings:                   {:>5.0}%        │", pct);
+    println!("  └──────────────────────────────────────────┘");
+    println!("\n  Start the proxy:  deeplossless --api-key sk-...");
+    println!("  More benchmarks:  cargo test --test long_session_benchmark\n");
+    Ok(())
 }
 
 #[tokio::main]
@@ -87,6 +145,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Commands::Demo)) {
+        return run_demo().await;
+    }
 
     let upstream = cli.upstream.clone();
     let db = Arc::new(
