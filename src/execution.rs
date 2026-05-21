@@ -101,23 +101,50 @@ pub fn normalize_reasoning(text: &str) -> String {
         .collect()
 }
 
-/// Compress lineage by squashing intermediate DerivedFrom edges.
-/// A → B → C becomes A → C if B adds no new information.
+/// Compress lineage by transitive collapse of DerivedFrom edges.
+/// A → B → C becomes A → C (preserves the full causation chain).
 pub fn compact_lineage(
     edges: &[(i64, i64, LineageEdge)],
 ) -> Vec<(i64, i64, LineageEdge)> {
-    // Keep non-DerivedFrom edges, squash DerivedFrom chains
-    let mut result = Vec::new();
-    let mut skip: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    use std::collections::{HashMap, HashSet};
+
+    // Build adjacency: from → [(to, kind)]
+    let mut adj: HashMap<i64, Vec<(i64, LineageEdge)>> = HashMap::new();
     for &(from, to, kind) in edges {
-        if kind == LineageEdge::DerivedFrom && skip.contains(&from) {
-            // Intermediate node already squashed, skip
-            continue;
+        adj.entry(from).or_default().push((to, kind));
+    }
+
+    // Transitive collapse: for each DerivedFrom chain, emit source → ultimate target
+    let mut result = Vec::new();
+    let mut collapsed: HashSet<(i64, i64)> = HashSet::new();
+
+    for &(from, to, kind) in edges {
+        match kind {
+            LineageEdge::DerivedFrom => {
+                // Follow the chain to find the ultimate target
+                let mut current = to;
+                let mut depth = 0;
+                while depth < 10 {
+                    if let Some(nexts) = adj.get(&current)
+                        && let Some((next, LineageEdge::DerivedFrom)) = nexts.first() {
+                        current = *next;
+                        depth += 1;
+                        continue;
+                    }
+                    break;
+                }
+                // Emit source → ultimate if not already covered
+                if from != current && collapsed.insert((from, current)) {
+                    result.push((from, current, LineageEdge::DerivedFrom));
+                }
+            }
+            // Non-DerivedFrom edges pass through unchanged
+            _ => {
+                if collapsed.insert((from, to)) {
+                    result.push((from, to, kind));
+                }
+            }
         }
-        if kind == LineageEdge::DerivedFrom {
-            skip.insert(to);
-        }
-        result.push((from, to, kind));
     }
     result
 }
@@ -308,9 +335,10 @@ pub fn group_execution_chain(
         // Look for assistant message with tool calls
         if msg.role == "assistant" && !msg.tool_calls.is_empty() {
             let reasoning_before = msg.content.clone();
-            let related = Vec::new(); // will be filled with DAG node IDs after insertion
+            let related = Vec::new();
 
             // Collect all tool call→result pairs for this assistant turn
+            let mut last_tool_end = i; // track how far we advanced
             for tc in &msg.tool_calls {
                 let mut tool_result = String::new();
 
@@ -327,12 +355,10 @@ pub fn group_execution_chain(
                         tool_result.push_str(&next.content);
                     }
                     // Stop at next assistant message (end of tool chain)
-                    if next.role == "assistant" {
-                        break;
-                    }
+                    if next.role == "assistant" { break; }
                     j += 1;
                 }
-                i = j; // advance past tool results
+                last_tool_end = j; // remember furthest advance
 
                 // Infer outcome from result using structured patterns
                 let outcome = {
@@ -372,6 +398,8 @@ pub fn group_execution_chain(
                     &related,
                 ));
             }
+            i = last_tool_end; // skip past all processed tool results
+            continue; // skip the i += 1 at loop bottom
         }
         i += 1;
     }
