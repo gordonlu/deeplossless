@@ -234,7 +234,7 @@ the upstream API as a protocol translator, so most runtime features are
 | Tool Result Cache | NO | Codex doesn't query `GET /v1/lcm/cache` |
 | Failure Memory | NO | Codex manages failures internally |
 | Plan Persistence | NO | Codex maintains its own plan state |
-| File Ownership Tracking | NO | Codex is single-agent |
+| File Ownership Tracking | NO | Unsupported |
 | Execution Compaction | NO | Codex handles its own context management |
 | Runtime Policy | NO | Decisions are made by Codex, not the proxy |
 
