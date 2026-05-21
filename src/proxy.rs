@@ -117,8 +117,15 @@ async fn responses(
     }
 
     // 1. Responses API → canonical IR
-    let canonical = crate::protocol::responses::request_from_responses(&req_body);
-    let streaming = canonical.stream;
+    let mut canonical = crate::protocol::responses::request_from_responses(&req_body);
+    // Map Codex model names to DeepSeek equivalents
+    canonical.model = map_model(&canonical.model);
+    // Codex sends Accept: text/event-stream — treat as implicit stream request
+    let accept_ss = headers.get("accept").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let streaming = canonical.stream || accept_ss.contains("text/event-stream");
+    if streaming && !canonical.stream {
+        canonical.stream = true;
+    }
 
     // 2. Canonical IR → Chat Completions (for DeepSeek)
     let chat_body = crate::protocol::chat_completions::request_to_chat(&canonical);
@@ -157,6 +164,11 @@ async fn responses(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
         tokio::spawn(async move {
+            // Send response.created first (Codex requires this)
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n")
+            ));
+
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut usage_buf: Option<serde_json::Value> = None;
@@ -192,6 +204,10 @@ async fn responses(
                     }
                 }
             }
+            // Send [DONE] marker
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("data: [DONE]\n\n")
+            ));
         });
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = StatusCode::OK;
@@ -326,6 +342,18 @@ async fn chat_completions(
 /// Get the cached API key, or "unset" if none has been provided yet.
 /// The compactor will fall back to Level 3 (deterministic) if the key
 /// is "unset".
+/// Map Codex model names to DeepSeek equivalents.
+/// Codex sends "gpt-5.5", "gpt-4o", "o3" etc. — translate to DeepSeek models.
+fn map_model(model: &str) -> String {
+    let m = model.to_lowercase();
+    if m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m == "gpt-5.5" {
+        if m.contains("mini") { return "deepseek-v4-flash".into(); }
+        return "deepseek-v4-pro".into();
+    }
+    if model.is_empty() || model == "auto" { return "deepseek-v4-pro".into(); }
+    model.to_string()
+}
+
 fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
     key.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "unset".to_string())
 }

@@ -27,11 +27,19 @@ pub fn from_chat_completions_sse(data: &str, usage_buffer: Option<&serde_json::V
 }
 
 /// Convert a canonical `StreamEvent` into a Responses API SSE data line.
+/// Codex requires `event: <type>\ndata: {...}\n\n` format.
 pub fn to_responses_sse(event: &StreamEvent) -> String {
-    format!(
-        "data: {}\n\n",
-        super::responses::stream_event_to_responses(event)
-    )
+    let data = super::responses::stream_event_to_responses(event);
+    if data.is_empty() {
+        return String::new();
+    }
+    // Extract event type from the JSON for the SSE event: header
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+        if let Some(evt) = v["type"].as_str() {
+            return format!("event: {evt}\ndata: {data}\n\n");
+        }
+    }
+    format!("data: {data}\n\n")
 }
 
 /// Convert a canonical `StreamEvent` into a Chat Completions SSE data line.
