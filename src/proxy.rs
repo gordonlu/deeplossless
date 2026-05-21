@@ -204,9 +204,39 @@ async fn responses(
                     }
                 }
             }
-            // Send [DONE] marker
+            // Process any remaining data in buffer (last line may not end with \n)
+            if !buf.trim().is_empty() {
+                let data_line = buf.trim().strip_prefix("data: ").unwrap_or(&buf);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
+                    && v.get("usage").is_some() {
+                        usage_buf = Some(v.clone());
+                    }
+                if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                    let sse_line = crate::protocol::streaming::to_responses_sse(&event);
+                    let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                        axum::body::Bytes::from(sse_line)
+                    ));
+                }
+            }
+            // Send final events: output_text.done → completed → [DONE]
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("data: [DONE]\n\n")
+                axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
+            ));
+            let final_usage = usage_buf.map(|v| serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                        "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                        "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
+                    }
+                }
+            })).unwrap_or(serde_json::json!({
+                "type": "response.completed",
+                "response": {}
+            }));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.completed\ndata: {final_usage}\n\ndata: [DONE]\n\n"))
             ));
         });
         let mut response = Response::new(Body::from_stream(stream));
