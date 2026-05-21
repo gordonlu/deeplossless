@@ -83,7 +83,7 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
     CanonicalRequest {
         instructions, messages, tools, model, stream, max_tokens, temperature, response_format,
         provider: ProviderKind::OpenAI,
-        capabilities: ProviderCapabilities { json_schema: true, parallel_tools: true, multimodal: true, ..Default::default() },
+        capabilities: ProviderCapabilities { tool_streaming: ToolStreamingMode::Parallel, reasoning: ReasoningMode::Partial, structured_output: StructuredOutputMode::JsonSchema, multimodal: true },
     }
 }
 

@@ -92,7 +92,7 @@ pub fn request_from_chat(body: &serde_json::Value) -> CanonicalRequest {
         instructions, messages, tools, model, stream, max_tokens, temperature,
         response_format,
         provider: ProviderKind::OpenAI,
-        capabilities: ProviderCapabilities { json_schema: true, parallel_tools: true, ..Default::default() },
+        capabilities: ProviderCapabilities { structured_output: StructuredOutputMode::JsonSchema, ..Default::default() },
     }
 }
 

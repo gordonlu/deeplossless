@@ -54,6 +54,59 @@ pub const LINEAGE_MIGRATION: &str = "
     CREATE INDEX IF NOT EXISTS idx_lineage_from ON lineage_edges(from_id);
     CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_id);";
 
+// ── Structured Reasoning ──────────────────────────────────────────────
+
+/// Runtime-relevant reasoning kind — not free-form text, but typed execution intelligence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasoningKind {
+    /// An assumption the agent is making.
+    Assumption,
+    /// A hypothesis being tested.
+    Hypothesis,
+    /// Validation of a previous hypothesis or assumption.
+    Validation,
+    /// Recognition that a previous approach failed.
+    Failure,
+    /// Resolution or fix applied.
+    Resolution,
+}
+
+/// A structured reasoning step — execution-oriented, not chain-of-thought essay.
+/// Links to execution units for provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningStep {
+    /// What kind of reasoning this step represents.
+    pub kind: ReasoningKind,
+    /// The reasoning content (concise, not verbose).
+    pub content: String,
+    /// Execution unit this step is linked to, if any.
+    pub execution_unit_id: Option<i64>,
+    /// Lineage: which previous reasoning step(s) this derives from.
+    #[serde(default)]
+    pub derived_from: Vec<i64>,
+}
+
+/// Compress a sequence of reasoning steps into a summary.
+/// Keeps Assumption + Failure + Resolution, drops intermediate Validation steps.
+pub fn distill_reasoning(steps: &[ReasoningStep]) -> String {
+    let mut out = String::new();
+    for step in steps {
+        match step.kind {
+            ReasoningKind::Assumption => {
+                out.push_str(&format!("Assumed: {}\n", step.content));
+            }
+            ReasoningKind::Failure => {
+                out.push_str(&format!("Failed: {}\n", step.content));
+            }
+            ReasoningKind::Resolution => {
+                out.push_str(&format!("Resolved: {}\n", step.content));
+            }
+            _ => {} // skip intermediate Hypothesis/Validation
+        }
+    }
+    out.trim().to_string()
+}
+
 // ── Execution Outcome ─────────────────────────────────────────────────
 
 /// Outcome of a tool execution within an agent reasoning loop.
@@ -302,6 +355,18 @@ pub struct CodeChange {
 
     pub created_at: String,
 }
+
+/// SQL migration for reasoning_steps table.
+pub const REASONING_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS reasoning_steps (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind                TEXT NOT NULL DEFAULT 'assumption',
+        content             TEXT NOT NULL DEFAULT '',
+        execution_unit_id   INTEGER REFERENCES execution_units(id),
+        derived_from        TEXT NOT NULL DEFAULT '[]',
+        created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_reasoning_kind ON reasoning_steps(kind);";
 
 /// SQL migration for code_changes table.
 pub const CODE_CHANGE_MIGRATION: &str = "

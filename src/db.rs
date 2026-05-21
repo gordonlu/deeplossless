@@ -321,6 +321,8 @@ impl Database {
         conn.execute_batch(crate::artifacts::MIGRATION)?;
         // v0.9: provenance lineage edges
         conn.execute_batch(crate::execution::LINEAGE_MIGRATION)?;
+        // v0.9: structured reasoning steps
+        conn.execute_batch(crate::execution::REASONING_MIGRATION)?;
         // v0.9: multi-agent safe runtime
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS agent_active_files (

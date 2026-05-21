@@ -38,13 +38,85 @@ pub enum ProviderKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Tool streaming capability modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolStreamingMode {
+    /// Provider streams tool deltas in parallel (OpenAI style).
+    Parallel,
+    /// Provider streams tools sequentially (DeepSeek style).
+    Sequential,
+    /// Provider doesn't stream tool calls (batch only).
+    None,
+}
+
+/// Reasoning visibility — can the runtime see the model's thinking?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasoningMode {
+    /// Full reasoning visible in streaming.
+    Full,
+    /// Provider summarizes reasoning, not full chain.
+    Partial,
+    /// Provider hides reasoning (encrypted or hidden).
+    Hidden,
+}
+
+/// Structured output support level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StructuredOutputMode {
+    /// Full JSON Schema support (strict mode).
+    JsonSchema,
+    /// JSON mode without schema validation.
+    JsonMode,
+    /// No structured output support.
+    None,
+}
+
+/// Provider capabilities — what the upstream API supports.
+/// Used by `CapabilityAdapter` to determine which features to use or downgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
-    pub reasoning: bool,
-    pub tool_streaming: bool,
+    pub tool_streaming: ToolStreamingMode,
+    pub reasoning: ReasoningMode,
+    pub structured_output: StructuredOutputMode,
     pub multimodal: bool,
-    pub json_schema: bool,
-    pub parallel_tools: bool,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            tool_streaming: ToolStreamingMode::Sequential,
+            reasoning: ReasoningMode::Hidden,
+            structured_output: StructuredOutputMode::None,
+            multimodal: false,
+        }
+    }
+}
+
+/// Centralized capability adapter — produces a downgrade plan.
+/// No provider-specific branches. The runtime uses capabilities to
+/// decide which features to enable, not which provider it's talking to.
+pub struct CapabilityAdapter;
+
+impl CapabilityAdapter {
+    /// Decide whether to use streaming based on capabilities.
+    pub fn use_streaming(caps: &ProviderCapabilities) -> bool {
+        !matches!(caps.tool_streaming, ToolStreamingMode::None)
+    }
+
+    /// Decide whether reasoning deltas should be exposed to the agent.
+    pub fn expose_reasoning(caps: &ProviderCapabilities) -> bool {
+        matches!(caps.reasoning, ReasoningMode::Full | ReasoningMode::Partial)
+    }
+
+    /// Whether to request structured output from the provider.
+    pub fn request_structured_output(caps: &ProviderCapabilities) -> bool {
+        !matches!(caps.structured_output, StructuredOutputMode::None)
+    }
+
+    /// Whether we can request JSON Schema (vs plain JSON mode).
+    pub fn use_json_schema(caps: &ProviderCapabilities) -> bool {
+        matches!(caps.structured_output, StructuredOutputMode::JsonSchema)
+    }
 }
 
 // ── Content parts ──────────────────────────────────────────────────────
