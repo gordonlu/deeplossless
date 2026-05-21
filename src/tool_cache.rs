@@ -319,13 +319,21 @@ impl CanonicalExecutionKey {
 }
 
 /// Normalize tool name to a provider-agnostic canonical form.
+/// Strips path traversal, whitespace, and provider-specific prefixes.
 fn normalize_tool_name(name: &str) -> String {
-    let n = name.to_lowercase();
-    if n.contains("grep") || n.contains("search_content") || n.contains("search_code") { "grep".into() }
-    else if n.contains("read") && (n.contains("file") || n == "read") { "read_file".into() }
-    else if n.contains("list") || n.contains("ls") || n.contains("tree") { "list_files".into() }
-    else if n.contains("symbol") || n.contains("document_symbol") { "symbol_search".into() }
-    else { name.to_string() }
+    // Sanitize: trim, lowercase, strip path separators
+    let sanitized: String = name.trim().to_lowercase()
+        .replace("..", "")
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | '"' | '\''))
+        .collect();
+    if sanitized.is_empty() { return "unknown".into(); }
+    if sanitized.contains("grep") || sanitized.contains("search_content") || sanitized.contains("search_code") { "grep".into() }
+    else if sanitized.contains("read") && (sanitized.contains("file") || sanitized == "read") { "read_file".into() }
+    else if sanitized.contains("list") || sanitized == "ls" || sanitized.contains("tree") { "list_files".into() }
+    else if sanitized.contains("symbol") || sanitized.contains("document_symbol") { "symbol_search".into() }
+    else if sanitized.contains("diagnostic") { "diagnostics".into() }
+    else { sanitized }
 }
 
 // ── Cache entry (L2) ──────────────────────────────────────────────────
