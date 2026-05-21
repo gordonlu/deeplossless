@@ -433,7 +433,7 @@ impl Database {
 
         tx.commit()?;
         let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_multiple_of(CHECKPOINT_INTERVAL)
+        if count % CHECKPOINT_INTERVAL == 0
             && let Err(e) = self.wal_checkpoint() {
                 tracing::warn!(target: "deeplossless::db", error = %e, "WAL checkpoint failed");
             }
