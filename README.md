@@ -3,13 +3,13 @@
 # deeplossless
 
 DeepLossless is an **inference-aware coding runtime** that reduces repeated
-work in long AI coding sessions. It also translates OpenAI's Responses API to
-Chat Completions — so Codex works with DeepSeek.
+work in long AI coding sessions. It sits as an OpenAI-compatible proxy between
+your client and the DeepSeek API.
 
 ```bash
 cargo install deeplossless
 deeplossless --api-key sk-...
-# Point Codex or any OpenAI client at http://127.0.0.1:8080/v1
+# Point any OpenAI-compatible client at http://127.0.0.1:8080/v1
 ```
 
 Most coding tokens are spent reconstructing already-known state — rereading
@@ -70,27 +70,6 @@ deeplossless
 ```
 
 OpenAI-compatible clients: point `base_url` to `http://127.0.0.1:8080/v1`.
-
-Codex with DeepSeek: deeplossless translates the Responses API internally.
-
-```bash
-# 1. Start deeplossless
-deeplossless --api-key sk-...
-
-# 2. Codex config (~/.codex/config.toml)
-#    model_provider = "localproxy"
-#
-#    [model_providers.localproxy]
-#    name = "deeplossless"
-#    base_url = "http://127.0.0.1:8080/v1"
-#    wire_api = "responses"
-#    env_key = "DEEPSEEK_API_KEY"
-
-# 3. Run
-codex
-```
-
-Model names are auto-mapped: `gpt-5` → `deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.
 
 ## Design Principles
 
@@ -216,6 +195,53 @@ POST /v1/lcm/rollback  {conv_id, id}        — Rollback to checkpoint
 POST /health                                — Health check (DB, upstream, compactor)
 GET  /metrics                               — Prometheus metrics
 ```
+
+## Codex + DeepSeek
+
+deeplossless can translate OpenAI's Responses API to Chat Completions, enabling
+Codex to work with DeepSeek. Model names are auto-mapped: `gpt-5*` →
+`deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.
+
+```bash
+# 1. Start deeplossless
+deeplossless --api-key sk-...
+
+# 2. Codex config (~/.codex/config.toml)
+[model_providers.localproxy]
+name = "deeplossless"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+env_key = "DEEPSEEK_API_KEY"
+
+[model_providers.localproxy.models.gpt-5]
+# Codex will use this model name, deeplossless remaps it
+
+# 3. Run
+codex
+```
+
+### Limitations with Codex
+
+Codex uses a **client-side execution model** — tool calls, retries, and plan
+state are managed inside the Codex process. deeplossless sits between Codex and
+the upstream API as a protocol translator, so most runtime features are
+**unavailable** when used with Codex:
+
+| Feature | Available via Codex? | Why |
+|---------|:--:|------|
+| Protocol translation (Responses → Chat) | YES | Required for Codex to work with DeepSeek |
+| DAG context injection | YES | `<lcm_context>` appended to system messages |
+| Tool Result Cache | NO | Codex doesn't query `GET /v1/lcm/cache` |
+| Failure Memory | NO | Codex manages failures internally |
+| Plan Persistence | NO | Codex maintains its own plan state |
+| File Ownership Tracking | NO | Codex is single-agent |
+| Execution Compaction | NO | Codex handles its own context management |
+| Runtime Policy | NO | Decisions are made by Codex, not the proxy |
+
+If you want the full runtime benefits (cache reuse, failure memory, plan
+persistence), use an agent that queries the LCM endpoints listed above. The
+Codex integration is primarily a **protocol compatibility layer** — it gets
+DeepSeek working, but without the inference savings.
 
 ## Session Report
 
