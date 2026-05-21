@@ -323,6 +323,28 @@ impl Database {
         conn.execute_batch(crate::execution::LINEAGE_MIGRATION)?;
         // v0.9: structured reasoning steps
         conn.execute_batch(crate::execution::REASONING_MIGRATION)?;
+
+        // v0.3.0: structured execution fields (additive, backward compatible)
+        let has_tool_args_json: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_args_json'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_tool_args_json {
+            conn.execute_batch("ALTER TABLE execution_units ADD COLUMN tool_args_json TEXT;")?;
+        }
+        let has_reasoning_steps: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='reasoning_steps'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_reasoning_steps {
+            conn.execute_batch("ALTER TABLE execution_units ADD COLUMN reasoning_steps TEXT NOT NULL DEFAULT '[]';")?;
+        }
+
+        // v0.3.0: artifact hashes for content-based cache invalidation
+        let has_file_hashes: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('tool_cache') WHERE name='dependent_file_hashes'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_file_hashes {
+            conn.execute_batch("ALTER TABLE tool_cache ADD COLUMN dependent_file_hashes TEXT NOT NULL DEFAULT '[]';")?;
+        }
         // v0.9: multi-agent safe runtime
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS agent_active_files (
@@ -756,10 +778,12 @@ impl Database {
     ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let related_json = serde_json::to_string(related_nodes)?;
+        let tool_args_json_str = String::new(); // populated if available, empty default
+        let reasoning_steps_json = "[]".to_string();
         conn.execute(
-            "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![conv_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_json],
+            "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes, tool_args_json, reasoning_steps)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![conv_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_json, tool_args_json_str, reasoning_steps_json],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -793,6 +817,8 @@ impl Database {
                 ).unwrap_or(crate::execution::ExecutionOutcome::Success),
                 related_nodes: serde_json::from_str(&related_str).unwrap_or_default(),
                 created_at: row.get(9)?,
+                tool_args_json: None,
+                reasoning_steps: vec![],
             })
         })?;
         let mut results = Vec::new();
@@ -1020,8 +1046,9 @@ impl Database {
         self.tool_cache_l1.put(tool_name, args_hash, result, dependent_files);
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let files_json = serde_json::to_string(dependent_files)?;
+        // dependent_file_hashes: placeholder empty JSON for backward compat
         conn.execute(
-            "INSERT OR REPLACE INTO tool_cache (tool_name, args_hash, result, dependent_files) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO tool_cache (tool_name, args_hash, result, dependent_files, dependent_file_hashes) VALUES (?1, ?2, ?3, ?4, '[]')",
             rusqlite::params![tool_name, args_hash, result, files_json],
         )?;
         Ok(())

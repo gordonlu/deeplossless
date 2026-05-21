@@ -190,13 +190,21 @@ pub struct ExecutionUnit {
 
     /// Tool call details.
     pub tool_name: String,
+    /// Legacy: raw arguments string. Prefer `tool_args_json`.
     pub tool_args: String,
+    /// Structured arguments (v0.3).
+    #[serde(default)]
+    pub tool_args_json: Option<serde_json::Value>,
 
     /// Tool execution result (truncated to preserve budget).
     pub tool_result: String,
 
     /// The assistant's reflection / next reasoning after seeing the result.
     pub reasoning_after: String,
+
+    /// Structured reasoning steps extracted from before/after (v0.3).
+    #[serde(default)]
+    pub reasoning_steps: Vec<ReasoningStep>,
 
     /// Inferred outcome of this execution step.
     pub outcome: ExecutionOutcome,
@@ -229,14 +237,42 @@ impl ExecutionUnit {
         outcome: ExecutionOutcome,
         related_nodes: &[i64],
     ) -> Self {
+        // Try to parse tool_args as JSON for structured storage
+        let tool_args_json = serde_json::from_str(tool_args).ok();
+        // Extract structured reasoning from before/after text
+        let reasoning_steps = [
+            (!reasoning_before.is_empty()).then(|| ReasoningStep {
+                kind: if reasoning_before.to_lowercase().contains("fail") || reasoning_before.to_lowercase().contains("error") {
+                    ReasoningKind::Failure
+                } else {
+                    ReasoningKind::Assumption
+                },
+                content: reasoning_before.chars().take(300).collect(),
+                execution_unit_id: None,
+                derived_from: vec![],
+            }),
+            (!reasoning_after.is_empty()).then(|| ReasoningStep {
+                kind: if reasoning_after.to_lowercase().contains("fix") || reasoning_after.to_lowercase().contains("resolved") {
+                    ReasoningKind::Resolution
+                } else {
+                    ReasoningKind::Validation
+                },
+                content: reasoning_after.chars().take(300).collect(),
+                execution_unit_id: None,
+                derived_from: vec![],
+            }),
+        ].into_iter().flatten().collect();
+
         Self {
             id: 0,
             conversation_id,
             reasoning_before: reasoning_before.to_string(),
             tool_name: tool_name.to_string(),
             tool_args: tool_args.to_string(),
+            tool_args_json,
             tool_result: tool_result.to_string(),
             reasoning_after: reasoning_after.to_string(),
+            reasoning_steps,
             outcome,
             related_nodes: related_nodes.to_vec(),
             created_at: String::new(),
