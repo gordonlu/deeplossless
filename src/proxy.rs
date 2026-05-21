@@ -166,31 +166,37 @@ async fn responses(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
         tokio::spawn(async move {
-            // Generate a stable response ID for this streaming session
+            // Generate IDs matching OpenAI format
             let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
-            // Send response.created first (Codex requires this)
-            tracing::debug!(target: "deeplossless::stream", resp_id, "stream started");
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from(format!(
-                    "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{resp_id}\"}}}}\n\n"
-                ))
-            ));
-            tracing::debug!(target: "deeplossless::stream", "sent: response.created");
-            // Codex requires response.in_progress + output_item.added before text deltas
             let msg_id = format!("msg_{}", crate::protocol::responses::monotonic_id());
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{}}\n\n")
-            ));
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from(format!(
-                    "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}}}\n\n"
-                ))
-            ));
-            // Codex also requires content_part.added before it processes text deltas
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n")
-            ));
-            tracing::debug!(target: "deeplossless::stream", msg_id, "sent: in_progress + output_item.added + content_part.added");
+            let model = canonical.model.clone();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+            // Helper: build the full response envelope used by created/in_progress/completed
+            let response_envelope = |status: &str| -> String {
+                format!("\"id\":\"{resp_id}\",\"object\":\"response\",\"created_at\":{now},\"status\":\"{status}\",\"model\":\"{model}\",\"output\":[],\"tools\":[],\"text\":{{\"format\":{{\"type\":\"text\"}}}},\"usage\":null")
+            };
+
+            // response.created (full envelope, status=in_progress)
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{{}}}}}\n\n",
+                response_envelope("in_progress")
+            ))));
+            // response.in_progress (same full envelope)
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "event: response.in_progress\ndata: {{\"type\":\"response.in_progress\",\"response\":{{{}}}}}\n\n",
+                response_envelope("in_progress")
+            ))));
+            // output_item.added (msg_xxx, status=in_progress)
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}}}\n\n"
+            ))));
+            // content_part.added (with item_id + annotations)
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"item_id\":\"{msg_id}\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}\n\n"
+            ))));
+            tracing::debug!(target: "deeplossless::stream", resp_id, msg_id, "sent stream preamble");
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -241,18 +247,16 @@ async fn responses(
                 }
             }
             tracing::debug!(target: "deeplossless::stream", completed_sent, "stream loop ended");
-            // Always send item lifecycle events
+            // Always send item lifecycle events with proper fields from upstream
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
             ));
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0}\n\n")
-            ));
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from(format!(
-                    "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[]}}}}\n\n"
-                ))
-            ));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "event: response.content_part.done\ndata: {{\"type\":\"response.content_part.done\",\"item_id\":\"{msg_id}\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}\n\n"
+            ))));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}]}}}}\n\n"
+            ))));
             // Only send response.completed if Done event didn't already include it
             if !completed_sent {
                 let final_usage = usage_buf.map(|v| serde_json::json!({
@@ -260,14 +264,29 @@ async fn responses(
                     "response": {
                         "id": resp_id,
                         "object": "response",
+                        "created_at": now,
                         "status": "completed",
+                        "model": model,
+                        "output": [{
+                            "id": msg_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "", "annotations": []}]
+                        }],
                         "usage": {
                             "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
                             "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
                             "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
                         }
                     }
-                })).unwrap_or(serde_json::json!({"type":"response.completed","response":{"id":resp_id,"object":"response","status":"completed"}}));
+                })).unwrap_or(serde_json::json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":resp_id,"object":"response","created_at":now,
+                        "status":"completed","model":model,
+                        "output":[{"id":msg_id,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}]
+                    }}));
                 let _ = tx.send(Ok::<_, std::convert::Infallible>(
                     axum::body::Bytes::from(format!("event: response.completed\ndata: {final_usage}\n\n"))
                 ));
