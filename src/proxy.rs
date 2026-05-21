@@ -188,9 +188,7 @@ async fn responses(
             ));
             // Codex also requires content_part.added before it processes text deltas
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from(format!(
-                    "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\"}}}}\n\n"
-                ))
+                axum::body::Bytes::from("event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n")
             ));
             tracing::debug!(target: "deeplossless::stream", msg_id, "sent: in_progress + output_item.added + content_part.added");
 
