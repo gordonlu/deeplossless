@@ -149,24 +149,41 @@ pub fn compact_lineage(
     result
 }
 
-/// Compress a sequence of reasoning steps into a summary.
-/// Keeps Assumption + Failure + Resolution, drops intermediate Validation steps.
-pub fn distill_reasoning(steps: &[ReasoningStep]) -> String {
-    let mut out = String::new();
-    for step in steps {
-        match step.kind {
-            ReasoningKind::Assumption => {
-                out.push_str(&format!("Assumed: {}\n", step.content));
-            }
-            ReasoningKind::Failure => {
-                out.push_str(&format!("Failed: {}\n", step.content));
-            }
-            ReasoningKind::Resolution => {
-                out.push_str(&format!("Resolved: {}\n", step.content));
-            }
-            _ => {} // skip intermediate Hypothesis/Validation
-        }
+/// Structured reasoning summary — preserves semantics for replay and retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningSummary {
+    pub assumptions: Vec<String>,
+    pub failures: Vec<String>,
+    pub resolutions: Vec<String>,
+}
+
+impl ReasoningSummary {
+    /// Extract a structured summary from reasoning steps.
+    pub fn from_steps(steps: &[ReasoningStep]) -> Self {
+        let assumptions: Vec<String> = steps.iter()
+            .filter(|s| s.kind == ReasoningKind::Assumption)
+            .map(|s| s.content.clone())
+            .collect();
+        let failures: Vec<String> = steps.iter()
+            .filter(|s| s.kind == ReasoningKind::Failure)
+            .map(|s| s.content.clone())
+            .collect();
+        let resolutions: Vec<String> = steps.iter()
+            .filter(|s| s.kind == ReasoningKind::Resolution)
+            .map(|s| s.content.clone())
+            .collect();
+        Self { assumptions, failures, resolutions }
     }
+}
+
+/// Compress a sequence of reasoning steps into a structured summary.
+/// Preserves Assumption + Failure + Resolution in typed fields.
+pub fn distill_reasoning(steps: &[ReasoningStep]) -> String {
+    let summary = ReasoningSummary::from_steps(steps);
+    let mut out = String::new();
+    for a in &summary.assumptions { out.push_str(&format!("Assumed: {a}\n")); }
+    for f in &summary.failures { out.push_str(&format!("Failed: {f}\n")); }
+    for r in &summary.resolutions { out.push_str(&format!("Resolved: {r}\n")); }
     out.trim().to_string()
 }
 
@@ -181,6 +198,12 @@ pub enum ExecutionOutcome {
     RecoveredFailure,
     /// Tool call failed and agent could not recover.
     Blocked,
+    /// Result served from cache — zero token execution.
+    CacheHit,
+    /// Cache entry existed but was stale (content changed since).
+    Stale,
+    /// Result replayed from prior execution (deterministic replay).
+    Replayed,
 }
 
 impl ExecutionOutcome {
@@ -189,6 +212,9 @@ impl ExecutionOutcome {
             Self::Success => "success",
             Self::RecoveredFailure => "recovered",
             Self::Blocked => "blocked",
+            Self::CacheHit => "cache_hit",
+            Self::Stale => "stale",
+            Self::Replayed => "replayed",
         }
     }
 
@@ -198,6 +224,9 @@ impl ExecutionOutcome {
             "success" => Some(Self::Success),
             "recovered" => Some(Self::RecoveredFailure),
             "blocked" => Some(Self::Blocked),
+            "cache_hit" => Some(Self::CacheHit),
+            "stale" => Some(Self::Stale),
+            "replayed" => Some(Self::Replayed),
             _ => None,
         }
     }
@@ -264,31 +293,41 @@ impl ExecutionUnit {
         outcome: ExecutionOutcome,
         related_nodes: &[i64],
     ) -> Self {
-        // Try to parse tool_args as JSON for structured storage
         let tool_args_json = serde_json::from_str(tool_args).ok();
-        // Extract structured reasoning from before/after text
-        let reasoning_steps = [
-            (!reasoning_before.is_empty()).then(|| ReasoningStep {
-                kind: if reasoning_before.to_lowercase().contains("fail") || reasoning_before.to_lowercase().contains("error") {
-                    ReasoningKind::Failure
-                } else {
-                    ReasoningKind::Assumption
-                },
-                content: reasoning_before.chars().take(300).collect(),
-                execution_unit_id: None,
-                derived_from: vec![],
-            }),
-            (!reasoning_after.is_empty()).then(|| ReasoningStep {
-                kind: if reasoning_after.to_lowercase().contains("fix") || reasoning_after.to_lowercase().contains("resolved") {
-                    ReasoningKind::Resolution
-                } else {
-                    ReasoningKind::Validation
-                },
-                content: reasoning_after.chars().take(300).collect(),
-                execution_unit_id: None,
-                derived_from: vec![],
-            }),
-        ].into_iter().flatten().collect();
+        // Outcome-guided reasoning extraction — infers kind from what happened, not keywords
+        let reasoning_steps = {
+            let mut steps = Vec::new();
+            if !reasoning_before.is_empty() {
+                let kind = match &outcome {
+                    ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked =>
+                        ReasoningKind::Failure,
+                    ExecutionOutcome::CacheHit | ExecutionOutcome::Replayed =>
+                        ReasoningKind::Validation,
+                    _ => ReasoningKind::Assumption,
+                };
+                steps.push(ReasoningStep {
+                    kind,
+                    content: reasoning_before.chars().take(300).collect(),
+                    execution_unit_id: None,
+                    derived_from: vec![],
+                });
+            }
+            if !reasoning_after.is_empty() {
+                let kind = match &outcome {
+                    ExecutionOutcome::Success => ReasoningKind::Resolution,
+                    ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked =>
+                        ReasoningKind::Hypothesis,
+                    _ => ReasoningKind::Validation,
+                };
+                steps.push(ReasoningStep {
+                    kind,
+                    content: reasoning_after.chars().take(300).collect(),
+                    execution_unit_id: None,
+                    derived_from: vec![],
+                });
+            }
+            steps
+        };
 
         Self {
             id: 0,

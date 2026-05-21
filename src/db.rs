@@ -136,6 +136,13 @@ impl Database {
 
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // Schema version tracking — prevents silent migration drift.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_meta (
+                version TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );"
+        )?;
         // FTS5 virtual table.  DROP + CREATE in separate calls to avoid
         // residual shadow-table state from a prior interrupted migration.
         conn.execute_batch("DROP TABLE IF EXISTS messages_fts;").ok();
