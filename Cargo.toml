@@ -2,8 +2,13 @@
 name = "deeplossless"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
-description = "Lossless Context Management proxy for DeepSeek — DAG-based conversation summarization with zero-loss SQLite persistence"
+description = "Inference-aware execution runtime for long-running AI coding agents"
+repository = "https://github.com/gordonlu/deeplossless"
+readme = "README.md"
+keywords = ["ai", "agent", "runtime", "inference", "coding", "proxy", "llm"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # HTTP proxy
