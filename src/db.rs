@@ -1042,41 +1042,67 @@ impl Database {
         result: &str,
         dependent_files: &[String],
     ) -> anyhow::Result<()> {
-        // Populate L1 first (fast path for subsequent reads)
-        self.tool_cache_l1.put(tool_name, args_hash, result, dependent_files);
+        self.tool_cache_put_with_hashes(tool_name, args_hash, result, dependent_files, &[])
+    }
+
+    /// Store a tool result with optional content hashes for ArtifactVersion-based validation.
+    pub fn tool_cache_put_with_hashes(
+        &self,
+        tool_name: &str,
+        args_hash: &str,
+        result: &str,
+        dependent_files: &[String],
+        file_hashes: &[String],
+    ) -> anyhow::Result<()> {
+        self.tool_cache_l1.put_with_hashes(tool_name, args_hash, result, dependent_files, file_hashes);
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let files_json = serde_json::to_string(dependent_files)?;
-        // dependent_file_hashes: placeholder empty JSON for backward compat
+        let hashes_json = serde_json::to_string(file_hashes).unwrap_or_else(|_| "[]".into());
         conn.execute(
-            "INSERT OR REPLACE INTO tool_cache (tool_name, args_hash, result, dependent_files, dependent_file_hashes) VALUES (?1, ?2, ?3, ?4, '[]')",
-            rusqlite::params![tool_name, args_hash, result, files_json],
+            "INSERT OR REPLACE INTO tool_cache (tool_name, args_hash, result, dependent_files, dependent_file_hashes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![tool_name, args_hash, result, files_json, hashes_json],
         )?;
         Ok(())
     }
 
     /// Invalidate cache entries whose dependent files overlap with changed_files.
-    /// Returns count of invalidated entries.
+    /// Uses content-hash comparison when file_hashes are available (v0.3);
+    /// falls back to path-based matching for legacy entries.
     pub fn tool_cache_invalidate(&self, changed_files: &[String]) -> anyhow::Result<usize> {
+        self.tool_cache_invalidate_with_hashes(changed_files, &[])
+    }
+
+    /// Invalidate with optional content hashes for precise matching.
+    pub fn tool_cache_invalidate_with_hashes(&self, changed_files: &[String], new_hashes: &[String]) -> anyhow::Result<usize> {
         if changed_files.is_empty() {
             return Ok(0);
         }
-        // Invalidate L1 first
         self.tool_cache_l1.invalidate(changed_files);
         let conn = self.read_conn();
-        // Find all cached entries
-        let mut stmt = conn.prepare("SELECT id, dependent_files FROM tool_cache")?;
-        let rows: Vec<(i64, String)> = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        let mut stmt = conn.prepare("SELECT id, dependent_files, dependent_file_hashes FROM tool_cache")?;
+        let rows: Vec<(i64, String, String)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })?.filter_map(|r| r.ok()).collect();
         drop(stmt);
         drop(conn);
 
         let changed_set: std::collections::HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+        let hash_set: std::collections::HashSet<&str> = new_hashes.iter().map(|s| s.as_str()).collect();
+        let use_hashes = !hash_set.is_empty();
         let mut invalidated = 0;
         let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        for (id, files_json) in &rows {
+        for (id, files_json, hashes_json) in &rows {
             let deps: Vec<String> = serde_json::from_str(files_json).unwrap_or_default();
-            if deps.iter().any(|f| changed_set.contains(f.as_str())) {
+            let hashes: Vec<String> = serde_json::from_str(hashes_json).unwrap_or_default();
+            let should_invalidate = if use_hashes && !hashes.is_empty() {
+                // Content-hash-based: invalidate only if hash differs
+                deps.iter().any(|f| changed_set.contains(f.as_str()))
+                    && !hashes.iter().any(|h| hash_set.contains(h.as_str()))
+            } else {
+                // Legacy path-based fallback
+                deps.iter().any(|f| changed_set.contains(f.as_str()))
+            };
+            if should_invalidate {
                 w.execute("DELETE FROM tool_cache WHERE id = ?1", rusqlite::params![id])?;
                 invalidated += 1;
             }

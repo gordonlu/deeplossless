@@ -22,6 +22,8 @@ pub struct L1HotCache {
 struct CacheEntry {
     result: std::sync::Arc<str>,
     dependent_files: Vec<String>,
+    /// Content hashes for dependent files (v0.3). Empty = path-only invalidation.
+    file_hashes: Vec<String>,
     hit_count: u64,
     last_accessed: Instant,
 }
@@ -58,6 +60,11 @@ impl L1HotCache {
 
     /// Store a result. LRU eviction, reverse index updated.
     pub fn put(&self, tool_name: &str, args_hash: &str, result: &str, dependent_files: &[String]) {
+        self.put_with_hashes(tool_name, args_hash, result, dependent_files, &[])
+    }
+
+    /// Store with optional content hashes for ArtifactVersion-based invalidation.
+    pub fn put_with_hashes(&self, tool_name: &str, args_hash: &str, result: &str, dependent_files: &[String], file_hashes: &[String]) {
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let key = (tool_name.to_string(), args_hash.to_string());
         if map.len() >= 128 && !map.contains_key(&key)
@@ -71,7 +78,6 @@ impl L1HotCache {
                 if let Some(keys) = idx.get_mut(f) { keys.retain(|k| k != &evict_key); }
             }
         }
-        // Update reverse index
         {
             let mut idx = self.file_index.write().unwrap_or_else(|e| e.into_inner());
             for f in dependent_files {
@@ -81,13 +87,19 @@ impl L1HotCache {
         map.insert(key, CacheEntry {
             result: std::sync::Arc::from(result.to_string()),
             dependent_files: dependent_files.to_vec(),
+            file_hashes: file_hashes.to_vec(),
             hit_count: 1,
             last_accessed: Instant::now(),
         });
     }
 
-    /// O(affected) invalidation via reverse dependency index.
+    /// O(affected) invalidation. File hashes (when provided) enable content-aware behavior:
+    /// entries with matching content hashes survive invalidation (reuse safe).
     pub fn invalidate(&self, changed_files: &[String]) -> usize {
+        self.invalidate_with_hashes(changed_files, &[])
+    }
+
+    pub fn invalidate_with_hashes(&self, changed_files: &[String], new_hashes: &[String]) -> usize {
         let idx = self.file_index.read().unwrap_or_else(|e| e.into_inner());
         let mut affected_keys = HashSet::new();
         for f in changed_files {
@@ -105,12 +117,19 @@ impl L1HotCache {
 
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let mut idx = self.file_index.write().unwrap_or_else(|e| e.into_inner());
+        let hash_set: std::collections::HashSet<&str> = new_hashes.iter().map(|s| s.as_str()).collect();
         let before = map.len();
         for key in &affected_keys {
-            map.remove(key);
-            // Clean up reverse index
-            for keys in idx.values_mut() {
-                keys.retain(|k| k != key);
+            // Content-hash check: if entry has matching file hashes, keep it
+            let should_keep = !new_hashes.is_empty()
+                && map.get(key).is_some_and(|e| {
+                    !e.file_hashes.is_empty() && e.file_hashes.iter().any(|h| hash_set.contains(h.as_str()))
+                });
+            if !should_keep {
+                map.remove(key);
+                for keys in idx.values_mut() {
+                    keys.retain(|k| k != key);
+                }
             }
         }
         before - map.len()
