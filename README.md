@@ -61,9 +61,12 @@ Instead of recomputing them every turn.
 # Try without API key first — runs a local demo
 deeplossless demo
 
-# Proxy mode: API key is only needed because deeplossless forwards
-# requests to the upstream LLM. The runtime itself runs 100% locally.
-deeplossless --api-key sk-...
+# Proxy mode: set once, never type again
+export DEEPSEEK_API_KEY=sk-...
+deeplossless
+
+# Or pass it on the first run (extracted from the first request's
+# Authorization header on subsequent runs — no need to retype)
 ```
 
 OpenAI-compatible clients: point `base_url` to `http://127.0.0.1:8080/v1`.
@@ -138,7 +141,7 @@ Custom: `RUNTIME_CACHE=0-1 RUNTIME_RETRIES=0-10 RUNTIME_SPECULATIVE=true|false R
 | `--port` | `8080` | Listen port |
 | `--upstream` | `https://api.deepseek.com` | Upstream API base URL |
 | `--db-path` | `~/.deeplossless/lcm.db` | SQLite database path |
-| `--api-key` | `DEEPSEEK_API_KEY` | DeepSeek API key (also extracted from first request) |
+| `--api-key` | `DEEPSEEK_API_KEY` | API key. Set once via env var, no need to retype each run |
 | `--admin-key` | `ADMIN_KEY` | Admin key for LCM endpoints (falls back to API key) |
 | `--rate-limit` | `100` | Max requests/second (0 disables) |
 | `--summarizer-model` | `deepseek-v4-pro` | Model for background LLM summarization |
