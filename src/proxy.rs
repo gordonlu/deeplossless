@@ -168,11 +168,13 @@ async fn responses(
             // Generate a stable response ID for this streaming session
             let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
             // Send response.created first (Codex requires this)
+            tracing::debug!(target: "deeplossless::stream", resp_id, "stream started");
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from(format!(
                     "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{resp_id}\"}}}}\n\n"
                 ))
             ));
+            tracing::debug!(target: "deeplossless::stream", "sent: response.created");
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -196,6 +198,7 @@ async fn responses(
                                     if matches!(event, StreamEvent::Done { .. }) {
                                         completed_sent = true;
                                     }
+                                    tracing::debug!(target: "deeplossless::stream", "sending SSE event");
                                     let sse_line = crate::protocol::streaming::to_responses_sse(&event);
                                     if tx.send(Ok::<_, std::convert::Infallible>(
                                         axum::body::Bytes::from(sse_line)
@@ -216,10 +219,12 @@ async fn responses(
                     }
                 if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                     if matches!(event, StreamEvent::Done { .. }) { completed_sent = true; }
+                                    tracing::debug!(target: "deeplossless::stream", "sending SSE event");
                     let sse_line = crate::protocol::streaming::to_responses_sse(&event);
                     let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line)));
                 }
             }
+            tracing::debug!(target: "deeplossless::stream", completed_sent, "stream loop ended");
             // Only send final events if completed wasn't already sent by Done event
             if !completed_sent {
                 let _ = tx.send(Ok::<_, std::convert::Infallible>(
