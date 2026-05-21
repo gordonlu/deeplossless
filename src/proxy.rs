@@ -186,7 +186,13 @@ async fn responses(
                     "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}}}\n\n"
                 ))
             ));
-            tracing::debug!(target: "deeplossless::stream", msg_id, "sent: in_progress + output_item.added");
+            // Codex also requires content_part.added before it processes text deltas
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!(
+                    "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\"}}}}\n\n"
+                ))
+            ));
+            tracing::debug!(target: "deeplossless::stream", msg_id, "sent: in_progress + output_item.added + content_part.added");
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -237,16 +243,20 @@ async fn responses(
                 }
             }
             tracing::debug!(target: "deeplossless::stream", completed_sent, "stream loop ended");
-            // Only send final events if completed wasn't already sent by Done event
+            // Always send item lifecycle events
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
+            ));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0}\n\n")
+            ));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!(
+                    "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[]}}}}\n\n"
+                ))
+            ));
+            // Only send response.completed if Done event didn't already include it
             if !completed_sent {
-                let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                    axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
-                ));
-                let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                    axum::body::Bytes::from(format!(
-                        "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[]}}}}\n\n"
-                    ))
-                ));
                 let final_usage = usage_buf.map(|v| serde_json::json!({
                     "type": "response.completed",
                     "response": {
