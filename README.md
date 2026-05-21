@@ -3,7 +3,14 @@
 # deeplossless
 
 DeepLossless is an **inference-aware coding runtime** that reduces repeated
-work in long AI coding sessions.
+work in long AI coding sessions. It also translates OpenAI's Responses API to
+Chat Completions — so Codex works with DeepSeek.
+
+```bash
+cargo install deeplossless
+deeplossless --api-key sk-...
+# Point Codex or any OpenAI client at http://127.0.0.1:8080/v1
+```
 
 Most coding tokens are spent reconstructing already-known state — rereading
 unchanged files, replanning the same tasks, retrying known-bad fixes.
@@ -51,9 +58,17 @@ Instead of recomputing them every turn.
 ## Quick start (proxy mode)
 
 ```bash
-cargo build --release
-DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
-# Point any OpenAI-compatible client to http://127.0.0.1:8080/v1
+cargo install deeplossless
+deeplossless --api-key sk-...
+```
+
+OpenAI-compatible clients: point `base_url` to `http://127.0.0.1:8080/v1`.
+
+Codex with DeepSeek: deeplossless translates the Responses API internally.
+
+```bash
+# Codex connects here — deeplossless translates to Chat Completions for DeepSeek
+codex config set base_url http://127.0.0.1:8080/v1
 ```
 
 ## Design Principles
@@ -129,8 +144,12 @@ Custom: `RUNTIME_CACHE=0-1 RUNTIME_RETRIES=0-10 RUNTIME_SPECULATIVE=true|false R
 ### Proxy
 
 ```
-POST /v1/chat/completions     — Transparent proxy, SSE streaming, DAG context injected
+POST /v1/chat/completions     — OpenAI-compatible proxy, SSE streaming, DAG context injected
+POST /v1/responses            — Responses API → Chat Completions (enables Codex + DeepSeek)
 ```
+
+Codex uses the Responses API natively. deeplossless translates it to Chat Completions
+internally, so Codex works with DeepSeek without any Codex-side configuration.
 
 ### Memory
 
