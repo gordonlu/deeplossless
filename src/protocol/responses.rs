@@ -8,8 +8,7 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
     let max_tokens = body["max_output_tokens"].as_u64().map(|n| n as u32);
     let temperature = body["temperature"].as_f64();
 
-    // instructions as Vec
-    let mut instructions = Vec::new();
+    let mut instructions: Vec<InstructionBlock> = Vec::new();
     if let Some(s) = body["instructions"].as_str() {
         instructions.push(InstructionBlock { text: s.to_string(), meta: None });
     }
@@ -23,13 +22,29 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
         }).collect())
         .unwrap_or_default();
 
-    let messages: Vec<Message> = if let Some(arr) = body["input"].as_array() {
-        arr.iter().map(|item| {
+    let mut messages: Vec<Message> = Vec::new();
+    if let Some(arr) = body["input"].as_array() {
+        for item in arr {
+            let item_type = item["type"].as_str().unwrap_or("");
             let role_str = item["role"].as_str().unwrap_or("user");
+            // Developer messages are system-level instructions — append to
+            // instructions and skip from the messages array.
+            if role_str == "developer" || role_str == "system" {
+                if let Some(content) = item["content"].as_array() {
+                    for block in content {
+                        if let Some(t) = block["text"].as_str() {
+                            instructions.push(InstructionBlock { text: t.to_string(), meta: None });
+                        }
+                    }
+                } else if let Some(s) = item["content"].as_str() {
+                    instructions.push(InstructionBlock { text: s.to_string(), meta: None });
+                }
+                continue;
+            }
             let role = match role_str {
-                "system" => Role::System, "assistant" => Role::Assistant,
-                "developer" => Role::Developer, "tool" => Role::Tool,
-                _ => Role::User,
+                "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
+                _ => if item_type == "function_call_output" { Role::Tool } else { Role::User },
             };
             let mut parts = Vec::new();
             let mut meta = None;
@@ -45,7 +60,7 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                             if let Some(url) = block["image_url"].as_str() {
                                 parts.push(ContentPart::Image { source_type: "url".into(), data: url.to_string(), detail: "auto".into() });
                             }
-                        }
+                            }
                         _ => {}
                     }
                 }
@@ -53,7 +68,7 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                 parts.push(ContentPart::Text { text: s.to_string() });
             }
             // function_call items
-            if let Some(ct) = item["type"].as_str() && ct == "function_call" {
+            if item_type == "function_call" {
                 let id = item["call_id"].as_str().unwrap_or("").to_string();
                 let name = item["name"].as_str().unwrap_or("").to_string();
                 let args_str = item["arguments"].as_str().unwrap_or(&item["arguments"].to_string()).to_string();
@@ -62,19 +77,35 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                 meta = Some(MessageMeta { tool_call_id: None, tool_calls: vec![ToolInvocation { id, name, arguments: args }] });
             }
             // function_call_output items
-            if let Some(ct) = item["type"].as_str() && ct == "function_call_output" {
+            if item_type == "function_call_output" {
                 let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                 let content = item["output"].as_str().unwrap_or("").to_string();
                 parts.push(ContentPart::ToolResult { call_id: call_id.clone(), content });
                 meta = Some(MessageMeta { tool_call_id: Some(call_id), tool_calls: vec![] });
             }
-            Message { role, parts, meta }
-        }).collect()
+            // Chat Completions-style tool messages (role=tool + tool_call_id)
+            if role == Role::Tool {
+                let explicit_call_id = item["tool_call_id"].as_str().map(|s| s.to_string());
+                if let Some(ref call_id) = explicit_call_id {
+                    if parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. })) {
+                        if meta.as_ref().and_then(|m| m.tool_call_id.as_ref()).is_none() {
+                            meta = Some(MessageMeta { tool_call_id: Some(call_id.clone()), tool_calls: vec![] });
+                        }
+                    } else {
+                        let content = parts.iter()
+                            .filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+                            .collect::<Vec<_>>().join("\n");
+                        parts.clear();
+                        parts.push(ContentPart::ToolResult { call_id: call_id.clone(), content });
+                        meta = Some(MessageMeta { tool_call_id: Some(call_id.clone()), tool_calls: vec![] });
+                    }
+                }
+            }
+            messages.push(Message { role, parts, meta });
+        }
     } else if let Some(s) = body["input"].as_str() {
-        vec![Message { role: Role::User, parts: vec![ContentPart::Text { text: s.to_string() }], meta: None }]
-    } else {
-        vec![]
-    };
+        messages.push(Message { role: Role::User, parts: vec![ContentPart::Text { text: s.to_string() }], meta: None });
+    }
 
     let response_format = body["text"]["format"].as_object()
         .filter(|f| f["type"] == "json_schema")

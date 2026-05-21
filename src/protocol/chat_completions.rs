@@ -99,13 +99,19 @@ pub fn request_from_chat(body: &serde_json::Value) -> CanonicalRequest {
 pub fn request_to_chat(req: &CanonicalRequest) -> serde_json::Value {
     use serde_json::json;
     let mut msgs: Vec<serde_json::Value> = Vec::new();
-    for inst in &req.instructions {
-        msgs.push(json!({"role": "system", "content": inst.text}));
+    // Merge all instruction blocks into a single system message to avoid
+    // system-message proliferation (which causes attention dilution and
+    // token waste with stateless providers like DeepSeek).
+    let system_text: Vec<&str> = req.instructions.iter().map(|i| i.text.as_str()).collect();
+    if !system_text.is_empty() {
+        msgs.push(json!({"role": "system", "content": system_text.join("\n\n")}));
     }
     for msg in &req.messages {
         let role = match msg.role {
-            Role::System => "system", Role::User => "user",
-            Role::Assistant => "assistant", Role::Tool | Role::Developer => "tool",
+            Role::System | Role::Developer => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
         };
         let text: Vec<&str> = msg.parts.iter().filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None }).collect();
         let content = if text.len() == 1 { text[0].to_string() } else { text.join("\n") };

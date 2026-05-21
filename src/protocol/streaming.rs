@@ -88,26 +88,44 @@ struct PartialToolCall {
     arguments: String,
 }
 
-/// Stateful stream assembler. Buffers partial tool call events and only
-/// emits complete tool calls on ToolCallEnd. Text and reasoning pass through.
+/// Stateful stream assembler. Buffers partial tool call arguments until
+/// ToolCallEnd emits the complete args delta, and accumulates text for the
+/// final lifecycle events (output_text.done, content_part.done, etc.).
 ///
-/// This prevents downstream consumers from seeing incomplete tool calls if
-/// SSE frames are split or reordered.
+/// Text and reasoning deltas pass through immediately for real-time streaming,
+/// with the full text accumulated for the final content envelope.
+///
+/// Lifecycle:
+///   feed(events) → emit events as they become ready
+///   upstream [DONE] → finish() → lifecycle events with full text
+///   emit [DONE], close stream
 pub struct StreamAssembler {
     partial_tools: HashMap<usize, PartialToolCall>,
-    /// Events emitted for the current message. Flushed on MessageEnd or Done.
-    pending: Vec<StreamEvent>,
+    /// Accumulated text from all TextDelta events, used in final lifecycle.
+    full_text: String,
+    /// Accumulated reasoning text from ReasoningDelta events.
+    full_reasoning: String,
 }
 
 impl StreamAssembler {
     pub fn new() -> Self {
-        Self { partial_tools: HashMap::new(), pending: Vec::new() }
+        Self { partial_tools: HashMap::new(), full_text: String::new(), full_reasoning: String::new() }
     }
 
     /// Feed a raw SSE event into the assembler.
-    /// Returns fully assembled events ready for downstream consumption.
+    /// Returns events ready for downstream consumption.
+    /// Text/reasoning/lifecycle events pass through immediately;
+    /// tool call deltas are buffered until ToolCallEnd.
     pub fn feed(&mut self, event: StreamEvent) -> Vec<StreamEvent> {
         match event {
+            StreamEvent::TextDelta { ref text } => {
+                self.full_text.push_str(text);
+                vec![event]
+            }
+            StreamEvent::ReasoningDelta { ref text } => {
+                self.full_reasoning.push_str(text);
+                vec![event]
+            }
             StreamEvent::ToolCallStart { index, id, name } => {
                 self.partial_tools.insert(index, PartialToolCall { id, name, arguments: String::new() });
                 vec![]
@@ -125,35 +143,42 @@ impl StreamAssembler {
                 }
                 events
             }
-            StreamEvent::MessageEnd => {
+            StreamEvent::Done { .. } | StreamEvent::MessageEnd => {
                 self.partial_tools.clear();
-                std::mem::take(&mut self.pending)
-            }
-            StreamEvent::Done { .. } => {
-                // Flush any incomplete tool calls on stream end
-                self.partial_tools.clear();
-                std::mem::take(&mut self.pending)
+                vec![]
             }
             StreamEvent::Error { .. } => {
                 self.partial_tools.clear();
-                self.pending.clear();
+                self.full_text.clear();
+                self.full_reasoning.clear();
                 vec![event]
             }
-            // Pass-through events: accumulate until flush
-            StreamEvent::MessageStart { .. } | StreamEvent::TextDelta { .. } | StreamEvent::ReasoningDelta { .. }
-            | StreamEvent::OutputItemAdded { .. } | StreamEvent::OutputItemDone { .. }
-            | StreamEvent::FunctionCallArgumentsDone { .. } => {
-                self.pending.push(event.clone());
-                vec![]
-            }
+            // All other events pass through immediately
+            _ => vec![event],
         }
     }
 
-    /// Force-flush any buffered state (called on stream close).
+    /// Called when upstream [DONE] arrives. Returns accumulated text content
+    /// for the final lifecycle events. Also clears any partial tool state.
+    pub fn finish(&mut self) -> AssembledContent {
+        self.partial_tools.clear();
+        AssembledContent {
+            text: std::mem::take(&mut self.full_text),
+            reasoning: std::mem::take(&mut self.full_reasoning),
+        }
+    }
+
+    /// Force-flush any buffered partial tool calls (called on stream close).
     pub fn flush(&mut self) -> Vec<StreamEvent> {
         self.partial_tools.clear();
-        std::mem::take(&mut self.pending)
+        vec![]
     }
+}
+
+/// Content accumulated by the assembler, used to populate final lifecycle events.
+pub struct AssembledContent {
+    pub text: String,
+    pub reasoning: String,
 }
 
 impl Default for StreamAssembler {
@@ -172,18 +197,17 @@ mod assembler_tests {
         assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into() }).is_empty());
         assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"ttern":"foo"}"#.into() }).is_empty());
         let events = asm.feed(StreamEvent::ToolCallEnd { index: 0 });
-        // On ToolCallEnd, we push ToolCallEnd + complete ArgsDelta
         assert_eq!(events.len(), 1, "should emit 1 event with complete args");
         assert!(matches!(events[0], StreamEvent::ToolCallArgsDelta { .. }));
     }
 
     #[test]
-    fn text_accumulates_until_flush() {
+    fn text_passes_through_immediately() {
         let mut asm = StreamAssembler::new();
-        assert!(asm.feed(StreamEvent::TextDelta { text: "hello ".into() }).is_empty());
-        assert!(asm.feed(StreamEvent::TextDelta { text: "world".into() }).is_empty());
-        let events = asm.feed(StreamEvent::MessageEnd);
-        assert_eq!(events.len(), 2, "text deltas flush on MessageEnd");
+        let events = asm.feed(StreamEvent::TextDelta { text: "hello ".into() });
+        assert_eq!(events.len(), 1, "text should pass through immediately");
+        let events = asm.feed(StreamEvent::TextDelta { text: "world".into() });
+        assert_eq!(events.len(), 1, "text should pass through immediately");
     }
 
     #[test]

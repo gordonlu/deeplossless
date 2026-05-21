@@ -106,6 +106,21 @@ async fn responses(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", format!("invalid JSON: {e}")),
     };
 
+    // Request diagnostics: log key metrics for token cost tracking
+    let prev_resp = req_body["previous_response_id"].as_str().unwrap_or("(none)");
+    let instructions_len = req_body["instructions"].as_str().map(|s| s.len()).unwrap_or(0);
+    let tools_count = req_body["tools"].as_array().map(|a| a.len()).unwrap_or(0);
+    let store = req_body["store"].as_bool().unwrap_or(true);
+    let prompt_cache_key = req_body["prompt_cache_key"].as_str().unwrap_or("(none)");
+    let input_count = req_body["input"].as_array().map(|a| a.len()).unwrap_or(0);
+    tracing::info!(target: "deeplossless",
+        previous_response_id=%prev_resp,
+        instructions_len, input_count, tools_count,
+        store, prompt_cache_key=%prompt_cache_key,
+        request_body_kb=body.len() as f64 / 1024.0,
+        turnaround=input_count.saturating_sub(1).min(99),
+        "request diagnostics");
+
     // Extract API key on first request
     {
         let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
@@ -143,18 +158,89 @@ async fn responses(
         }
     };
 
+    // ── Dry-run: save translated body, return mock response ──
+    if state.dry_run {
+        let out_dir = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".deeplossless");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let _ = std::fs::write(out_dir.join("last_request.json"),
+            serde_json::to_string_pretty(&req_body).unwrap_or_default());
+        let _ = std::fs::write(out_dir.join("translated.json"),
+            serde_json::to_string_pretty(&injected).unwrap_or_default());
+
+        let msgs = injected["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+        tracing::info!(target: "deeplossless", msg_count=msgs.len(),
+            model=%canonical.model, stream=canonical.stream,
+            "dry-run: saved to ~/.deeplossless/");
+
+        // Return mock streaming response
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from("data: {\"type\":\"response.output_text.delta\",\"delta\":\"[dry-run] request saved to ~/.deeplossless/translated.json\"}\n\n")
+        ));
+        let _ = tx.send(Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from("data: [DONE]\n\n")
+        ));
+        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
+        response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header"));
+        return response;
+    }
+
+    // Token breakdown: compute system/history split for diagnostics
+    let (mut system_len, mut user_len, mut history_len) = (0usize, 0usize, 0usize);
+    let mut instr_hash = String::from("-");
+    if let Some(msgs) = injected["messages"].as_array() {
+        for msg in msgs {
+            let role = msg["role"].as_str().unwrap_or("");
+            let content = msg["content"].as_str().unwrap_or("");
+            match role {
+                "system" => {
+                    system_len += content.len();
+                    if instr_hash == "-" {
+                        use sha2::{Digest, Sha256};
+                        instr_hash = hex::encode(&Sha256::digest(content.as_bytes())[..6]);
+                    }
+                }
+                "user" => user_len += content.len(),
+                _ => history_len += content.len(),
+            }
+        }
+    }
+
     // 4. Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
+    let api_key = get_cached_key(&state.api_key);
+    let req_stream = injected.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let req_msgs = injected.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    tracing::info!(target: "deeplossless",
+        msg_count=req_msgs, instr_hash,
+        system_kb=system_len as f64 / 1024.0,
+        user_kb=user_len as f64 / 1024.0,
+        history_kb=history_len as f64 / 1024.0,
+        "token breakdown");
+    tracing::debug!(target: "deeplossless", model=%canonical.model, canonical_stream=canonical.stream,
+        req_stream, msg_count=req_msgs, upstream_url,
+        has_api_key=!api_key.is_empty() && api_key != "unset",
+        "sending upstream request");
     let resp = match state
         .client
         .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
+        .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&injected)
         .send()
         .await
     {
-        Ok(r) => r,
+        Ok(r) => {
+            tracing::debug!(target: "deeplossless", status=%r.status(),
+                content_type=?r.headers().get("content-type"),
+                "upstream response received");
+            r
+        }
         Err(e) => {
             metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
@@ -165,6 +251,9 @@ async fn responses(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
+        let response_store = state.response_store.clone();
+        let store_response = store;
+        let request_body = body.clone();
         tokio::spawn(async move {
             // Generate IDs matching OpenAI format
             let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
@@ -201,11 +290,18 @@ async fn responses(
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut usage_buf: Option<serde_json::Value> = None;
-            let mut completed_sent = false;
+            let mut first_chunk = true;
+            let mut assembler = crate::protocol::streaming::StreamAssembler::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
                         let s = String::from_utf8_lossy(&c);
+                        if first_chunk {
+                            first_chunk = false;
+                            tracing::info!(target: "deeplossless",
+                                len=c.len(), preview=&s[..s.len().min(200)],
+                                "first upstream chunk");
+                        }
                         buf.push_str(&s);
                         while let Some(pos) = buf.find('\n') {
                             let line = buf[..pos].trim().to_string();
@@ -216,21 +312,33 @@ async fn responses(
                                         usage_buf = Some(v.clone());
                                     }
                                 if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
-                                    // Track if we've already sent completed
+                                    // Done = transport-level EOF, drain remaining buffers
                                     if matches!(event, StreamEvent::Done { .. }) {
-                                        completed_sent = true;
+                                        for assembled in assembler.flush() {
+                                            let sse_line = crate::protocol::streaming::to_responses_sse(&assembled);
+                                            if tx.send(Ok::<_, std::convert::Infallible>(
+                                                axum::body::Bytes::from(sse_line)
+                                            )).is_err() { break; }
+                                        }
+                                        continue;
                                     }
-                                    tracing::debug!(target: "deeplossless::stream", "sending SSE event");
-                                    let sse_line = crate::protocol::streaming::to_responses_sse(&event);
-                                    if tx.send(Ok::<_, std::convert::Infallible>(
-                                        axum::body::Bytes::from(sse_line)
-                                    )).is_err() { break; }
+                                    for assembled in assembler.feed(event) {
+                                        tracing::debug!(target: "deeplossless::stream", "sending SSE event");
+                                        let sse_line = crate::protocol::streaming::to_responses_sse(&assembled);
+                                        if tx.send(Ok::<_, std::convert::Infallible>(
+                                            axum::body::Bytes::from(sse_line)
+                                        )).is_err() { break; }
+                                    }
                                 }
                             }
                         }
                     }
                     Err(e) => { warn!("stream error: {e}"); break; }
                 }
+            }
+            if first_chunk {
+                tracing::warn!(target: "deeplossless",
+                    "byte_stream produced zero chunks — upstream returned empty body");
             }
             // Process trailing buffer (last line without \n)
             if !buf.trim().is_empty() {
@@ -240,60 +348,95 @@ async fn responses(
                         usage_buf = Some(v.clone());
                     }
                 if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
-                    if matches!(event, StreamEvent::Done { .. }) { completed_sent = true; }
-                                    tracing::debug!(target: "deeplossless::stream", "sending SSE event");
-                    let sse_line = crate::protocol::streaming::to_responses_sse(&event);
-                    let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line)));
+                    if !matches!(event, StreamEvent::Done { .. }) {
+                        for assembled in assembler.feed(event) {
+                            let sse_line = crate::protocol::streaming::to_responses_sse(&assembled);
+                            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line)));
+                        }
+                    }
                 }
             }
-            tracing::debug!(target: "deeplossless::stream", completed_sent, "stream loop ended");
-            // Always send item lifecycle events with proper fields from upstream
+            // Upstream [DONE] → finish assembly, get accumulated content
+            let content = assembler.finish();
+            let input_tokens_est = crate::tokenizer::count(&request_body);
+            let output_tokens = usage_buf.as_ref()
+                .and_then(|v| v["usage"]["completion_tokens"].as_u64())
+                .unwrap_or(0);
+            let output_text_len = content.text.len();
+            tracing::info!(target: "deeplossless",
+                input_tokens_est, output_tokens, output_text_len,
+                "turn complete");
+
+            // Build lifecycle events using serde_json for proper escaping
+            let part_json = serde_json::json!({
+                "type": "output_text", "text": content.text, "annotations": []
+            });
+            let content_json = serde_json::json!([&part_json]);
+            let item_json = serde_json::json!({
+                "id": msg_id, "type": "message", "status": "completed",
+                "role": "assistant", "content": content_json
+            });
+            let output_item_done = serde_json::json!({
+                "type": "response.output_item.done", "output_index": 0, "item": item_json
+            });
+            let content_part_done = serde_json::json!({
+                "type": "response.content_part.done", "item_id": msg_id,
+                "output_index": 0, "content_index": 0, "part": part_json
+            });
+            let usage_json = usage_buf.map(|v| serde_json::json!({
+                "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
+            })).unwrap_or(serde_json::json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}));
+            let completed = serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": resp_id, "object": "response", "created_at": now,
+                    "status": "completed", "model": model,
+                    "output": [item_json],
+                    "usage": usage_json
+                }
+            });
+
+            // Emit lifecycle events in correct order
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
             ));
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
-                "event: response.content_part.done\ndata: {{\"type\":\"response.content_part.done\",\"item_id\":\"{msg_id}\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}\n\n"
-            ))));
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
-                "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}]}}}}\n\n"
-            ))));
-            // Only send response.completed if Done event didn't already include it
-            if !completed_sent {
-                let final_usage = usage_buf.map(|v| serde_json::json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": resp_id,
-                        "object": "response",
-                        "created_at": now,
-                        "status": "completed",
-                        "model": model,
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.content_part.done\ndata: {content_part_done}\n\n"))
+            ));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.output_item.done\ndata: {output_item_done}\n\n"))
+            ));
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.completed\ndata: {completed}\n\n"))
+            ));
+            // Persist the response so GET /v1/responses/{id} returns real data,
+            // and Codex's previous_response_id continuity can work incrementally.
+            if store_response {
+                if let Ok(mut store) = response_store.lock() {
+                    let resp_obj = serde_json::json!({
+                        "id": resp_id, "object": "response", "created_at": now,
+                        "status": "completed", "model": model,
                         "output": [{
-                            "id": msg_id,
-                            "type": "message",
-                            "status": "completed",
+                            "id": msg_id, "type": "message", "status": "completed",
                             "role": "assistant",
-                            "content": [{"type": "output_text", "text": "", "annotations": []}]
+                            "content": [{"type": "output_text", "text": content.text, "annotations": []}]
                         }],
-                        "usage": {
-                            "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                            "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                            "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
-                        }
-                    }
-                })).unwrap_or(serde_json::json!({
-                    "type":"response.completed",
-                    "response":{
-                        "id":resp_id,"object":"response","created_at":now,
-                        "status":"completed","model":model,
-                        "output":[{"id":msg_id,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}]
-                    }}));
-                let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                    axum::body::Bytes::from(format!("event: response.completed\ndata: {final_usage}\n\n"))
-                ));
+                        "usage": usage_json
+                    });
+                    store.insert(resp_id.clone(), resp_obj);
+                    tracing::info!(target: "deeplossless",
+                        resp_id, text_len=content.text.len(),
+                        stored_count=store.len(),
+                        "response stored");
+                }
             }
+            // Transport-level EOF marker
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("data: [DONE]\n\n")
             ));
+            // tx dropped here → stream closes
         });
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = StatusCode::OK;
@@ -323,13 +466,24 @@ async fn responses(
     }
 }
 
-/// Responses API retrieve — returns a minimal response object since
-/// DeepSeek doesn't support response retrieval natively. Codex uses this
-/// for status polling and stream reconnection.
+/// Responses API retrieve — looks up a previously stored response.
+/// Codex uses this for status polling, stream reconnection, and
+/// `previous_response_id`-based incremental turns.
 async fn responses_retrieve(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(response_id): Path<String>,
 ) -> Response {
+    // Check response store first
+    if let Ok(store) = state.response_store.lock() {
+        if let Some(resp) = store.get(&response_id) {
+            tracing::debug!(target: "deeplossless",
+                %response_id, "response retrieve hit");
+            return Json(resp.clone()).into_response();
+        }
+    }
+    tracing::warn!(target: "deeplossless",
+        %response_id, "response retrieve miss — returning empty");
+    // Fallback: minimal response — better than a 404 for Codex compatibility
     Json(json!({
         "id": response_id,
         "object": "response",

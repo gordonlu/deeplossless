@@ -83,6 +83,7 @@ pub mod tokenizer;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -103,6 +104,12 @@ pub struct AppState {
     pub summarizer_model: String,
     /// Runtime cycle tracking for policy-driven execution.
     pub cycle: Arc<StdMutex<runtime::ExecutionCycle>>,
+    /// When true, skip upstream calls — save translated body to disk and return mock response.
+    pub dry_run: bool,
+    /// Completed response objects keyed by response ID. Enables
+    /// `previous_response_id` continuity so Codex can do incremental turns
+    /// instead of rebuilding full context on every request.
+    pub response_store: Arc<StdMutex<HashMap<String, serde_json::Value>>>,
 }
 
 impl AppState {
