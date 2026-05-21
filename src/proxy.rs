@@ -207,7 +207,7 @@ async fn responses(
                     Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid upstream JSON: {e}")),
                 };
                 let canonical_resp = crate::protocol::chat_completions::response_from_chat(&chat_resp);
-                let responses_body = crate::protocol::responses::response_to_responses(&canonical_resp, None);
+                let responses_body = crate::protocol::responses::response_to_responses(&canonical_resp);
                 let mut response = Response::new(Body::from(serde_json::to_string(&responses_body).unwrap_or_default()));
                 *response.status_mut() = StatusCode::OK;
                 response.headers_mut().insert("content-type", "application/json".parse().expect("static header"));

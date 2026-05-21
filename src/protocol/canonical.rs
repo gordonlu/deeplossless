@@ -1,85 +1,107 @@
-//! Canonical runtime representation — the intermediate representation (IR)
-//! that all provider adapters translate to/from.
+//! # Protocol IR
 //!
-//! Architecture:
+//! Provider-neutral, model-neutral, transport-neutral intermediate representation.
+//! This is the **protocol layer** — ingress/egress format translation.
+//!
+//! The **execution layer** lives in `crate::execution` (ExecutionUnit,
+//! FailurePattern, PlanState, CodeChange). Protocol IR maps provider formats
+//! to structured data; execution IR operates on runtime artifacts.
+//!
 //! ```text
-//! OpenAI Responses / DeepSeek Chat / Anthropic Messages
-//!         ↓ adapter::from_*
-//!   CanonicalRequest
-//!         ↓ runtime (pipeline: DAG, cache, failure detection)
-//!   CanonicalResponse
-//!         ↓ adapter::to_*
-//! OpenAI Responses / DeepSeek Chat / Anthropic Messages
+//! Provider format
+//!     ↓ adapter (dumb parse/normalize)
+//! Protocol IR (this module)
+//!     ↓ pipeline
+//! Execution IR (crate::execution)
+//!     ↓ runtime policy
+//! Execution IR (updated)
+//!     ↓ projection
+//! Protocol IR
+//!     ↓ adapter (dumb serialize)
+//! Provider format
 //! ```
 
 use serde::{Deserialize, Serialize};
 
-// ── Content parts (typed content items) ───────────────────────────────
+// ── Provider identity ──────────────────────────────────────────────────
 
-/// A typed piece of content within a message.
-/// This is the key abstraction — replaces free-form "content" strings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    #[serde(rename = "openai")]
+    OpenAI,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    #[serde(rename = "unknown")]
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    pub reasoning: bool,
+    pub tool_streaming: bool,
+    pub multimodal: bool,
+    pub json_schema: bool,
+    pub parallel_tools: bool,
+}
+
+// ── Content parts ──────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentPart {
-    /// Plain text.
     #[serde(rename = "text")]
     Text { text: String },
 
-    /// An image reference (URL or base64).
     #[serde(rename = "image")]
     Image {
-        /// "url" or "base64"
         source_type: String,
-        /// URL or data URI
         data: String,
-        /// Optional detail level
         #[serde(default)]
         detail: String,
     },
 
-    /// A tool invocation from the assistant.
     #[serde(rename = "tool_call")]
     ToolCall {
-        /// Unique ID for this invocation.
         id: String,
-        /// Tool/function name.
         name: String,
-        /// JSON-encoded arguments.
-        arguments: String,
+        /// Structured arguments, not raw string — enables hashing/cache/diff.
+        arguments: serde_json::Value,
     },
 
-    /// A tool execution result.
+    /// Tool execution result — first-class runtime object, not "assistant message".
     #[serde(rename = "tool_result")]
     ToolResult {
-        /// Which tool call this responds to.
         call_id: String,
-        /// The result content.
         content: String,
     },
+}
 
-    /// Reasoning/thinking content.
-    #[serde(rename = "reasoning")]
-    Reasoning { text: String },
+/// Reasoning/thinking trace — NOT a ContentPart.
+/// Reasoning is a distinct execution artifact, not text content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningTrace {
+    pub text: String,
+    #[serde(default)]
+    pub summarized: bool,
+    pub tokens: Option<u32>,
 }
 
 // ── Message ────────────────────────────────────────────────────────────
 
-/// A single message in the conversation. Each message has a role and
-/// one or more typed content parts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub parts: Vec<ContentPart>,
-    /// Provider-specific metadata (e.g., tool_call_id for tool messages).
     #[serde(default)]
     pub meta: Option<MessageMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageMeta {
-    /// For tool result messages: which tool call this responds to.
     pub tool_call_id: Option<String>,
-    /// For assistant messages with tool calls: the tool calls can be in meta.
     #[serde(default)]
     pub tool_calls: Vec<ToolInvocation>,
 }
@@ -91,64 +113,71 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+    /// OpenAI Responses "developer" role — distinct from Tool.
+    Developer,
 }
 
-// ── Tool definition ────────────────────────────────────────────────────
+// ── Instructions ───────────────────────────────────────────────────────
 
-/// A tool that the model can invoke.
+/// Multiple system-level instruction blocks (preserves provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstructionBlock {
+    pub text: String,
+    #[serde(default)]
+    pub meta: Option<serde_json::Value>,
+}
+
+// ── Tools ──────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    /// Whether to enforce strict JSON schema validation.
     #[serde(default)]
     pub strict: bool,
 }
 
-/// A tool invocation (used in responses and in meta).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInvocation {
     pub id: String,
     pub name: String,
-    pub arguments: String,
+    /// Structured arguments — not raw String. Enables hash/cache/diff/replay.
+    pub arguments: serde_json::Value,
 }
 
 // ── Request ────────────────────────────────────────────────────────────
 
-/// Canonical request — the IR that all adapters produce.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRequest {
-    /// System-level instructions. Separate from the message list.
-    pub instructions: Option<String>,
+    /// System instructions (supports multiple blocks).
+    #[serde(default)]
+    pub instructions: Vec<InstructionBlock>,
 
-    /// The conversation messages.
+    #[serde(default)]
     pub messages: Vec<Message>,
 
-    /// Available tools.
     #[serde(default)]
     pub tools: Vec<ToolDef>,
 
-    /// Model name.
     pub model: String,
 
-    /// Whether to stream the response.
     #[serde(default)]
     pub stream: bool,
 
-    /// Max output tokens.
     pub max_tokens: Option<u32>,
 
-    /// Sampling temperature.
     pub temperature: Option<f64>,
 
-    /// Structured output format (JSON schema).
     pub response_format: Option<ResponseFormat>,
 
-    /// Provider hint — which provider generated this request.
-    /// Used by the pipeline for provider-specific behavior.
+    /// Which provider generated this request.
     #[serde(default)]
-    pub provider_hint: String,
+    pub provider: ProviderKind,
+
+    /// What the provider supports.
+    #[serde(default)]
+    pub capabilities: ProviderCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,25 +189,19 @@ pub struct ResponseFormat {
 
 // ── Response ───────────────────────────────────────────────────────────
 
-/// Canonical response — the IR that adapters consume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalResponse {
-    /// Unique response ID.
     pub id: String,
-
-    /// Model that produced the response.
     pub model: String,
-
-    /// Response status.
     pub status: ResponseStatus,
-
-    /// The output messages/content.
     pub output: Vec<ContentPart>,
 
-    /// Token usage.
+    /// Reasoning trace if the model produced one.
+    #[serde(default)]
+    pub reasoning_trace: Option<ReasoningTrace>,
+
     pub usage: Usage,
 
-    /// Provider metadata.
     #[serde(default)]
     pub provider_meta: Option<serde_json::Value>,
 }
@@ -198,46 +221,37 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
-// ── Streaming events ───────────────────────────────────────────────────
+// ── Streaming events (with lifecycle state) ─────────────────────────────
 
-/// Normalized streaming events — the IR for SSE streaming.
+/// Each tool call: Start → ArgsDelta* → End.
+/// Each message: MessageStart → (TextDelta | ToolCall*) → MessageEnd.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StreamEvent {
-    /// A chunk of text content.
+    #[serde(rename = "message_start")]
+    MessageStart { role: String },
+
     #[serde(rename = "text_delta")]
-    TextDelta {
-        /// Content being appended.
-        text: String,
-    },
+    TextDelta { text: String },
 
-    /// A tool call is being built up.
-    #[serde(rename = "tool_call_delta")]
-    ToolCallDelta {
-        /// Which tool call index.
-        index: usize,
-        /// Tool call ID.
-        id: String,
-        /// Tool name (usually on first chunk).
-        name: Option<String>,
-        /// Partial arguments JSON.
-        arguments_delta: String,
-    },
+    #[serde(rename = "tool_call_start")]
+    ToolCallStart { index: usize, id: String, name: String },
 
-    /// Reasoning/thinking delta.
+    #[serde(rename = "tool_call_args_delta")]
+    ToolCallArgsDelta { index: usize, arguments_delta: String },
+
+    #[serde(rename = "tool_call_end")]
+    ToolCallEnd { index: usize },
+
     #[serde(rename = "reasoning_delta")]
     ReasoningDelta { text: String },
 
-    /// Response completed.
-    #[serde(rename = "done")]
-    Done {
-        /// Final usage stats.
-        usage: Usage,
-        /// Finish reason from the model.
-        finish_reason: String,
-    },
+    #[serde(rename = "message_end")]
+    MessageEnd,
 
-    /// An error occurred.
+    #[serde(rename = "done")]
+    Done { usage: Usage, finish_reason: String },
+
     #[serde(rename = "error")]
     Error { message: String, code: Option<String> },
 }

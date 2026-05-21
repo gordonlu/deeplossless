@@ -43,36 +43,21 @@ pub fn to_chat_completions_sse(event: &StreamEvent) -> String {
             "choices": [{"delta": {"content": text}, "index": 0}],
             "object": "chat.completion.chunk",
         }),
-        StreamEvent::ToolCallDelta { index, id, name, arguments_delta } => {
-            let mut delta = json!({
-                "index": index,
-                "function": {"arguments": arguments_delta},
-            });
-            if !id.is_empty() {
-                delta["id"] = json!(id);
-            }
-            if let Some(n) = name {
-                delta["function"]["name"] = json!(n);
-            }
-            json!({
-                "choices": [{"delta": {"tool_calls": [delta]}, "index": 0}],
-                "object": "chat.completion.chunk",
-            })
-        }
-        StreamEvent::Done { usage, finish_reason } => {
-            json!({
-                "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}],
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                },
-                "object": "chat.completion.chunk",
-            })
-        }
-        StreamEvent::Error { message, code } => {
-            json!({"error": {"message": message, "code": code}})
-        }
+        StreamEvent::ToolCallStart { index, id, name } => json!({
+            "choices": [{"delta": {"tool_calls": [{"index": index, "id": id, "function": {"name": name, "arguments": ""}, "type": "function"}]}, "index": 0}],
+            "object": "chat.completion.chunk",
+        }),
+        StreamEvent::ToolCallArgsDelta { index, arguments_delta } => json!({
+            "choices": [{"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments_delta}}]}, "index": 0}],
+            "object": "chat.completion.chunk",
+        }),
+        StreamEvent::ToolCallEnd { .. } => json!({"choices": [{"delta": {}, "index": 0}], "object": "chat.completion.chunk"}),
+        StreamEvent::Done { usage, finish_reason } => json!({
+            "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens},
+            "object": "chat.completion.chunk",
+        }),
+        StreamEvent::Error { message, code } => json!({"error": {"message": message, "code": code}}),
         _ => json!({"choices": [{"delta": {}, "index": 0}]}),
     };
 
