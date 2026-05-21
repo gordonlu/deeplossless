@@ -255,6 +255,39 @@ pub fn is_cacheable(tool_name: &str) -> bool {
     !matches!(ToolKind::from_name(tool_name), ToolKind::Other)
 }
 
+// ── Canonical Execution Identity ──────────────────────────────────────
+
+/// The stable key for cache correctness, replay determinism, and failure matching.
+/// Normalizes tool name + args across provider/format differences.
+///
+/// `grep("tokio", "src/")` and `search_content("tokio", directory="src/")`
+/// resolve to the same canonical key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalExecutionKey {
+    pub tool_name: String,
+    pub args_hash: String,
+}
+
+impl CanonicalExecutionKey {
+    pub fn new(tool_name: &str, args: &str) -> Self {
+        let normalized = normalize_args(args);
+        Self {
+            tool_name: normalize_tool_name(tool_name),
+            args_hash: sha256_hex(&normalized),
+        }
+    }
+}
+
+/// Normalize tool name to a provider-agnostic canonical form.
+fn normalize_tool_name(name: &str) -> String {
+    let n = name.to_lowercase();
+    if n.contains("grep") || n.contains("search_content") || n.contains("search_code") { "grep".into() }
+    else if n.contains("read") && (n.contains("file") || n == "read") { "read_file".into() }
+    else if n.contains("list") || n.contains("ls") || n.contains("tree") { "list_files".into() }
+    else if n.contains("symbol") || n.contains("document_symbol") { "symbol_search".into() }
+    else { name.to_string() }
+}
+
 // ── Cache entry (L2) ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
