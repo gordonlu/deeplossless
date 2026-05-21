@@ -101,6 +101,22 @@ pub fn normalize_reasoning(text: &str) -> String {
         .collect()
 }
 
+/// Maximum lineage edges per conversation before TTL compaction kicks in.
+const LINEAGE_TTL: usize = 1000;
+
+/// Apply TTL-based lineage compaction: keep only the most recent edges,
+/// squash intermediate DerivedFrom chains, drop edges beyond TTL.
+pub fn compact_lineage_with_ttl(
+    edges: &[(i64, i64, LineageEdge)],
+) -> Vec<(i64, i64, LineageEdge)> {
+    if edges.len() <= LINEAGE_TTL {
+        return compact_lineage(edges);
+    }
+    // Keep last TTL edges, compact the rest
+    let recent = &edges[edges.len().saturating_sub(LINEAGE_TTL)..];
+    compact_lineage(recent)
+}
+
 /// Compress lineage by transitive collapse of DerivedFrom edges.
 /// A → B → C becomes A → C (preserves the full causation chain).
 pub fn compact_lineage(

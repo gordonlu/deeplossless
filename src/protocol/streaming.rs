@@ -28,18 +28,20 @@ pub fn from_chat_completions_sse(data: &str, usage_buffer: Option<&serde_json::V
 
 /// Convert a canonical `StreamEvent` into a Responses API SSE data line.
 /// Codex requires `event: <type>\ndata: {...}\n\n` format.
+/// Escapes newlines in data to prevent SSE injection.
 pub fn to_responses_sse(event: &StreamEvent) -> String {
     let data = super::responses::stream_event_to_responses(event);
     if data.is_empty() {
         return String::new();
     }
-    // Extract event type from the JSON for the SSE event: header
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+    // SSE-safe: escape newlines in the data payload
+    let safe_data = data.replace('\n', "\\n").replace('\r', "\\r");
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&safe_data) {
         if let Some(evt) = v["type"].as_str() {
-            return format!("event: {evt}\ndata: {data}\n\n");
+            return format!("event: {evt}\ndata: {safe_data}\n\n");
         }
     }
-    format!("data: {data}\n\n")
+    format!("data: {safe_data}\n\n")
 }
 
 /// Convert a canonical `StreamEvent` into a Chat Completions SSE data line.
