@@ -2,73 +2,84 @@
 //!
 //! These tests start a real axum mock upstream + the deeplossless proxy,
 //! then send requests through the proxy and verify correct forwarding,
-//! storage, and DAG context injection.
+//! storage, and DAG context injection. Tests cover both Chat Completions
+//! and Responses API protocols, including tool call/result round-tripping
+//! and streaming conversion.
 
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// Start a mock upstream server on a random port, returning the address
-/// and a shutdown sender.
-async fn start_mock_upstream() -> (SocketAddr, oneshot::Sender<()>) {
-    let app = Router::new().route("/v1/chat/completions", post(mock_chat));
+// ── Shared test helpers ──────────────────────────────────────────────────
+
+type CapturedRequest = Arc<Mutex<Option<Value>>>;
+
+/// Start a mock upstream server. The `reply_fn` decides what JSON to return.
+/// The `captured` (if provided) gets populated with the received Chat Completions body.
+async fn start_mock_upstream_ex(
+    capture: Option<CapturedRequest>,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let captured = capture.unwrap_or_else(|| Arc::new(Mutex::new(None)));
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = captured.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+
+            let is_streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_streaming {
+                // Return an error JSON so the handler doesn't try to parse SSE
+                Json(json!({"error": "streaming not supported in mock"}))
+            } else {
+                Json(json!({
+                    "id": "mock-cmpl-001",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Mock response"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15
+                    }
+                }))
+            }
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-
     tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async { rx.await.ok(); })
             .await
             .unwrap();
     });
-
     (addr, tx)
 }
 
-async fn mock_chat(Json(body): Json<Value>) -> Json<Value> {
-    let is_streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    if is_streaming {
-        // Streaming responses aren't tested via JSON assertion
-        Json(json!({"error": "streaming not supported in mock"}))
-    } else {
-        Json(json!({
-            "id": "mock-cmpl-001",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "Mock response"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15
-            }
-        }))
-    }
+async fn start_mock_upstream() -> (SocketAddr, oneshot::Sender<()>) {
+    start_mock_upstream_ex(None).await
 }
 
-#[tokio::test]
-async fn proxy_non_streaming_round_trip() {
-    let (upstream_addr, _shutdown) = start_mock_upstream().await;
-
-    // Build proxy pointed at the mock
+/// Build a deeplossless AppState pointed at the given upstream address.
+/// `suffix` should be unique per test to avoid SQLite locking.
+async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossless::AppState {
     let db = Arc::new(
         deeplossless::db::Database::builder()
-            .path(std::env::temp_dir().join(format!("proxy_test_{}", std::process::id())))
+            .path(std::env::temp_dir().join(format!("proxy_test_{}_{}", std::process::id(), suffix)))
             .build()
             .await
             .unwrap(),
     );
     let dag = Arc::new(
-        deeplossless::dag::DagEngine::builder()
-            .build(db.clone()),
+        deeplossless::dag::DagEngine::builder().build(db.clone()),
     );
     let compactor = Arc::new(tokio::sync::Mutex::new(
         deeplossless::compactor::Compactor::spawn(
@@ -82,8 +93,7 @@ async fn proxy_non_streaming_round_trip() {
             },
         ),
     ));
-
-    let state = deeplossless::AppState {
+    deeplossless::AppState {
         upstream: format!("http://{}", upstream_addr),
         api_key: std::sync::Arc::new(std::sync::Mutex::new(Some("test-key".to_string()))),
         admin_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -93,16 +103,30 @@ async fn proxy_non_streaming_round_trip() {
         client: reqwest::Client::new(),
         summarizer_model: "deepseek-v4-flash".into(),
         cycle: std::sync::Arc::new(std::sync::Mutex::new(
-            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Minimal)
+            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Minimal),
         )),
-    };
+        dry_run: false,
+        response_store: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    }
+}
 
+/// Start the proxy on a random port, return its address.
+async fn start_proxy(state: deeplossless::AppState) -> SocketAddr {
     let app = deeplossless::proxy::routes().with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = listener.local_addr().unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
 
-    // Send a non-streaming request through the proxy
+// ── Existing Chat Completions test ───────────────────────────────────────
+
+#[tokio::test]
+async fn chat_completions_text_round_trip() {
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(upstream_addr, "cc").await;
+    let proxy_addr = start_proxy(state).await;
+
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{}/v1/chat/completions", proxy_addr))
@@ -118,8 +142,250 @@ async fn proxy_non_streaming_round_trip() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "proxy should return 200");
-
+    assert!(resp.status().is_success());
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "Mock response");
+}
+
+// ── Responses API tests ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn responses_api_text_round_trip() {
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let (upstream_addr, _shutdown) = start_mock_upstream_ex(Some(captured.clone())).await;
+    let state = build_proxy_state(upstream_addr, "responses_text").await;
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .json(&json!({
+            "input": "write hello world in python",
+            "instructions": "You are a helpful coding assistant.",
+            "model": "deepseek-v4-flash",
+            "max_output_tokens": 100,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success(), "Responses API should return 200");
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response", "should return Responses API format");
+    assert_eq!(body["status"], "completed");
+    assert!(body["output"].is_array(), "should have output array");
+
+    // Verify the upstream received a Chat Completions request
+    let upstream_req = captured.lock().unwrap().take().expect("upstream should have received a request");
+    assert_eq!(upstream_req["model"], "deepseek-v4-flash");
+    assert!(upstream_req["messages"].is_array());
+    let msgs = upstream_req["messages"].as_array().unwrap();
+    assert!(msgs.iter().any(|m| m["role"] == "system"), "should have system message");
+    assert!(msgs.iter().any(|m| m["role"] == "user"), "should have user message");
+}
+
+#[tokio::test]
+async fn responses_api_tool_call_round_trip() {
+    // Mock upstream that returns a tool call response
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            Json(json!({
+                "id": "mock-cmpl-002",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "grep",
+                                "arguments": r#"{"pattern":"fn main","path":"src/"}"#
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+            }))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { rx.await.ok(); })
+            .await
+            .unwrap();
+    });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "tool_call_rtt").await;
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .json(&json!({
+            "input": [{"role": "user", "content": "search the codebase"}],
+            "instructions": "Use tools to search.",
+            "model": "deepseek-v4-flash",
+            "tools": [{"type": "function", "name": "grep", "description": "search files"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success(), "Responses API should return 200");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "incomplete", "tool_calls finish_reason maps to incomplete");
+
+    // Should contain function_call in output
+    let output = body["output"].as_array().expect("should have output");
+    let has_fn_call = output.iter().any(|o| o["type"] == "function_call");
+    assert!(has_fn_call, "response should contain function_call output item");
+
+    // Verify upstream received Chat Completions with tools
+    let upstream = captured.lock().unwrap().take().expect("upstream should have received body");
+    assert!(upstream["tools"].is_array(), "upstream should receive tool definitions");
+    assert_eq!(upstream["tools"][0]["function"]["name"], "grep");
+
+    // Verify usage tokens propagated
+    let usage = body["usage"].as_object().expect("should have usage");
+    assert!(usage.contains_key("input_tokens"));
+    assert!(usage.contains_key("output_tokens"));
+}
+
+#[tokio::test]
+async fn pipeline_tool_result_caching() {
+    // Direct test: call the pipeline's process() with tool call + result,
+    // then verify the tool cache was populated.  This avoids the HTTP layer
+    // and the spawn_blocking race.
+    use deeplossless::tool_cache;
+
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let (upstream_addr, _shutdown) = start_mock_upstream_ex(Some(captured.clone())).await;
+    let state = build_proxy_state(upstream_addr, "pipeline_cache").await;
+    let db = state.db.clone();
+
+    let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
+
+    let req_body = json!({
+        "model": "deepseek-v4-flash",
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "search for process_data"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "grep", "arguments": r#"{"pattern":"process_data","path":"src/"}"#}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1",
+             "content": "src/lib.rs:42 pub fn process_data()"}
+        ],
+    });
+
+    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    assert!(output.conv_id > 0);
+
+    // Now wait for the spawn_blocking task to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify tool cache was populated
+    let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"process_data","path":"src/"}"#);
+    eprintln!("checking cache: name={cname:?} hash={args_hash:?}");
+    match db.tool_cache_get(&cname, &args_hash) {
+        Ok(Some((result, _ts))) => {
+            assert!(result.contains("process_data"), "cached result should contain expected content");
+        }
+        Ok(None) => {
+            // Try a short retry — spawn_blocking may still be running
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            match db.tool_cache_get(&cname, &args_hash) {
+                Ok(Some((result, _ts))) => assert!(result.contains("process_data")),
+                _ => panic!("cache still empty after 1.5 s total wait"),
+            }
+        }
+        Err(e) => {
+            panic!("cache lookup error: {e}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_api_streaming_round_trip() {
+    // Mock upstream that returns SSE Chat Completions chunks
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+
+            // Return SSE streaming response via axum::response::Sse
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { rx.await.ok(); })
+            .await
+            .unwrap();
+    });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "streaming").await;
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "input": "say hello",
+            "instructions": "Be concise.",
+            "model": "deepseek-v4-flash",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success(), "streaming should return 200");
+
+    // Read the SSE body as text
+    let sse_body = resp.text().await.unwrap();
+    assert!(!sse_body.is_empty(), "SSE body should not be empty");
+
+    // Verify it contains Responses API SSE events
+    assert!(sse_body.contains("response.created"), "should have response.created event");
+    assert!(sse_body.contains("response.output_text.delta"), "should have text delta events");
+    assert!(sse_body.contains("response.completed"), "should have response.completed");
+    assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
+
+    // Verify upstream received streaming=true
+    let upstream = captured.lock().unwrap().take().expect("upstream should have received body");
+    assert_eq!(upstream["stream"], true, "upstream should receive streaming=true");
 }
