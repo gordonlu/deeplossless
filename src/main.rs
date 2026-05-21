@@ -89,7 +89,7 @@ enum Commands {
 async fn run_demo() -> anyhow::Result<()> {
     use deeplossless::runtime::RuntimeProfile;
     let db = Arc::new(deeplossless::db::Database::builder()
-        .path(":memory:").build().await?);
+        .path("/tmp/deeplossless_demo.db").build().await?);
     let dag = Arc::new(deeplossless::dag::DagEngine::builder()
         .max_level(3).recent_messages(20).build(db.clone()));
     let _cycle = Arc::new(StdMutex::new(
@@ -132,6 +132,8 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("  └──────────────────────────────────────────┘");
     println!("\n  Start the proxy:  deeplossless --api-key sk-...");
     println!("  More benchmarks:  cargo test --test long_session_benchmark\n");
+    // Clean up temp DB from demo
+    let _ = std::fs::remove_file("/tmp/deeplossless_demo.db");
     Ok(())
 }
 
