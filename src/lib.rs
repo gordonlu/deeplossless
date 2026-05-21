@@ -72,6 +72,7 @@ pub mod runtime;
 pub mod tool_cache;
 pub mod metrics;
 pub mod pipeline;
+pub mod protocol;
 pub mod proxy;
 pub mod session;
 pub mod snippet;

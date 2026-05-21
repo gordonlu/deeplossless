@@ -62,6 +62,7 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
@@ -89,6 +90,135 @@ pub fn routes() -> Router<AppState> {
         .route("/health", get(lcm_health))
         .route("/v1/health", get(lcm_health))
         .route("/metrics", get(metrics::handle_metrics))
+}
+
+/// Responses API endpoint — translates to Chat Completions internally.
+/// Codex and other Responses API clients connect here.
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let req_body: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", format!("invalid JSON: {e}")),
+    };
+
+    // Extract API key on first request
+    {
+        let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
+        if key.is_none()
+            && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+            && let Some(bearer) = auth.strip_prefix("Bearer ")
+                .or_else(|| auth.strip_prefix("bearer "))
+        {
+            *key = Some(bearer.to_string());
+        }
+    }
+
+    // 1. Responses API → canonical IR
+    let canonical = crate::protocol::responses::request_from_responses(&req_body);
+    let streaming = canonical.stream;
+
+    // 2. Canonical IR → Chat Completions (for DeepSeek)
+    let chat_body = crate::protocol::chat_completions::request_to_chat(&canonical);
+
+    // 3. Run the chat pipeline (DAG context injection, message persistence)
+    let pipeline = crate::pipeline::ChatPipeline::new(&state);
+    let chat_body_val: serde_json::Value = chat_body.clone();
+    let injected = match pipeline.process(&canonical.model, &chat_body_val).await {
+        Ok(out) => out.injected_body,
+        Err(e) => {
+            warn!("pipeline error: {e}, falling back to passthrough");
+            chat_body_val
+        }
+    };
+
+    // 4. Forward to upstream
+    let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
+    let resp = match state
+        .client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
+        .header("Content-Type", "application/json")
+        .json(&injected)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
+        }
+    };
+
+    // 5. Handle streaming vs non-streaming
+    if streaming {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = UnboundedReceiverStream::new(rx);
+        tokio::spawn(async move {
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+            let mut usage_buf: Option<serde_json::Value> = None;
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(c) => {
+                        let s = String::from_utf8_lossy(&c);
+                        buf.push_str(&s);
+                        // Process complete SSE lines
+                        while let Some(pos) = buf.find('\n') {
+                            let line = buf[..pos].trim().to_string();
+                            buf = buf[pos + 1..].to_string();
+                            if let Some(data_line) = line.strip_prefix("data: ") {
+                                // Accumulate usage from chunk
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
+                                    && v.get("usage").is_some() {
+                                        usage_buf = Some(v.clone());
+                                    }
+                                if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                                    let sse_line = crate::protocol::streaming::to_responses_sse(&event);
+                                    if tx.send(Ok::<_, std::convert::Infallible>(
+                                        axum::body::Bytes::from(sse_line)
+                                    )).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("stream error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
+        response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header"));
+        response
+    } else {
+        // Non-streaming: translate Chat Completions response → Responses format
+        match resp.bytes().await {
+            Ok(bytes) => {
+                let chat_resp: serde_json::Value = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid upstream JSON: {e}")),
+                };
+                let canonical_resp = crate::protocol::chat_completions::response_from_chat(&chat_resp);
+                let responses_body = crate::protocol::responses::response_to_responses(&canonical_resp, None);
+                let mut response = Response::new(Body::from(serde_json::to_string(&responses_body).unwrap_or_default()));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert("content-type", "application/json".parse().expect("static header"));
+                response
+            }
+            Err(e) => {
+                metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
+            }
+        }
+    }
 }
 
 async fn chat_completions(
