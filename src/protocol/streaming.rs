@@ -6,21 +6,23 @@
 
 pub use super::canonical::StreamEvent;
 
-/// Convert a Chat Completions SSE data line into a canonical `StreamEvent`.
-/// Returns `None` if the line doesn't contain a meaningful event (e.g., `[DONE]`).
-pub fn from_chat_completions_sse(data: &str, usage_buffer: Option<&serde_json::Value>) -> Option<StreamEvent> {
+/// Convert a Chat Completions SSE data line into canonical `StreamEvent`s.
+/// Returns empty Vec if the line contains no meaningful event.
+/// The first chunk of a tool call may return both ToolCallStart + ToolCallArgsDelta.
+pub fn from_chat_completions_sse(data: &str, usage_buffer: Option<&serde_json::Value>) -> Vec<StreamEvent> {
     if data == "[DONE]" {
-        // Use accumulated usage from previous events
         let usage = usage_buffer.map(|v| super::canonical::Usage {
             prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
             total_tokens: v["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32,
         }).unwrap_or_default();
 
-        return Some(StreamEvent::Done {
+        return vec![StreamEvent::Done {
             usage,
             finish_reason: "stop".into(),
-        });
+            incomplete: false,
+            error_reason: None,
+        }];
     }
 
     super::responses::stream_event_from_chat(data)
@@ -62,11 +64,14 @@ pub fn to_chat_completions_sse(event: &StreamEvent) -> String {
             "object": "chat.completion.chunk",
         }),
         StreamEvent::ToolCallEnd { .. } => json!({"choices": [{"delta": {}, "index": 0}], "object": "chat.completion.chunk"}),
-        StreamEvent::Done { usage, finish_reason } => json!({
-            "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}],
-            "usage": {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens},
-            "object": "chat.completion.chunk",
-        }),
+        StreamEvent::Done { usage, finish_reason, incomplete, error_reason: _ } => {
+            let reason = if *incomplete { "length" } else { finish_reason.as_str() };
+            json!({
+                "choices": [{"delta": {}, "index": 0, "finish_reason": reason}],
+                "usage": {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens},
+                "object": "chat.completion.chunk",
+            })
+        },
         StreamEvent::Error { message, code } => json!({"error": {"message": message, "code": code}}),
         _ => json!({"choices": [{"delta": {}, "index": 0}]}),
     };
@@ -139,6 +144,7 @@ impl StreamAssembler {
             StreamEvent::ToolCallEnd { index } => {
                 let mut events = Vec::new();
                 if let Some(ptc) = self.partial_tools.remove(&index) {
+                    events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
                     events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments });
                 }
                 events
@@ -168,10 +174,22 @@ impl StreamAssembler {
         }
     }
 
-    /// Force-flush any buffered partial tool calls (called on stream close).
+    /// Graceful flush — completes any partially assembled tool calls and
+    /// emits them as [ToolCallStart, ToolCallArgsDelta] pairs. Called when
+    /// the upstream stream ends normally (Done/MessagenEnd received).
     pub fn flush(&mut self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (index, ptc) in self.partial_tools.drain() {
+            events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
+            events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments });
+        }
+        events
+    }
+
+    /// Abort flush — discards partial tool call state without emitting.
+    /// Called on transport error, where partial results are unsafe to use.
+    pub fn abort_flush(&mut self) {
         self.partial_tools.clear();
-        vec![]
     }
 }
 
@@ -197,8 +215,9 @@ mod assembler_tests {
         assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into() }).is_empty());
         assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"ttern":"foo"}"#.into() }).is_empty());
         let events = asm.feed(StreamEvent::ToolCallEnd { index: 0 });
-        assert_eq!(events.len(), 1, "should emit 1 event with complete args");
-        assert!(matches!(events[0], StreamEvent::ToolCallArgsDelta { .. }));
+        assert_eq!(events.len(), 2, "should emit ToolCallStart + complete ToolCallArgsDelta");
+        assert!(matches!(events[0], StreamEvent::ToolCallStart { .. }));
+        assert!(matches!(events[1], StreamEvent::ToolCallArgsDelta { .. }));
     }
 
     #[test]
@@ -215,7 +234,7 @@ mod assembler_tests {
         let mut asm = StreamAssembler::new();
         assert!(asm.feed(StreamEvent::ToolCallStart { index: 0, id: "tc1".into(), name: "grep".into() }).is_empty());
         assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: "{".into() }).is_empty());
-        let events = asm.feed(StreamEvent::Done { usage: Usage::default(), finish_reason: "stop".into() });
+        let events = asm.feed(StreamEvent::Done { usage: Usage::default(), finish_reason: "stop".into(), incomplete: false, error_reason: None });
         assert!(events.is_empty(), "incomplete tool dropped on Done");
     }
 

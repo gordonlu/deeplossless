@@ -272,6 +272,15 @@ pub enum ToolKind {
     Other,
 }
 
+/// Whether stream interception should inject cached result as text.
+/// Only intercept tools whose results are compact enough to not flood the
+/// conversation with raw data. `read_file`/`list_files` results can be
+/// huge and are better re-executed than dumped inline.
+pub fn is_interceptable(tool_name: &str) -> bool {
+    let kind = ToolKind::from_name(tool_name);
+    matches!(kind, ToolKind::Grep | ToolKind::SymbolSearch | ToolKind::Diagnostics)
+}
+
 impl ToolKind {
     pub fn from_name(name: &str) -> Self {
         let n = name.to_lowercase();

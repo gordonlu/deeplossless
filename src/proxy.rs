@@ -60,6 +60,145 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
     }))).into_response()
 }
 
+/// Check the tool cache for a pair of [ToolCallStart, ToolCallArgsDelta] events.
+/// Returns `(Some(cached_result), 2)` if hit, or `(None, 0)` if the first event
+/// at `offset` is not an interceptable tool call pair.
+fn check_tool_cache(
+    events: &[StreamEvent],
+    offset: usize,
+    db: &crate::db::Database,
+    cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
+) -> (Option<String>, usize) {
+    if offset + 1 >= events.len() { return (None, 0); }
+    if let StreamEvent::ToolCallStart { index: si, name, .. } = &events[offset] {
+        // Only intercept tools whose results are compact (grep/search/diagnostics).
+        // Large results (read_file, list_files) would flood the conversation.
+        if !crate::tool_cache::is_interceptable(name) { return (None, 0); }
+        if let StreamEvent::ToolCallArgsDelta { index: ai, arguments_delta } = &events[offset + 1] {
+            if si == ai {
+                let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments_delta);
+                match db.tool_cache_get(&cname, &args_hash) {
+                    Ok(Some((result, _hits))) => {
+                        if let Ok(mut c) = cycle.lock() {
+                            c.metrics.cache_hits += 1;
+                        }
+                        tracing::info!(target: "deeplossless",
+                            tool=name, args_hash, result_len=result.len(),
+                            "cache hit — intercepting tool call");
+                        return (Some(result), 2);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(target: "deeplossless",
+                            tool=name, error=%e, "cache lookup error, forwarding tool call");
+                    }
+                }
+            }
+        }
+    }
+    (None, 0)
+}
+
+/// Process assembled events, with tool cache interception. For cache hits,
+/// emits text deltas instead of forwarding tool calls. Processes ALL events
+/// in the Vec (no early return — handles multi-tool-call scenarios correctly).
+///
+/// Cache-hit text is fed back through the assembler (when provided) so the
+/// final lifecycle events contain the cached content.
+fn process_events(
+    events: Vec<StreamEvent>,
+    db: &crate::db::Database,
+    cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>,
+    mut assembler: Option<&mut crate::protocol::streaming::StreamAssembler>,
+    use_responses_format: bool,
+) -> bool {
+    let mut i = 0;
+    while i < events.len() {
+        let (cached, consumed) = check_tool_cache(&events, i, db, cycle);
+        if let Some(text) = cached {
+            let text_ev = StreamEvent::TextDelta { text };
+            if use_responses_format {
+                if let Some(asm) = assembler.as_mut() {
+                    for ev in asm.feed(text_ev) {
+                        let sse_line = crate::protocol::streaming::to_responses_sse(&ev);
+                        if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+                            return false;
+                        }
+                    }
+                } else {
+                    let sse_line = crate::protocol::streaming::to_responses_sse(&text_ev);
+                    if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+                        return false;
+                    }
+                }
+            } else {
+                let sse_line = crate::protocol::streaming::to_chat_completions_sse(&text_ev);
+                if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+                    return false;
+                }
+            }
+            i += consumed;
+            continue;
+        }
+        // Normal emission
+        let sse_line = if use_responses_format {
+            crate::protocol::streaming::to_responses_sse(&events[i])
+        } else {
+            crate::protocol::streaming::to_chat_completions_sse(&events[i])
+        };
+        if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Session log entry — one JSON line per request, written when `--log-dir` is set.
+#[derive(serde::Serialize)]
+struct LogEntry {
+    ts: String,
+    endpoint: &'static str,
+    model: String,
+    request_body_kb: f64,
+    input_tokens_est: usize,
+    output_tokens: u64,
+    output_text_len: usize,
+    cache_hits: u64,
+    msg_count: usize,
+    tools_count: usize,
+    instructions_len: usize,
+    instr_hash: String,
+    prompt_cache_key: String,
+    upstream_status: u16,
+    elapsed_ms: u64,
+    error: Option<String>,
+}
+
+/// Session file path, created once per process. All requests append to the same file.
+static SESSION_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn session_file_path(log_dir: &str) -> &std::path::PathBuf {
+    SESSION_FILE.get_or_init(|| {
+        let _ = std::fs::create_dir_all(log_dir);
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        std::path::PathBuf::from(format!("{}/session-{ts}.jsonl", log_dir.trim_end_matches('/')))
+    })
+}
+
+fn write_log(log_dir: Option<&str>, entry: &LogEntry) {
+    let Some(dir) = log_dir else { return };
+    let path = session_file_path(dir);
+    // Append one line — best-effort, never crash on log failure
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        if let Ok(line) = serde_json::to_string(entry) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -252,8 +391,20 @@ async fn responses(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
         let response_store = state.response_store.clone();
+        let db = state.db.clone();
+        let cycle = state.cycle.clone();
         let store_response = store;
         let request_body = body.clone();
+        let log_dir = state.log_dir.clone();
+        let upstream_status = resp.status().as_u16();
+        let start = std::time::Instant::now();
+        let log_model = canonical.model.clone();
+        let log_instr_hash = instr_hash.clone();
+        let log_prompt_cache_key = prompt_cache_key.to_string();
+        let log_tools_count = tools_count;
+        let log_instructions_len = instructions_len;
+        let log_msg_count = req_msgs;
+        let log_request_body_kb = body.len() as f64 / 1024.0;
         tokio::spawn(async move {
             // Generate IDs matching OpenAI format
             let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
@@ -311,24 +462,15 @@ async fn responses(
                                     && v.get("usage").is_some() {
                                         usage_buf = Some(v.clone());
                                     }
-                                if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                                for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                                     // Done = transport-level EOF, drain remaining buffers
                                     if matches!(event, StreamEvent::Done { .. }) {
-                                        for assembled in assembler.flush() {
-                                            let sse_line = crate::protocol::streaming::to_responses_sse(&assembled);
-                                            if tx.send(Ok::<_, std::convert::Infallible>(
-                                                axum::body::Bytes::from(sse_line)
-                                            )).is_err() { break; }
-                                        }
+                                        let events = assembler.flush();
+                                        if !process_events(events, &db, &cycle, &tx, Some(&mut assembler), true) { break; }
                                         continue;
                                     }
-                                    for assembled in assembler.feed(event) {
-                                        tracing::debug!(target: "deeplossless::stream", "sending SSE event");
-                                        let sse_line = crate::protocol::streaming::to_responses_sse(&assembled);
-                                        if tx.send(Ok::<_, std::convert::Infallible>(
-                                            axum::body::Bytes::from(sse_line)
-                                        )).is_err() { break; }
-                                    }
+                                    let events = assembler.feed(event);
+                                    if !process_events(events, &db, &cycle, &tx, Some(&mut assembler), true) { break; }
                                 }
                             }
                         }
@@ -347,12 +489,10 @@ async fn responses(
                     && v.get("usage").is_some() {
                         usage_buf = Some(v.clone());
                     }
-                if let Some(event) = crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                     if !matches!(event, StreamEvent::Done { .. }) {
-                        for assembled in assembler.feed(event) {
-                            let sse_line = crate::protocol::streaming::to_responses_sse(&assembled);
-                            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line)));
-                        }
+                        let events = assembler.feed(event);
+                        process_events(events, &db, &cycle, &tx, Some(&mut assembler), true);
                     }
                 }
             }
@@ -366,6 +506,29 @@ async fn responses(
             tracing::info!(target: "deeplossless",
                 input_tokens_est, output_tokens, output_text_len,
                 "turn complete");
+
+            // Write session log if --log-dir is set
+            if log_dir.is_some() {
+                let cache_hits = cycle.lock().ok().map(|c| c.metrics.cache_hits).unwrap_or(0);
+                write_log(log_dir.as_deref(), &LogEntry {
+                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                    endpoint: "responses",
+                    model: log_model,
+                    request_body_kb: log_request_body_kb,
+                    input_tokens_est,
+                    output_tokens,
+                    output_text_len,
+                    cache_hits,
+                    msg_count: log_msg_count,
+                    tools_count: log_tools_count,
+                    instructions_len: log_instructions_len,
+                    instr_hash: log_instr_hash,
+                    prompt_cache_key: log_prompt_cache_key,
+                    upstream_status,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    error: if upstream_status >= 400 { Some(format!("HTTP {upstream_status}")) } else { None },
+                });
+            }
 
             // Build lifecycle events using serde_json for proper escaping
             let part_json = serde_json::json!({
@@ -556,21 +719,98 @@ async fn chat_completions(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
+        let db = state.db.clone();
+        let cycle = state.cycle.clone();
+        let log_dir = state.log_dir.clone();
+        let upstream_status = status.as_u16();
+        let start = std::time::Instant::now();
+        let log_model = model.to_string();
+        let log_body = body.clone();
         tokio::spawn(async move {
             let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+            let mut usage_buf: Option<serde_json::Value> = None;
+            let mut assembler = crate::protocol::streaming::StreamAssembler::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
-                        if tx.send(Ok::<_, std::convert::Infallible>(c)).is_err() {
-                            break;
+                        let s = String::from_utf8_lossy(&c);
+                        buf.push_str(&s);
+                        while let Some(pos) = buf.find('\n') {
+                            let line = buf[..pos].trim().to_string();
+                            buf = buf[pos + 1..].to_string();
+                            if let Some(data_line) = line.strip_prefix("data: ") {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
+                                    && v.get("usage").is_some() {
+                                        usage_buf = Some(v.clone());
+                                    }
+                                for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                                    if matches!(event, StreamEvent::Done { .. }) {
+                                        let flush_events = assembler.flush();
+                                        if !process_events(flush_events, &db, &cycle, &tx, None, false) { break; }
+                                        continue;
+                                    }
+                                    let assembled = assembler.feed(event);
+                                    if !process_events(assembled, &db, &cycle, &tx, None, false) { break; }
+                                }
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("stream error: {e}");
-                        break;
-                    }
+                    Err(e) => { warn!("stream error: {e}"); break; }
                 }
             }
+            // Flush remaining assembler state (stream may have ended without Done)
+            {
+                let flush_events = assembler.flush();
+                process_events(flush_events, &db, &cycle, &tx, None, false);
+            }
+            // Emit incomplete Done if stream ended without a proper finish_reason
+            if usage_buf.is_none() {
+                let err_done = serde_json::json!({
+                    "choices": [{"delta": {}, "index": 0, "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "object": "chat.completion.chunk",
+                });
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!("data: {err_done}\n\n"))));
+            } else if let Some(ref v) = usage_buf {
+                let usage = serde_json::json!({
+                    "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+                    "usage": v["usage"],
+                    "object": "chat.completion.chunk",
+                });
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!("data: {usage}\n\n"))));
+            }
+            // Write session log
+            if log_dir.is_some() {
+                let content = assembler.finish();
+                let input_tokens_est = crate::tokenizer::count(&log_body);
+                let output_tokens = usage_buf.as_ref()
+                    .and_then(|v| v["usage"]["completion_tokens"].as_u64())
+                    .unwrap_or(0);
+                let cache_hits = cycle.lock().ok().map(|c| c.metrics.cache_hits).unwrap_or(0);
+                let body_json: Option<serde_json::Value> = serde_json::from_str(&log_body).ok();
+                let msg_count = body_json.as_ref().and_then(|v| v["messages"].as_array()).map(|a| a.len()).unwrap_or(0);
+                let tools_count = body_json.as_ref().and_then(|v| v["tools"].as_array()).map(|a| a.len()).unwrap_or(0);
+                write_log(log_dir.as_deref(), &LogEntry {
+                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                    endpoint: "chat_completions",
+                    model: log_model,
+                    request_body_kb: log_body.len() as f64 / 1024.0,
+                    input_tokens_est,
+                    output_tokens,
+                    output_text_len: content.text.len(),
+                    cache_hits,
+                    msg_count,
+                    tools_count,
+                    instructions_len: 0,
+                    instr_hash: "-".into(),
+                    prompt_cache_key: "-".into(),
+                    upstream_status,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    error: if upstream_status >= 400 { Some(format!("HTTP {upstream_status}")) } else { None },
+                });
+            }
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")));
         });
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;

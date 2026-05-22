@@ -334,7 +334,7 @@ pub enum StreamEvent {
     FunctionCallArgumentsDone { call_id: String, name: String, arguments: String },
 
     #[serde(rename = "done")]
-    Done { usage: Usage, finish_reason: String },
+    Done { usage: Usage, finish_reason: String, incomplete: bool, error_reason: Option<String> },
 
     #[serde(rename = "error")]
     Error { message: String, code: Option<String> },

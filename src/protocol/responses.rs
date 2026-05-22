@@ -146,40 +146,47 @@ pub fn response_to_responses(cr: &CanonicalResponse) -> serde_json::Value {
 
 // ── Streaming ──────────────────────────────────────────────────────────
 
-pub fn stream_event_from_chat(data: &str) -> Option<StreamEvent> {
-    let v: serde_json::Value = serde_json::from_str(data).ok()?;
-    let choices = v["choices"].as_array()?;
-    let choice = choices.first()?;
+pub fn stream_event_from_chat(data: &str) -> Vec<StreamEvent> {
+    let Some(v) = serde_json::from_str::<serde_json::Value>(data).ok() else { return vec![] };
+    let Some(choices) = v["choices"].as_array() else { return vec![] };
+    let Some(choice) = choices.first() else { return vec![] };
     let delta = &choice["delta"];
     if let Some(content) = delta["content"].as_str() {
-        return Some(StreamEvent::TextDelta { text: content.to_string() });
+        return vec![StreamEvent::TextDelta { text: content.to_string() }];
     }
     if let Some(tool_calls) = delta["tool_calls"].as_array()
         && let Some(tc) = tool_calls.first() {
         let index = tc["index"].as_u64().unwrap_or(0) as usize;
-        // ToolCallStart if name present, otherwise ToolCallArgsDelta
         if let Some(name) = tc["function"]["name"].as_str() {
-            return Some(StreamEvent::ToolCallStart { index, id: tc["id"].as_str().unwrap_or("").to_string(), name: name.to_string() });
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
+            let mut events = vec![StreamEvent::ToolCallStart { index, id, name: name.to_string() }];
+            if !args.is_empty() {
+                events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: args });
+            }
+            return events;
         }
         let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
         if !args.is_empty() {
-            return Some(StreamEvent::ToolCallArgsDelta { index, arguments_delta: args });
+            return vec![StreamEvent::ToolCallArgsDelta { index, arguments_delta: args }];
         }
     }
     if let Some(reason) = choice["finish_reason"].as_str() {
-        return Some(StreamEvent::Done {
+        return vec![StreamEvent::Done {
             usage: Usage {
                 prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
                 completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
                 total_tokens: v["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32,
             },
             finish_reason: reason.to_string(),
-        });
+            incomplete: false,
+            error_reason: None,
+        }];
     }
     if let Some(err) = v["error"].as_object() {
-        return Some(StreamEvent::Error { message: err["message"].as_str().unwrap_or("").to_string(), code: err["code"].as_str().map(|s| s.to_string()) });
+        return vec![StreamEvent::Error { message: err["message"].as_str().unwrap_or("").to_string(), code: err["code"].as_str().map(|s| s.to_string()) }];
     }
-    None
+    vec![]
 }
 
 pub fn stream_event_to_responses(event: &StreamEvent) -> String {

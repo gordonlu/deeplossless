@@ -82,6 +82,12 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// Enable per-request JSON logging to a directory. One JSON line per
+    /// request, written to `<log-dir>/session-<timestamp>.jsonl`. Disabled
+    /// by default (no log writes for normal users).
+    #[arg(long)]
+    log_dir: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -277,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         dry_run: cli.dry_run,
         response_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        log_dir: cli.log_dir,
     };
 
     // Reset rate counter every second
