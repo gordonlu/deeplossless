@@ -79,13 +79,19 @@ Example hook (Python):
 ```python
 import requests, json, os
 
-BASE = "http://127.0.0.1:8080"
+# Base URL must include /v1
+BASE = "http://127.0.0.1:8080/v1"
 CONV_ID = os.getenv("CONV_ID", "1")
 AUTH = {"Authorization": f"Bearer {os.getenv('ADMIN_KEY', '')}"}
 
+# LCM endpoints are at BASE/lcm/..., chat at BASE/chat/completions
+# Full path examples:
+#   http://127.0.0.1:8080/v1/lcm/grep/1
+#   http://127.0.0.1:8080/v1/chat/completions
+
 def before_turn(user_query):
     """Inject DAG context into the prompt."""
-    r = requests.get(f"{BASE}/v1/lcm/grep/{CONV_ID}", params={"query": user_query}, headers=AUTH)
+    r = requests.get(f"{BASE}/lcm/grep/{CONV_ID}", params={"query": user_query}, headers=AUTH)
     if r.ok:
         matches = r.json().get("matches", [])
         return "\n".join(m["preview"] for m in matches[:5])
@@ -93,14 +99,14 @@ def before_turn(user_query):
 
 def before_tool(tool_name, args_json):
     """Check cache before executing a tool."""
-    r = requests.get(f"{BASE}/v1/lcm/cache", params={"tool": tool_name, "args": args_json}, headers=AUTH)
+    r = requests.get(f"{BASE}/lcm/cache", params={"tool": tool_name, "args": args_json}, headers=AUTH)
     if r.ok and r.json().get("hit"):
         return r.json()["result"]  # Use cached result, skip execution
     return None
 
 def after_tool(tool_name, args_json, result, files=None):
     """Store tool result in cache."""
-    requests.post(f"{BASE}/v1/lcm/cache/put", json={
+    requests.post(f"{BASE}/lcm/cache/put", json={
         "tool": tool_name, "args": args_json,
         "result": result,
         "files": json.dumps(files or [])
@@ -108,7 +114,7 @@ def after_tool(tool_name, args_json, result, files=None):
 
 def after_failure(signature, fix_attempted, why_failed, assumptions=None, files=None):
     """Record a failed fix to prevent retrying it."""
-    requests.post(f"{BASE}/v1/lcm/failure", json={
+    requests.post(f"{BASE}/lcm/failure", json={
         "conv_id": CONV_ID, "signature": signature,
         "attempted_fix": fix_attempted, "why_failed": why_failed,
         "assumptions": json.dumps(assumptions or []),
@@ -118,12 +124,98 @@ def after_failure(signature, fix_attempted, why_failed, assumptions=None, files=
 
 ---
 
+## Configuration details
+
+### Base URL must include `/v1`
+
+deeplossless serves all endpoints under `/v1`:
+
+```
+http://127.0.0.1:8080/v1/chat/completions
+http://127.0.0.1:8080/v1/responses
+http://127.0.0.1:8080/v1/lcm/grep/...
+```
+
+When configuring an agent, the base URL **must end with `/v1`**:
+
+```json
+// ✅ Correct
+{ "baseURL": "http://127.0.0.1:8080/v1" }
+
+// ❌ Wrong — agent will hit http://127.0.0.1:8080/chat/completions
+{ "baseURL": "http://127.0.0.1:8080" }
+```
+
+This is the most common configuration mistake. If your agent can't connect,
+verify the URL includes `/v1`.
+
+### API key
+
+The API key is extracted from the first request's `Authorization: Bearer sk-...`
+header. You can set it via environment variable or the `--api-key` CLI flag:
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+deeplossless
+# or
+deeplossless --api-key sk-...
+```
+
+The key is cached after the first successful request — subsequent restarts
+won't need it retyped.
+
+---
+
+## Troubleshooting
+
+### Agent can't connect
+
+```bash
+# Verify the proxy is running
+curl http://127.0.0.1:8080/health
+# → "healthy"
+
+# Verify the API path works
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
+# → Should return a JSON response
+```
+
+### Responses API not working (Codex)
+
+Codex requires the Responses API. The proxy translates it internally:
+
+```bash
+curl http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer sk-..." \
+  -H "accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"input":"hi","model":"deepseek-v4-flash"}'
+# → Should return SSE events
+```
+
+### Tool cache not hitting
+
+The pipeline auto-caches tool results from conversation history. Verify with:
+
+```bash
+curl http://127.0.0.1:8080/v1/lcm/cache?tool=grep&args=%7B%22pattern%22%3A%22test%22%7D \
+  -H "Authorization: Bearer <your-key>"
+```
+
+Enable `--log-dir ~/.deeplossless/logs` to see per-request cache statistics.
+
+---
+
 ## What agents should expect
 
 - The system prompt contains a structured `<lcm_context>` block (automatic)
 - Stream-level tool cache interception may replace tool calls with cached results (automatic)
 - Repeated operations on unchanged files may be short-circuited (automatic)
 - **Active endpoints return real data but require the agent to call them** — they are not automatically injected
+- **Base URL must include `/v1`** — the most common configuration mistake
 
 Agents should NOT expect:
 
