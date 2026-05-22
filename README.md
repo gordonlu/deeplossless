@@ -138,6 +138,8 @@ Custom: `RUNTIME_CACHE=0-1 RUNTIME_RETRIES=0-10 RUNTIME_SPECULATIVE=true|false R
 | `--admin-key` | `ADMIN_KEY` | Admin key for LCM endpoints (falls back to API key) |
 | `--rate-limit` | `100` | Max requests/second (0 disables) |
 | `--summarizer-model` | `deepseek-v4-pro` | Model for background LLM summarization |
+| `--dry-run` | disabled | Skip upstream, save translated body for offline debugging |
+| `--log-dir` | disabled | Enable per-request JSON logging to a directory |
 
 ## API
 
@@ -223,25 +225,25 @@ codex
 ### Limitations with Codex
 
 Codex uses a **client-side execution model** — tool calls, retries, and plan
-state are managed inside the Codex process. deeplossless sits between Codex and
-the upstream API as a protocol translator, so most runtime features are
-**unavailable** when used with Codex:
+state are managed inside the Codex process. deeplossless operates at the
+canonical IR layer between Codex and DeepSeek, so some features work
+transparently while others require agent-side LCM API integration:
 
-| Feature | Available via Codex? | Why |
+| Feature | Available via Codex? | How |
 |---------|:--:|------|
-| Protocol translation (Responses → Chat) | YES | Required for Codex to work with DeepSeek |
-| DAG context injection | YES | `<lcm_context>` appended to system messages |
-| Tool Result Cache | NO | Codex doesn't query `GET /v1/lcm/cache` |
-| Failure Memory | NO | Codex manages failures internally |
+| Protocol translation (Responses → Chat) | YES | Canonical IR bidirectional translation |
+| Tool Cache Interception | YES | Stream-level: detects tool calls, returns cached results inline |
+| DAG Context Injection | YES | `<lcm_context>` appended to system messages |
+| Pipeline Auto-Caching | YES | Tool results extracted from conversation history automatically |
+| Failure Auto-Detection | YES | Pipeline detects error patterns from tool results |
+| Tool Cache (manual) | NO | Codex doesn't query `GET /v1/lcm/cache` |
+| Failure Memory (manual) | NO | Codex doesn't query failure endpoints |
 | Plan Persistence | NO | Codex maintains its own plan state |
 | File Ownership Tracking | NO | Unsupported |
-| Execution Compaction | NO | Codex handles its own context management |
 | Runtime Policy | NO | Decisions are made by Codex, not the proxy |
 
-If you want the full runtime benefits (cache reuse, failure memory, plan
-persistence), use an agent that queries the LCM endpoints listed above. The
-Codex integration is primarily a **protocol compatibility layer** — it gets
-DeepSeek working, but without the inference savings.
+Features marked YES work **transparently** — Codex doesn't need to know they
+exist. The canonical IR layer intercepts and optimizes at the protocol level.
 
 ## Session Report
 
