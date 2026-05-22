@@ -47,10 +47,11 @@ Want to see what the runtime actually does? `cargo test --test simulated_session
 
 DeepLossless reuses:
 
-- **repeated grep/search results** — deterministic tool cache with partial invalidation
+- **repeated tool calls** — stream-level interception replaces cached tool calls inline
+- **file reads** — structured summaries (AST symbols, line counts) instead of raw content
 - **failed fix attempts** — failure memory stores why_failed + invalidated_assumptions
 - **execution plans** — plan state persists across turns, avoids replanning
-- **repo state deltas** — stores what changed, not full code blocks
+- **execution events** — append-only event sourcing enables deterministic replay
 - **summarized reasoning traces** — execution compaction distills outcomes
 
 Instead of recomputing them every turn.
@@ -106,7 +107,9 @@ between your client and the DeepSeek API:
 | **Plan Persistence** | Execution state (goal, steps, assumptions), not plan text. Avoids repeated planning |
 | **Execution Units** | Agent memory atoms: `think → act → observe → reflect` cycles with outcome inference |
 | **Runtime Policy** | Advisory decisions with confidence scores + estimated token savings |
-| **Event Sourcing** | Append-only log for audit trail and rollback |
+| **Event Sourcing** | Append-only execution_events table — every StreamEvent persisted for replay |
+| **Replay Engine** | Deterministic reconstruction of execution sequences from event log |
+| **Snapshot Isolation** | Copy-on-write memory versions with budget-aware retention tiers (L0–L3) |
 
 ## Runtime Strategies
 
@@ -173,6 +176,14 @@ GET  /v1/lcm/execution/search?q=         — Execution memory: bugs, tool chains
 GET  /v1/lcm/runtime/stats               — Runtime metrics (tokens, cache rate, failures)
 GET  /v1/lcm/runtime/report?conv_id=&format= — Session report (markdown or SVG share card)
 GET  /v1/lcm/runtime/debug-dump          — Structured dump for GitHub issues (no user content)
+```
+
+### Replay
+
+```
+GET  /v1/lcm/replay/{execution_id}         — Reconstruct execution from event log
+POST /v1/lcm/snapshot                       — Take an execution snapshot
+GET  /v1/lcm/versions                       — List memory version history
 ```
 
 ### Agent hooks

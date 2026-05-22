@@ -190,16 +190,7 @@ fn event_kind_name(ev: &StreamEvent) -> String {
 }
 
 fn event_to_payload(ev: &StreamEvent) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "kind": event_kind_name(ev),
-        "detail": match ev {
-            StreamEvent::TextDelta { text } => serde_json::json!({"text_len": text.len()}),
-            StreamEvent::ToolCallStart { name, .. } => serde_json::json!({"name": name}),
-            StreamEvent::ToolCallArgsDelta { index, .. } => serde_json::json!({"index": index}),
-            StreamEvent::Done { finish_reason, incomplete, .. } => serde_json::json!({"finish_reason": finish_reason, "incomplete": incomplete}),
-            _ => serde_json::json!({}),
-        },
-    })).unwrap_or_default()
+    serde_json::to_string(ev).unwrap_or_default()
 }
 
 /// Session log entry — one JSON line per request, written when `--log-dir` is set.

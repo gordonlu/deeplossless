@@ -75,6 +75,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod protocol;
 pub mod proxy;
+pub mod replay;
 pub mod session;
 pub mod snapshot;
 pub mod snippet;

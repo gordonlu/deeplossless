@@ -45,6 +45,9 @@ These require the agent to make explicit HTTP calls. They will NOT fire automati
 | `POST /v1/lcm/file/release` | After editing | Release lock |
 | `POST /v1/lcm/compress` | Context getting too long | Compress a message range into a summary node |
 | `POST /v1/lcm/rollback` | Need to undo | Rollback to a previous DAG checkpoint |
+| `GET /v1/lcm/replay/{execution_id}` | Audit or debug | Reconstruct full StreamEvent sequence from event log |
+| `POST /v1/lcm/snapshot` | Before important operations | Take an execution snapshot for later rollback |
+| `GET /v1/lcm/versions` | Audit trail | List memory version history |
 
 ---
 
