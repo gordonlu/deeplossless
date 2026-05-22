@@ -125,7 +125,8 @@ fn process_events(
             let kind = "TextDelta";
             let payload = event_to_payload(&text_ev);
             let sn = seq;
-            tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, kind, &payload, sn); });
+            let epoch_ms = chrono::Utc::now().timestamp_millis();
+            tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, kind, &payload, sn, None, epoch_ms); });
             seq += 1;
             if use_responses_format {
                 if let Some(asm) = assembler.as_mut() {
@@ -156,7 +157,8 @@ fn process_events(
         let kind = event_kind_name(ev);
         let payload = event_to_payload(ev);
         let sn = seq;
-        tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, &kind, &payload, sn); });
+        let epoch_ms = chrono::Utc::now().timestamp_millis();
+        tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, &kind, &payload, sn, None, epoch_ms); });
         seq += 1;
         // Normal emission
         let sse_line = if use_responses_format {
@@ -254,6 +256,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
         .route("/v1/lcm/runtime/debug-dump", get(lcm_debug_dump))
         .route("/v1/lcm/runtime/report", get(lcm_runtime_report))
+        .route("/v1/lcm/score/{conv_id}", get(lcm_score))
+        .route("/v1/lcm/audit/{conv_id}", get(lcm_audit_trail))
+        .route("/v1/lcm/audit/report/{conv_id}", get(lcm_audit_report))
         .route("/v1/lcm/replay/{execution_id}", get(lcm_replay))
         .route("/v1/lcm/snapshot", post(lcm_snapshot_take))
         .route("/v1/lcm/versions", get(lcm_versions))
@@ -266,6 +271,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/file/release", post(lcm_file_release))
         .route("/v1/lcm/file/conflicts", get(lcm_file_conflicts))
         .route("/v1/lcm/health/{conv_id}", get(lcm_dag_health))
+        .route("/v1/lcm/motifs/{conv_id}", get(lcm_motifs))
+        .route("/v1/lcm/observe", post(lcm_observe))
         .route("/v1/lcm/compress", post(lcm_compress))
         .route("/v1/lcm/delete", post(lcm_delete))
         .route("/v1/lcm/rollback", post(lcm_rollback))
@@ -1296,6 +1303,56 @@ async fn lcm_runtime_report(
 }
 
 /// Replay an execution from the event log — returns full StreamEvent sequence.
+/// GET /v1/lcm/audit/{conv_id} — audit trail for a conversation.
+async fn lcm_audit_trail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conv_id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let query = crate::audit::AuditQuery {
+        conv_id: Some(conv_id),
+        limit: 500,
+        ..Default::default()
+    };
+    match crate::audit::build_audit_trail(&state.db, &query) {
+        Ok(records) => Json(json!({"conv_id": conv_id, "records": records, "total": records.len()})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "AUDIT_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/audit/report/{conv_id} — aggregated audit report.
+async fn lcm_audit_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conv_id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    match crate::audit::build_audit_report(&state.db, Some(conv_id)) {
+        Ok(report) => Json(json!({"conv_id": conv_id, "report": report})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "AUDIT_REPORT_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/score/{conv_id} — execution outcome scoring.
+async fn lcm_score(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conv_id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    match state.db.compute_execution_score(conv_id) {
+        Ok(score) => Json(score).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SCORE_ERROR", format!("{e}")),
+    }
+}
+
 async fn lcm_replay(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1638,4 +1695,50 @@ async fn lcm_rollback(
         })).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+/// POST /v1/lcm/motifs/{conv_id} — extract execution motifs from a conversation.
+async fn lcm_motifs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conv_id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    match crate::motif::extract_motifs_from_db(&state.db, &[conv_id], None) {
+        Ok(motifs) => Json(json!({"conv_id": conv_id, "motifs": motifs})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "MOTIF_ERROR", format!("{e}")),
+    }
+}
+
+/// POST /v1/lcm/observe — create a FileObservation from file path and content.
+async fn lcm_observe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    if path.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "missing 'path' field");
+    }
+    let observation = crate::file_observation::observe_file(path, content);
+
+    // Persist to file_observations table
+    if let Err(e) = state.db.store_file_observation(
+        &observation.path,
+        &observation.content_hash,
+        &observation.semantic_hash,
+        &serde_json::to_string(&observation.ast).unwrap_or_default(),
+        observation.size_bytes,
+        observation.line_count,
+    ) {
+        tracing::warn!(target: "deeplossless::proxy", "failed to persist file observation: {e}");
+    }
+
+    Json(json!(observation)).into_response()
 }

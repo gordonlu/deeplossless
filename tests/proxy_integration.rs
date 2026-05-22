@@ -878,3 +878,241 @@ async fn snapshot_and_versions_endpoints() {
     assert!(vers.len() >= 2, "should have at least 2 versions: {versions_json}");
     assert!(vers.iter().any(|v| v["mutation_kind"] == "test"), "should have test version");
 }
+
+// ── LCM Audit / Score / Motif / Observe integration tests ───────────────
+
+fn dummy_upstream_addr() -> std::net::SocketAddr {
+    "127.0.0.1:1".parse().unwrap()
+}
+
+#[tokio::test]
+async fn lcm_audit_trail_and_report_endpoints() {
+    let state = build_proxy_state(dummy_upstream_addr(), "audit_test").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+    let base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+    let auth = "Bearer test-key";
+
+    // Store execution units via DB
+    let conv_id = state.db.find_or_create_conversation("audit_int_fp", "deepseek-v4-flash").unwrap();
+    for i in 0..4 {
+        let outcome = match i {
+            0 => "success",
+            1 => "success",
+            2 => "blocked",
+            _ => "cache_hit",
+        };
+        state.db.store_execution_unit(conv_id, "", "grep", "{}", if i == 2 { "Error: fail" } else { "ok" }, "", outcome, &[]).unwrap();
+    }
+
+    // Test audit trail endpoint
+    let trail_resp = client
+        .get(format!("{base}/v1/lcm/audit/{conv_id}"))
+        .header("authorization", auth)
+        .send().await.unwrap();
+    assert!(trail_resp.status().is_success(), "audit trail: {trail_resp:?}");
+    let trail_json: serde_json::Value = trail_resp.json().await.unwrap();
+    assert_eq!(trail_json["conv_id"], conv_id);
+    let records = trail_json["records"].as_array().unwrap();
+    assert_eq!(records.len(), 4, "all 4 units should be in trail");
+
+    // Test audit report endpoint
+    let report_resp = client
+        .get(format!("{base}/v1/lcm/audit/report/{conv_id}"))
+        .header("authorization", auth)
+        .send().await.unwrap();
+    assert!(report_resp.status().is_success(), "audit report: {report_resp:?}");
+    let report_json: serde_json::Value = report_resp.json().await.unwrap();
+    assert_eq!(report_json["report"]["total_actions"], 4);
+    assert!(report_json["report"]["failures"]["blocked"].as_i64().unwrap_or(0) >= 1);
+    assert!(report_json["report"]["cache_perf"]["hits"].as_i64().unwrap_or(0) >= 1);
+}
+
+#[tokio::test]
+async fn lcm_score_endpoint() {
+    let state = build_proxy_state(dummy_upstream_addr(), "score_test").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+    let base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+    let auth = "Bearer test-key";
+
+    let conv_id = state.db.find_or_create_conversation("score_int_fp", "deepseek-v4-flash").unwrap();
+    state.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
+    state.db.store_execution_unit(conv_id, "", "build", "{}", "Error: fail", "", "blocked", &[]).unwrap();
+    state.db.store_execution_unit(conv_id, "", "grep", "{}", "cached", "", "cache_hit", &[]).unwrap();
+
+    let score_resp = client
+        .get(format!("{base}/v1/lcm/score/{conv_id}"))
+        .header("authorization", auth)
+        .send().await.unwrap();
+    assert!(score_resp.status().is_success(), "score: {score_resp:?}");
+    let score: serde_json::Value = score_resp.json().await.unwrap();
+    assert!(score.get("composite").and_then(|v| v.as_f64()).is_some(), "composite should exist");
+    assert!(score.get("success_rate").and_then(|v| v.as_f64()).is_some(), "success_rate should exist");
+    assert!(score.get("hallucination_risk").and_then(|v| v.as_f64()).is_some(), "hallucination_risk should exist");
+}
+
+#[tokio::test]
+async fn lcm_motifs_endpoint() {
+    let state = build_proxy_state(dummy_upstream_addr(), "motif_int").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+    let base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+    let auth = "Bearer test-key";
+
+    let conv_id = state.db.find_or_create_conversation("motif_int_fp", "deepseek-v4-flash").unwrap();
+    // Repeated grep→read_file pattern
+    for _ in 0..2 {
+        state.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
+        state.db.store_execution_unit(conv_id, "", "read_file", "{}", "data", "", "success", &[]).unwrap();
+    }
+
+    let motifs_resp = client
+        .get(format!("{base}/v1/lcm/motifs/{conv_id}"))
+        .header("authorization", auth)
+        .send().await.unwrap();
+    assert!(motifs_resp.status().is_success(), "motifs: {motifs_resp:?}");
+    let motifs_json: serde_json::Value = motifs_resp.json().await.unwrap();
+    let motifs = motifs_json["motifs"].as_array().unwrap();
+    assert!(!motifs.is_empty(), "should find motifs");
+    let gr: Vec<_> = motifs.iter().filter(|m| m["tool_chain"].as_array().map(|a| a.len()) == Some(2)).collect();
+    assert!(!gr.is_empty(), "should have grep→read_file motif");
+}
+
+#[tokio::test]
+async fn lcm_observe_endpoint() {
+    let state = build_proxy_state(dummy_upstream_addr(), "observe_int").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+    let base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+    let auth = "Bearer test-key";
+
+    let observe_resp = client
+        .post(format!("{base}/v1/lcm/observe"))
+        .header("authorization", auth)
+        .json(&json!({
+            "path": "src/main.rs",
+            "content": "fn hello() {\n    println!(\"world\");\n}\n"
+        }))
+        .send().await.unwrap();
+    assert!(observe_resp.status().is_success(), "observe: {observe_resp:?}");
+    let obs: serde_json::Value = observe_resp.json().await.unwrap();
+    assert_eq!(obs["path"], "src/main.rs");
+    assert!(obs["semantic_hash"].as_str().unwrap_or("").len() >= 8);
+    assert!(obs["ast"]["functions"].as_array().map(|a| a.len()) >= Some(1));
+}
+
+#[tokio::test]
+async fn lcm_observe_rejects_missing_path() {
+    let state = build_proxy_state(dummy_upstream_addr(), "observe_reject").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+    let base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+    let auth = "Bearer test-key";
+
+    let resp = client
+        .post(format!("{base}/v1/lcm/observe"))
+        .header("authorization", auth)
+        .json(&json!({"content": "fn x() {}"}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 400, "missing path should 400");
+}
+
+// ── Parallel execution integration test ─────────────────────────────────
+
+#[tokio::test]
+async fn parallel_group_detection_and_join() {
+    // Verify that the pipeline detects multi-tool-call turns, tags execution
+    // units with span/parallel metadata, inserts HappensBefore edges, and
+    // creates a join DAG node.
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "parallel_test").await;
+    let db = state.db.clone();
+    let dag = state.dag.clone();
+
+    let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
+
+    // Request with two tool calls in one assistant turn (parallelizable)
+    let req_body = serde_json::json!({
+        "model": "deepseek-v4-flash",
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "check main.rs and lib.rs"},
+            {"role": "assistant", "content": "Let me look at both files.", "tool_calls": [
+                {"id": "call_grep", "type": "function",
+                 "function": {"name": "grep", "arguments": r#"{"pattern":"main","path":"src/main.rs"}"#}},
+                {"id": "call_read", "type": "function",
+                 "function": {"name": "read_file", "arguments": r#"{"path":"src/lib.rs"}"#}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_grep",
+             "content": "src/main.rs:1: fn main() {}"},
+            {"role": "tool", "tool_call_id": "call_read",
+             "content": "pub fn helper() {}"},
+            {"role": "assistant", "content": "Both files look good."}
+        ],
+    });
+
+    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    assert!(output.conv_id > 0, "should get a valid conversation ID");
+    let conv_id = output.conv_id;
+
+    // Wait for spawn_blocking persistence to finish
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    // ── 1. Verify execution units have parallel metadata ──────────────
+    let mut units = db.get_execution_units(conv_id, 10).unwrap();
+    assert_eq!(units.len(), 2, "should have 2 execution units for 2 tool calls");
+    // Sort by ID ascending for deterministic assertion order
+    units.sort_by_key(|u| u.id);
+
+    // Both units should have the same parallel_group and span_mode=parallel
+    assert!(!units[0].parallel_group.is_empty(), "unit 0 should have parallel_group");
+    assert!(!units[1].parallel_group.is_empty(), "unit 1 should have parallel_group");
+    assert_eq!(units[0].parallel_group, units[1].parallel_group,
+        "both units should share the same parallel_group");
+    assert_eq!(units[0].span_mode, "parallel", "unit 0 span_mode should be parallel");
+    assert_eq!(units[1].span_mode, "parallel", "unit 1 span_mode should be parallel");
+
+    // Each should have a unique span_id
+    assert_ne!(units[0].span_id, units[1].span_id, "span_ids should be unique");
+
+    // Both should share the same parent_span_id
+    assert_eq!(units[0].parent_span_id, units[1].parent_span_id,
+        "both units should share parent_span_id");
+
+    // Verify tool_call_id was preserved
+    let call_ids: Vec<&str> = units.iter().map(|u| u.tool_call_id.as_str()).collect();
+    assert!(call_ids.contains(&"call_grep"), "should contain call_grep");
+    assert!(call_ids.contains(&"call_read"), "should contain call_read");
+
+    // ── 2. Verify HappensBefore edges in dag_edges table ──────────────
+    let hb_edges = db.get_edges_by_kind("happens_before").unwrap();
+
+    assert!(!hb_edges.is_empty(), "should have at least one HappensBefore edge");
+
+    // Each edge should point to the join DAG node (to_id should match a join node)
+    for (from_id, to_id, kind) in &hb_edges {
+        assert_eq!(kind, "happens_before");
+        // Verify from_id is an execution unit ID
+        assert!(
+            units.iter().any(|u| u.id == *from_id),
+            "from_id {from_id} should be one of the execution unit IDs"
+        );
+        // Verify to_id is a join DAG node
+        if let Some(node) = dag.db().get_node(*to_id).unwrap() {
+            assert!(node.is_join, "target node should be a join node");
+        }
+    }
+
+    // ── 3. Verify join DAG node exists ────────────────────────────────
+    let all_nodes = db.get_all_dag_nodes(conv_id).unwrap();
+    let join_nodes: Vec<_> = all_nodes.iter().filter(|n| n.is_join).collect();
+    assert_eq!(join_nodes.len(), 1, "should have exactly 1 join DAG node");
+
+    let join_node = join_nodes[0];
+    assert!(join_node.summary.contains("Parallel group"), "join node summary should mention parallel group");
+
+    // ── 4. Verify governance worked: both branches succeeded ──────────
+    assert_eq!(units[0].outcome.as_str(), "success");
+    assert_eq!(units[1].outcome.as_str(), "success");
+}

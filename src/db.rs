@@ -186,6 +186,7 @@ impl Database {
                 child_ids       TEXT NOT NULL DEFAULT '[]',
                 snippets        TEXT NOT NULL DEFAULT '[]',
                 is_leaf         INTEGER NOT NULL DEFAULT 1,
+                is_join         INTEGER NOT NULL DEFAULT 0,
                 deleted         INTEGER NOT NULL DEFAULT 0,
                 deleted_at      TEXT,
                 semantic_hash   TEXT NOT NULL DEFAULT '',
@@ -384,7 +385,52 @@ impl Database {
         // v0.4.0: execution events — append-only event sourcing
         conn.execute_batch(crate::execution::EVENT_MIGRATION)?;
 
+        // v0.5.0: mutation engine log
+        conn.execute_batch(crate::mutation::MUTATION_LOG_MIGRATION)?;
+
+        // v0.5.0: file observations for structured file caching
+        conn.execute_batch(crate::file_observation::MIGRATION)?;
+
+        // v0.5.0: tool_call_id for parallel group matching
+        let has_tool_call_id: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_call_id'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_tool_call_id {
+            conn.execute_batch(crate::execution::MIGRATION_ALTER_V6)?;
+        }
+
+        // v0.6: audit P0 columns for execution_events
+        let has_epoch_ms: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('execution_events') WHERE name='epoch_ms'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_epoch_ms {
+            conn.execute_batch(crate::execution::EVENT_MIGRATION_ALTER_V6)?;
+        }
+
+        // v0.6: epoch_ms for execution_units (stable ordering)
+        let has_unit_epoch_ms: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='epoch_ms'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_unit_epoch_ms {
+            conn.execute_batch(crate::execution::EXECUTION_UNITS_ALTER_V6)?;
+        }
+
         Ok(())
+    }
+
+    /// Access the writer connection for advanced operations (mutation engine, etc).
+    pub(crate) fn writer_conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Get all conversation IDs.
+    pub fn get_all_conversation_ids(&self) -> anyhow::Result<Vec<i64>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare("SELECT id FROM conversations ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        let mut ids = Vec::new();
+        for row in rows { ids.push(row?); }
+        Ok(ids)
     }
 
     /// Find a conversation by session fingerprint, or create one.
@@ -466,7 +512,7 @@ impl Database {
         child_ids: &[i64],
         is_leaf: bool,
     ) -> anyhow::Result<DagNode> {
-        self.insert_dag_node_full(conversation_id, level, summary, token_count, parent_ids, child_ids, &[], is_leaf)
+        self.insert_dag_node_full(conversation_id, level, summary, token_count, parent_ids, child_ids, &[], is_leaf, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -480,6 +526,7 @@ impl Database {
         child_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
         is_leaf: bool,
+        is_join: bool,
     ) -> anyhow::Result<DagNode> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let parent_json = serde_json::to_string(parent_ids)?;
@@ -487,9 +534,9 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         conn.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
-            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32, hash],
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_leaf as i32, is_join as i32, hash],
         )?;
         let id = conn.last_insert_rowid();
 
@@ -513,6 +560,7 @@ impl Database {
             child_ids: child_ids.to_vec(),
             snippets: snippets.to_vec(),
             is_leaf,
+            is_join,
             deleted: false,
             semantic_hash: Self::semantic_hash(summary, snippets),
             access_count: 0,
@@ -524,7 +572,7 @@ impl Database {
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE id = ?1 AND deleted = 0",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
@@ -568,7 +616,7 @@ impl Database {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
             placeholders.join(","),
         );
@@ -587,7 +635,7 @@ impl Database {
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
              ORDER BY level DESC, id DESC LIMIT 1",
         )?;
@@ -598,7 +646,7 @@ impl Database {
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes
              WHERE conversation_id = ?1 AND level = (
                  SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
@@ -614,7 +662,7 @@ impl Database {
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -635,6 +683,19 @@ impl Database {
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
+        self.insert_summary_atomic_inner(conversation_id, level, summary, token_count, source_ids, snippets, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn insert_summary_atomic_inner(
+        &self,
+        conversation_id: i64,
+        level: u8,
+        summary: &str,
+        token_count: i64,
+        source_ids: &[i64],
+        snippets: &[crate::snippet::Snippet],
+        is_join: bool,
+    ) -> anyhow::Result<DagNode> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
@@ -643,9 +704,9 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         tx.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
-            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, hash],
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_join as i32, hash],
         )?;
         let new_id = tx.last_insert_rowid();
 
@@ -733,12 +794,25 @@ impl Database {
             child_ids: source_ids.to_vec(),
             snippets: snippets.to_vec(),
             is_leaf: false,
+            is_join,
             deleted: false,
             semantic_hash: Self::semantic_hash(summary, snippets),
             access_count: 0,
             last_accessed_at: None,
             reasoning: String::new(),
         })
+    }
+
+    /// Atomically insert a join node (parallel execution sync point).
+    pub fn insert_join_atomic(
+        &self,
+        conversation_id: i64,
+        summary: &str,
+        token_count: i64,
+        source_ids: &[i64],
+        snippets: &[crate::snippet::Snippet],
+    ) -> anyhow::Result<DagNode> {
+        self.insert_summary_atomic_inner(conversation_id, 0, summary, token_count, source_ids, snippets, true)
     }
 
     /// Update the reasoning chain for a node (execution provenance).
@@ -772,13 +846,19 @@ impl Database {
     }
 
     /// Get event log for a conversation, ordered by time.
-    pub fn get_events(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, Option<i64>, String)>> {
+    #[allow(clippy::type_complexity)]
+    pub fn get_events(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, Option<i64>, String, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT event_type, node_id, payload FROM dag_events WHERE conv_id = ?1 ORDER BY id DESC LIMIT ?2"
+            "SELECT event_type, node_id, payload, created_at FROM dag_events WHERE conv_id = ?1 ORDER BY id DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
         let mut results = Vec::new();
         for row in rows { results.push(row?); }
@@ -788,6 +868,7 @@ impl Database {
     // ── Execution units (v0.7) ──────────────────────────────────────
 
     /// Store an execution unit and return its ID.
+    /// Also writes an append-only execution event.
     pub fn store_execution_unit(
         &self,
         conv_id: i64,
@@ -799,16 +880,72 @@ impl Database {
         outcome: &str,
         related_nodes: &[i64],
     ) -> anyhow::Result<i64> {
+        self.store_execution_unit_with_span(
+            conv_id, reasoning_before, tool_name, tool_args,
+            tool_result, reasoning_after, outcome, related_nodes,
+            "", "", "", "", "", "",
+        )
+    }
+
+    /// Store an execution unit with full span/parallel metadata and replay session.
+    /// Always writes an append-only event to execution_events with epoch_ms.
+    /// `replay_session_id` groups related executions for replay lineage.
+    pub fn store_execution_unit_with_span(
+        &self,
+        conv_id: i64,
+        reasoning_before: &str,
+        tool_name: &str,
+        tool_args: &str,
+        tool_result: &str,
+        reasoning_after: &str,
+        outcome: &str,
+        related_nodes: &[i64],
+        span_id: &str,
+        parent_span_id: &str,
+        span_mode: &str,
+        parallel_group: &str,
+        tool_call_id: &str,
+        replay_session_id: &str,
+    ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let related_json = serde_json::to_string(related_nodes)?;
-        let tool_args_json_str = String::new(); // populated if available, empty default
+        let tool_args_json_str = String::new();
         let reasoning_steps_json = "[]".to_string();
+        let epoch_ms = chrono::Utc::now().timestamp_millis();
+
         conn.execute(
-            "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes, tool_args_json, reasoning_steps)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![conv_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_json, tool_args_json_str, reasoning_steps_json],
+            "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes, tool_args_json, reasoning_steps, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms, replay_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                conv_id, reasoning_before, tool_name, tool_args, tool_result,
+                reasoning_after, outcome, related_json, tool_args_json_str,
+                reasoning_steps_json, span_id, parent_span_id, span_mode, parallel_group,
+                tool_call_id, epoch_ms, replay_session_id,
+            ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let exec_id = conn.last_insert_rowid();
+
+        // Append-only event log (authoritative audit source)
+        let payload = serde_json::json!({
+            "tool_name": tool_name,
+            "outcome": outcome,
+            "span_id": span_id,
+            "parent_span_id": parent_span_id,
+            "span_mode": span_mode,
+            "parallel_group": parallel_group,
+        });
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, conv_id, epoch_ms, replay_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                exec_id, "execution_completed",
+                &serde_json::to_string(&payload).unwrap_or_default(),
+                span_id, parent_span_id, span_mode, parallel_group,
+                tool_call_id, conv_id, epoch_ms, replay_session_id,
+            ],
+        )?;
+
+        Ok(exec_id)
     }
 
     /// Get execution units for a conversation, newest first.
@@ -820,7 +957,9 @@ impl Database {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, reasoning_before, tool_name, tool_args,
-                    tool_result, reasoning_after, outcome, related_nodes, created_at
+                    tool_result, reasoning_after, outcome, related_nodes, created_at,
+                    span_id, parent_span_id, span_mode, parallel_group, tool_call_id,
+                    epoch_ms, replay_session_id
              FROM execution_units
              WHERE conversation_id = ?1
              ORDER BY id DESC LIMIT ?2"
@@ -842,6 +981,13 @@ impl Database {
                 created_at: row.get(9)?,
                 tool_args_json: None,
                 reasoning_steps: vec![],
+                span_id: row.get::<_, String>(10).unwrap_or_default(),
+                parent_span_id: row.get::<_, String>(11).unwrap_or_default(),
+                span_mode: row.get::<_, String>(12).unwrap_or_default(),
+                parallel_group: row.get::<_, String>(13).unwrap_or_default(),
+                tool_call_id: row.get::<_, String>(14).unwrap_or_default(),
+                epoch_ms: row.get::<_, i64>(15).unwrap_or_default(),
+                replay_session_id: row.get::<_, String>(16).unwrap_or_default(),
             })
         })?;
         let mut results = Vec::new();
@@ -1016,6 +1162,53 @@ impl Database {
             "SELECT COUNT(*) FROM failure_patterns WHERE conversation_id = ?1",
             rusqlite::params![conv_id], |r| r.get(0))?;
         Ok((leaf_count, summary_count, total_tokens, failure_count))
+    }
+
+    /// Fetch execution scoring data for a conversation.
+    /// Returns (execution_units, dag_metrics) for `score_execution`.
+    pub fn get_scoring_data(
+        &self, conv_id: i64,
+    ) -> anyhow::Result<(Vec<crate::execution::ExecutionUnit>, crate::execution::DagMetrics)> {
+        let units = self.get_execution_units(conv_id, 1000)?;
+        let (leaf_count, summary_count, total_tokens, _failure_count) = self.collect_session_metrics(conv_id)?;
+        let conn = self.read_conn();
+        let total_edges: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dag_edges WHERE from_id IN (SELECT id FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0)",
+            rusqlite::params![conv_id], |r| r.get(0),
+        ).unwrap_or(0);
+        let reuse_edges: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dag_edges WHERE kind = 'reuses' AND from_id IN (SELECT id FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0)",
+            rusqlite::params![conv_id], |r| r.get(0),
+        ).unwrap_or(0);
+        let dag = crate::execution::DagMetrics {
+            leaf_count,
+            summary_count,
+            total_tokens,
+            max_budget_tokens: 128_000,
+            reuse_edge_count: reuse_edges,
+            total_edge_count: total_edges,
+        };
+        Ok((units, dag))
+    }
+
+    /// Store a file observation.
+    pub fn store_file_observation(
+        &self, path: &str, content_hash: &str, semantic_hash: &str,
+        ast_json: &str, size_bytes: usize, line_count: usize,
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO file_observations (path, content_hash, semantic_hash, ast_json, size_bytes, line_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![path, content_hash, semantic_hash, ast_json, size_bytes as i64, line_count as i64],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Compute and return the execution score for a conversation.
+    pub fn compute_execution_score(&self, conv_id: i64) -> anyhow::Result<crate::execution::ExecutionScore> {
+        let (units, dag) = self.get_scoring_data(conv_id)?;
+        Ok(crate::execution::ExecutionScore::from_units(&units, &dag))
     }
 
     /// Get top N most-hit tool cache entries for the session report.
@@ -1216,11 +1409,12 @@ impl Database {
 
     /// Store a single execution event. Append-only — never updated.
     /// Called from stream handlers as events flow through the proxy.
-    pub fn store_execution_event(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64) -> anyhow::Result<i64> {
+    /// `epoch_ms` is a Unix timestamp in milliseconds for stable ordering.
+    pub fn store_execution_event(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![execution_id, event_kind, event_payload, seq_no],
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1236,6 +1430,44 @@ impl Database {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    #[allow(clippy::type_complexity)]
+    /// Read all execution events for a conversation (authoritative audit source).
+    /// Returns (id, execution_id, event_kind, event_payload, seq_no, created_at, span_id,
+    ///          parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms).
+    pub fn get_execution_events_by_conv(
+        &self, conv_id: i64, limit: usize,
+    ) -> anyhow::Result<Vec<(i64, Option<i64>, String, String, i64, String, String, String, String, String, String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, event_kind, event_payload, seq_no, created_at,
+                    span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms
+             FROM execution_events
+             WHERE conv_id = ?1
+             ORDER BY epoch_ms DESC, id DESC
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+            ))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert a provenance lineage edge into the lineage_edges table.
+    /// This is the authoritative edge store for DependsOn, DerivedFrom, etc.
+    /// Returns the edge ID.
+    pub fn insert_lineage_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT OR IGNORE INTO lineage_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
+            rusqlite::params![from_id, to_id, kind],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 
     // ── Memory Versions (v0.4.0) ───────────────────────────────────────
@@ -1504,7 +1736,7 @@ impl Database {
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
              FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0
              ORDER BY id ASC",
         )?;
@@ -1578,6 +1810,63 @@ impl Database {
             rusqlite::params![from_id, to_id, kind],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Delete edges matching the given from_id, to_id, and kind.
+    pub fn delete_edges(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<usize> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let affected = conn.execute(
+            "DELETE FROM dag_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3",
+            rusqlite::params![from_id, to_id, kind],
+        )?;
+        Ok(affected)
+    }
+
+    /// Query edges by kind. Returns (from_id, to_id, kind) tuples.
+    pub fn get_edges_by_kind(&self, kind: &str) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, kind FROM dag_edges WHERE kind = ?1 ORDER BY id"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![kind], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Gather mutation candidates: finds nodes with low access_count or stale last_accessed_at.
+    pub fn find_decay_candidates(&self, conv_id: i64, min_access: i64) -> anyhow::Result<Vec<crate::dag::DagNode>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids,
+                    is_leaf, is_join, snippets, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+             FROM dag_nodes
+             WHERE conversation_id = ?1 AND deleted = 0 AND is_leaf = 0 AND access_count < ?2
+             ORDER BY access_count ASC LIMIT 20"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, min_access], |row| {
+            Ok(crate::dag::DagNode {
+                id: row.get(0)?, conversation_id: row.get(1)?, level: row.get(2)?,
+                summary: row.get(3)?, token_count: row.get(4)?,
+                parent_ids: serde_json::from_str(&row.get::<_,String>(5)?).unwrap_or_default(),
+                child_ids: serde_json::from_str(&row.get::<_,String>(6)?).unwrap_or_default(),
+                is_leaf: row.get::<_,i64>(7)? != 0,
+                is_join: row.get::<_,i64>(8)? != 0,
+                snippets: serde_json::from_str(&row.get::<_,String>(9)?).unwrap_or_default(),
+                deleted: row.get::<_,i64>(10)? != 0,
+                semantic_hash: row.get(11)?,
+                access_count: row.get(12)?,
+                last_accessed_at: row.get(13)?,
+                reasoning: row.get(14)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
     }
 
     /// Get all outgoing edges from a node.
@@ -2082,11 +2371,12 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let child_str: String = row.get(6)?;
         let snippet_str: String = row.get(7)?;
         let is_leaf_int: i32 = row.get(8)?;
-        let deleted_int: i32 = row.get(9)?;
-        let semantic_hash: String = row.get(10)?;
-        let access_count: i64 = row.get(11).unwrap_or(0);
-        let last_accessed_at: Option<String> = row.get(12).ok().flatten();
-        let reasoning: String = row.get(13).unwrap_or_default();
+        let is_join_int: i32 = row.get(9)?;
+        let deleted_int: i32 = row.get(10)?;
+        let semantic_hash: String = row.get(11)?;
+        let access_count: i64 = row.get(12).unwrap_or(0);
+        let last_accessed_at: Option<String> = row.get(13).ok().flatten();
+        let reasoning: String = row.get(14).unwrap_or_default();
         Ok(DagNode {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -2097,6 +2387,7 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
             child_ids: serde_json::from_str(&child_str).unwrap_or_default(),
             snippets: serde_json::from_str(&snippet_str).unwrap_or_default(),
             is_leaf: is_leaf_int != 0,
+            is_join: is_join_int != 0,
             deleted: deleted_int != 0,
             semantic_hash,
             access_count,
@@ -2339,7 +2630,7 @@ mod tests {
                 frequency: 0,
             },
         ];
-        db.insert_dag_node_full(conv_id, 1, "fixed port binding error", 15, &[], &[], &snippets, false).unwrap();
+        db.insert_dag_node_full(conv_id, 1, "fixed port binding error", 15, &[], &[], &snippets, false, false).unwrap();
 
         // Search for "port" — should find the summary
         let results = db.search_unified(conv_id, "port").unwrap();

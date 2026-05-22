@@ -139,6 +139,8 @@ pub struct DagNode {
     pub child_ids: Vec<i64>,
     /// True when this is a raw message leaf (level 0).
     pub is_leaf: bool,
+    /// True when this is an explicit join node for parallel execution.
+    pub is_join: bool,
     /// Precision-critical snippets extracted before compression.
     pub snippets: Vec<Snippet>,
     /// True when this node has been soft-deleted (excluded from context assembly).
@@ -405,7 +407,8 @@ impl DagEngine {
             &[],        // parent_ids
             source_ids, // child_ids (for backward compat, mirrors Refines edges)
             &[],        // snippets
-            false,
+            false,      // is_leaf
+            false,      // is_join
         )?;
 
         // The insert already creates Summarizes edges. Remove them and
@@ -566,7 +569,8 @@ impl DagEngine {
             &[],        // parent_ids: set when summarized by a higher node
             source_ids, // child_ids: the source nodes being summarized
             snippets,
-            false,
+            false,      // is_leaf
+            false,      // is_join
         )?;
 
         for pid in source_ids {

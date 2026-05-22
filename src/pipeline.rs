@@ -130,6 +130,13 @@ impl ChatPipeline {
         let correction = dag.config().token_correction_factor;
         let msgs = messages.clone();
         tokio::task::spawn_blocking(move || {
+            // Generate a unique replay session ID for this pipeline run
+            let replay_session_id = {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                format!("rs_{}_{:x}", conv_id, now.as_nanos())
+            };
             if let Err(e) = db.store_messages(conv_id, &msgs) {
                 tracing::warn!(target: "deeplossless::pipeline", "failed to store messages: {e}");
                 return;
@@ -152,8 +159,58 @@ impl ChatPipeline {
                     .map(crate::session::normalize_message)
                     .collect();
                 let units = crate::execution::group_execution_chain(conv_id, &normalized);
+
+                // ── Parallel execution detection ──────────────────────
+                // Scan normalized messages for multi-tool turns and build
+                // ForkJoinTrackers. Each turn with ≥2 tool calls becomes a
+                // parallel group. Match units to groups by tool_call_id.
+                let root_span = crate::parallel::ExecutionSpan::root_span();
+                let mut active_trackers: Vec<crate::parallel::ForkJoinTracker> = Vec::new();
+                // Stores the final HappensBefore edges for DB insertion
+                let mut pending_hb_edges: Vec<crate::parallel::HappensBeforeEdge> = Vec::new();
+                let mut next_turn_index: usize = 0;
+
+                for msg in &normalized {
+                    if let Some(tc_info) = crate::parallel::ParallelDetector::detect(msg) {
+                        let tracker = crate::parallel::ForkJoinTracker::fork(
+                            conv_id, next_turn_index, &root_span, &tc_info,
+                            crate::parallel::ParallelGovernance::default(),
+                        );
+                        active_trackers.push(tracker);
+                    }
+                    if msg.role == "assistant" && !msg.tool_calls.is_empty() {
+                        next_turn_index += 1;
+                    }
+                }
+
+                // Process units with parallel awareness
+                // Track the last unit ID to populate DependsOn lineage edges
+                let mut last_exec_id: Option<i64> = None;
                 for unit in &units {
-                    if let Err(e) = db.store_execution_unit(
+                    // Find which active tracker this unit belongs to (if any)
+                    let (span_id, parent_span_id, span_mode, parallel_group) =
+                        if !unit.tool_call_id.is_empty() {
+                            active_trackers
+                                .iter()
+                                .find(|t| t.branches.iter().any(|b| b.tool_call_id == unit.tool_call_id))
+                                .map(|t| {
+                                    let branch = t.branches.iter().find(|b| b.tool_call_id == unit.tool_call_id);
+                                    match branch {
+                                        Some(b) => (
+                                            b.span_id.as_str().to_string(),
+                                            t.parent_span.span_id.as_str().to_string(),
+                                            crate::parallel::SpanMode::Parallel.as_str().to_string(),
+                                            t.group_id.clone(),
+                                        ),
+                                        None => (String::new(), String::new(), String::new(), String::new()),
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            (String::new(), String::new(), String::new(), String::new())
+                        };
+
+                    let exec_id = match db.store_execution_unit_with_span(
                         conv_id,
                         &unit.reasoning_before,
                         &unit.tool_name,
@@ -162,11 +219,38 @@ impl ChatPipeline {
                         &unit.reasoning_after,
                         unit.outcome.as_str(),
                         &unit.related_nodes,
+                        &span_id,
+                        &parent_span_id,
+                        &span_mode,
+                        &parallel_group,
+                        &unit.tool_call_id,
+                        &replay_session_id,
                     ) {
-                        tracing::warn!(target: "deeplossless::pipeline", "failed to store execution unit: {e}");
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::warn!(target: "deeplossless::pipeline", "failed to store execution unit: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Record DependsOn lineage edge: consecutive units in a conversation
+                    // form a dependency chain (unit N depends on unit N-1's output).
+                    if let Some(prev_id) = last_exec_id {
+                        if let Err(e) = db.insert_lineage_edge(prev_id, exec_id, "depends_on") {
+                            tracing::warn!(target: "deeplossless::pipeline",
+                                "failed to insert DependsOn edge: {e}");
+                        }
                     }
+                    last_exec_id = Some(exec_id);
+
+                    // Update tracker with result
+                    if !unit.tool_call_id.is_empty() {
+                        for tracker in &mut active_trackers {
+                            tracker.record_branch_result(&unit.tool_call_id, exec_id, &unit.outcome);
+                        }
+                    }
+
                     // Auto-populate tool cache from message history.
-                    // Agent doesn't need hooks — proxy sees tool_use→tool_result pairs.
                     if crate::tool_cache::is_cacheable(&unit.tool_name)
                         && !unit.tool_result.is_empty() {
                         let (_name, args_hash) = crate::tool_cache::cache_key(
@@ -188,12 +272,49 @@ impl ChatPipeline {
                             conv_id, &sig,
                             "",
                             &unit.tool_result,
-                            &[], &[],
-                            None,
+                            &[], &[], None,
                         );
                         tracing::info!(target: "deeplossless::pipeline",
                             conv_id, tool = %unit.tool_name,
                             "auto-recorded failure pattern");
+                    }
+                }
+
+                // Complete any finished parallel trackers and record HappensBefore edges.
+                // For groups that should force-join, insert a join DAG node.
+                for tracker in &active_trackers {
+                    if !tracker.should_force_join() {
+                        continue;
+                    }
+                    // Insert a join DAG node
+                    let summary = format!(
+                        "Parallel group {} ({} branches)",
+                        tracker.group_id,
+                        tracker.branch_count(),
+                    );
+                    match dag.db().insert_join_atomic(
+                        conv_id,
+                        &summary,
+                        0,
+                        &[],
+                        &[],
+                    ) {
+                        Ok(join_node) => {
+                            let edges = tracker.clone().complete(join_node.id);
+                            for hb in &edges {
+                                if let Err(e) = db.insert_edge(
+                                    hb.from_id, hb.to_id, "happens_before",
+                                ) {
+                                    tracing::warn!(target: "deeplossless::pipeline",
+                                        "failed to insert HappensBefore edge: {e}");
+                                }
+                            }
+                            pending_hb_edges.extend(edges);
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "deeplossless::pipeline",
+                                "failed to insert join DAG node: {e}");
+                        }
                     }
                 }
             }

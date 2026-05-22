@@ -257,6 +257,19 @@ async fn main() -> anyhow::Result<()> {
         deeplossless::compactor::Compactor::spawn(db.clone(), compactor_config),
     ));
 
+    // Spawn background mutation engine
+    let mutation_engine = Arc::new(
+        deeplossless::mutation::MutationEngine::new(
+            deeplossless::mutation::MutationConfig::default(),
+            db.clone(),
+            dag.clone(),
+        ),
+    );
+    deeplossless::mutation::spawn_mutation_cycle(
+        mutation_engine,
+        deeplossless::mutation::MutationConfig::default().interval_secs,
+    );
+
     let state = AppState {
         upstream: cli.upstream,
         api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
