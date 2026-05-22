@@ -82,23 +82,86 @@ DeepLossless 使用 DeepSeek 当前模型，并自动映射第三方名称：
 
 DeepSeek V4 Pro 和 V4 Flash 均支持 1M token 上下文窗口。运行时的 DAG 组装确保即使原始对话历史超出上下文窗口，重要上下文也不会丢失。
 
-## 首次运行
+## 验证
+
+### 第 1 步 — 冒烟测试（无需 API key）
 
 ```bash
-# 1. 启动运行时
-deeplossless --api-key sk-...
+deeplossless demo
+```
 
-# 2. 新开终端，验证是否正常工作
-curl http://127.0.0.1:8080/v1/chat/completions \
+运行本地冒烟测试以验证二进制文件安装正确。不需要 API key 或网络访问。
+
+### 第 2 步 — 使用 API key 启动
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+deeplossless
+
+# 预期输出：
+# deeplossless listening on 127.0.0.1:8080
+# upstream: https://api.deepseek.com
+```
+
+### 第 3 步 — 非流式对话
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-..." \
-  -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"你好"}]}'
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"用一个词打招呼"}]}' \
+  | jq '.choices[0].message.content'
 ```
 
-响应：
-```json
-{"choices":[{"message":{"content":"你好！有什么可以帮你的？"}}]}
+应返回简单的问候语。
+
+### 第 4 步 — 流式对话
+
+```bash
+curl -sN http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"数到3"}],"stream":true}'
 ```
+
+应输出 SSE 数据块（`data: {...}`），以 `data: [DONE]` 结束。
+
+### 第 5 步 — Responses API（Codex 路径）
+
+```bash
+curl -sN http://127.0.0.1:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"input":"Say hi","model":"deepseek-v4-flash"}' \
+  | head -20
+```
+
+应输出 Responses API SSE 事件（`event: response.created` 等）。
+
+### 第 6 步 — 运行时统计
+
+```bash
+curl -s http://127.0.0.1:8080/v1/lcm/runtime/stats \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  | jq .
+```
+
+显示缓存命中/未命中、token 数量、运行时策略。
+
+### 故障排除
+
+如果第 2 步失败，报 `address already in use`，更换端口：
+
+```bash
+deeplossless --port 8081
+```
+
+如果第 3-5 步返回错误，请检查：
+
+1. API key 是否有 DeepSeek V4 模型的访问权限
+2. 代理日志是否显示 `upstream response received status=200`
+3. 使用 `--log-dir /tmp/logs` 启用每请求诊断日志
 
 ## 价格
 

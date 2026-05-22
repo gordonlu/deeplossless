@@ -90,23 +90,87 @@ Both DeepSeek V4 Pro and V4 Flash support 1M token context windows. The
 runtime's DAG assembly ensures important context survives even when the raw
 conversation history exceeds the context window.
 
-## First Run
+## Verification
+
+### Step 1 — Smoke test (no API key)
 
 ```bash
-# 1. Start the runtime
-deeplossless --api-key sk-...
+deeplossless demo
+```
 
-# 2. Open a second terminal, verify it's working
-curl http://127.0.0.1:8080/v1/chat/completions \
+This runs a local smoke test to verify the binary installed correctly. No API
+key or network access required.
+
+### Step 2 — Start with an API key
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+deeplossless
+
+# Expected output:
+# deeplossless listening on 127.0.0.1:8080
+# upstream: https://api.deepseek.com
+```
+
+### Step 3 — Non-streaming chat
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-..." \
-  -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}'
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Say hello in one word"}]}' \
+  | jq '.choices[0].message.content'
 ```
 
-Response:
-```json
-{"choices":[{"message":{"content":"Hello! How can I help you?"}}]}
+Should return a simple greeting.
+
+### Step 4 — Streaming chat
+
+```bash
+curl -sN http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Count to 3"}],"stream":true}'
 ```
+
+Should output SSE chunks (`data: {...}`) ending with `data: [DONE]`.
+
+### Step 5 — Responses API (Codex path)
+
+```bash
+curl -sN http://127.0.0.1:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"input":"Say hi","model":"deepseek-v4-flash"}' \
+  | head -20
+```
+
+Should output Responses API SSE events (`event: response.created`, etc.).
+
+### Step 6 — Runtime stats
+
+```bash
+curl -s http://127.0.0.1:8080/v1/lcm/runtime/stats \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  | jq .
+```
+
+Shows cache hit/miss, token counts, runtime profile.
+
+### Troubleshooting
+
+If step 2 fails with `address already in use`, change the port:
+
+```bash
+deeplossless --port 8081
+```
+
+If steps 3-5 return errors, check:
+
+1. The API key has access to DeepSeek V4 models
+2. The proxy log shows `upstream response received status=200` for successful requests
+3. Enable `--log-dir /tmp/logs` to see per-request diagnostics
 
 ## Pricing
 
