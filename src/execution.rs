@@ -655,3 +655,17 @@ pub const PLAN_MIGRATION: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_plan_conv
         ON plan_states(conversation_id);";
+
+pub const EVENT_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS execution_events (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        execution_id    INTEGER,
+        event_kind      TEXT NOT NULL,
+        event_payload   TEXT NOT NULL,
+        seq_no          INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_execution
+        ON execution_events(execution_id, seq_no);
+    CREATE INDEX IF NOT EXISTS idx_events_kind
+        ON execution_events(event_kind);";

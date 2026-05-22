@@ -66,7 +66,7 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
 fn check_tool_cache(
     events: &[StreamEvent],
     offset: usize,
-    db: &crate::db::Database,
+    db: &std::sync::Arc<crate::db::Database>,
     cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
 ) -> (Option<String>, usize) {
     if offset + 1 >= events.len() { return (None, 0); }
@@ -82,10 +82,11 @@ fn check_tool_cache(
                         if let Ok(mut c) = cycle.lock() {
                             c.metrics.cache_hits += 1;
                         }
+                        let transformed = crate::tool_cache::transform_result(name, &result);
                         tracing::info!(target: "deeplossless",
-                            tool=name, args_hash, result_len=result.len(),
+                            tool=name, args_hash, raw_len=result.len(), transformed_len=transformed.len(),
                             "cache hit — intercepting tool call");
-                        return (Some(result), 2);
+                        return (Some(transformed), 2);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -107,17 +108,25 @@ fn check_tool_cache(
 /// final lifecycle events contain the cached content.
 fn process_events(
     events: Vec<StreamEvent>,
-    db: &crate::db::Database,
+    db: std::sync::Arc<crate::db::Database>,
     cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
     tx: &tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>,
     mut assembler: Option<&mut crate::protocol::streaming::StreamAssembler>,
     use_responses_format: bool,
 ) -> bool {
+    let mut seq: i64 = 0;
     let mut i = 0;
     while i < events.len() {
-        let (cached, consumed) = check_tool_cache(&events, i, db, cycle);
+        let (cached, consumed) = check_tool_cache(&events, i, &db, cycle);
         if let Some(text) = cached {
             let text_ev = StreamEvent::TextDelta { text };
+            // Fire-and-forget event store (best-effort, never blocks the stream)
+            let db2 = db.clone();
+            let kind = "TextDelta";
+            let payload = event_to_payload(&text_ev);
+            let sn = seq;
+            tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, &kind, &payload, sn); });
+            seq += 1;
             if use_responses_format {
                 if let Some(asm) = assembler.as_mut() {
                     for ev in asm.feed(text_ev) {
@@ -141,11 +150,19 @@ fn process_events(
             i += consumed;
             continue;
         }
+        // Store event before emission (best-effort, non-blocking)
+        let ev = &events[i];
+        let db2 = db.clone();
+        let kind = event_kind_name(ev);
+        let payload = event_to_payload(ev);
+        let sn = seq;
+        tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, &kind, &payload, sn); });
+        seq += 1;
         // Normal emission
         let sse_line = if use_responses_format {
-            crate::protocol::streaming::to_responses_sse(&events[i])
+            crate::protocol::streaming::to_responses_sse(ev)
         } else {
-            crate::protocol::streaming::to_chat_completions_sse(&events[i])
+            crate::protocol::streaming::to_chat_completions_sse(ev)
         };
         if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
             return false;
@@ -153,6 +170,36 @@ fn process_events(
         i += 1;
     }
     true
+}
+
+fn event_kind_name(ev: &StreamEvent) -> String {
+    match ev {
+        StreamEvent::TextDelta { .. } => "TextDelta",
+        StreamEvent::ToolCallStart { .. } => "ToolCallStart",
+        StreamEvent::ToolCallArgsDelta { .. } => "ToolCallArgsDelta",
+        StreamEvent::ToolCallEnd { .. } => "ToolCallEnd",
+        StreamEvent::ReasoningDelta { .. } => "ReasoningDelta",
+        StreamEvent::MessageStart { .. } => "MessageStart",
+        StreamEvent::MessageEnd => "MessageEnd",
+        StreamEvent::OutputItemAdded { .. } => "OutputItemAdded",
+        StreamEvent::OutputItemDone { .. } => "OutputItemDone",
+        StreamEvent::FunctionCallArgumentsDone { .. } => "FunctionCallArgumentsDone",
+        StreamEvent::Done { .. } => "Done",
+        StreamEvent::Error { .. } => "Error",
+    }.to_string()
+}
+
+fn event_to_payload(ev: &StreamEvent) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "kind": event_kind_name(ev),
+        "detail": match ev {
+            StreamEvent::TextDelta { text } => serde_json::json!({"text_len": text.len()}),
+            StreamEvent::ToolCallStart { name, .. } => serde_json::json!({"name": name}),
+            StreamEvent::ToolCallArgsDelta { index, .. } => serde_json::json!({"index": index}),
+            StreamEvent::Done { finish_reason, incomplete, .. } => serde_json::json!({"finish_reason": finish_reason, "incomplete": incomplete}),
+            _ => serde_json::json!({}),
+        },
+    })).unwrap_or_default()
 }
 
 /// Session log entry — one JSON line per request, written when `--log-dir` is set.
@@ -466,11 +513,11 @@ async fn responses(
                                     // Done = transport-level EOF, drain remaining buffers
                                     if matches!(event, StreamEvent::Done { .. }) {
                                         let events = assembler.flush();
-                                        if !process_events(events, &db, &cycle, &tx, Some(&mut assembler), true) { break; }
+                                        if !process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true) { break; }
                                         continue;
                                     }
                                     let events = assembler.feed(event);
-                                    if !process_events(events, &db, &cycle, &tx, Some(&mut assembler), true) { break; }
+                                    if !process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true) { break; }
                                 }
                             }
                         }
@@ -492,7 +539,7 @@ async fn responses(
                 for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                     if !matches!(event, StreamEvent::Done { .. }) {
                         let events = assembler.feed(event);
-                        process_events(events, &db, &cycle, &tx, Some(&mut assembler), true);
+                        process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true);
                     }
                 }
             }
@@ -747,11 +794,11 @@ async fn chat_completions(
                                 for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                                     if matches!(event, StreamEvent::Done { .. }) {
                                         let flush_events = assembler.flush();
-                                        if !process_events(flush_events, &db, &cycle, &tx, None, false) { break; }
+                                        if !process_events(flush_events, db.clone(), &cycle, &tx, None, false) { break; }
                                         continue;
                                     }
                                     let assembled = assembler.feed(event);
-                                    if !process_events(assembled, &db, &cycle, &tx, None, false) { break; }
+                                    if !process_events(assembled, db.clone(), &cycle, &tx, None, false) { break; }
                                 }
                             }
                         }
@@ -762,7 +809,7 @@ async fn chat_completions(
             // Flush remaining assembler state (stream may have ended without Done)
             {
                 let flush_events = assembler.flush();
-                process_events(flush_events, &db, &cycle, &tx, None, false);
+                process_events(flush_events, db.clone(), &cycle, &tx, None, false);
             }
             // Emit incomplete Done if stream ended without a proper finish_reason
             if usage_buf.is_none() {

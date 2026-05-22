@@ -272,13 +272,69 @@ pub enum ToolKind {
     Other,
 }
 
-/// Whether stream interception should inject cached result as text.
-/// Only intercept tools whose results are compact enough to not flood the
-/// conversation with raw data. `read_file`/`list_files` results can be
-/// huge and are better re-executed than dumped inline.
+/// Whether stream interception should check the cache for this tool.
+/// All deterministic tools are interceptable — the difference is in how
+/// the cached result is presented to the client:
+///
+/// - grep/search/diagnostics → raw result as-is (compact)
+/// - read_file/list_files → structured summary via AST extraction (not raw content)
 pub fn is_interceptable(tool_name: &str) -> bool {
+    !matches!(ToolKind::from_name(tool_name), ToolKind::Other)
+}
+
+/// Transform a cached result before injecting it into the stream.
+/// For read_file/list_files, extracts a structured summary (symbols, line count)
+/// instead of dumping raw file content into the conversation.
+/// For grep/search/diagnostics, returns the raw result unchanged.
+pub fn transform_result(tool_name: &str, raw_result: &str) -> String {
     let kind = ToolKind::from_name(tool_name);
-    matches!(kind, ToolKind::Grep | ToolKind::SymbolSearch | ToolKind::Diagnostics)
+    match kind {
+        ToolKind::ReadFile => {
+            let line_count = raw_result.lines().count();
+            let snippets = crate::snippet::extract(raw_result);
+            let symbols: Vec<String> = snippets
+                .iter()
+                .filter(|s| matches!(s.snippet_type, crate::snippet::SnippetType::CodeBlock))
+                .map(|s| s.content.clone())
+                .collect();
+            let paths: Vec<String> = snippets
+                .iter()
+                .filter(|s| matches!(s.snippet_type, crate::snippet::SnippetType::FilePath))
+                .map(|s| s.content.clone())
+                .collect();
+            let parts: Vec<&str> = symbols.iter().map(|s| s.as_str())
+                .chain(paths.iter().map(|s| s.as_str()))
+                .take(8)
+                .collect();
+            if parts.is_empty() {
+                format!("[cached] {line_count} lines")
+            } else {
+                format!("[cached] {line_count} lines, includes: {}", parts.join("; "))
+            }
+        }
+        ToolKind::ListFiles => {
+            // Filter noise: extract likely source paths, skip dotfiles and build artifacts
+            let interesting: Vec<&str> = raw_result
+                .lines()
+                .filter(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.starts_with('.')
+                        && !trimmed.contains("node_modules")
+                        && !trimmed.contains("target/")
+                        && !trimmed.contains(".git/")
+                        && !trimmed.is_empty()
+                })
+                .take(15)
+                .collect();
+            if interesting.len() < raw_result.lines().count() {
+                format!("[cached] {} entries (top 15): {}", raw_result.lines().count(), interesting.join(", "))
+            } else {
+                format!("[cached] {} entries: {}", interesting.len(), interesting.join(", "))
+            }
+        }
+        // Grep, SymbolSearch, Diagnostics: compact enough to return as-is
+        _ => raw_result.to_string(),
+    }
 }
 
 impl ToolKind {

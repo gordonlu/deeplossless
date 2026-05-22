@@ -381,6 +381,9 @@ impl Database {
         // v0.4.0: execution snapshots — replay acceleration with budget-aware retention
         conn.execute_batch(crate::snapshot::MIGRATION)?;
 
+        // v0.4.0: execution events — append-only event sourcing
+        conn.execute_batch(crate::execution::EVENT_MIGRATION)?;
+
         Ok(())
     }
 
@@ -1207,6 +1210,142 @@ impl Database {
         Ok(stmt.query_row(rusqlite::params![conv_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         }).ok())
+    }
+
+    // ── Execution Events (v0.4.0) ──────────────────────────────────────
+
+    /// Store a single execution event. Append-only — never updated.
+    /// Called from stream handlers as events flow through the proxy.
+    pub fn store_execution_event(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![execution_id, event_kind, event_payload, seq_no],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read all events for an execution in seq_no order (replay).
+    pub fn get_execution_events(&self, execution_id: i64) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, event_kind, event_payload, seq_no, created_at FROM execution_events WHERE execution_id = ?1 ORDER BY seq_no"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![execution_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ── Memory Versions (v0.4.0) ───────────────────────────────────────
+
+    /// Create a new memory version, linked to a parent. Returns the new version id.
+    pub fn create_memory_version(
+        &self, parent_version_id: Option<i64>, mutation_kind: &str,
+        mutation_desc: &str, dag_root_id: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO memory_versions (parent_version_id, mutation_kind, mutation_desc, dag_root_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![parent_version_id, mutation_kind, mutation_desc, dag_root_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// List memory versions in reverse chronological order.
+    pub fn list_memory_versions(&self, limit: usize) -> anyhow::Result<Vec<crate::snapshot::MemoryVersion>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_version_id, mutation_kind, mutation_desc, dag_root_id, created_at FROM memory_versions ORDER BY id DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok(crate::snapshot::MemoryVersion {
+                id: row.get(0)?,
+                parent_version_id: row.get(1)?,
+                mutation_kind: row.get(2)?,
+                mutation_desc: row.get(3)?,
+                dag_root_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ── Execution Snapshots (v0.4.0) ────────────────────────────────────
+
+    /// Take an append-only snapshot. Returns the snapshot id.
+    pub fn take_snapshot(
+        &self, execution_id: i64, memory_version_id: i64,
+        tier: i32, data: &str, size_bytes: i64, retention_ttl: Option<i64>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO execution_snapshots (execution_id, memory_version_id, tier, snapshot_data, size_bytes, retention_ttl) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![execution_id, memory_version_id, tier, data, size_bytes, retention_ttl],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Restore a snapshot by id.
+    pub fn restore_snapshot(&self, id: i64) -> anyhow::Result<Option<crate::snapshot::ExecutionSnapshot>> {
+        let conn = self.read_conn();
+        let row = conn.query_row(
+            "SELECT id, execution_id, memory_version_id, tier, snapshot_data, size_bytes, retention_ttl, created_at FROM execution_snapshots WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok(crate::snapshot::ExecutionSnapshot {
+                id: row.get(0)?,
+                execution_id: row.get(1)?,
+                memory_version_id: row.get(2)?,
+                tier: row.get(3)?,
+                snapshot_data: row.get(4)?,
+                size_bytes: row.get(5)?,
+                retention_ttl: row.get(6)?,
+                created_at: row.get(7)?,
+            }),
+        ).ok();
+        Ok(row)
+    }
+
+    /// Enforce snapshot budget — evicts oldest snapshots when over limit.
+    /// Returns the number evicted.
+    pub fn enforce_snapshot_budget(&self, budget: &crate::snapshot::SnapshotBudget) -> anyhow::Result<usize> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut evicted = 0;
+
+        // L0 ring buffer: keep max_hot_snapshots, evict oldest
+        let l0_count: i64 = conn.query_row("SELECT COUNT(*) FROM execution_snapshots WHERE tier = 0", [], |r| r.get(0))?;
+        if l0_count > budget.max_hot_snapshots as i64 {
+            let to_remove = l0_count - budget.max_hot_snapshots as i64;
+            conn.execute(
+                "DELETE FROM execution_snapshots WHERE id IN (SELECT id FROM execution_snapshots WHERE tier = 0 ORDER BY created_at ASC LIMIT ?1)",
+                rusqlite::params![to_remove],
+            )?;
+            evicted += to_remove;
+        }
+
+        // L2 soft limit
+        let l2_count: i64 = conn.query_row("SELECT COUNT(*) FROM execution_snapshots WHERE tier = 2", [], |r| r.get(0))?;
+        if l2_count > budget.max_full_snapshots as i64 {
+            let to_remove = l2_count - budget.max_full_snapshots as i64;
+            conn.execute(
+                "DELETE FROM execution_snapshots WHERE id IN (SELECT id FROM execution_snapshots WHERE tier = 2 ORDER BY created_at ASC LIMIT ?1)",
+                rusqlite::params![to_remove],
+            )?;
+            evicted += to_remove;
+        }
+
+        // Hard size cap: remove oldest non-frozen (L3)
+        let total_size: i64 = conn.query_row("SELECT COALESCE(SUM(size_bytes), 0) FROM execution_snapshots", [], |r| r.get(0))?;
+        if total_size > budget.max_total_size_bytes as i64 {
+            // Evict oldest non-frozen until under budget (simple: delete a batch)
+            conn.execute(
+                "DELETE FROM execution_snapshots WHERE id IN (SELECT id FROM execution_snapshots WHERE tier < 3 ORDER BY size_bytes DESC, created_at ASC LIMIT 10)",
+                [],
+            )?;
+            evicted += 1; // at least one batch attempt
+        }
+
+        Ok(evicted as usize)
     }
 
     // ── Multi-agent safe runtime (v0.9) ─────────────────────────────────
