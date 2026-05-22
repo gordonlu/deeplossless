@@ -1,228 +1,126 @@
 # deeplossless Agent Integration Guide
 
-deeplossless is an inference-aware runtime that sits as an OpenAI-compatible proxy
-between AI coding agents and the LLM API. It reduces repeated reasoning, tool
-execution, repo rereads, and planning during long coding sessions.
-
-This document is accurate as of v0.2.0. Some runtime features (tool cache,
-failure memory, plan persistence) have working storage backends but are not yet
-exposed as HTTP endpoints.
+deeplossless is an inference-aware execution runtime for AI coding agents.
+v0.4.0.
 
 ---
 
-## Auto-failure detection
+## Two layers: Automatic vs. Active
 
-The pipeline detects failures in tool execution results automatically. When a
-tool result contains error output, the runtime creates a failure pattern
-without the agent needing to call any endpoint. The agent can still augment
-failures with `POST /v1/lcm/failure` for additional context (`why_failed`,
-`invalidated_assumptions`).
+deeplossless operates in two tiers:
 
-## Debug dump
+### Automatic (zero agent changes)
 
-When reporting issues, run this and paste the output into the GitHub issue:
+These work transparently through the proxy, no agent code required:
 
-```bash
-curl http://127.0.0.1:8080/v1/lcm/runtime/debug-dump | jq .
-```
+| Feature | How |
+|---------|-----|
+| Protocol translation | Responses API ↔ Chat Completions, canonical IR |
+| DAG context injection | `<lcm_context>` appended to system messages |
+| Tool cache interception | Stream-level: detects tool calls, returns cached results inline |
+| Pipeline auto-caching | Tool results extracted from conversation history |
+| Failure auto-detection | Pipeline detects error patterns in tool results |
+| Message persistence | Every request/response stored in SQLite WAL |
+| Execution unit extraction | Tool call chains grouped into `think → act → observe → reflect` |
+| Session fingerprinting | SHA-256 over first 3 messages |
+| Debug dump | `GET /v1/lcm/runtime/debug-dump` (counters only, no user content) |
 
-The dump contains only counts, hashes, and structural metadata. No message
-content, file contents, API keys, or embedding vectors are exposed.
+### Active (agent must call these endpoints)
 
-## What happens automatically
+These require the agent to make explicit HTTP calls. They will NOT fire automatically.
 
-When an agent connects to deeplossless as its API proxy, the following happens
-without any extra work by the agent:
-
-| Feature | Mechanism |
-|---------|-----------|
-| Message persistence | Every request/response stored verbatim in SQLite WAL |
-| DAG context assembly | Summaries + recent messages injected into system prompt |
-| Execution unit extraction | Tool call chains (`think → act → observe → reflect`) extracted from message history |
-| Session fingerprinting | SHA-256 over first 3 messages for multi-turn conversation tracking |
-| Context injection | Three-tier `<lcm_context>` block (Summaries → Snippets → Recent) |
-| Code change auto-invalidation | Stored code changes trigger cache invalidation for affected files |
-
-## What the agent can call directly
-
-These features have HTTP endpoints. Agents can call them in a lightweight hook layer.
-
-| Feature | Mechanism | Agent-side work |
-|---------|-----------|-----------------|
-| Tool cache | **Automatic** — pipeline extracts from message history | None — agent just sends normal tool_use/tool_result |
-| Failure detection | **Automatic** — pipeline detects errors in tool results | None — but can augment with `POST /v1/lcm/failure` |
-| Execution units | **Automatic** — pipeline groups tool chains | None |
-| Plan store | `POST /v1/lcm/plan` | After creating a plan |
-| Plan read | `GET /v1/lcm/plan/{conv_id}` | To resume a plan |
-| File claim | `POST /v1/lcm/file/claim` | Before editing a file (multi-agent safety) |
+| Endpoint | When to call | Why |
+|----------|-------------|-----|
+| `GET /v1/lcm/cache?tool=&args=` | Before executing a tool | Skip execution if result is cached |
+| `POST /v1/lcm/cache/put` | After executing a tool | Store result for future reuse |
+| `GET /v1/lcm/grep/{conv_id}?query=` | Before composing the next prompt | Inject relevant DAG context into system message |
+| `GET /v1/lcm/status/{conv_id}` | Periodically | Monitor DAG health (tokens, node count, level) |
+| `GET /v1/lcm/expand/{node_id}` | When the model asks about history | Expand a compressed summary back to original messages |
+| `GET /v1/lcm/global/search?q=` | Cross-session context needed | Search ALL conversations for relevant patterns |
+| `GET /v1/lcm/execution/search?q=` | Debugging or learning | Find similar bugs, tool chains, code edits |
+| `POST /v1/lcm/plan` | After creating a plan | Persist execution state |
+| `GET /v1/lcm/plan/{conv_id}` | Resuming work | Read active plan |
+| `POST /v1/lcm/failure` | After a fix fails | Record why_failed + invalidated assumptions |
+| `POST /v1/lcm/file/claim` | Before editing a file | Multi-agent safety (409 if conflicted) |
+| `POST /v1/lcm/file/release` | After editing | Release lock |
+| `POST /v1/lcm/compress` | Context getting too long | Compress a message range into a summary node |
+| `POST /v1/lcm/rollback` | Need to undo | Rollback to a previous DAG checkpoint |
 
 ---
 
-## Architecture
+## Active integration pattern
+
+The critical pattern for agents that want to maximize deeplossless:
 
 ```
-Agent
-  ↓  POST /v1/chat/completions
-deeplossless (proxy)
-  ├─ fingerprint → store messages → DAG assemble → inject context
-  ↓  forwarded with context
-Upstream LLM API (DeepSeek / OpenAI)
+Before each turn:
+  1. GET /v1/lcm/grep/{conv_id}?query=<user's question>
+     → Append returned DAG context to system message
+
+Before each tool call:
+  2. GET /v1/lcm/cache?tool=<name>&args=<json>
+     → If hit: use cached result, skip execution
+     → If miss: execute normally
+
+After each tool call:
+  3. POST /v1/lcm/cache/put  {tool, args, result, files}
+     → Store for future interception
+
+After each fix failure:
+  4. POST /v1/lcm/failure  {signature, attempted_fix, why_failed, assumptions, files}
+     → Prevent the agent from retrying known-bad approaches
 ```
 
-Optional hooks (only for plan + file safety):
+Example hook (Python):
 
 ```python
-# Plan persistence (optional, plan reuse improves over long sessions)
-def after_plan(goal, steps, assumptions):
-    requests.post("http://127.0.0.1:8080/v1/lcm/plan", json={
-        "goal": goal, "steps": json.dumps(steps),
-        "assumptions": json.dumps(assumptions)})
+import requests, json, os
 
-# Multi-agent safety (optional, only needed with multiple concurrent agents)
-def before_edit(file_path):
-    r = requests.post("http://127.0.0.1:8080/v1/lcm/file/claim", json={
-        "agent_id": os.getenv("AGENT_ID", "main"),
-        "file_path": file_path})
-    if r.status_code == 409:
-        print(f"WARNING: {file_path} held by {r.json()['held_by']}")
+BASE = "http://127.0.0.1:8080"
+CONV_ID = os.getenv("CONV_ID", "1")
+AUTH = {"Authorization": f"Bearer {os.getenv('ADMIN_KEY', '')}"}
+
+def before_turn(user_query):
+    """Inject DAG context into the prompt."""
+    r = requests.get(f"{BASE}/v1/lcm/grep/{CONV_ID}", params={"query": user_query}, headers=AUTH)
+    if r.ok:
+        matches = r.json().get("matches", [])
+        return "\n".join(m["preview"] for m in matches[:5])
+    return ""
+
+def before_tool(tool_name, args_json):
+    """Check cache before executing a tool."""
+    r = requests.get(f"{BASE}/v1/lcm/cache", params={"tool": tool_name, "args": args_json}, headers=AUTH)
+    if r.ok and r.json().get("hit"):
+        return r.json()["result"]  # Use cached result, skip execution
+    return None
+
+def after_tool(tool_name, args_json, result, files=None):
+    """Store tool result in cache."""
+    requests.post(f"{BASE}/v1/lcm/cache/put", json={
+        "tool": tool_name, "args": args_json,
+        "result": result,
+        "files": json.dumps(files or [])
+    }, headers=AUTH)
+
+def after_failure(signature, fix_attempted, why_failed, assumptions=None, files=None):
+    """Record a failed fix to prevent retrying it."""
+    requests.post(f"{BASE}/v1/lcm/failure", json={
+        "conv_id": CONV_ID, "signature": signature,
+        "attempted_fix": fix_attempted, "why_failed": why_failed,
+        "assumptions": json.dumps(assumptions or []),
+        "files": json.dumps(files or [])
+    }, headers=AUTH)
 ```
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/gordonlu/deeplossless.git
-cd deeplossless
-cargo build --release
-```
-
----
-
-## Starting the runtime
-
-```bash
-DEEPSEEK_API_KEY=sk-... ./target/release/deeplossless
-```
-
-The proxy listens on `http://127.0.0.1:8080`. Point any OpenAI-compatible client
-at this base URL.
-
-```bash
-# Optional: select strategy profile
-RUNTIME_PROFILE=efficient ./target/release/deeplossless
-```
-
----
-
-## Runtime profiles
-
-| Profile | Cache | Retries | Speculative | Context | Plan Freeze | Token Budget |
-|---------|-------|---------|-------------|---------|-------------|-------------|
-| `minimal` | 100% | 1 | No | 20% | Yes | 30% |
-| `efficient` | 80% | 2 | No | 50% | No | 60% |
-| `exploratory` | 50% | 3 | Yes | 80% | No | 80% |
-| `autonomous` | 30% | 5 | Yes | 100% | No | 95% |
-| `custom` | user-defined via `RUNTIME_CACHE=`, `RUNTIME_RETRIES=`, etc. |
-
-Profiles control the runtime policy engine's aggressiveness, not agent behavior.
-All policy decisions are advisory — the agent can accept, ignore, or override
-each recommendation.
-
----
-
-## API endpoints for agents
-
-### Read-only (available without extra integration)
-
-```
-GET  /v1/lcm/grep/{conv_id}?query=      FTS5 full-text search
-GET  /v1/lcm/status/{conv_id}           DAG health (tokens, leaves, level)
-GET  /v1/lcm/expand/{node_id}           Expand summary to children
-GET  /v1/lcm/trace/{node_id}            Sentence-level provenance
-GET  /v1/lcm/snippets/{node_id}         Extracted precision-critical values
-GET  /v1/lcm/global/search?q=&limit=    Cross-session semantic search
-GET  /v1/lcm/execution/search?q=        Find similar bugs, tool chains, edits
-GET  /v1/lcm/runtime/stats              JSON metrics (tokens, cache rate, failures)
-GET  /v1/lcm/runtime/report?label=&format=md|svg   Shareable session recap
-```
-
-### Active operations (available without extra integration)
-
-```
-POST /v1/lcm/compress  {conv_id, from, to}   Compress message range
-POST /v1/lcm/delete    {conv_id, id}         Soft-delete from context
-POST /v1/lcm/rollback  {conv_id, id}         Rollback to checkpoint
-```
-
-### Multi-agent safety
-
-```
-POST /v1/lcm/file/claim    {agent_id, file_path}    Claim file (409 if held)
-POST /v1/lcm/file/release  {agent_id, file_path}    Release claim
-GET  /v1/lcm/file/conflicts                         List all active claims
-```
-
----
-
-## Recommended tool categories for caching
-
-Highest reuse value (deterministic, frequently repeated):
-
-- `grep` / `search_content` / `search_code`
-- `read_file` / `read`
-- `list_files` / `ls` / `tree`
-- `symbol_search` / `workspace_symbol`
-- `diagnostics`
-
-Lower reuse value:
-
-- Non-deterministic external APIs
-- Timestamp-dependent operations
-- Operations on rapidly-changing state (e.g., compile/test output)
-
----
-
-## Failure memory
-
-When populated via `store_failure_pattern()`, deeplossless records:
-
-- **signature** — normalized error message
-- **attempted_fix** — what the agent tried
-- **why_failed** — why the fix didn't work (the critical field)
-- **invalidated_assumptions** — assumptions that turned out wrong
-- **related_files** — files involved
-
-The runtime policy engine can then recommend `RetryWithFix` instead of
-blind retry when the same failure pattern is detected.
-
-This is per-pattern, not global — retrying "E0308 type mismatch" doesn't
-count against retries for "KeyError column_name".
-
----
-
-## Plan persistence
-
-When populated via `store_plan_state()`, deeplossless stores:
-
-```
-goal, pending_steps, completed_steps, blocked_steps,
-invalidated_steps, assumptions, is_active
-```
-
-Plans are deactivated when new plans are created. File changes mark active
-plans as potentially stale (assumptions may have been invalidated).
 
 ---
 
 ## What agents should expect
 
-Agents using deeplossless should expect:
-
-- Tool results may be served from cache (`GET /v1/lcm/cache`)
-- Execution state persists across turns (messages, DAG nodes, provenance)
-- The system prompt contains a structured `<lcm_context>` block
-- Repeated operations on unchanged files may be short-circuited
+- The system prompt contains a structured `<lcm_context>` block (automatic)
+- Stream-level tool cache interception may replace tool calls with cached results (automatic)
+- Repeated operations on unchanged files may be short-circuited (automatic)
+- **Active endpoints return real data but require the agent to call them** — they are not automatically injected
 
 Agents should NOT expect:
 
@@ -232,60 +130,16 @@ Agents should NOT expect:
 
 ---
 
-## What the runtime is NOT
-
-deeplossless does NOT:
-
-- Replace the agent's planning or reasoning loop
-- Control which tools the agent can call
-- Modify the agent's prompts or decisions
-- Force optimization — all policy decisions are advisory by default
-
----
-
 ## How to evaluate
 
-Measure what the runtime reduces, not what it compresses:
-
-| Good metrics | Bad metrics |
-|-------------|-------------|
-| Repeated rereads avoided | Compression ratio |
-| Repeated planning avoided | Retrieval quality |
-| Repeated tool calls reused | Embedding similarity |
-| Failure loops prevented | Prompt length |
-| Execution continuity across long sessions | Raw QPS |
-
-Benchmark:
 ```bash
 cargo test --test long_session_benchmark -- --nocapture
-cargo test --test perf_benchmark -- --nocapture
+cargo test --test proxy_integration          # 11 integration tests incl. cache + LCM
 python3 bench/run.py
 ```
 
----
-
-## Recommended workloads
-
-Best evaluation workloads:
-
-- Long coding sessions (50+ turns)
-- Dependency debugging with layered failures
-- Partial symbol renames (some imports stale)
-- Configuration drift (keys renamed, not all files updated)
-- Misleading error chains (stack trace points wrong direction)
-
-Weak evaluation workloads:
-
-- Single-turn chat
-- Trivia QA
-- Short RAG demos
-
----
-
-## Design note
-
-deeplossless measures its success by inference economics — how much repeated
-work it prevents — not by context window size or retrieval quality.
-
-The core thesis: long AI coding sessions waste more tokens on repeated
-inference than on insufficient context.
+Measure inference economics, not retrieval quality:
+- Repeated tool calls avoided
+- Cache hit rate across long sessions
+- Failure loops broken
+- Execution continuity across turns

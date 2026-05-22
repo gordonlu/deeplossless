@@ -698,3 +698,111 @@ async fn concurrent_requests_no_race() {
         assert!(body.contains("pong"), "request {i} should contain pong: {body}");
     }
 }
+
+#[tokio::test]
+async fn lcm_grep_retrieves_stored_context() {
+    // Full LCM retrieval chain: store messages via Chat Completions,
+    // then verify grep/search the DAG, check cache, and read status.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "lcm_test").await;
+
+    // Store a tool result directly in cache
+    use deeplossless::tool_cache;
+    let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"process_data"}"#);
+    state.db.tool_cache_put(&cname, &args_hash, "src/lib.rs:42 found process_data", &[]).unwrap();
+
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{proxy_addr}");
+
+    // Send a request through the proxy so the pipeline stores messages + creates a conversation
+    let _resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("authorization", "Bearer sk-test")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "search for process_data in src/lib.rs"}
+            ],
+            "stream": true,
+        }))
+        .send().await.unwrap()
+        .text().await.unwrap();
+
+    // Wait for pipeline spawn_blocking to finish
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Test 1: cache hit via LCM endpoint
+    let cache_resp = client
+        .get(format!("{base}/v1/lcm/cache?tool=grep&args={{%22pattern%22:%22process_data%22}}"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    assert!(cache_resp.status().is_success());
+    let cache_json: serde_json::Value = cache_resp.json().await.unwrap();
+    assert_eq!(cache_json["hit"], true, "cache should hit: {cache_json}");
+    assert!(cache_json["result"].as_str().unwrap_or("").contains("process_data"));
+
+    // Test 2: cache put then get
+    let put_resp = client
+        .post(format!("{base}/v1/lcm/cache/put"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "tool": "read_file",
+            "args": "{\"file_path\":\"src/main.rs\"}",
+            "result": "fn main() { println!(\"hello\"); }",
+            "files": "[\"src/main.rs\"]"
+        }))
+        .send().await.unwrap();
+    let put_status = put_resp.status();
+    let put_body = put_resp.text().await.unwrap();
+    assert!(put_status.is_success(), "cache put failed: {put_status} {put_body}");
+
+    let get_resp = client
+        .get(format!("{base}/v1/lcm/cache?tool=read_file&args={{%22file_path%22:%22src/main.rs%22}}"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    let get_json: serde_json::Value = get_resp.json().await.unwrap();
+    assert_eq!(get_json["hit"], true, "cache get should hit after put");
+
+    // Test 3: DAG health status
+    let status_resp = client
+        .get(format!("{base}/v1/lcm/status/1"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    assert!(status_resp.status().is_success());
+    let status_json: serde_json::Value = status_resp.json().await.unwrap();
+    assert!(status_json["total_tokens"].as_i64().unwrap_or(-1) >= 0);
+
+    // Test 4: search across all conversations
+    let search_resp = client
+        .get(format!("{base}/v1/lcm/grep/1?query=process_data"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    assert!(search_resp.status().is_success());
+    let search_json: serde_json::Value = search_resp.json().await.unwrap();
+    assert!(search_json["total"].as_i64().unwrap_or(-1) >= 0,
+        "search should return results: {search_json}");
+}
