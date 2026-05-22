@@ -19,6 +19,21 @@ of recomputing them every turn.
 
 Long context windows are not memory. Repeated inference is waste.
 
+## Why DeepSeek?
+
+DeepSeek makes long-running coding sessions **economically viable** — V4 Pro
+offers a 1M token context window at a fraction of the cost of comparable models.
+
+However, lower token cost alone does not solve:
+- **repeated reasoning** — agents re-derive the same conclusions
+- **repeated file reads** — same files read across turns without reuse
+- **execution instability** — same failure patterns retried without learning
+- **context degradation** — important details lost as sessions grow
+
+DeepLossless is designed specifically for **long-session DeepSeek coding
+workflows** — it adds execution memory, tool caching, and replay on top of
+DeepSeek's cost-efficient inference.
+
 ```
 Long coding session (3 tasks, 86 turns)
 
