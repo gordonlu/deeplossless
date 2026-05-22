@@ -125,7 +125,7 @@ fn process_events(
             let kind = "TextDelta";
             let payload = event_to_payload(&text_ev);
             let sn = seq;
-            tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, &kind, &payload, sn); });
+            tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, kind, &payload, sn); });
             seq += 1;
             if use_responses_format {
                 if let Some(asm) = assembler.as_mut() {

@@ -1225,6 +1225,7 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    #[allow(clippy::type_complexity)]
     /// Read all events for an execution in seq_no order (replay).
     pub fn get_execution_events(&self, execution_id: i64) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
         let conn = self.read_conn();
