@@ -378,6 +378,9 @@ impl Database {
         // v0.8: plan persistence
         conn.execute_batch(crate::execution::PLAN_MIGRATION)?;
 
+        // v0.4.0: execution snapshots — replay acceleration with budget-aware retention
+        conn.execute_batch(crate::snapshot::MIGRATION)?;
+
         Ok(())
     }
 

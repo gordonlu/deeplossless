@@ -76,6 +76,7 @@ pub mod pipeline;
 pub mod protocol;
 pub mod proxy;
 pub mod session;
+pub mod snapshot;
 pub mod snippet;
 pub mod summarizer;
 pub mod tokenizer;
@@ -110,6 +111,9 @@ pub struct AppState {
     /// `previous_response_id` continuity so Codex can do incremental turns
     /// instead of rebuilding full context on every request.
     pub response_store: Arc<StdMutex<HashMap<String, serde_json::Value>>>,
+    /// When set, enables per-request JSON logging to this directory.
+    /// Each request writes one JSON line to a timestamped .jsonl file.
+    pub log_dir: Option<String>,
 }
 
 impl AppState {
