@@ -21,8 +21,9 @@ Long context windows are not memory. Repeated inference is waste.
 
 ## Why DeepSeek?
 
-DeepSeek makes long-running coding sessions **economically viable** — V4 Pro
-offers a 1M token context window at a fraction of the cost of comparable models.
+DeepSeek makes long-running coding sessions **economically viable** — both
+DeepSeek V4 Pro and DeepSeek V4 Flash offer 1M token context windows at a
+fraction of the cost of comparable models.
 
 However, lower token cost alone does not solve:
 - **repeated reasoning** — agents re-derive the same conclusions

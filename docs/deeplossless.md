@@ -12,8 +12,8 @@ your coding agent and the DeepSeek API, adding:
 - **Execution replay** — append-only event log enables deterministic replay
   and audit trails
 
-DeepSeek's V4 Pro (1M context) and V4 Flash make long coding sessions
-economically viable. DeepLossless adds execution memory on top.
+DeepSeek V4 Pro and V4 Flash (both with 1M context) make long coding
+sessions economically viable. DeepLossless adds execution memory on top.
 
 ## Installation
 
@@ -82,13 +82,13 @@ DeepLossless uses DeepSeek's current models and auto-maps third-party names:
 | Agent requests | Routed to |
 |---------------|-----------|
 | `deepseek-v4-pro` | `deepseek-v4-pro` (1M context) |
-| `deepseek-v4-flash` | `deepseek-v4-flash` |
+| `deepseek-v4-flash` | `deepseek-v4-flash` (1M context) |
 | `gpt-5`, `gpt-5.5`, `o3` | `deepseek-v4-pro` |
 | `gpt-*-mini` | `deepseek-v4-flash` |
 
-DeepSeek V4 Pro's 1M token context window is fully supported. The runtime's
-DAG assembly ensures important context survives even when the raw conversation
-history exceeds the context window.
+Both DeepSeek V4 Pro and V4 Flash support 1M token context windows. The
+runtime's DAG assembly ensures important context survives even when the raw
+conversation history exceeds the context window.
 
 ## First Run
 
