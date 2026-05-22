@@ -254,6 +254,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
         .route("/v1/lcm/runtime/debug-dump", get(lcm_debug_dump))
         .route("/v1/lcm/runtime/report", get(lcm_runtime_report))
+        .route("/v1/lcm/replay/{execution_id}", get(lcm_replay))
         .route("/v1/lcm/cache/put", post(lcm_cache_put))
         .route("/v1/lcm/cache", get(lcm_cache_get))
         .route("/v1/lcm/failure", post(lcm_failure_put))
@@ -1290,6 +1291,27 @@ async fn lcm_runtime_report(
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert("content-type", "text/markdown; charset=utf-8".parse().expect("static header"));
     response
+}
+
+/// Replay an execution from the event log — returns full StreamEvent sequence.
+async fn lcm_replay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(execution_id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    match crate::replay::replay_execution(&state.db, execution_id) {
+        Ok(events) => {
+            let items: Vec<serde_json::Value> = events
+                .iter()
+                .map(|(seq, ev)| serde_json::json!({"seq_no": seq, "event": ev}))
+                .collect();
+            Json(json!({"execution_id": execution_id, "events": items, "total": items.len()})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "REPLAY_ERROR", format!("{e}")),
+    }
 }
 
 /// Runtime metrics endpoint — exposes inference-economics counters for benchmarking.
