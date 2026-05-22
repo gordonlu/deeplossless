@@ -519,6 +519,47 @@ mod tests {
     }
 
     #[test]
+    fn transform_read_file_extracts_symbols() {
+        let result = transform_result("read_file", "pub fn foo() {\n    let x = 1;\n}\n\npub struct Bar {\n    x: i32,\n}\n\nfn baz() {}");
+        // Base safety: must start with [cached] and include line count
+        assert!(result.starts_with("[cached]"), "should have [cached] prefix, got: {result}");
+        assert!(result.contains("lines"), "should mention lines, got: {result}");
+    }
+
+    #[test]
+    fn transform_read_file_empty_is_safe() {
+        // Empty file: must not panic and must not dump anything
+        let result = transform_result("read_file", "");
+        assert_eq!(result, "[cached] 0 lines");
+    }
+
+    #[test]
+    fn transform_list_files_filters_noise() {
+        let result = transform_result("list_files", "src/main.rs\nsrc/lib.rs\n.git/config\nnode_modules/react/index.js\nCargo.toml");
+        // Should filter out .git and node_modules
+        assert!(!result.contains(".git"), "should filter .git: {result}");
+        assert!(!result.contains("node_modules"), "should filter node_modules: {result}");
+        assert!(result.contains("src/main.rs"), "should include source files: {result}");
+        assert!(result.starts_with("[cached]"), "should have [cached] prefix");
+    }
+
+    #[test]
+    fn transform_grep_passes_through() {
+        let raw = "src/main.rs:42: found foo";
+        let result = transform_result("grep", raw);
+        assert_eq!(result, raw, "grep results should pass through unchanged");
+    }
+
+    #[test]
+    fn transform_result_never_panics_on_weird_input() {
+        // Safety: transform must never crash on any input
+        transform_result("read_file", &"x".repeat(10000)); // huge input
+        transform_result("list_files", "\0\n\x01\n\x02"); // binary garbage
+        transform_result("grep", "\n\n\n"); // empty lines
+        transform_result("unknown_tool", "anything");
+    }
+
+    #[test]
     fn should_invalidate_on_dependency_change() {
         let entry = ToolCacheEntry {
             id: 1, tool_name: "grep".into(), args_hash: "abc".into(),

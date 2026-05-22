@@ -806,3 +806,75 @@ async fn lcm_grep_retrieves_stored_context() {
     assert!(search_json["total"].as_i64().unwrap_or(-1) >= 0,
         "search should return results: {search_json}");
 }
+
+#[tokio::test]
+async fn snapshot_and_versions_endpoints() {
+    // Test POST /v1/lcm/snapshot and GET /v1/lcm/versions end-to-end.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "snap_versions").await;
+    let db = state.db.clone();
+
+    // Create memory versions
+    let v1 = db.create_memory_version(None, "test", "initial version", None).unwrap();
+    let _v2 = db.create_memory_version(Some(v1), "test", "second version", None).unwrap();
+
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{proxy_addr}");
+
+    // Take a snapshot via API
+    let snap_resp = client
+        .post(format!("{base}/v1/lcm/snapshot"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "execution_id": 1,
+            "memory_version_id": v1,
+            "tier": 1,
+            "data": "{\"state\":\"test snapshot\"}",
+        }))
+        .send().await.unwrap();
+    assert!(snap_resp.status().is_success(), "snapshot should succeed: {snap_resp:?}");
+    let snap_json: serde_json::Value = snap_resp.json().await.unwrap();
+    assert_eq!(snap_json["status"], "stored");
+    let snap_id = snap_json["id"].as_i64().unwrap();
+    assert!(snap_id > 0);
+
+    // Restore the snapshot directly via DB
+    let restored = db.restore_snapshot(snap_id).unwrap();
+    assert!(restored.is_some());
+    assert!(restored.unwrap().snapshot_data.contains("test snapshot"));
+
+    // List versions via API
+    let versions_resp = client
+        .get(format!("{base}/v1/lcm/versions"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    assert!(versions_resp.status().is_success());
+    let versions_json: serde_json::Value = versions_resp.json().await.unwrap();
+    let vers = versions_json["versions"].as_array().unwrap();
+    assert!(vers.len() >= 2, "should have at least 2 versions: {versions_json}");
+    assert!(vers.iter().any(|v| v["mutation_kind"] == "test"), "should have test version");
+}

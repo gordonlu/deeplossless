@@ -255,6 +255,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/runtime/debug-dump", get(lcm_debug_dump))
         .route("/v1/lcm/runtime/report", get(lcm_runtime_report))
         .route("/v1/lcm/replay/{execution_id}", get(lcm_replay))
+        .route("/v1/lcm/snapshot", post(lcm_snapshot_take))
+        .route("/v1/lcm/versions", get(lcm_versions))
         .route("/v1/lcm/cache/put", post(lcm_cache_put))
         .route("/v1/lcm/cache", get(lcm_cache_get))
         .route("/v1/lcm/failure", post(lcm_failure_put))
@@ -1311,6 +1313,48 @@ async fn lcm_replay(
             Json(json!({"execution_id": execution_id, "events": items, "total": items.len()})).into_response()
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "REPLAY_ERROR", format!("{e}")),
+    }
+}
+
+/// Take an execution snapshot for later replay/rollback.
+async fn lcm_snapshot_take(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HashMap<String, serde_json::Value>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let execution_id = body.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let memory_version_id = body.get("memory_version_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let tier = body.get("tier").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("{}");
+    let size_bytes = data.len() as i64;
+    let ttl = body.get("retention_ttl").and_then(|v| v.as_i64());
+
+    if execution_id == 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "execution_id required");
+    }
+    match state.db.take_snapshot(execution_id, memory_version_id, tier, data, size_bytes, ttl) {
+        Ok(id) => {
+            let _ = state.db.enforce_snapshot_budget(&crate::snapshot::SnapshotBudget::default());
+            Json(json!({"status": "stored", "id": id})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
+    }
+}
+
+/// List memory version history.
+async fn lcm_versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    match state.db.list_memory_versions(50) {
+        Ok(versions) => Json(json!({"versions": versions})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "VERSION_ERROR", format!("{e}")),
     }
 }
 
