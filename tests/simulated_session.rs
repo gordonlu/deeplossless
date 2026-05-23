@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Comprehensive simulated multi-session benchmark — exercises the full
 //! inference-economics pipeline: cache hits/misses, failure patterns,
 //! plan reuse & invalidation, cross-session dedup, delta injection,

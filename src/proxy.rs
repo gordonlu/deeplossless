@@ -81,6 +81,7 @@ fn check_tool_cache(
                 match db.tool_cache_get(&cname, &args_hash) {
                     Ok(Some((result, _hits))) => {
                         if let Ok(mut c) = cycle.lock() {
+                            #[allow(deprecated)]
                             c.record_cache_hit(name);
                         }
                         let transformed = crate::tool_cache::transform_result(name, &result);

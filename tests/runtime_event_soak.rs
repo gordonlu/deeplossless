@@ -4,7 +4,7 @@
 //! extended lifetime: many retries, interleaved cancellation,
 //! partial failure, mixed completion, replay ordering.
 
-use deeplossless::runtime_events::{CancellationSource, RuntimeEvent};
+use deeplossless::runtime_events::RuntimeEvent;
 use deeplossless::runtime_state_view::RuntimeStateView;
 
 #[test]
@@ -836,7 +836,7 @@ fn operational_cross_conv_isolation() {
             tool_name: "grep".into(), tool_call_id: tcid,
             span_id: format!("sp_{cycle}"), attempt: 1,
             tokens_spent: 10, cache_hit: false,
-            execution_unit_id: cycle as i64,
+            execution_unit_id: cycle,
         });
     }
 
