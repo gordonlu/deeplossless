@@ -110,13 +110,11 @@ impl Default for MutationConfig {
 pub struct MutationEngine {
     pub config: MutationConfig,
     db: Arc<Database>,
-    #[allow(dead_code)]
-    dag: Arc<DagEngine>,
 }
 
 impl MutationEngine {
-    pub fn new(config: MutationConfig, db: Arc<Database>, dag: Arc<DagEngine>) -> Self {
-        Self { config, db, dag }
+    pub fn new(config: MutationConfig, db: Arc<Database>, _dag: Arc<DagEngine>) -> Self {
+        Self { config, db }
     }
 
     /// Run one full mutation cycle for a conversation.
@@ -509,13 +507,19 @@ impl MutationEngine {
 
 /// Spawn a background task that runs mutation cycles periodically.
 /// Queries all conversation IDs from the DB on each cycle.
+/// Accepts an optional shutdown flag for graceful teardown.
 pub fn spawn_mutation_cycle(
     engine: Arc<MutationEngine>,
     interval_secs: u64,
+    shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
+            if shutdown.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                tracing::info!(target: "deeplossless::mutation", "shutdown signal received, stopping mutation cycle");
+                break;
+            }
             interval.tick().await;
             let ids: Vec<i64> = match engine.db.get_all_conversation_ids() {
                 Ok(ids) => ids,

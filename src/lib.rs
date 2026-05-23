@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 //! deeplossless — Lossless Context Management proxy for DeepSeek API.
 //!
 //! # Architecture Invariants
@@ -61,18 +62,22 @@
 //! DAG mutations (insert node + back-link to sources) must be atomic.
 //! A database transaction wraps both operations.
 
-#![allow(clippy::too_many_arguments)]
-
 pub mod compactor;
 pub mod dag;
 pub mod db;
+pub mod dependency_kind;
+pub mod dependency_view;
 pub mod embeddings;
 pub mod artifacts;
 pub mod audit;
 pub mod execution;
 pub mod file_observation;
 pub mod parallel;
+pub mod provider;
 pub mod runtime;
+pub mod runtime_events;
+pub mod runtime_invariants;
+pub mod runtime_state_view;
 pub mod tool_cache;
 pub mod metrics;
 pub mod motif;
@@ -81,6 +86,8 @@ pub mod pipeline;
 pub mod protocol;
 pub mod proxy;
 pub mod replay;
+pub mod response_store;
+pub mod runtime_coordinator;
 pub mod session;
 pub mod snapshot;
 pub mod snippet;
@@ -89,36 +96,47 @@ pub mod tokenizer;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::Mutex;
-use std::collections::HashMap;
+use tokio::sync::{Mutex, Notify};
 
+/// Runtime execution services.
 #[derive(Clone)]
-pub struct AppState {
-    pub upstream: String,
-    /// API key extracted from the first incoming request's Authorization header.
-    /// `None` until the first request arrives. The compactor/spawner reads this
-    /// for background summarization calls.
-    pub api_key: Arc<StdMutex<Option<String>>>,
-    /// Separate admin key for LCM endpoint authentication. If set, takes
-    /// priority over `api_key` for LCM auth. If unset, LCM falls back to
-    /// `api_key` for backward compatibility.
-    pub admin_key: Arc<StdMutex<Option<String>>>,
+pub struct RuntimeServices {
+    pub client: reqwest::Client,
+    pub cycle: Arc<StdMutex<runtime::ExecutionCycle>>,
+    pub rate_limiter: Arc<runtime::RateLimiter>,
+    /// Shutdown signal — notified when the runtime is stopping.
+    /// Background tasks MUST select on this to avoid orphan mutations.
+    pub shutdown_notify: Arc<Notify>,
+}
+
+/// Storage and persistence services.
+#[derive(Clone)]
+pub struct StorageServices {
     pub db: Arc<db::Database>,
     pub dag: Arc<dag::DagEngine>,
+    pub response_store: response_store::ResponseStore,
+}
+
+/// Shared application state — split along service boundaries.
+#[derive(Clone)]
+pub struct AppState {
+    // ── Upstream / Network ───────────────────────────────────────────
+    pub upstream: String,
+    /// API key extracted from the first incoming request's Authorization header.
+    pub api_key: Arc<StdMutex<Option<String>>>,
+    /// Separate admin key for LCM endpoint authentication.
+    pub admin_key: Arc<StdMutex<Option<String>>>,
+
+    // ── Storage ──────────────────────────────────────────────────────
+    pub storage: StorageServices,
+
+    // ── Execution ────────────────────────────────────────────────────
     pub compactor: Arc<Mutex<compactor::Compactor>>,
-    pub client: reqwest::Client,
-    /// Model used for background summarization (configurable via CLI/env).
+    pub runtime: RuntimeServices,
+
+    // ── Config ───────────────────────────────────────────────────────
     pub summarizer_model: String,
-    /// Runtime cycle tracking for policy-driven execution.
-    pub cycle: Arc<StdMutex<runtime::ExecutionCycle>>,
-    /// When true, skip upstream calls — save translated body to disk and return mock response.
     pub dry_run: bool,
-    /// Completed response objects keyed by response ID. Enables
-    /// `previous_response_id` continuity so Codex can do incremental turns
-    /// instead of rebuilding full context on every request.
-    pub response_store: Arc<StdMutex<HashMap<String, serde_json::Value>>>,
-    /// When set, enables per-request JSON logging to this directory.
-    /// Each request writes one JSON line to a timestamped .jsonl file.
     pub log_dir: Option<String>,
 }
 

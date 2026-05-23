@@ -68,17 +68,48 @@ impl RuntimeProfile {
         }
     }
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "minimal" => Some(Self::Minimal),
-            "efficient" => Some(Self::Efficient),
-            "exploratory" | "explore" => Some(Self::Exploratory),
-            "autonomous" | "auto" => Some(Self::Autonomous),
-            "custom" => Some(Self::Custom),
-            _ => None,
-        }
-    }
+}
+
+// ── Runtime Mode ─────────────────────────────────────────────────────
+
+/// Execution mode controlling how the runtime processes requests (B-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeMode {
+    /// Normal operation — real LLM calls, real tool execution.
+    Live,
+    /// Deterministic replay from execution events — reads past results
+    /// from the event log instead of making live LLM calls.
+    Replay {
+        /// Replay session ID for lineage tracking.
+        session_id: String,
+        /// Stop replay at this logical sequence number.
+        up_to_seq: i64,
+    },
+    /// Dry-run: evaluate policies and produce a decision plan without
+    /// executing any tools or LLM calls. Used for budget estimation.
+    DryRun,
+}
+
+impl RuntimeMode {
+    pub fn is_live(&self) -> bool { matches!(self, Self::Live) }
+    pub fn is_replay(&self) -> bool { matches!(self, Self::Replay { .. }) }
+    pub fn is_dry_run(&self) -> bool { matches!(self, Self::DryRun) }
+}
+
+/// Separates execution output from side effects (A-4).
+/// In replay mode, only the output is replayed; side effects are skipped.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionResult {
+    /// The tool execution result text.
+    pub output: String,
+    /// The outcome classification.
+    pub outcome: crate::execution::ExecutionOutcome,
+    /// Token cost incurred (0 for cache hits and replays).
+    pub tokens_spent: u64,
+    /// Whether this execution had side effects (filesystem mutation, API call).
+    pub has_side_effects: bool,
+    /// Whether this was a cache hit or replay (skip side effects on replay).
+    pub is_replay: bool,
 }
 
 // ── Runtime Strategy (internal) ───────────────────────────────────────
@@ -335,18 +366,32 @@ impl RuntimeDecision {
 // ── Runtime Metrics ───────────────────────────────────────────────────
 
 /// Cost-aware metrics that feed back into the scheduler.
+///
+/// ## Derivable fields (Phase 2.7 audit)
+/// Fields marked `/// DERIVABLE` can be computed from `RuntimeEvents` alone
+/// and are retained temporarily for parity validation with `RuntimeStateView`.
+/// DO NOT add new mutation logic to these fields.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuntimeMetrics {
+    /// DERIVABLE: `RuntimeStateView::total_tokens()`
     pub tokens_spent: u64,
+    /// DERIVABLE: `RuntimeStateView::cache_hit_count()`
     pub cache_hits: u64,
+    /// DERIVABLE: `total_completions - cache_hits` — not yet exposed in StateView
     pub cache_misses: u64,
+    /// DERIVABLE: `RuntimeStateView::failure_count()`
     pub repeated_failures: u64,
+    /// EXTERNAL: computed from file observation data, not in events
     pub reread_ratio: f64,
+    /// EXTERNAL: computed from planning metadata
     pub planning_reuse_ratio: f64,
+    /// EXTERNAL: user-configured budget, not in events
     pub budget_remaining_pct: f64,
+    /// EXTERNAL: user-configured budget
     pub budget_total: u64,
-
+    /// SEMI-DERIVABLE: count consecutive ToolCallFailed from event tail
     pub failure_streak: u32,
+    /// EXTERNAL: no event source; remove after Phase 3 replay
     pub tool_repeat_count: u32,
 }
 
@@ -359,28 +404,71 @@ impl RuntimeMetrics {
         let total = self.cache_hits + self.cache_misses;
         total > 0 && (self.cache_hits as f64 / total as f64) > 0.6
     }
+
+    /// Runtime invariant audit (P0): verify metrics are internally consistent.
+    /// Returns a list of violations if any invariants are broken.
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if self.budget_remaining_pct > 1.0 {
+            issues.push(format!(
+                "budget_remaining_pct {:.2} exceeds 1.0",
+                self.budget_remaining_pct
+            ));
+        }
+        if self.failure_streak > 0 && self.repeated_failures == 0 {
+            issues.push("failure_streak > 0 but repeated_failures == 0".into());
+        }
+        if self.reread_ratio > 1.0 {
+            issues.push(format!("reread_ratio {:.2} exceeds 1.0", self.reread_ratio));
+        }
+        if self.planning_reuse_ratio > 1.0 {
+            issues.push(format!(
+                "planning_reuse_ratio {:.2} exceeds 1.0",
+                self.planning_reuse_ratio
+            ));
+        }
+        issues
+    }
 }
 
 // ── Execution Cycle ───────────────────────────────────────────────────
 
 /// State machine tracking the current inference cycle.
+///
+/// ## Field derivability (Phase 2.7 audit)
+/// Fields marked `/// DERIVABLE` are computable from `self.events` alone.
+/// They exist as safety-net projections during Phase 2 transition.
+/// DO NOT add mutation logic to derivable fields — use record_* methods.
 #[derive(Debug, Clone)]
 pub struct ExecutionCycle {
+    /// CONFIG: runtime profile, not derivable.
     pub profile: RuntimeProfile,
+    /// CONFIG: derived from profile at construction.
     pub strategy: RuntimeStrategy,
+    /// Partially derivable — see RuntimeMetrics doc.
     pub metrics: RuntimeMetrics,
+    /// CONFIG: execution mode.
+    pub mode: RuntimeMode,
 
+    /// EXTERNAL: active plan from planning subsystem.
     pub active_plan_id: Option<i64>,
+    /// SEMI-DERIVABLE: last N ToolCallFailed execution_unit_ids.
     pub recent_failure_ids: Vec<i64>,
-    pub cache_hits_this_cycle: Vec<String>,
+    /// EXTERNAL: file observation delta.
     pub context_delta: Vec<String>,
 
-    /// Decisions made this cycle (for audit).
+    /// EXTERNAL: audit trail of policy decisions.
     pub decisions: Vec<RuntimeDecision>,
+    /// SOURCE OF TRUTH: append-only lifecycle event log.
+    pub events: Vec<crate::runtime_events::RuntimeEvent>,
 }
 
 impl ExecutionCycle {
     pub fn new(profile: RuntimeProfile) -> Self {
+        Self::with_mode(profile, RuntimeMode::Live)
+    }
+
+    pub fn with_mode(profile: RuntimeProfile, mode: RuntimeMode) -> Self {
         let strategy = RuntimeStrategy::from_profile(profile);
         let metrics = RuntimeMetrics {
             budget_remaining_pct: 1.0,
@@ -390,34 +478,309 @@ impl ExecutionCycle {
             profile,
             strategy,
             metrics,
+            mode,
             active_plan_id: None,
             recent_failure_ids: Vec::new(),
-            cache_hits_this_cycle: Vec::new(),
             context_delta: Vec::new(),
             decisions: Vec::new(),
+            events: Vec::new(),
         }
     }
 
-    pub fn record_cache_hit(&mut self, tool_name: &str) {
-        self.metrics.cache_hits += 1;
-        self.cache_hits_this_cycle.push(tool_name.to_string());
+    /// Append a runtime event. Infallible — event append failures MUST NOT
+    /// propagate to callers. The event stream is append-only metadata.
+    fn append_event(&mut self, event: crate::runtime_events::RuntimeEvent) {
+        self.events.push(event);
     }
 
-    pub fn record_cache_miss(&mut self) {
-        self.metrics.cache_misses += 1;
+    /// Should the runtime actually execute tools/LLM calls? False in DryRun.
+    #[must_use = "DryRun mode check — ignoring this executes tools when it shouldn't"]
+    pub fn should_execute(&self) -> bool {
+        !self.mode.is_dry_run()
     }
 
-    pub fn record_tokens(&mut self, tokens: u64) {
-        self.metrics.tokens_spent += tokens;
+    /// Is this a replay — should we skip side effects?
+    #[must_use = "replay mode check — ignoring this may execute side effects during replay"]
+    pub fn is_replay(&self) -> bool {
+        self.mode.is_replay()
     }
 
-    pub fn record_failure(&mut self) {
+    // ── Lifecycle events (Phase 2: append event THEN update projection) ─
+
+    /// Append ExecutionStarted event.
+    pub fn record_execution_started(&mut self, conv_id: i64, profile: &str) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::ExecutionStarted {
+            conv_id, logical_seq: seq,
+            profile: profile.to_string(),
+        });
+    }
+
+    /// Append ToolCallScheduled event.
+    pub fn record_tool_call_scheduled(
+        &mut self, conv_id: i64, tool_name: &str,
+        tool_call_id: &str, span_id: &str, attempt: u32,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::ToolCallScheduled {
+            conv_id, logical_seq: seq,
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            span_id: span_id.to_string(),
+            attempt,
+        });
+    }
+
+    /// Append ToolCallCompleted event, then update metrics projection.
+    pub fn record_tool_call_completed(
+        &mut self, conv_id: i64, tool_name: &str,
+        tool_call_id: &str, span_id: &str, attempt: u32,
+        tokens_spent: u64, cache_hit: bool, execution_unit_id: i64,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::ToolCallCompleted {
+            conv_id, logical_seq: seq,
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            span_id: span_id.to_string(),
+            attempt,
+            tokens_spent,
+            cache_hit,
+            execution_unit_id,
+        });
+        // Projection update
+        self.metrics.tokens_spent += tokens_spent;
+        if cache_hit {
+            self.metrics.cache_hits += 1;
+        }
+    }
+
+    /// Append ToolCallFailed event, then update projection.
+    pub fn record_tool_call_failed(
+        &mut self, conv_id: i64, tool_name: &str,
+        tool_call_id: &str, span_id: &str, attempt: u32,
+        error_signature: &str, retryable: bool, execution_unit_id: i64,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::ToolCallFailed {
+            conv_id, logical_seq: seq,
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            span_id: span_id.to_string(),
+            attempt,
+            error_signature: error_signature.to_string(),
+            retryable,
+            execution_unit_id,
+        });
+        // Projection update
         self.metrics.repeated_failures += 1;
         self.metrics.failure_streak += 1;
     }
 
+    /// Append RetryScheduled event.
+    pub fn record_retry_scheduled(
+        &mut self, conv_id: i64, tool_call_id: &str,
+        attempt: u32, suggested_fix: &str,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::RetryScheduled {
+            conv_id, logical_seq: seq,
+            tool_call_id: tool_call_id.to_string(),
+            attempt,
+            suggested_fix: suggested_fix.to_string(),
+        });
+    }
+
+    /// Append RetryAborted event.
+    pub fn record_retry_aborted(
+        &mut self, conv_id: i64, tool_call_id: &str,
+        total_attempts: u32, reason: &str,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::RetryAborted {
+            conv_id, logical_seq: seq,
+            tool_call_id: tool_call_id.to_string(),
+            total_attempts,
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Append CancellationRequested event.
+    pub fn record_cancellation_requested(
+        &mut self, conv_id: i64,
+        source: crate::runtime_events::CancellationSource,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::CancellationRequested {
+            conv_id, logical_seq: seq, source,
+        });
+    }
+
+    /// Append CancellationAcknowledged event.
+    pub fn record_cancellation_acknowledged(
+        &mut self, conv_id: i64, tool_call_id: &str, span_id: &str,
+    ) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::CancellationAcknowledged {
+            conv_id, logical_seq: seq,
+            tool_call_id: tool_call_id.to_string(),
+            span_id: span_id.to_string(),
+        });
+    }
+
+    /// Append CancellationCompleted event.
+    pub fn record_cancellation_completed(&mut self, conv_id: i64, clean: bool) {
+        let seq = crate::execution::next_logical_seq();
+        self.append_event(crate::runtime_events::RuntimeEvent::CancellationCompleted {
+            conv_id, logical_seq: seq, clean,
+        });
+    }
+
+    // ── Projection-only methods (legacy — prefer lifecycle methods) ───
+    //
+    // These mutate metrics directly. Prefer the lifecycle methods above
+    // (record_tool_call_completed, record_tool_call_failed, etc.) which
+    // emit RuntimeEvents AND update projections.
+    //
+    // These methods are RETAINED for existing test callers only.
+    // NEW production code MUST use the lifecycle methods above.
+    // When all callers are migrated, these will be removed.
+
+    /// Use record_tool_call_completed with cache_hit=true instead.
+    /// Retained for existing callers only.
+    #[deprecated(note = "use record_tool_call_completed with cache_hit=true")]
+    pub fn record_cache_hit(&mut self, _tool_name: &str) {
+        self.metrics.cache_hits += 1;
+    }
+    /// Computed as completions - cache_hits. No event needed.
+    /// Retained for existing callers only.
+    #[deprecated(note = "computed from event log")]
+    pub fn record_cache_miss(&mut self) {
+        self.metrics.cache_misses += 1;
+    }
+    /// Use record_tool_call_completed which includes tokens_spent.
+    /// Retained for existing callers only.
+    #[deprecated(note = "use record_tool_call_completed")]
+    pub fn record_tokens(&mut self, tokens: u64) {
+        self.metrics.tokens_spent += tokens;
+    }
+    /// Use record_tool_call_failed.
+    /// Retained for existing callers only.
+    #[deprecated(note = "use record_tool_call_failed")]
+    pub fn record_failure(&mut self) {
+        self.metrics.repeated_failures += 1;
+        self.metrics.failure_streak += 1;
+    }
+    /// Derivable from events. Use RuntimeStateView instead.
+    /// Retained for existing callers only.
+    #[deprecated(note = "derive from events via RuntimeStateView")]
     pub fn record_success(&mut self) {
         self.metrics.failure_streak = 0;
+    }
+
+    /// Bulk-set metrics from a session summary for reporting purposes.
+    /// This is a snapshot operation, not incremental — for use in
+    /// `generate_report` / `generate_svg_card` per-session overrides.
+    pub fn set_session_metrics(&mut self, tokens: u64, failures: u64, streak: u32) {
+        self.metrics.tokens_spent = tokens;
+        self.metrics.repeated_failures = failures;
+        self.metrics.failure_streak = streak;
+    }
+}
+
+// ── Retry Classification (provider-aware, formal) ────────────────────
+
+/// Formal retry classification — replaces heuristic string matching.
+/// Retry is now a runtime semantic, not a utility function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    /// Network-level: timeout, DNS failure, connection refused.
+    /// Retryable with backoff.
+    Transient,
+    /// Provider rate limit (429). Retryable with jittered backoff.
+    RateLimited,
+    /// Insufficient output quality (e.g. summary didn't reduce tokens).
+    /// Retryable at next escalation level.
+    QualityInsufficient,
+    /// Authentication/authorization failure (401, 403).
+    /// NOT retryable — retrying wastes tokens.
+    AuthFailed,
+    /// Malformed response, parse error, empty content.
+    /// NOT retryable — provider is returning garbage.
+    MalformedResponse,
+    /// Permanent upstream error (5xx that persists across attempts).
+    /// NOT retryable after max attempts.
+    UpstreamFailure,
+}
+
+impl RetryClass {
+    /// Whether this error class is retryable at the same escalation level.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Transient | Self::RateLimited | Self::QualityInsufficient)
+    }
+
+    /// Whether this error should skip escalation to the next LLM level
+    /// (go directly to deterministic fallback).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::AuthFailed | Self::MalformedResponse)
+    }
+
+    /// Classify an error from its message and HTTP status.
+    pub fn classify(error_msg: &str, http_status: Option<u16>) -> Self {
+        let msg = error_msg.to_lowercase();
+
+        if http_status == Some(429) || msg.contains("rate limit") || msg.contains("429") {
+            return Self::RateLimited;
+        }
+        if msg.contains("timeout") || msg.contains("connection") || msg.contains("timed out")
+            || msg.contains("dns") || msg.contains("refused") || msg.contains("reset")
+        {
+            return Self::Transient;
+        }
+        if msg.contains("insufficient reduction") || msg.contains("empty choice") {
+            return Self::QualityInsufficient;
+        }
+        match http_status {
+            Some(401) | Some(403) => Self::AuthFailed,
+            Some(s) if s >= 500 => Self::UpstreamFailure,
+            Some(400) | Some(404) | Some(422) => Self::MalformedResponse,
+            _ => {
+                // Unknown — classify as upstream failure if message suggests it
+                if msg.contains("http 5") || msg.contains("server error") {
+                    Self::UpstreamFailure
+                } else {
+                    Self::Transient // default: safe to retry once
+                }
+            }
+        }
+    }
+}
+
+/// Formal backoff calculation keyed by retry class.
+pub struct RetryBackoff {
+    pub max_retries: u32,
+}
+
+impl RetryBackoff {
+    pub fn new(max_retries: u32) -> Self {
+        Self { max_retries: max_retries.min(5) }
+    }
+
+    /// Compute delay for this attempt, in milliseconds.
+    pub fn delay_ms(&self, attempt: u32, class: RetryClass) -> u64 {
+        let jitter = crate::summarizer::jitter_millis(attempt);
+        let base_secs = match class {
+            RetryClass::RateLimited => 2u64.pow(attempt.min(4)),
+            RetryClass::Transient => 1u64.pow(attempt.min(3)).max(1),
+            RetryClass::QualityInsufficient => 0, // no delay — escalate immediately
+            _ => 0, // non-retryable — don't wait
+        };
+        base_secs * 1000 + jitter
+    }
+
+    /// Whether this attempt should be retried, given the class and current count.
+    pub fn should_retry(&self, attempt: u32, class: RetryClass) -> bool {
+        class.is_retryable() && attempt < self.max_retries
     }
 }
 
@@ -426,52 +789,90 @@ impl ExecutionCycle {
 /// Advisory policy engine. Recommends optimization actions that the agent
 /// can accept, ignore, or override. Never overrides model intent.
 ///
-/// Core responsibilities:
-///   ✅ cache reuse       — avoid redundant tool execution
-///   ✅ delta injection   — minimize repeated context
-///   ✅ failure avoidance — prevent error loops
-///   ✅ context compaction — distill when budget critical
-///
-/// Explicitly NOT:
-///   ❌ autonomous planning    — model stays in control
-///   ❌ multi-agent orchestration
-///   ❌ self-reflection loops  — token black hole for DeepSeek
-///   ❌ recursive reasoning    — model-killer for DeepSeek
+/// Uses a composable pipeline of [`PipelineStage`] implementations so each
+/// decision rule is independently testable and reorderable (C-3).
 pub struct RuntimePolicy;
 
+/// A single decision stage in the runtime pipeline.
+/// Each stage evaluates one condition; the first matching stage wins.
+pub trait PipelineStage: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn evaluate(&self, state: &RuntimeState) -> Option<RuntimeDecision>;
+}
+
+// ── Built-in pipeline stages ─────────────────────────────────────────
+
+struct CacheReuseStage;
+impl PipelineStage for CacheReuseStage {
+    fn name(&self) -> &'static str { "cache_reuse" }
+    fn evaluate(&self, state: &RuntimeState) -> Option<RuntimeDecision> {
+        let hit = state.cache_hit.as_ref()?;
+        let confidence = RuntimeStrategy::from_profile(state.profile).cache_aggressiveness;
+        if confidence > 0.3 {
+            Some(RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving))
+        } else {
+            None
+        }
+    }
+}
+
+struct RetryWithFixStage;
+impl PipelineStage for RetryWithFixStage {
+    fn name(&self) -> &'static str { "retry_with_fix" }
+    fn evaluate(&self, state: &RuntimeState) -> Option<RuntimeDecision> {
+        let fh = state.failure_hint.as_ref()?;
+        if fh.suggested_fix.is_empty() { return None; }
+        if fh.retry_count >= RuntimeStrategy::from_profile(state.profile).max_retries_per_failure {
+            return None;
+        }
+        Some(RuntimeDecision::retry_with_fix(0, &fh.suggested_fix))
+    }
+}
+
+struct ContinuePlanStage;
+impl PipelineStage for ContinuePlanStage {
+    fn name(&self) -> &'static str { "continue_plan" }
+    fn evaluate(&self, state: &RuntimeState) -> Option<RuntimeDecision> {
+        let ph = state.plan_hint.as_ref()?;
+        if ph.pending_step_count > 0 {
+            Some(RuntimeDecision::continue_plan(0, &ph.goal))
+        } else {
+            None
+        }
+    }
+}
+
+struct TokenCriticalStage;
+impl PipelineStage for TokenCriticalStage {
+    fn name(&self) -> &'static str { "token_critical" }
+    fn evaluate(&self, state: &RuntimeState) -> Option<RuntimeDecision> {
+        if state.metrics.is_token_critical() {
+            Some(RuntimeDecision::compact_and_proceed())
+        } else {
+            None
+        }
+    }
+}
+
 impl RuntimePolicy {
+    /// Ordered list of pipeline stages. Reorder to change evaluation priority.
+    pub fn stages() -> Vec<Box<dyn PipelineStage>> {
+        vec![
+            Box::new(CacheReuseStage),
+            Box::new(RetryWithFixStage),
+            Box::new(ContinuePlanStage),
+            Box::new(TokenCriticalStage),
+        ]
+    }
+
     /// Primary API: produce an advisory decision from a complete [`RuntimeState`].
-    /// This is the pure function — no side effects, no infrastructure.
+    /// Iterates through the configured pipeline stages; first match wins.
     pub fn decide(state: &RuntimeState) -> RuntimeDecision {
-        // Rule 1: Tool cache hit with sufficient confidence
-        if let Some(ref hit) = state.cache_hit {
-            let confidence = RuntimeStrategy::from_profile(state.profile).cache_aggressiveness;
-            if confidence > 0.3 {
-                return RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving);
+        for stage in Self::stages() {
+            if let Some(decision) = stage.evaluate(state) {
+                return decision;
             }
         }
-
-        // Rule 2: Failure with known fix (per-pattern retry limit)
-        if let Some(ref fh) = state.failure_hint
-            && !fh.suggested_fix.is_empty()
-            && fh.retry_count < RuntimeStrategy::from_profile(state.profile).max_retries_per_failure
-        {
-            return RuntimeDecision::retry_with_fix(0, &fh.suggested_fix);
-        }
-
-        // Rule 3: Active plan with pending steps
-        if let Some(ref ph) = state.plan_hint
-            && ph.pending_step_count > 0
-        {
-            return RuntimeDecision::continue_plan(0, &ph.goal);
-        }
-
-        // Rule 4: Token budget critical
-        if state.metrics.is_token_critical() {
-            return RuntimeDecision::compact_and_proceed();
-        }
-
-        // Rule 5: No optimization applies — model's turn
         RuntimeDecision::delegate("no applicable optimization")
     }
 
@@ -684,6 +1085,127 @@ impl ExecutionCompactor {
             out.push_str(&format!("{name} → {brief}"));
         }
         out
+    }
+}
+
+// ── Rate Limiter (token bucket, AppState-owned) ─────────────────────────
+
+/// Sliding-window rate limiter owned by AppState.
+/// Replaces the global `AtomicU64` + reset-loop pattern (P0: no process-global
+/// mutable state, no test pollution, multi-tenant safe).
+#[derive(Debug)]
+pub struct RateLimiter {
+    max_per_sec: u64,
+    window_ns: u128,
+    counter: std::sync::atomic::AtomicU64,
+    window_start: std::sync::Mutex<std::time::Instant>,
+}
+
+impl RateLimiter {
+    pub fn new(max_per_sec: u64) -> Self {
+        Self {
+            max_per_sec,
+            window_ns: 1_000_000_000,
+            counter: std::sync::atomic::AtomicU64::new(0),
+            window_start: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
+
+    /// Check if the request is allowed. Returns `true` if within rate limit.
+    /// Automatically resets the counter when the window expires.
+    pub fn check(&self) -> bool {
+        if self.max_per_sec == 0 {
+            return true; // disabled
+        }
+        let mut guard = self.window_start.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if now.duration_since(*guard).as_nanos() >= self.window_ns {
+            // New window: atomic reset (race-safe: at most 1 window worth of extra requests)
+            self.counter.store(1, std::sync::atomic::Ordering::Relaxed);
+            *guard = now;
+            return true;
+        }
+        let prev = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prev < self.max_per_sec
+    }
+
+    pub fn max_per_sec(&self) -> u64 { self.max_per_sec }
+}
+
+// ── Background Tasks (lifecycle management) ────────────────────────────
+
+/// Owns background task handles and provides graceful shutdown.
+/// Replaces detached `tokio::spawn(loop{...})` patterns (P0: no dangling
+/// workers, no test pollution, observable lifecycle).
+pub struct BackgroundTasks {
+    handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for BackgroundTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackgroundTasks {
+    pub fn new() -> Self {
+        Self {
+            handles: std::sync::Mutex::new(Vec::new()),
+            shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Register a join handle for lifecycle tracking (works through Arc).
+    pub fn register_handle(self: &std::sync::Arc<Self>, handle: tokio::task::JoinHandle<()>) {
+        if let Ok(mut guard) = self.handles.lock() {
+            guard.push(handle);
+        }
+    }
+
+    /// Register a join handle for lifecycle tracking (mutable reference).
+    pub fn register(&mut self, handle: tokio::task::JoinHandle<()>) {
+        if let Ok(mut guard) = self.handles.lock() {
+            guard.push(handle);
+        }
+    }
+
+    /// Signal shutdown and await all handles with a timeout.
+    pub async fn shutdown(self: &std::sync::Arc<Self>, timeout: std::time::Duration) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let handles = self.handles.lock().ok().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+        for handle in handles {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { break; }
+            let _ = tokio::time::timeout(remaining, handle).await;
+        }
+    }
+
+    pub fn shutdown_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.shutdown.clone()
+    }
+}
+
+// ── RuntimeProfile string parsing (move logic out of main.rs) ─────────
+
+impl RuntimeProfile {
+    /// Parse from CLI string. Logs a warning on unknown values and falls back
+    /// to `Autonomous`. Replaces the `match` block in main.rs.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "minimal" => Self::Minimal,
+            "efficient" => Self::Efficient,
+            "exploratory" => Self::Exploratory,
+            "autonomous" => Self::Autonomous,
+            "custom" => Self::Custom,
+            other => {
+                tracing::warn!(target: "deeplossless::runtime",
+                    "unknown runtime profile '{other}', falling back to autonomous");
+                Self::Autonomous
+            }
+        }
     }
 }
 

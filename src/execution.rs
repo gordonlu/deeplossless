@@ -1,4 +1,14 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Logical sequence counter for deterministic execution ordering (P0-6).
+/// Incremented on each execution unit creation. Independent of wall clock.
+static NEXT_LOGICAL_SEQ: AtomicI64 = AtomicI64::new(1);
+
+/// Return the next logical sequence number for deterministic ordering.
+pub fn next_logical_seq() -> i64 {
+    NEXT_LOGICAL_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 // ── Provenance Lineage (typed edges between execution nodes) ──────────
 

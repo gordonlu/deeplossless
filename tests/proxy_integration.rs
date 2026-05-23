@@ -82,7 +82,7 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         deeplossless::dag::DagEngine::builder().build(db.clone()),
     );
     let compactor = Arc::new(tokio::sync::Mutex::new(
-        deeplossless::compactor::Compactor::spawn(
+        deeplossless::compactor::Compactor::new(
             db.clone(),
             deeplossless::compactor::CompactorConfig {
                 summarizer: deeplossless::summarizer::SummarizerConfig {
@@ -91,22 +91,29 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
                 },
                 ..Default::default()
             },
+            None,
         ),
     ));
     deeplossless::AppState {
         upstream: format!("http://{}", upstream_addr),
         api_key: std::sync::Arc::new(std::sync::Mutex::new(Some("test-key".to_string()))),
         admin_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        db,
-        dag,
+        storage: deeplossless::StorageServices {
+            db,
+            dag,
+            response_store: deeplossless::response_store::ResponseStore::default(),
+        },
         compactor,
-        client: reqwest::Client::new(),
+        runtime: deeplossless::RuntimeServices {
+            client: reqwest::Client::new(),
+            cycle: std::sync::Arc::new(std::sync::Mutex::new(
+                deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Minimal),
+            )),
+            rate_limiter: std::sync::Arc::new(deeplossless::runtime::RateLimiter::new(0)),
+            shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        },
         summarizer_model: "deepseek-v4-flash".into(),
-        cycle: std::sync::Arc::new(std::sync::Mutex::new(
-            deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Minimal),
-        )),
         dry_run: false,
-        response_store: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         log_dir: None,
     }
 }
@@ -276,7 +283,7 @@ async fn pipeline_tool_result_caching() {
     let captured: CapturedRequest = Arc::new(Mutex::new(None));
     let (upstream_addr, _shutdown) = start_mock_upstream_ex(Some(captured.clone())).await;
     let state = build_proxy_state(upstream_addr, "pipeline_cache").await;
-    let db = state.db.clone();
+    let db = state.storage.db.clone();
 
     let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
 
@@ -433,7 +440,7 @@ async fn tool_cache_intercepts_tool_call() {
     // Pre-populate the tool cache — same args the upstream will "generate"
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
-    state.db.tool_cache_put(&cname, &args_hash, "src/main.rs:42 found foo", &["src/main.rs".to_string()]).unwrap();
+    state.storage.db.tool_cache_put(&cname, &args_hash, "src/main.rs:42 found foo", &["src/main.rs".to_string()]).unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
@@ -498,7 +505,7 @@ async fn chat_completions_cache_intercept() {
     let state = build_proxy_state(addr, "chat_cache").await;
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
-    state.db.tool_cache_put(&cname, &args_hash, "cached: found foo", &[]).unwrap();
+    state.storage.db.tool_cache_put(&cname, &args_hash, "cached: found foo", &[]).unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
@@ -560,7 +567,7 @@ async fn multi_tool_call_one_cache_hit() {
     // Pre-populate grep cache only
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
-    state.db.tool_cache_put(&cname, &args_hash, "found foo at line 42", &[]).unwrap();
+    state.storage.db.tool_cache_put(&cname, &args_hash, "found foo at line 42", &[]).unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
@@ -732,7 +739,7 @@ async fn lcm_grep_retrieves_stored_context() {
     // Store a tool result directly in cache
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"process_data"}"#);
-    state.db.tool_cache_put(&cname, &args_hash, "src/lib.rs:42 found process_data", &[]).unwrap();
+    state.storage.db.tool_cache_put(&cname, &args_hash, "src/lib.rs:42 found process_data", &[]).unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
@@ -835,7 +842,7 @@ async fn snapshot_and_versions_endpoints() {
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "snap_versions").await;
-    let db = state.db.clone();
+    let db = state.storage.db.clone();
 
     // Create memory versions
     let v1 = db.create_memory_version(None, "test", "initial version", None).unwrap();
@@ -894,7 +901,7 @@ async fn lcm_audit_trail_and_report_endpoints() {
     let auth = "Bearer test-key";
 
     // Store execution units via DB
-    let conv_id = state.db.find_or_create_conversation("audit_int_fp", "deepseek-v4-flash").unwrap();
+    let conv_id = state.storage.db.find_or_create_conversation("audit_int_fp", "deepseek-v4-flash").unwrap();
     for i in 0..4 {
         let outcome = match i {
             0 => "success",
@@ -902,7 +909,7 @@ async fn lcm_audit_trail_and_report_endpoints() {
             2 => "blocked",
             _ => "cache_hit",
         };
-        state.db.store_execution_unit(conv_id, "", "grep", "{}", if i == 2 { "Error: fail" } else { "ok" }, "", outcome, &[]).unwrap();
+        state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", if i == 2 { "Error: fail" } else { "ok" }, "", outcome, &[]).unwrap();
     }
 
     // Test audit trail endpoint
@@ -936,10 +943,10 @@ async fn lcm_score_endpoint() {
     let client = reqwest::Client::new();
     let auth = "Bearer test-key";
 
-    let conv_id = state.db.find_or_create_conversation("score_int_fp", "deepseek-v4-flash").unwrap();
-    state.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
-    state.db.store_execution_unit(conv_id, "", "build", "{}", "Error: fail", "", "blocked", &[]).unwrap();
-    state.db.store_execution_unit(conv_id, "", "grep", "{}", "cached", "", "cache_hit", &[]).unwrap();
+    let conv_id = state.storage.db.find_or_create_conversation("score_int_fp", "deepseek-v4-flash").unwrap();
+    state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
+    state.storage.db.store_execution_unit(conv_id, "", "build", "{}", "Error: fail", "", "blocked", &[]).unwrap();
+    state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", "cached", "", "cache_hit", &[]).unwrap();
 
     let score_resp = client
         .get(format!("{base}/v1/lcm/score/{conv_id}"))
@@ -960,11 +967,11 @@ async fn lcm_motifs_endpoint() {
     let client = reqwest::Client::new();
     let auth = "Bearer test-key";
 
-    let conv_id = state.db.find_or_create_conversation("motif_int_fp", "deepseek-v4-flash").unwrap();
+    let conv_id = state.storage.db.find_or_create_conversation("motif_int_fp", "deepseek-v4-flash").unwrap();
     // Repeated grep→read_file pattern
     for _ in 0..2 {
-        state.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
-        state.db.store_execution_unit(conv_id, "", "read_file", "{}", "data", "", "success", &[]).unwrap();
+        state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
+        state.storage.db.store_execution_unit(conv_id, "", "read_file", "{}", "data", "", "success", &[]).unwrap();
     }
 
     let motifs_resp = client
@@ -1027,8 +1034,8 @@ async fn parallel_group_detection_and_join() {
     // creates a join DAG node.
     let (_upstream_addr, _shutdown) = start_mock_upstream().await;
     let state = build_proxy_state(_upstream_addr, "parallel_test").await;
-    let db = state.db.clone();
-    let dag = state.dag.clone();
+    let db = state.storage.db.clone();
+    let dag = state.storage.dag.clone();
 
     let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
 

@@ -8,6 +8,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use futures::StreamExt;
+use futures::FutureExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
@@ -28,7 +29,7 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
     let mut checks = serde_json::json!({});
 
     // DB check — fast SELECT 1 on writer connection
-    match state.db.wal_checkpoint() {
+    match state.storage.db.wal_checkpoint() {
         Ok(()) => checks["database"] = json!("ok"),
         Err(e) => {
             healthy = false;
@@ -38,7 +39,7 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
 
     // Upstream reachability — lightweight HEAD
     let upstream = state.upstream.trim_end_matches('/');
-    match state.client.head(upstream).send().await {
+    match state.runtime.client.head(upstream).send().await {
         Ok(resp) => checks["upstream"] = json!(format!("reachable (http {})", resp.status())),
         Err(e) => {
             healthy = false;
@@ -80,11 +81,11 @@ fn check_tool_cache(
                 match db.tool_cache_get(&cname, &args_hash) {
                     Ok(Some((result, _hits))) => {
                         if let Ok(mut c) = cycle.lock() {
-                            c.metrics.cache_hits += 1;
+                            c.record_cache_hit(name);
                         }
                         let transformed = crate::tool_cache::transform_result(name, &result);
                         tracing::info!(target: "deeplossless",
-                            tool=name, args_hash, raw_len=result.len(), transformed_len=transformed.len(),
+                            tool=name, %args_hash, raw_len=result.len(), transformed_len=transformed.len(),
                             "cache hit — intercepting tool call");
                         return (Some(transformed), 2);
                     }
@@ -125,8 +126,12 @@ fn process_events(
             let kind = "TextDelta";
             let payload = event_to_payload(&text_ev);
             let sn = seq;
-            let epoch_ms = chrono::Utc::now().timestamp_millis();
-            tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, kind, &payload, sn, None, epoch_ms); });
+            let epoch_ms = crate::execution::next_logical_seq();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = db2.store_execution_event(None, kind, &payload, sn, None, epoch_ms) {
+                    tracing::warn!(target: "deeplossless", "execution event store failed: {e}");
+                }
+            });
             seq += 1;
             if use_responses_format {
                 if let Some(asm) = assembler.as_mut() {
@@ -157,8 +162,12 @@ fn process_events(
         let kind = event_kind_name(ev);
         let payload = event_to_payload(ev);
         let sn = seq;
-        let epoch_ms = chrono::Utc::now().timestamp_millis();
-        tokio::task::spawn_blocking(move || { let _ = db2.store_execution_event(None, &kind, &payload, sn, None, epoch_ms); });
+        let epoch_ms = crate::execution::next_logical_seq();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db2.store_execution_event(None, &kind, &payload, sn, None, epoch_ms) {
+                tracing::warn!(target: "deeplossless", "execution event store failed: {e}");
+            }
+        });
         seq += 1;
         // Normal emission
         let sse_line = if use_responses_format {
@@ -413,7 +422,7 @@ async fn responses(
         req_stream, msg_count=req_msgs, upstream_url,
         has_api_key=!api_key.is_empty() && api_key != "unset",
         "sending upstream request");
-    let resp = match state
+    let resp = match state.runtime
         .client
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -438,9 +447,9 @@ async fn responses(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
-        let response_store = state.response_store.clone();
-        let db = state.db.clone();
-        let cycle = state.cycle.clone();
+        let response_store = state.storage.response_store.clone();
+        let db = state.storage.db.clone();
+        let cycle = state.runtime.cycle.clone();
         let store_response = store;
         let request_body = body.clone();
         let log_dir = state.log_dir.clone();
@@ -453,7 +462,9 @@ async fn responses(
         let log_instructions_len = instructions_len;
         let log_msg_count = req_msgs;
         let log_request_body_kb = body.len() as f64 / 1024.0;
+        let shutdown = state.runtime.shutdown_notify.clone();
         tokio::spawn(async move {
+            if shutdown.notified().now_or_never().is_some() { return; }
             // Generate IDs matching OpenAI format
             let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
             let msg_id = format!("msg_{}", crate::protocol::responses::monotonic_id());
@@ -476,7 +487,7 @@ async fn responses(
                 "event: response.in_progress\ndata: {{\"type\":\"response.in_progress\",\"response\":{{{}}}}}\n\n",
                 response_envelope("in_progress")
             ))));
-            // output_item.added (msg_xxx, status=in_progress)
+            // output_item.added (status=in_progress)
             let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
                 "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}}}\n\n"
             ))));
@@ -625,23 +636,20 @@ async fn responses(
             // Persist the response so GET /v1/responses/{id} returns real data,
             // and Codex's previous_response_id continuity can work incrementally.
             if store_response {
-                if let Ok(mut store) = response_store.lock() {
-                    let resp_obj = serde_json::json!({
-                        "id": resp_id, "object": "response", "created_at": now,
-                        "status": "completed", "model": model,
-                        "output": [{
-                            "id": msg_id, "type": "message", "status": "completed",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": content.text, "annotations": []}]
-                        }],
-                        "usage": usage_json
-                    });
-                    store.insert(resp_id.clone(), resp_obj);
-                    tracing::info!(target: "deeplossless",
-                        resp_id, text_len=content.text.len(),
-                        stored_count=store.len(),
-                        "response stored");
-                }
+                let resp_obj = serde_json::json!({
+                    "id": resp_id, "object": "response", "created_at": now,
+                    "status": "completed", "model": model,
+                    "output": [{
+                        "id": msg_id, "type": "message", "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content.text, "annotations": []}]
+                    }],
+                    "usage": usage_json
+                });
+                response_store.insert(resp_id.clone(), resp_obj);
+                tracing::info!(target: "deeplossless",
+                    resp_id, text_len=content.text.len(),
+                    "response stored");
             }
             // Transport-level EOF marker
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
@@ -685,22 +693,14 @@ async fn responses_retrieve(
     Path(response_id): Path<String>,
 ) -> Response {
     // Check response store first
-    if let Ok(store) = state.response_store.lock() {
-        if let Some(resp) = store.get(&response_id) {
-            tracing::debug!(target: "deeplossless",
-                %response_id, "response retrieve hit");
-            return Json(resp.clone()).into_response();
-        }
+    if let Some(resp) = state.storage.response_store.get(&response_id) {
+        tracing::debug!(target: "deeplossless",
+            %response_id, "response retrieve hit");
+        return Json(resp).into_response();
     }
     tracing::warn!(target: "deeplossless",
-        %response_id, "response retrieve miss — returning empty");
-    // Fallback: minimal response — better than a 404 for Codex compatibility
-    Json(json!({
-        "id": response_id,
-        "object": "response",
-        "status": "completed",
-        "output": [],
-    })).into_response()
+        %response_id, "response retrieve miss");
+    json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("response '{response_id}' not found"))
 }
 
 async fn chat_completions(
@@ -741,7 +741,7 @@ async fn chat_completions(
 
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
-    let resp = match state
+    let resp = match state.runtime
         .client
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
@@ -767,14 +767,16 @@ async fn chat_completions(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
-        let db = state.db.clone();
-        let cycle = state.cycle.clone();
+        let db = state.storage.db.clone();
+        let cycle = state.runtime.cycle.clone();
         let log_dir = state.log_dir.clone();
         let upstream_status = status.as_u16();
         let start = std::time::Instant::now();
         let log_model = model.to_string();
         let log_body = body.clone();
+        let shutdown = state.runtime.shutdown_notify.clone();
         tokio::spawn(async move {
+            if shutdown.notified().now_or_never().is_some() { return; }
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut usage_buf: Option<serde_json::Value> = None;
@@ -888,17 +890,12 @@ async fn chat_completions(
 /// Map Codex model names to DeepSeek equivalents.
 /// Codex sends "gpt-5.5", "gpt-4o", "o3" etc. — translate to DeepSeek models.
 fn map_model(model: &str) -> String {
-    let m = model.to_lowercase();
-    if m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m == "gpt-5.5" {
-        if m.contains("mini") { return "deepseek-v4-flash".into(); }
-        return "deepseek-v4-pro".into();
-    }
-    if model.is_empty() || model == "auto" { return "deepseek-v4-pro".into(); }
-    model.to_string()
+    crate::protocol::ModelRegistry::default().map_model(model)
 }
 
 fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
-    key.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "unset".to_string())
+    let guard = key.lock().unwrap_or_else(|e| e.into_inner());
+    guard.clone().unwrap_or_default()
 }
 
 /// Verify that a request to a Context-ReAct endpoint carries a valid
@@ -908,7 +905,7 @@ fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
 fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
     // Prefer explicit admin_key
     let admin = state.admin_key.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ref admin_key) = *admin {
+    if let Some(admin_key) = admin.as_ref() {
         return check_bearer(headers, admin_key);
     }
     drop(admin);
@@ -941,7 +938,7 @@ async fn lcm_grep(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
-    match state.db.search_unified(conv_id, query) {
+    match state.storage.db.search_unified(conv_id, query) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
             "query": query,
@@ -963,9 +960,9 @@ async fn lcm_expand(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    // Expand a summary node to its children (original messages)
-    match state.dag.get_children(node_id) {
+    match state.storage.dag.get_children(node_id) {
         Ok(children) => {
-            let node = state.dag.get_node(node_id).ok().flatten();
+            let node = state.storage.dag.get_node(node_id).ok().flatten();
             Json(json!({
                 "node_id": node_id,
                 "summary": node.map(|n| n.summary),
@@ -986,7 +983,7 @@ async fn lcm_snippets(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }    match state.dag.get_node(node_id) {
+    }    match state.storage.dag.get_node(node_id) {
         Ok(Some(node)) => {
             Json(serde_json::json!({
                 "node_id": node_id,
@@ -1013,10 +1010,12 @@ async fn lcm_stream_context(
     let budget: usize = params.get("budget").and_then(|s| s.parse().ok()).unwrap_or(2000);
     let q_owned: Option<String> = params.get("q").cloned();
 
-    let dag = state.dag.clone();
+    let dag = state.storage.dag.clone();
+    let shutdown = state.runtime.shutdown_notify.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
+        if shutdown.notified().now_or_never().is_some() { return; }
         let q_ref = q_owned.as_deref();
         let nodes = dag.assemble_context(conv_id, budget, q_ref)
             .unwrap_or_default();
@@ -1069,12 +1068,9 @@ async fn lcm_file_claim(
     let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
     let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
     let operation = body.get("operation").map(|s| s.as_str()).unwrap_or("edit");
-    match state.db.claim_file(agent_id, file_path, operation) {
+    match state.storage.db.claim_file(agent_id, file_path, operation) {
         Ok(Ok(())) => Json(json!({"status": "claimed", "agent_id": agent_id, "file_path": file_path})).into_response(),
-        Ok(Err(conflict_agent)) => (
-            StatusCode::CONFLICT,
-            Json(json!({"status": "conflict", "held_by": conflict_agent, "file_path": file_path}))
-        ).into_response(),
+        Ok(Err(conflict_agent)) => json_error(StatusCode::CONFLICT, "CONFLICT", format!("file '{file_path}' held by agent '{conflict_agent}'")),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CLAIM_ERROR", format!("{e}")),
     }
 }
@@ -1090,7 +1086,7 @@ async fn lcm_file_release(
     }
     let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
     let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
-    match state.db.release_file(agent_id, file_path) {
+    match state.storage.db.release_file(agent_id, file_path) {
         Ok(()) => Json(json!({"status": "released"})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "RELEASE_ERROR", format!("{e}")),
     }
@@ -1104,7 +1100,7 @@ async fn lcm_file_conflicts(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match state.db.list_all_file_claims() {
+    match state.storage.db.list_all_file_claims() {
         Ok(claims) => {
             let rows: Vec<Value> = claims.iter().map(|(aid, path, op)| json!({
                 "agent_id": aid, "file_path": path, "operation": op
@@ -1131,7 +1127,7 @@ async fn lcm_cache_put(
     if tool.is_empty() || hash.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
     }
-    match state.db.tool_cache_put(tool, &hash, result, &files) {
+    match state.storage.db.tool_cache_put(tool, &hash, result, &files) {
         Ok(()) => Json(json!({"status": "cached", "tool": tool})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
     }
@@ -1149,7 +1145,7 @@ async fn lcm_cache_get(
     if tool.is_empty() || hash.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
     }
-    match state.db.tool_cache_get(tool, &hash) {
+    match state.storage.db.tool_cache_get(tool, &hash) {
         Ok(Some((result, hits))) => Json(json!({"hit": true, "result": result, "hit_count": hits})).into_response(),
         Ok(None) => Json(json!({"hit": false})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
@@ -1171,7 +1167,7 @@ async fn lcm_failure_put(
         .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
 
     if sig.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "signature required"); }
-    match state.db.store_failure_pattern(conv_id, sig, fix, why, &assumptions, &files, None) {
+    match state.storage.db.store_failure_pattern(conv_id, sig, fix, why, &assumptions, &files, None) {
         Ok(id) => Json(json!({"status": "stored", "id": id})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "FAILURE_ERROR", format!("{e}")),
     }
@@ -1190,7 +1186,7 @@ async fn lcm_plan_put(
         .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
 
     if goal.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "goal required"); }
-    match state.db.store_plan_state(conv_id, goal, &steps, &assumptions) {
+    match state.storage.db.store_plan_state(conv_id, goal, &steps, &assumptions) {
         Ok(id) => Json(json!({"status": "stored", "id": id})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
@@ -1201,7 +1197,7 @@ async fn lcm_plan_get(
     State(state): State<AppState>,
     Path(conv_id): Path<i64>,
 ) -> Response {
-    match state.db.get_active_plan(conv_id) {
+    match state.storage.db.get_active_plan(conv_id) {
         Ok(Some((id, goal, pending, assumptions))) => Json(json!({
             "id": id, "goal": goal,
             "pending_steps": pending,
@@ -1216,14 +1212,14 @@ async fn lcm_plan_get(
 async fn lcm_debug_dump(
     State(state): State<AppState>,
 ) -> Response {
-    let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
+    let cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
     let m = &cycle.metrics;
 
     // Cache stats (no content, just key counts)
-    let cache_entry_count = state.db.top_tool_cache_entries(999).unwrap_or_default().len();
+    let cache_entry_count = state.storage.db.top_tool_cache_entries(999).unwrap_or_default().len();
     let (total_nodes, total_convs, total_embeddings, active_plan_count, event_count) =
-        state.db.debug_counts().unwrap_or((-1, -1, -1, -1, -1));
-    let failure_count: i64 = state.db.search_failure_patterns("error", 9999)
+        state.storage.db.debug_counts().unwrap_or((-1, -1, -1, -1, -1));
+    let failure_count: i64 = state.storage.db.search_failure_patterns("error", 9999)
         .map(|r| r.len() as i64).unwrap_or(-1);
 
     Json(json!({
@@ -1267,24 +1263,28 @@ async fn lcm_runtime_report(
     let fmt = params.get("format").map(|s| s.as_str()).unwrap_or("md");
 
     // Per-conversation data if conv_id provided
-    let (_leaf_count, _summary_count, total_tokens, failure_count) = conv_id
-        .and_then(|cid| state.db.collect_session_metrics(cid).ok())
-        .unwrap_or((0, 0, 0, 0));
+    let (_leaf_count, _summary_count, total_tokens, failure_count) = match conv_id.and_then(|cid| state.storage.db.collect_session_metrics(cid).ok()) {
+        Some(m) => m,
+        None => {
+            if conv_id.is_some() {
+                tracing::warn!(target: "deeplossless", "collect_session_metrics failed for conv_id={:?}", conv_id);
+            }
+            (0, 0, 0, 0)
+        }
+    };
 
-    let top_reused = state.db.top_tool_cache_entries(8)
+    let top_reused = state.storage.db.top_tool_cache_entries(8)
         .unwrap_or_default()
         .into_iter()
         .map(|(name, count)| (name, count as u64))
         .collect::<Vec<_>>();
 
     let duration: u64 = params.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mut cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-    // If conv_id provided, override global metrics with per-session data
+    // Override global metrics with per-session data for accurate reporting
     if conv_id.is_some() {
-        cycle.metrics.tokens_spent = total_tokens as u64;
-        cycle.metrics.repeated_failures = failure_count as u64;
-        cycle.metrics.failure_streak = failure_count.min(1) as u32;
+        cycle.set_session_metrics(total_tokens as u64, failure_count as u64, failure_count.min(1) as u32);
     }
 
     if fmt == "svg" {
@@ -1317,7 +1317,7 @@ async fn lcm_audit_trail(
         limit: 500,
         ..Default::default()
     };
-    match crate::audit::build_audit_trail(&state.db, &query) {
+    match crate::audit::build_audit_trail(&state.storage.db, &query) {
         Ok(records) => Json(json!({"conv_id": conv_id, "records": records, "total": records.len()})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "AUDIT_ERROR", format!("{e}")),
     }
@@ -1332,7 +1332,7 @@ async fn lcm_audit_report(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match crate::audit::build_audit_report(&state.db, Some(conv_id)) {
+    match crate::audit::build_audit_report(&state.storage.db, Some(conv_id)) {
         Ok(report) => Json(json!({"conv_id": conv_id, "report": report})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "AUDIT_REPORT_ERROR", format!("{e}")),
     }
@@ -1347,7 +1347,7 @@ async fn lcm_score(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match state.db.compute_execution_score(conv_id) {
+    match state.storage.db.compute_execution_score(conv_id) {
         Ok(score) => Json(score).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SCORE_ERROR", format!("{e}")),
     }
@@ -1361,13 +1361,19 @@ async fn lcm_replay(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match crate::replay::replay_execution(&state.db, execution_id) {
-        Ok(events) => {
-            let items: Vec<serde_json::Value> = events
+    match crate::replay::replay_execution(&state.storage.db, execution_id) {
+        Ok(result) => {
+            let items: Vec<serde_json::Value> = result
+                .events
                 .iter()
-                .map(|(seq, ev)| serde_json::json!({"seq_no": seq, "event": ev}))
+                .map(|e| serde_json::json!({"seq_no": e.seq_no, "event": e.event, "schema_version": e.schema_version}))
                 .collect();
-            Json(json!({"execution_id": execution_id, "events": items, "total": items.len()})).into_response()
+            Json(json!({
+                "execution_id": execution_id,
+                "events": items,
+                "total": items.len(),
+                "corrupt_count": result.corrupt_count,
+            })).into_response()
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "REPLAY_ERROR", format!("{e}")),
     }
@@ -1384,7 +1390,7 @@ async fn lcm_snapshot_take(
     }
     let execution_id = body.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let memory_version_id = body.get("memory_version_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let tier = body.get("tier").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let tier_raw = body.get("tier").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("{}");
     let size_bytes = data.len() as i64;
     let ttl = body.get("retention_ttl").and_then(|v| v.as_i64());
@@ -1392,9 +1398,26 @@ async fn lcm_snapshot_take(
     if execution_id == 0 {
         return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "execution_id required");
     }
-    match state.db.take_snapshot(execution_id, memory_version_id, tier, data, size_bytes, ttl) {
+
+    // Validate tier — fail fast on invalid values
+    if let Err(e) = crate::snapshot::SnapshotTier::from_i32(tier_raw) {
+        return json_error(StatusCode::BAD_REQUEST, "INVALID_TIER", format!("{e}"));
+    }
+
+    // Compute continuity metadata from the provided data
+    let last_event_seq_no = body.get("last_event_seq_no").and_then(|v| v.as_i64()).unwrap_or(0);
+    let boundary_hash = crate::snapshot::compute_boundary_hash(
+        &[(0_i64, data)],
+        1,
+    );
+    let integrity_hash = crate::snapshot::compute_chain_hash(&[(0_i64, data)]);
+
+    match state.storage.db.take_snapshot(
+        execution_id, memory_version_id, tier_raw, data, size_bytes, ttl,
+        last_event_seq_no, &boundary_hash, &integrity_hash,
+    ) {
         Ok(id) => {
-            let _ = state.db.enforce_snapshot_budget(&crate::snapshot::SnapshotBudget::default());
+            let _ = state.storage.db.enforce_snapshot_budget(&crate::snapshot::SnapshotBudget::default());
             Json(json!({"status": "stored", "id": id})).into_response()
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
@@ -1409,7 +1432,7 @@ async fn lcm_versions(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match state.db.list_memory_versions(50) {
+    match state.storage.db.list_memory_versions(50) {
         Ok(versions) => Json(json!({"versions": versions})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "VERSION_ERROR", format!("{e}")),
     }
@@ -1423,7 +1446,7 @@ async fn lcm_runtime_stats(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let cycle = state.cycle.lock().unwrap_or_else(|e| e.into_inner());
+    let cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
     let m = &cycle.metrics;
     let total_cache = m.cache_hits + m.cache_misses;
     Json(json!({
@@ -1453,7 +1476,7 @@ async fn lcm_execution_search(
     }
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
-    match state.dag.search_execution_memory(query, limit) {
+    match state.storage.dag.search_execution_memory(query, limit) {
         Ok(refs) => Json(json!({ "results": refs })).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("{e}")),
     }
@@ -1469,7 +1492,7 @@ async fn lcm_global_search(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
-    match state.dag.search_cross_session(query, limit) {
+    match state.storage.dag.search_cross_session(query, limit) {
         Ok(results) => {
             let items: Vec<Value> = results.iter().map(|(nid, cid, summary)| json!({
                 "node_id": nid,
@@ -1489,7 +1512,7 @@ async fn lcm_dag_health(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }    match state.dag.validate_dag(conv_id) {
+    }    match state.storage.dag.validate_dag(conv_id) {
         Ok(issues) => {
             let healthy = issues.is_empty();
             Json(json!({
@@ -1510,7 +1533,7 @@ async fn lcm_similar(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }    match state.db.find_similar_by_hash(&hash) {
+    }    match state.storage.db.find_similar_by_hash(&hash) {
         Ok(results) => Json(json!({
             "hash": hash,
             "matches": results.iter().map(|(h, nid, cid, preview)| json!({
@@ -1532,7 +1555,7 @@ async fn lcm_trace(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }    match state.db.get_provenance_with_excerpts(node_id) {
+    }    match state.storage.db.get_provenance_with_excerpts(node_id) {
         Ok(rows) => {
             let sources: Vec<Value> = rows.iter().map(|(sid, off, len, excerpt)| json!({
                 "source_node_id": sid,
@@ -1558,9 +1581,9 @@ async fn lcm_status(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let leaves = state.dag.get_leaves(conv_id).unwrap_or_default();
-    let tip = state.dag.get_active_tip(conv_id).ok().flatten();
-    let total = state.dag.total_tokens(conv_id).unwrap_or(0);
+    let leaves = state.storage.dag.get_leaves(conv_id).unwrap_or_default();
+    let tip = state.storage.dag.get_active_tip(conv_id).ok().flatten();
+    let total = state.storage.dag.total_tokens(conv_id).unwrap_or(0);
     Json(json!({
         "conversation_id": conv_id,
         "total_tokens": total,
@@ -1575,7 +1598,6 @@ async fn lcm_status(
 
 #[derive(serde::Deserialize)]
 struct LcmRangeOp {
-    #[allow(dead_code)]
     conv_id: i64,
     from: i64,
     to: i64,
@@ -1583,8 +1605,6 @@ struct LcmRangeOp {
 
 #[derive(serde::Deserialize)]
 struct LcmIdOp {
-    #[allow(dead_code)]
-    conv_id: i64,
     id: i64,
 }
 
@@ -1600,7 +1620,7 @@ async fn lcm_compress(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "Context-ReAct requires Authorization header");
     }
     // Try DAG leaves first, then fall back to raw messages
-    let content: Vec<String> = match state.dag.get_leaves(op.conv_id) {
+    let content: Vec<String> = match state.storage.dag.get_leaves(op.conv_id) {
         Ok(leaves) if leaves.len() >= 2 => leaves.iter()
             .skip_while(|n| n.id < op.from)
             .take_while(|n| n.id <= op.to)
@@ -1608,7 +1628,7 @@ async fn lcm_compress(
             .collect(),
         _ => {
             // Fallback: read from DB directly
-            let db = state.dag.db();
+            let db = state.storage.dag.db();
             let raw = db.get_messages_in_range(op.conv_id, op.from, op.to);
             match raw {
                 Ok(msgs) if msgs.len() >= 2 => msgs,
@@ -1629,11 +1649,11 @@ async fn lcm_compress(
     };
 
     match summarizer.summarize_escalate(&text).await {
-        Ok((summary, _level)) => {
-            let tc = crate::tokenizer::count(&summary) as i64;
+        Ok(result) => {
+            let tc = crate::tokenizer::count(&result.text) as i64;
             let snippets = crate::snippet::extract(&text);
-            match state.dag.compress_group_with_snippets(
-                op.conv_id, &[], &summary, tc, 1, &snippets,
+            match state.storage.dag.compress_group_with_snippets(
+                op.conv_id, &[], &result.text, tc, 1, &snippets,
             ) {
                 Ok(node) => Json(json!({
                     "node_id": node.id,
@@ -1660,7 +1680,7 @@ async fn lcm_delete(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match state.dag.db().delete_dag_node(op.id) {
+    match state.storage.dag.db().delete_dag_node(op.id) {
         Ok(_) => Json(json!({"deleted": op.id})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DELETE_ERROR", format!("delete: {e}")),
     }
@@ -1677,12 +1697,12 @@ async fn lcm_rollback(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let node = match state.dag.get_node(op.id) {
+    let node = match state.storage.dag.get_node(op.id) {
         Ok(Some(n)) => n,
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     };
-    let children = state.dag.get_children(op.id).unwrap_or_default();
+    let children = state.storage.dag.get_children(op.id).unwrap_or_default();
     Json(json!({
         "rollback_to": op.id,
         "summary": node.summary,
@@ -1706,7 +1726,7 @@ async fn lcm_motifs(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    match crate::motif::extract_motifs_from_db(&state.db, &[conv_id], None) {
+    match crate::motif::extract_motifs_from_db(&state.storage.db, &[conv_id], None) {
         Ok(motifs) => Json(json!({"conv_id": conv_id, "motifs": motifs})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "MOTIF_ERROR", format!("{e}")),
     }
@@ -1728,15 +1748,8 @@ async fn lcm_observe(
     }
     let observation = crate::file_observation::observe_file(path, content);
 
-    // Persist to file_observations table
-    if let Err(e) = state.db.store_file_observation(
-        &observation.path,
-        &observation.content_hash,
-        &observation.semantic_hash,
-        &serde_json::to_string(&observation.ast).unwrap_or_default(),
-        observation.size_bytes,
-        observation.line_count,
-    ) {
+    // Persist to file_observations table (P0 transactional snapshot)
+    if let Err(e) = state.storage.db.store_file_observation(&observation) {
         tracing::warn!(target: "deeplossless::proxy", "failed to persist file observation: {e}");
     }
 

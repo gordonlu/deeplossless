@@ -103,8 +103,8 @@ pub struct ChatPipeline {
 impl ChatPipeline {
     pub fn new(state: &AppState) -> Self {
         Self {
-            db: state.db.clone(),
-            dag: state.dag.clone(),
+            db: state.storage.db.clone(),
+            dag: state.storage.dag.clone(),
             compactor: state.compactor.clone(),
         }
     }
@@ -246,7 +246,9 @@ impl ChatPipeline {
                     // Update tracker with result
                     if !unit.tool_call_id.is_empty() {
                         for tracker in &mut active_trackers {
-                            tracker.record_branch_result(&unit.tool_call_id, exec_id, &unit.outcome);
+                            if let Err(e) = tracker.record_branch_result(&unit.tool_call_id, exec_id, &unit.outcome) {
+                                tracing::warn!(target: "deeplossless::pipeline", "record_branch_result: {e}");
+                            }
                         }
                     }
 
@@ -300,7 +302,13 @@ impl ChatPipeline {
                         &[],
                     ) {
                         Ok(join_node) => {
-                            let edges = tracker.clone().complete(join_node.id);
+                            let edges = match tracker.clone().complete(join_node.id) {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    tracing::warn!(target: "deeplossless::pipeline", "complete failed: {e}");
+                                    continue;
+                                }
+                            };
                             for hb in &edges {
                                 if let Err(e) = db.insert_edge(
                                     hb.from_id, hb.to_id, "happens_before",
@@ -333,10 +341,12 @@ impl ChatPipeline {
                 CompactEvent::GroupCompressed { tokens_saved, .. } => {
                     tracing::debug!(target: "deeplossless::pipeline", conv_id, tokens_saved, "compaction completed");
                 }
-                CompactEvent::BelowThreshold => {}
-                CompactEvent::Error { message } => {
+                CompactEvent::BelowThreshold { .. } => {}
+                CompactEvent::Error { message, .. } => {
                     tracing::warn!(target: "deeplossless::pipeline", conv_id, error = %message, "compaction error");
                 }
+                CompactEvent::CompactionCompleted { .. } => {}
+                CompactEvent::Pong => {}
             }
         }
         drop(compactor);

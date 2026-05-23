@@ -1,39 +1,5 @@
-use axum::{
-    http::StatusCode,
-    middleware::{self, Next},
-    response::Response,
-    extract::Request,
-};
 use clap::Parser;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex;
-use tower_http::catch_panic::CatchPanicLayer;
-use tower_http::cors::CorsLayer;
-use tower_http::limit::RequestBodyLimitLayer;
-
-use deeplossless::AppState;
-
-/// Rate limiter state (written once at startup, read on every request).
-static RATE_COUNT: AtomicU64 = AtomicU64::new(0);
-static RATE_MAX: AtomicU64 = AtomicU64::new(100);
-
-async fn rate_limit_mw(
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let max = RATE_MAX.load(Ordering::Relaxed);
-    if max == 0 {
-        return Ok(next.run(req).await);
-    }
-    let prev = RATE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if prev >= max {
-        deeplossless::metrics::RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(next.run(req).await)
-}
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Inference-aware execution runtime for AI coding agents")]
@@ -107,11 +73,12 @@ enum Commands {
 
 async fn run_demo() -> anyhow::Result<()> {
     use deeplossless::runtime::RuntimeProfile;
+    let demo_db_path = std::env::temp_dir().join("deeplossless_demo.db");
     let db = Arc::new(deeplossless::db::Database::builder()
-        .path("/tmp/deeplossless_demo.db").build().await?);
+        .path(&demo_db_path).build().await?);
     let dag = Arc::new(deeplossless::dag::DagEngine::builder()
         .max_level(3).recent_messages(20).build(db.clone()));
-    let _cycle = Arc::new(StdMutex::new(
+    let _cycle = Arc::new(std::sync::Mutex::new(
         deeplossless::runtime::ExecutionCycle::new(RuntimeProfile::Efficient)));
 
     // Quick smoke test — insert a conversation to verify DB/DAG work
@@ -139,7 +106,7 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("    curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .\n");
     println!("  Benchmarks (no API key needed):");
     println!("    cargo test --test long_session_benchmark -- --nocapture\n");
-    let _ = std::fs::remove_file("/tmp/deeplossless_demo.db");
+    let _ = std::fs::remove_file(&demo_db_path);
     Ok(())
 }
 
@@ -170,7 +137,7 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
 
     // Run translation: Responses → Canonical → Chat Completions
     let mut canonical = deeplossless::protocol::responses::request_from_responses(&req_body);
-    canonical.model = map_model_protocol(&canonical.model);
+    canonical.model = deeplossless::protocol::map_model(&canonical.model);
     let chat_body = deeplossless::protocol::chat_completions::request_to_chat(&canonical);
 
     // Show translated messages
@@ -201,16 +168,6 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn map_model_protocol(model: &str) -> String {
-    let m = model.to_lowercase();
-    if m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m == "gpt-5.5" {
-        if m.contains("mini") { return "deepseek-v4-flash".into(); }
-        return "deepseek-v4-pro".into();
-    }
-    if model.is_empty() || model == "auto" { return "deepseek-v4-pro".into(); }
-    model.to_string()
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -229,94 +186,21 @@ async fn main() -> anyhow::Result<()> {
         return run_translate(&file);
     }
 
-    let upstream = cli.upstream.clone();
-    let db = Arc::new(
-        deeplossless::db::Database::builder()
-            .path(&cli.db_path)
-            .build()
-            .await?,
-    );
-    let dag = Arc::new(
-        deeplossless::dag::DagEngine::builder()
-            .build(db.clone()),
-    );
-
-    let initial_api_key = cli.api_key.clone()
-        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
-
-    let compactor_config = deeplossless::compactor::CompactorConfig {
-        summarizer: deeplossless::summarizer::SummarizerConfig {
-            api_key: initial_api_key.clone().unwrap_or_default(),
-            upstream: upstream.clone(),
-            model: cli.summarizer_model.clone(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let compactor = Arc::new(Mutex::new(
-        deeplossless::compactor::Compactor::spawn(db.clone(), compactor_config),
-    ));
-
-    // Spawn background mutation engine
-    let mutation_engine = Arc::new(
-        deeplossless::mutation::MutationEngine::new(
-            deeplossless::mutation::MutationConfig::default(),
-            db.clone(),
-            dag.clone(),
-        ),
-    );
-    deeplossless::mutation::spawn_mutation_cycle(
-        mutation_engine,
-        deeplossless::mutation::MutationConfig::default().interval_secs,
-    );
-
-    let state = AppState {
+    let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
         upstream: cli.upstream,
-        api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
-        admin_key: Arc::new(std::sync::Mutex::new(cli.admin_key)),
-        db,
-        dag,
-        compactor,
-        client: reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?,
+        db_path: cli.db_path,
+        api_key: cli.api_key,
+        admin_key: cli.admin_key,
         summarizer_model: cli.summarizer_model,
-        cycle: Arc::new(std::sync::Mutex::new(
-            deeplossless::runtime::ExecutionCycle::new(match cli.runtime_profile.as_str() {
-                "minimal" => deeplossless::runtime::RuntimeProfile::Minimal,
-                "efficient" => deeplossless::runtime::RuntimeProfile::Efficient,
-                "exploratory" => deeplossless::runtime::RuntimeProfile::Exploratory,
-                "autonomous" => deeplossless::runtime::RuntimeProfile::Autonomous,
-                "custom" => deeplossless::runtime::RuntimeProfile::Custom,
-                other => {
-                    tracing::warn!(target: "deeplossless", "unknown runtime profile '{other}', falling back to autonomous");
-                    deeplossless::runtime::RuntimeProfile::Autonomous
-                }
-            })
-        )),
+        rate_limit: cli.rate_limit,
+        runtime_profile: cli.runtime_profile,
         dry_run: cli.dry_run,
-        response_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
         log_dir: cli.log_dir,
     };
+    let coordinator = deeplossless::runtime_coordinator::RuntimeCoordinator::build(cfg).await?;
+    let upstream = coordinator.state.upstream.clone();
 
-    // Reset rate counter every second
-    RATE_MAX.store(cli.rate_limit, Ordering::Relaxed);
-    if cli.rate_limit > 0 {
-        tokio::spawn(async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                RATE_COUNT.store(0, Ordering::Relaxed);
-            }
-        });
-    }
-
-    let app = deeplossless::proxy::routes()
-        .with_state(state)
-        .layer(axum::middleware::from_fn(deeplossless::metrics::middleware))
-        .layer(CatchPanicLayer::new())
-        .layer(CorsLayer::permissive())
-        .layer(middleware::from_fn(rate_limit_mw))
-        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024)); // 20 MB
+    let app = coordinator.router();
 
     let addr = format!("{}:{}", cli.host, cli.port);
     tracing::info!("deeplossless listening on {addr}");
@@ -324,14 +208,16 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Graceful shutdown: wait for SIGINT (Ctrl+C), then
-    // drain pending requests with a 15-second timeout.
+    // Graceful shutdown: signal → drain → cleanup
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
             tracing::info!("shutdown signal received, draining requests…");
         })
         .await?;
+
+    // Signal background tasks and wait with timeout
+    coordinator.shutdown(std::time::Duration::from_secs(15)).await;
 
     tracing::info!("deeplossless stopped");
 

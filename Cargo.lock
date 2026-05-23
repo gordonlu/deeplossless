@@ -405,6 +405,7 @@ dependencies = [
  "sha2",
  "shellexpand",
  "tempfile",
+ "thiserror",
  "tiktoken",
  "tokio",
  "tokio-stream",

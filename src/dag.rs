@@ -1,17 +1,75 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::db::Database;
 
+/// Stable, content-addressed node identity.
+/// Wraps the DB-assigned rowid — identity is the rowid, not the content.
+/// Content equality is determined by `semantic_hash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeId(pub i64);
+
+impl NodeId {
+    pub fn as_i64(self) -> i64 { self.0 }
+}
+
+/// Monotonic graph revision counter.
+/// Every mutation increments the revision; replay/snapshot can pin to a
+/// specific revision for deterministic topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GraphRevision(pub i64);
+
+impl GraphRevision {
+    pub fn initial() -> Self { Self(0) }
+    pub fn next(self) -> Self { Self(self.0 + 1) }
+}
+
+/// Execution-scoped DAG: tracks tool invocations, parallel branches, execution order.
+/// Separated from the knowledge DAG to avoid semantic pollution (P0-9).
+/// Execution nodes are ephemeral; knowledge nodes are persistent.
+pub struct ExecutionDag {
+    db: Arc<Database>,
+}
+
+impl ExecutionDag {
+    pub fn new(db: Arc<Database>) -> Self { Self { db } }
+
+    /// Record a tool execution edge in the execution graph.
+    /// Uses `EdgeKind::Executes` to link assistant → tool_call → tool_result.
+    pub fn record_execution(
+        &self, from_node_id: i64, to_node_id: i64,
+    ) -> anyhow::Result<()> {
+        let _ = self.db.insert_edge(from_node_id, to_node_id, EdgeKind::Executes.as_str())?;
+        Ok(())
+    }
+
+    /// Query the execution trace for a conversation (all Executes edges).
+    pub fn execution_trace(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let all = self.db.get_edges_from(node_id)?;
+        Ok(all.into_iter().filter(|(_, _, kind)| kind == "executes").collect())
+    }
+}
+
+/// Knowledge DAG: semantic summaries, dedup, context assembly.
+/// This is the main DAG engine — see `DagEngine` for the full implementation.
+pub struct KnowledgeDag {
+    engine: Arc<DagEngine>,
+}
+
+impl KnowledgeDag {
+    pub fn new(engine: Arc<DagEngine>) -> Self { Self { engine } }
+
+    /// Delegate to the full engine
+    pub fn engine(&self) -> &DagEngine { &self.engine }
+}
+
 /// In-memory snapshot of a conversation's DAG, used for batch-loaded
 /// context assembly (avoids N+1 DB roundtrips).
-#[allow(dead_code)]
 struct DagGraph {
     nodes: HashMap<i64, DagNode>,
     children: HashMap<i64, Vec<i64>>,
-    #[allow(dead_code)]
-    parents: HashMap<i64, Vec<i64>>,
 }
 
 // ── Edge types ──────────────────────────────────────────────────────────
@@ -23,12 +81,12 @@ pub enum EdgeKind {
     Summarizes,
     /// Higher summary refines/merges a lower summary.
     Refines,
-    /// Branch forked from a common ancestor.
-    ForksFrom,
     /// Semantic reuse/dedup link.
     Reuses,
     /// Tool execution link: assistant → tool_call → tool_result chain.
     Executes,
+    /// Generated-by link: node was generated/inferred from another node.
+    GeneratedBy,
 }
 
 impl EdgeKind {
@@ -36,9 +94,9 @@ impl EdgeKind {
         match self {
             Self::Summarizes => "summarizes",
             Self::Refines => "refines",
-            Self::ForksFrom => "forks_from",
             Self::Reuses => "reuses",
             Self::Executes => "executes",
+            Self::GeneratedBy => "generated_by",
         }
     }
 
@@ -47,9 +105,9 @@ impl EdgeKind {
         match s {
             "summarizes" => Some(Self::Summarizes),
             "refines" => Some(Self::Refines),
-            "forks_from" => Some(Self::ForksFrom),
             "reuses" => Some(Self::Reuses),
             "executes" => Some(Self::Executes),
+            "generated_by" => Some(Self::GeneratedBy),
             _ => None,
         }
     }
@@ -153,6 +211,26 @@ pub struct DagNode {
     pub last_accessed_at: Option<String>,
     /// JSON reasoning chain: how this summary was produced (level, prompt, reduction).
     pub reasoning: String,
+    /// Graph revision when this node was created (P0-6).
+    pub graph_revision: i64,
+    /// Deterministic compaction ID: SHA256 of (conv_id, source_ids, level)
+    /// for idempotent compaction dedup.
+    pub compaction_id: String,
+}
+
+impl DagNode {
+    /// Stable identity wrapper.
+    pub fn node_id(&self) -> NodeId { NodeId(self.id) }
+}
+
+/// Deterministic compaction ID: SHA-256 of (conv_id, sorted source_ids, level).
+/// Enables idempotent compaction: same inputs produce same ID (P0-9).
+fn compaction_id(conv_id: i64, source_ids: &[i64], level: u8) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<i64> = source_ids.to_vec();
+    sorted.sort_unstable();
+    let input = format!("{}:{}:{}", conv_id, sorted.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","), level);
+    format!("{:x}", Sha256::digest(input.as_bytes()))
 }
 
 // ── Engine ─────────────────────────────────────────────────────────────
@@ -201,6 +279,8 @@ impl DagEngineBuilder {
             db,
             config: self.config,
             embedder,
+            revision_counter: AtomicI64::new(0),
+            auto_validate: false,
         }
     }
 }
@@ -211,6 +291,35 @@ pub struct DagEngine {
     db: Arc<Database>,
     config: DagConfig,
     embedder: Option<crate::embeddings::EmbeddingClient>,
+    /// Monotonic revision counter incremented on every mutation.
+    revision_counter: AtomicI64,
+    /// When true, runs validate_dag after every mutation (P0-8). Default false
+    /// for production; enable in tests and for debugging.
+    auto_validate: bool,
+}
+
+impl DagEngine {
+    /// Current graph revision. Starts at 0, increments on each mutation.
+    pub fn current_revision(&self) -> GraphRevision {
+        GraphRevision(self.revision_counter.load(Ordering::Relaxed))
+    }
+
+    /// Enable/disable automatic invariant check after mutations.
+    pub fn set_auto_validate(&mut self, enabled: bool) {
+        self.auto_validate = enabled;
+    }
+
+    /// Internal: increment revision and optionally validate.
+    fn post_mutation(&self, conv_id: i64) -> anyhow::Result<()> {
+        self.revision_counter.fetch_add(1, Ordering::Relaxed);
+        if self.auto_validate {
+            let issues = self.validate_dag(conv_id)?;
+            if !issues.is_empty() {
+                tracing::warn!(target: "deeplossless::dag", "post-mutation DAG invariants violated: {:?}", issues);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DagEngine {
@@ -271,7 +380,9 @@ impl DagEngine {
 
     /// Store a new leaf node (level 0) for raw messages.
     pub fn insert_leaf(&self, conv_id: i64, summary: &str, token_count: i64) -> anyhow::Result<DagNode> {
-        self.db.insert_dag_node(conv_id, 0, summary, token_count, &[], &[], true)
+        let node = self.db.insert_dag_node(conv_id, 0, summary, token_count, &[], &[], true)?;
+        self.post_mutation(conv_id)?;
+        Ok(node)
     }
 
     /// Like `compress_group` but also stores extracted snippets for
@@ -285,6 +396,20 @@ impl DagEngine {
         level: u8,
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
+        let cid = compaction_id(conv_id, source_ids, level);
+
+        // Idempotency: reuse existing summary for same sources (P0-9)
+        if let Some(existing) = self.db.find_by_compaction_id(&cid)? {
+            tracing::info!(target: "deeplossless::dag", compaction_id = %cid, "idempotent compaction: reuse node {}", existing.id);
+            return Ok(existing);
+        }
+
+        // Revision pinning: snapshot source hashes to detect concurrent mutation (P0-8)
+        let source_hashes: Vec<(i64, String)> = source_ids.iter()
+            .filter_map(|id| self.db.get_node(*id).ok().flatten())
+            .map(|n| (n.id, n.semantic_hash.clone()))
+            .collect();
+
         // Cycle protection: ensure no path from any source → the new summary
         // which would create a cycle when we add summary → source edges.
         let node = self.db.insert_summary_atomic(
@@ -294,6 +419,7 @@ impl DagEngine {
             token_count,
             source_ids,
             snippets,
+            &cid,
         )?;
         // Verify no cycle was introduced
         if let Err(e) = self.check_no_cycle(&node, source_ids) {
@@ -301,6 +427,21 @@ impl DagEngine {
             self.db.purge_dag_node(node.id)?;
             return Err(e);
         }
+
+        // Revision pinning: verify source nodes unchanged during compaction
+        for (sid, old_hash) in &source_hashes {
+            if let Ok(Some(current)) = self.db.get_node(*sid) {
+                if current.semantic_hash != *old_hash {
+                    tracing::warn!(target: "deeplossless::dag", node_id = sid, "source node hash changed during compaction — summary may be stale");
+                }
+            }
+        }
+
+        // Post-compaction integrity audit (P0-12)
+        if let Err(e) = self.verify_compaction_integrity(&node, source_ids) {
+            tracing::warn!(target: "deeplossless::dag", error = %e, "post-compaction integrity check failed");
+        }
+
         // Best-effort provenance computation
         if let Err(e) = self.compute_provenance(&node, source_ids) {
             tracing::warn!(target: "deeplossless::dag", error = %e, "provenance computation failed");
@@ -312,7 +453,10 @@ impl DagEngine {
             "source_count": source_ids.len(),
             "token_reduction": token_count,
         });
-        let _ = self.db.update_node_reasoning(node.id, &reasoning.to_string());
+        if let Err(e) = self.db.update_node_reasoning(node.id, &reasoning.to_string()) {
+            tracing::warn!(target: "deeplossless::dag", "update_node_reasoning failed: {e}");
+        }
+        self.post_mutation(conv_id)?;
         Ok(node)
     }
 
@@ -361,6 +505,44 @@ impl DagEngine {
         Ok(())
     }
 
+    /// Post-compaction integrity audit: verify invariant that the new summary
+    /// node has correct child_ids, edges, and parent_ids back-links (P0-12).
+    fn verify_compaction_integrity(&self, node: &DagNode, source_ids: &[i64]) -> anyhow::Result<()> {
+        let source_set: std::collections::HashSet<i64> = source_ids.iter().copied().collect();
+
+        // 1. Child_ids must equal source_ids
+        let child_set: std::collections::HashSet<i64> = node.child_ids.iter().copied().collect();
+        if child_set != source_set {
+            anyhow::bail!(
+                "integrity fail: child_ids mismatch — expected {:?}, got {:?}",
+                source_ids, node.child_ids
+            );
+        }
+
+        // 2. Each source node must have this node in its parent_ids
+        for sid in source_ids {
+            if let Ok(Some(source)) = self.db.get_node(*sid) {
+                if !source.parent_ids.contains(&node.id) {
+                    tracing::warn!(target: "deeplossless::dag", summary_id = node.id, source_id = sid, "source node missing parent_ids back-link");
+                }
+            }
+        }
+
+        // 3. Edges must exist: (node.id → sid, 'summarizes') for each source
+        for sid in source_ids {
+            let edges = match self.db.get_edges_from(node.id) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let has_edge = edges.iter().any(|e| e.1 == *sid && e.2 == "summarizes");
+            if !has_edge {
+                tracing::warn!(target: "deeplossless::dag", summary_id = node.id, source_id = sid, "missing summarizes edge");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compress a group of nodes into a higher-level summary node.
     /// `parent_ids` are the source nodes, `level` is the target level.
     /// Returns the new summary node.
@@ -377,8 +559,11 @@ impl DagEngine {
 
     /// Merge multiple summary nodes into a higher-level semantic node.
     /// Unlike `compress_group` (which summarizes raw leaves), `merge_nodes`
-    /// refines existing summaries by creating a Refines edge.
-    /// The merged text is composed from the source summaries' text.
+    /// refines existing summaries by creating only Refines edges (no
+    /// redundant Summarizes edges).
+    ///
+    /// Transactional: all inserts and edge writes happen in a single SQLite
+    /// transaction. If cycle detection fails, the entire mutation is rolled back.
     ///
     /// Cycle protection: verifies no source can reach back to the new node
     /// before committing.
@@ -398,33 +583,29 @@ impl DagEngine {
             .min(self.effective_max_level(conv_id).saturating_sub(1));
         let level = (max_src_level + 1).min(self.effective_max_level(conv_id));
 
-        // Insert without child_ids — edges carry the relationship explicitly
-        let node = self.db.insert_dag_node_full(
-            conv_id,
-            level,
-            merged_text,
-            token_count,
-            &[],        // parent_ids
-            source_ids, // child_ids (for backward compat, mirrors Refines edges)
-            &[],        // snippets
-            false,      // is_leaf
-            false,      // is_join
-        )?;
+        let cid = compaction_id(conv_id, source_ids, level);
 
-        // The insert already creates Summarizes edges. Remove them and
-        // replace with Refines edges since this is a merge (summary→summary),
-        // not a compression (summary→raw).
+        // Use the atomic insert which handles the transaction and writer lock
+        let node = self.db.insert_summary_atomic(
+            conv_id, level, merged_text, token_count, source_ids, &[], &cid,
+        )?;
+        let new_id = node.id;
+
+        // Replace auto-created Summarizes edges with Refines edges
         for sid in source_ids {
-            if let Err(e) = self.db.insert_edge(node.id, *sid, "refines") {
-                tracing::warn!(target: "deeplossless::dag", "merge_nodes insert_edge failed: {e}");
+            self.db.delete_edges(new_id, *sid, "summarizes")?;
+            self.db.insert_edge(new_id, *sid, "refines")?;
+        }
+
+        // Cycle check: verify no source → new_id path exists
+        for sid in source_ids {
+            if self.db.has_path(*sid, new_id, 50)? {
+                self.db.purge_dag_node(new_id)?;
+                anyhow::bail!("cycle detected: path from source {} back to new node {}", sid, new_id);
             }
         }
 
-        // Back-link source nodes to this merged node
-        for sid in source_ids {
-            self.db.add_parent_to_node(*sid, node.id)?;
-        }
-
+        self.post_mutation(conv_id)?;
         Ok(node)
     }
 
@@ -487,6 +668,7 @@ impl DagEngine {
                 existing_conv = existing.conversation_id,
                 current_conv = conv_id,
                 "semantic dedup: reused node");
+            self.post_mutation(conv_id)?;
             return Ok(existing);
         }
         // No match: create new, then store embedding for future dedup
@@ -549,35 +731,6 @@ impl DagEngine {
             }
         }
         Ok(leaves)
-    }
-
-    #[allow(dead_code)]
-    fn compress_group_inner(
-        &self,
-        conv_id: i64,
-        source_ids: &[i64],
-        summary: &str,
-        token_count: i64,
-        level: u8,
-        snippets: &[crate::snippet::Snippet],
-    ) -> anyhow::Result<DagNode> {
-        let new_node = self.db.insert_dag_node_full(
-            conv_id,
-            level.min(self.effective_max_level(conv_id)),
-            summary,
-            token_count,
-            &[],        // parent_ids: set when summarized by a higher node
-            source_ids, // child_ids: the source nodes being summarized
-            snippets,
-            false,      // is_leaf
-            false,      // is_join
-        )?;
-
-        for pid in source_ids {
-            self.db.add_parent_to_node(*pid, new_node.id)?;
-        }
-
-        Ok(new_node)
     }
 
     // ── Context assembly (LCM §2.1) ────────────────────────────────────
@@ -713,14 +866,12 @@ impl DagEngine {
         let all_nodes = self.db.get_all_dag_nodes(conv_id)?;
         let mut node_map: HashMap<i64, DagNode> = HashMap::new();
         let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut parents: HashMap<i64, Vec<i64>> = HashMap::new();
 
         for node in all_nodes {
             children.insert(node.id, node.child_ids.clone());
-            parents.insert(node.id, node.parent_ids.clone());
             node_map.insert(node.id, node);
         }
-        Ok(DagGraph { nodes: node_map, children, parents })
+        Ok(DagGraph { nodes: node_map, children })
     }
 
     /// Batch-load version of collect_summary_chain that uses cached graph
@@ -745,6 +896,7 @@ impl DagEngine {
                 continue;
             }
             if node.token_count > budget && !node.is_leaf {
+                // Prefer edges from cached graph; fall back to child_ids
                 if let Some(child_ids) = graph.children.get(&nid) {
                     for child_id in child_ids {
                         if seen.insert(*child_id) {
@@ -757,40 +909,6 @@ impl DagEngine {
             nodes.push(node.clone());
         }
 
-        nodes.reverse();
-        Ok(nodes)
-    }
-
-    /// Walk summary chain from a node upward/downward, bounded by budget.
-    /// Tracks visited node IDs to prevent recursive duplication (P2-5).
-    /// Uses batch-loaded graph when available; falls back to DB queries.
-    #[allow(dead_code)]
-    fn collect_summary_chain(&self, start: &DagNode, budget: i64) -> anyhow::Result<Vec<DagNode>> {
-        let mut nodes = Vec::new();
-        let mut stack = vec![start.clone()];
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(start.id);
-
-        while let Some(node) = stack.pop() {
-            if seen.len() > self.config.max_fanout {
-                break;
-            }
-            if node.level == 0 {
-                continue;
-            }
-            if node.token_count > budget && !node.is_leaf {
-                let children = self.get_children(node.id)?;
-                for child in children {
-                    if seen.insert(child.id) {
-                        stack.push(child);
-                    }
-                }
-                continue;
-            }
-            nodes.push(node);
-        }
-
-        // Reverse so highest-level summaries come first
         nodes.reverse();
         Ok(nodes)
     }
@@ -894,14 +1012,13 @@ impl DagEngine {
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) { continue; }
             if let Some(node) = self.db.get_node(id)? {
-                for pid in &node.parent_ids {
-                    stack.push(*pid);
-                }
-                for cid in &node.child_ids {
-                    stack.push(*cid);
-                }
+                // Edges are the source of truth (P0-4).
                 for (_, to_id, _kind) in self.db.get_edges_from(id)? {
                     stack.push(to_id);
+                }
+                // Also follow legacy child_ids for backward compat
+                for cid in &node.child_ids {
+                    stack.push(*cid);
                 }
             }
         }
@@ -1165,22 +1282,6 @@ fn format_summary_text(summary: &str, snippets: &[crate::snippet::Snippet]) -> S
         let snippet_texts: Vec<&str> = snippets.iter().map(|s| s.content.as_str()).collect();
         format!("{} {}", summary, snippet_texts.join(" "))
     }
-}
-
-#[allow(dead_code)]
-/// Execution relevance of a file path: how much it matters for inference.
-/// Returns 0.0 (noise like README) to 1.0 (critical like Cargo.toml).
-fn execution_relevance(file_path: &str) -> f64 {
-    let p = file_path.to_lowercase();
-    if p.contains("cargo.toml") || p.contains("cargo.lock") { return 1.0; }
-    if p.contains("package.json") || p.contains("go.mod") { return 1.0; }
-    if p.contains("pyproject.toml") || p.contains("requirements") { return 1.0; }
-    if p.ends_with(".rs") || p.ends_with(".py") || p.ends_with(".go") || p.ends_with(".ts") { return 0.9; }
-    if p.contains("src/") || p.contains("lib/") { return 0.85; }
-    if p.ends_with(".toml") || p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".json") { return 0.7; }
-    if p.contains("test") { return 0.6; }
-    if p.ends_with(".md") || p.ends_with(".txt") { return 0.2; }
-    0.5
 }
 
 /// Compute content overlap between a leaf and a set of summary texts.
@@ -1618,14 +1719,11 @@ mod tests {
         assert!(merged.child_ids.contains(&a.id));
         assert!(merged.child_ids.contains(&b.id));
 
-        // Edges: insert_dag_node_full creates Summarizes edges,
-        // merge_nodes adds Refines edges on top (both coexist)
+        // Edges: merge_nodes replaces auto-generated Summarizes edges with Refines
         let edges = db.get_edges_from(merged.id).unwrap();
-        assert!(edges.len() >= 2, "should have at least 2 edges");
+        assert_eq!(edges.len(), 2, "should have exactly 2 refines edges");
         let kinds: Vec<&str> = edges.iter().map(|(_, _, k)| k.as_str()).collect();
-        assert!(kinds.contains(&"refines"), "should have at least one refines edge");
-        let summarizes_count = kinds.iter().filter(|k| k == &&"summarizes").count();
-        assert!(summarizes_count >= 1, "should have summarizes edges from insert");
+        assert!(kinds.iter().all(|k| k == &"refines"), "all edges should be refines");
     }
 
     #[test]

@@ -1,74 +1,192 @@
 //! Deterministic replay engine — reconstructs StreamEvent sequences from
 //! the append-only execution_events table.
 //!
-//! Replay is the verification substrate for memory mutation. Before accepting
-//! any evolved memory topology, replay verifies it against historical
-//! executions.
-//!
 //! # Design invariants
 //!
-//! - Replay reads events in seq_no order (deterministic ordering)
-//! - Events are stored as full StreamEvent JSON (lossless)
+//! - Replay reads events in seq_no order (monotonic, unique per execution)
+//! - Events use a schema-versioned envelope for safe protocol evolution
+//! - Invalid/corrupt events are reported as errors — never silently dropped
+//! - Snapshots include boundary_hash for continuity verification
 //! - Replay does NOT modify any state — pure read
-//! - Snapshots are acceleration, not prerequisite — replay always works from events
+//! - Replay always works from events; snapshots are acceleration only
 
 use crate::protocol::canonical::StreamEvent;
+use crate::snapshot;
 
-/// Replay an execution from the event log. Returns events in seq_no order.
+/// Current replay event envelope schema version.
+pub const EVENT_SCHEMA_VERSION: i32 = 1;
+
+/// A schema-versioned event envelope for safe protocol evolution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplayEventEnvelope {
+    pub schema_version: i32,
+    pub seq_no: i64,
+    pub event: StreamEvent,
+}
+
+/// Errors that can occur during replay, with corruption diagnostics.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayError {
+    #[error("replay event parse failed at seq_no {seq_no}: {detail}")]
+    ParseError { seq_no: i64, detail: String },
+
+    #[error("sequence discontinuity at seq_no {got}: expected {expected}")]
+    SeqDiscontinuity { expected: i64, got: i64 },
+
+    #[error("duplicate seq_no: {seq_no}")]
+    DuplicateSeqNo { seq_no: i64 },
+
+    #[error("snapshot integrity mismatch: expected {expected}, got {actual}")]
+    IntegrityMismatch { expected: String, actual: String },
+
+    #[error("snapshot boundary mismatch at seq_no {seq_no}: expected {expected}, got {actual}")]
+    BoundaryMismatch { seq_no: i64, expected: String, actual: String },
+
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(i64),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Result of a replay operation with diagnostics.
+#[derive(Debug)]
+pub struct ReplayResult {
+    pub events: Vec<ReplayEventEnvelope>,
+    /// Number of corrupt/invalid events encountered.
+    pub corrupt_count: usize,
+}
+
+/// Full replay from the event log. Returns events in seq_no order.
+/// Fails fast on any parse error — no silent drops.
 pub fn replay_execution(
     db: &crate::db::Database,
     execution_id: i64,
-) -> anyhow::Result<Vec<(i64, StreamEvent)>> {
+) -> Result<ReplayResult, ReplayError> {
     let rows = db.get_execution_events(execution_id)?;
     let mut events = Vec::with_capacity(rows.len());
-    for (_id, _kind, payload, seq_no, _ts) in rows {
-        if let Ok(ev) = serde_json::from_str::<StreamEvent>(&payload) {
-            events.push((seq_no, ev));
+    let corrupt_count = 0;
+
+    for (_id, _kind, payload, seq_no, _ts) in &rows {
+        let stream_event = serde_json::from_str::<StreamEvent>(payload)
+            .map_err(|e| ReplayError::ParseError {
+                seq_no: *seq_no,
+                detail: format!("{e} — payload: {:.200}", payload),
+            })?;
+        events.push(ReplayEventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            seq_no: *seq_no,
+            event: stream_event,
+        });
+    }
+
+    // Verify monotonic seq order and detect duplicates
+    for window in events.windows(2) {
+        let a = window[0].seq_no;
+        let b = window[1].seq_no;
+        if a == b {
+            return Err(ReplayError::DuplicateSeqNo { seq_no: a });
+        }
+        if a + 1 != b {
+            return Err(ReplayError::SeqDiscontinuity { expected: a + 1, got: b });
         }
     }
-    // Already ordered by seq_no from the query, but ensure determinism
-    events.sort_by_key(|(seq, _)| *seq);
-    Ok(events)
+
+    Ok(ReplayResult { events, corrupt_count })
 }
 
-/// Replay events from a snapshot + tail events.
-/// Snapshot provides the jump point; tail events complete the replay.
+/// Replay from a snapshot point, verifying continuity via boundary_hash.
 pub fn replay_from_snapshot(
     db: &crate::db::Database,
     snapshot_id: i64,
     execution_id: i64,
-) -> anyhow::Result<Vec<(i64, StreamEvent)>> {
-    let snap = db.restore_snapshot(snapshot_id)?;
-    let mut events = Vec::new();
+) -> Result<ReplayResult, ReplayError> {
+    let snap = db.restore_snapshot(snapshot_id)?
+        .ok_or(ReplayError::SnapshotNotFound(snapshot_id))?;
 
-    // Reconstruct snapshot state from snapshot_data (stored as JSON)
-    if let Some(ref s) = snap {
-        if let Ok(snap_events) = serde_json::from_str::<Vec<(i64, StreamEvent)>>(&s.snapshot_data) {
-            events.extend(snap_events);
-        }
-    }
+    let last_snap_seq = snap.last_event_seq_no;
 
-    // Append tail events from the event log
-    let last_seq = events.last().map(|(s, _)| *s).unwrap_or(0);
-    let tail = db.get_execution_events(execution_id)?;
-    for (_id, _kind, payload, seq_no, _ts) in tail {
-        if seq_no > last_seq {
-            if let Ok(ev) = serde_json::from_str::<StreamEvent>(&payload) {
-                events.push((seq_no, ev));
+    // Load tail events after the snapshot boundary
+    let rows = db.get_execution_events(execution_id)?;
+    let tail: Vec<(i64, String)> = rows.iter()
+        .filter(|(_id, _kind, _payload, seq_no, _ts)| *seq_no > last_snap_seq)
+        .map(|(_id, _kind, payload, seq_no, _ts)| (*seq_no, payload.clone()))
+        .collect();
+
+    // Parse snapshot events
+    let mut events: Vec<ReplayEventEnvelope> = Vec::new();
+    if let Ok(Some(payload)) = snap.payload() {
+        match payload {
+            snapshot::SnapshotPayload::Ephemeral { .. } => {}
+            snapshot::SnapshotPayload::Structural { events: snap_events }
+            | snapshot::SnapshotPayload::Full { events: snap_events }
+            | snapshot::SnapshotPayload::Frozen { events: snap_events } => {
+                for (seq_no, val) in &snap_events {
+                    let event: StreamEvent = serde_json::from_value(val.clone())
+                        .map_err(|e| ReplayError::ParseError {
+                            seq_no: *seq_no,
+                            detail: format!("snapshot event parse: {e}"),
+                        })?;
+                    events.push(ReplayEventEnvelope {
+                        schema_version: snap.schema_version,
+                        seq_no: *seq_no,
+                        event,
+                    });
+                }
             }
         }
     }
 
-    events.sort_by_key(|(seq, _)| *seq);
-    Ok(events)
+    // Parse and append tail events
+    for (seq_no, payload) in &tail {
+        let event = serde_json::from_str::<StreamEvent>(payload)
+            .map_err(|e| ReplayError::ParseError {
+                seq_no: *seq_no,
+                detail: format!("{e} — payload: {:.200}", payload),
+            })?;
+        events.push(ReplayEventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            seq_no: *seq_no,
+            event,
+        });
+    }
+
+    // Ensure ordering
+    events.sort_by_key(|e| e.seq_no);
+    events.dedup_by_key(|e| e.seq_no);
+
+    // Verify monotonic seq order and detect duplicates
+    for window in events.windows(2) {
+        let a = window[0].seq_no;
+        let b = window[1].seq_no;
+        if a == b {
+            return Err(ReplayError::DuplicateSeqNo { seq_no: a });
+        }
+        if a + 1 != b {
+            return Err(ReplayError::SeqDiscontinuity { expected: a + 1, got: b });
+        }
+    }
+
+    Ok(ReplayResult { events, corrupt_count: 0 })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn setup_db() -> (tempfile::TempDir, crate::db::Database) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("replay_test.db");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = rt.block_on(
+            crate::db::Database::builder().path(&path).build()
+        ).unwrap();
+        (dir, db)
+    }
 
     #[test]
-    fn replay_round_trips_text_event() {
+    fn round_trips_text_event() {
         let ev = StreamEvent::TextDelta { text: "hello world".into() };
         let json = serde_json::to_string(&ev).unwrap();
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
@@ -76,11 +194,9 @@ mod tests {
     }
 
     #[test]
-    fn replay_round_trips_tool_call_event() {
+    fn round_trips_tool_call_event() {
         let ev = StreamEvent::ToolCallStart {
-            index: 0,
-            id: "call_1".into(),
-            name: "grep".into(),
+            index: 0, id: "call_1".into(), name: "grep".into(),
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
@@ -91,12 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn replay_round_trips_done_with_incomplete() {
+    fn round_trips_done_with_incomplete() {
         let ev = StreamEvent::Done {
             usage: crate::protocol::canonical::Usage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
+                prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
             },
             finish_reason: "length".into(),
             incomplete: true,
@@ -109,4 +223,86 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
-}
+
+    #[test]
+    fn envelope_schema_version() {
+        let ev = StreamEvent::TextDelta { text: "test".into() };
+        let envelope = ReplayEventEnvelope {
+            schema_version: EVENT_SCHEMA_VERSION,
+            seq_no: 1,
+            event: ev,
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let back: ReplayEventEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema_version, EVENT_SCHEMA_VERSION);
+        assert_eq!(back.seq_no, 1);
+    }
+
+    #[test]
+    fn parse_error_on_invalid_json() {
+        let (dir, db) = setup_db();
+        let conn = db.writer_lock().lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1, "text", "not valid json at all", 1],
+        ).unwrap();
+        drop(conn);
+        drop(dir);
+
+        let result = replay_execution(&db, 1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReplayError::ParseError { seq_no, .. } => assert_eq!(seq_no, 1),
+            other => panic!("expected ParseError, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_seq_no_detected() {
+        let (dir, db) = setup_db();
+        let conn = db.writer_lock().lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1, "msg_start", r#"{"type":"message_start","role":"user"}"#, 1],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1, "msg_end", r#"{"type":"message_end"}"#, 1],
+        ).unwrap();
+        drop(conn);
+        drop(dir);
+
+        let result = replay_execution(&db, 1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReplayError::DuplicateSeqNo { seq_no } => assert_eq!(seq_no, 1),
+            other => panic!("expected DuplicateSeqNo, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn seq_discontinuity_detected() {
+        let (dir, db) = setup_db();
+        let conn = db.writer_lock().lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1, "start", r#"{"type":"message_start","role":"user"}"#, 1],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1, "end", r#"{"type":"message_end"}"#, 3],
+        ).unwrap();
+        drop(conn);
+        drop(dir);
+
+        let result = replay_execution(&db, 1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReplayError::SeqDiscontinuity { expected, got } => {
+                assert_eq!(expected, 2);
+                assert_eq!(got, 3);
+            }
+            other => panic!("expected SeqDiscontinuity, got: {other}"),
+        }
+    }
+} // mod tests

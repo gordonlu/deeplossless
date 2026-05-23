@@ -190,6 +190,7 @@ impl Database {
                 deleted         INTEGER NOT NULL DEFAULT 0,
                 deleted_at      TEXT,
                 semantic_hash   TEXT NOT NULL DEFAULT '',
+                graph_revision  INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -233,6 +234,15 @@ impl Database {
 
         // Graceful migration: add soft-delete columns if upgrading from earlier schema.
         // SQLite has no ADD COLUMN IF NOT EXISTS; we use PRAGMA table_info.
+        let has_graph_revision: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'graph_revision'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_graph_revision {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN graph_revision INTEGER NOT NULL DEFAULT 0;")?;
+        }
+
         let has_deleted: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'deleted'")
             .ok()
@@ -288,6 +298,21 @@ impl Database {
         if !has_reasoning {
             conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN reasoning TEXT NOT NULL DEFAULT '';")?;
         }
+
+        // v0.10: compaction_id for idempotent compaction dedup (P0-9)
+        let has_compaction_id: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'compaction_id'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_compaction_id {
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN compaction_id TEXT NOT NULL DEFAULT '';")?;
+        }
+        // Index for fast dedup lookup
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_dag_compaction_id
+                 ON dag_nodes(compaction_id) WHERE compaction_id != '';"
+        )?;
 
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_conv
@@ -381,6 +406,14 @@ impl Database {
 
         // v0.4.0: execution snapshots — replay acceleration with budget-aware retention
         conn.execute_batch(crate::snapshot::MIGRATION)?;
+
+        // v0.6.1: snapshot schema versioning + integrity fields
+        let has_snapshot_schema: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('execution_snapshots') WHERE name='schema_version'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_snapshot_schema {
+            conn.execute_batch(crate::snapshot::ALTER_MIGRATION)?;
+        }
 
         // v0.4.0: execution events — append-only event sourcing
         conn.execute_batch(crate::execution::EVENT_MIGRATION)?;
@@ -566,13 +599,15 @@ impl Database {
             access_count: 0,
             last_accessed_at: None,
             reasoning: String::new(),
+            graph_revision: 0,
+            compaction_id: String::new(),
         })
     }
 
     pub fn get_node(&self, node_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes WHERE id = ?1 AND deleted = 0",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
@@ -586,8 +621,9 @@ impl Database {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
-                    n.token_count, n.parent_ids, n.child_ids, n.snippets, n.is_leaf, n.deleted,
-                    n.semantic_hash, n.access_count, n.last_accessed_at, n.reasoning
+                    n.token_count, n.parent_ids, n.child_ids, n.snippets,
+                    n.is_leaf, n.is_join, n.deleted,
+                    n.semantic_hash, n.access_count, n.last_accessed_at, n.reasoning, n.graph_revision, n.compaction_id
              FROM dag_nodes n, json_each(n.child_ids) AS j
              WHERE j.value = ?1 AND n.deleted = 0
              LIMIT ?2",
@@ -616,7 +652,7 @@ impl Database {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
             placeholders.join(","),
         );
@@ -635,7 +671,7 @@ impl Database {
     pub fn get_tip_node(&self, conv_id: i64) -> anyhow::Result<Option<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
              ORDER BY level DESC, id DESC LIMIT 1",
         )?;
@@ -646,7 +682,7 @@ impl Database {
     pub fn get_tip_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes
              WHERE conversation_id = ?1 AND level = (
                  SELECT MAX(level) FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
@@ -662,7 +698,7 @@ impl Database {
     pub fn get_all_dag_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
@@ -682,8 +718,9 @@ impl Database {
         token_count: i64,
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
+        compaction_id: &str,
     ) -> anyhow::Result<DagNode> {
-        self.insert_summary_atomic_inner(conversation_id, level, summary, token_count, source_ids, snippets, false)
+        self.insert_summary_atomic_inner(conversation_id, level, summary, token_count, source_ids, snippets, false, compaction_id)
     }
     #[allow(clippy::too_many_arguments)]
     fn insert_summary_atomic_inner(
@@ -695,6 +732,7 @@ impl Database {
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
         is_join: bool,
+        compaction_id: &str,
     ) -> anyhow::Result<DagNode> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
@@ -704,9 +742,9 @@ impl Database {
         let snippet_json = serde_json::to_string(snippets)?;
         let hash = Self::semantic_hash(summary, snippets);
         tx.execute(
-            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9)",
-            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_join as i32, hash],
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, compaction_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9, ?10)",
+            rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_join as i32, hash, compaction_id],
         )?;
         let new_id = tx.last_insert_rowid();
 
@@ -800,7 +838,24 @@ impl Database {
             access_count: 0,
             last_accessed_at: None,
             reasoning: String::new(),
+            graph_revision: 0,
+            compaction_id: compaction_id.to_string(),
         })
+    }
+
+    /// Look up an existing summary node by its deterministic compaction_id.
+    /// Used for idempotent compaction dedup (P0-9).
+    pub fn find_by_compaction_id(&self, compaction_id: &str) -> anyhow::Result<Option<DagNode>> {
+        if compaction_id.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
+             FROM dag_nodes WHERE compaction_id = ?1 AND deleted = 0",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![compaction_id], Self::row_to_node)?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Atomically insert a join node (parallel execution sync point).
@@ -812,7 +867,7 @@ impl Database {
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
-        self.insert_summary_atomic_inner(conversation_id, 0, summary, token_count, source_ids, snippets, true)
+        self.insert_summary_atomic_inner(conversation_id, 0, summary, token_count, source_ids, snippets, true, "")
     }
 
     /// Update the reasoning chain for a node (execution provenance).
@@ -911,7 +966,7 @@ impl Database {
         let related_json = serde_json::to_string(related_nodes)?;
         let tool_args_json_str = String::new();
         let reasoning_steps_json = "[]".to_string();
-        let epoch_ms = chrono::Utc::now().timestamp_millis();
+        let epoch_ms = crate::execution::next_logical_seq();
 
         conn.execute(
             "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes, tool_args_json, reasoning_steps, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms, replay_session_id)
@@ -1191,16 +1246,20 @@ impl Database {
         Ok((units, dag))
     }
 
-    /// Store a file observation.
+    /// Atomically store a file observation (P0 transactional snapshot).
     pub fn store_file_observation(
-        &self, path: &str, content_hash: &str, semantic_hash: &str,
-        ast_json: &str, size_bytes: usize, line_count: usize,
+        &self,
+        obs: &crate::file_observation::FileObservation,
     ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let ast_json = serde_json::to_string(&obs.ast)?;
         conn.execute(
-            "INSERT INTO file_observations (path, content_hash, semantic_hash, ast_json, size_bytes, line_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![path, content_hash, semantic_hash, ast_json, size_bytes as i64, line_count as i64],
+            "INSERT INTO file_observations (path, content_hash, semantic_hash, ast_json, size_bytes, line_count, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                obs.path, obs.content_hash, obs.semantic_hash, ast_json,
+                obs.size_bytes as i64, obs.line_count as i64, obs.kind.as_str(),
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1229,8 +1288,8 @@ impl Database {
     /// Checks L1 in-memory cache first, falls back to SQLite.
     pub fn tool_cache_get(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<(String, i64)>> {
         // L1 hot cache check (no SQLite round-trip)
-        if let Some(result) = self.tool_cache_l1.get(tool_name, args_hash) {
-            return Ok(Some((result, 1)));
+        if let Some((result, _count)) = self.tool_cache_l1.get(tool_name, args_hash) {
+            return Ok(Some((result.to_string(), 1)));
         }
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
@@ -1470,6 +1529,43 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Read lineage edges pointing TO a given node.
+    pub fn get_lineage_to(&self, to_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, kind FROM lineage_edges WHERE to_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![to_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut result = Vec::new();
+        for row in rows { result.push(row?); }
+        Ok(result)
+    }
+
+    /// Get file paths that a specific execution unit depends on.
+    /// Reads from tool_cache dependent_files JSON column.
+    pub fn get_dependent_files_for_unit(&self, _execution_unit_id: i64) -> anyhow::Result<Vec<String>> {
+        // Execution units don't have a direct file-dependency column.
+        // File dependencies are tracked per cache entry (tool_cache table).
+        // For now, return empty — this is a placeholder for Phase 3 integration.
+        // TODO: when cache entries include execution_unit_id, filter here.
+        Ok(Vec::new())
+    }
+
+    /// Get cache entry IDs that depend on a given file path.
+    pub fn get_cache_ids_for_file(&self, file_path: &str) -> anyhow::Result<Vec<i64>> {
+        let conn = self.read_conn();
+        let pattern = format!("%{}%", file_path.replace('%', "%%"));
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tool_cache WHERE dependent_files LIKE ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern], |row| row.get(0))?;
+        let mut ids = Vec::new();
+        for row in rows { ids.push(row?); }
+        Ok(ids)
+    }
+
     // ── Memory Versions (v0.4.0) ───────────────────────────────────────
 
     /// Create a new memory version, linked to a parent. Returns the new version id.
@@ -1507,14 +1603,22 @@ impl Database {
     // ── Execution Snapshots (v0.4.0) ────────────────────────────────────
 
     /// Take an append-only snapshot. Returns the snapshot id.
+    /// `last_event_seq_no`, `boundary_hash`, `integrity_hash` are computed
+    /// from the snapshot data for continuity verification.
     pub fn take_snapshot(
         &self, execution_id: i64, memory_version_id: i64,
         tier: i32, data: &str, size_bytes: i64, retention_ttl: Option<i64>,
+        last_event_seq_no: i64, boundary_hash: &str, integrity_hash: &str,
     ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT INTO execution_snapshots (execution_id, memory_version_id, tier, snapshot_data, size_bytes, retention_ttl) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![execution_id, memory_version_id, tier, data, size_bytes, retention_ttl],
+            "INSERT INTO execution_snapshots (execution_id, memory_version_id, tier, schema_version, snapshot_data, size_bytes, retention_ttl, last_event_seq_no, boundary_hash, integrity_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                execution_id, memory_version_id, tier,
+                crate::snapshot::SCHEMA_VERSION,
+                data, size_bytes, retention_ttl,
+                last_event_seq_no, boundary_hash, integrity_hash,
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1523,17 +1627,21 @@ impl Database {
     pub fn restore_snapshot(&self, id: i64) -> anyhow::Result<Option<crate::snapshot::ExecutionSnapshot>> {
         let conn = self.read_conn();
         let row = conn.query_row(
-            "SELECT id, execution_id, memory_version_id, tier, snapshot_data, size_bytes, retention_ttl, created_at FROM execution_snapshots WHERE id = ?1",
+            "SELECT id, execution_id, memory_version_id, schema_version, tier, snapshot_data, last_event_seq_no, boundary_hash, integrity_hash, size_bytes, retention_ttl, created_at FROM execution_snapshots WHERE id = ?1",
             rusqlite::params![id],
             |row| Ok(crate::snapshot::ExecutionSnapshot {
                 id: row.get(0)?,
                 execution_id: row.get(1)?,
                 memory_version_id: row.get(2)?,
-                tier: row.get(3)?,
-                snapshot_data: row.get(4)?,
-                size_bytes: row.get(5)?,
-                retention_ttl: row.get(6)?,
-                created_at: row.get(7)?,
+                schema_version: row.get(3)?,
+                tier: row.get(4)?,
+                snapshot_data: row.get(5)?,
+                last_event_seq_no: row.get(6)?,
+                boundary_hash: row.get(7)?,
+                integrity_hash: row.get(8)?,
+                size_bytes: row.get(9)?,
+                retention_ttl: row.get(10)?,
+                created_at: row.get(11)?,
             }),
         ).ok();
         Ok(row)
@@ -1579,6 +1687,12 @@ impl Database {
         }
 
         Ok(evicted as usize)
+    }
+
+    /// Access the writer lock for direct SQL. Used by dag engine for
+    /// transactional graph mutations (P0-2).
+    pub fn writer_lock(&self) -> &Mutex<Connection> {
+        &self.writer
     }
 
     // ── Multi-agent safe runtime (v0.9) ─────────────────────────────────
@@ -1736,7 +1850,7 @@ impl Database {
     pub fn get_leaf_nodes(&self, conv_id: i64) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes WHERE conversation_id = ?1 AND is_leaf = 1 AND deleted = 0
              ORDER BY id ASC",
         )?;
@@ -1843,7 +1957,7 @@ impl Database {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids,
-                    is_leaf, is_join, snippets, deleted, semantic_hash, access_count, last_accessed_at, reasoning
+                    is_leaf, is_join, snippets, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes
              WHERE conversation_id = ?1 AND deleted = 0 AND is_leaf = 0 AND access_count < ?2
              ORDER BY access_count ASC LIMIT 20"
@@ -1862,6 +1976,8 @@ impl Database {
                 access_count: row.get(12)?,
                 last_accessed_at: row.get(13)?,
                 reasoning: row.get(14)?,
+                graph_revision: row.get(15).unwrap_or(0),
+                compaction_id: row.get(16).unwrap_or_default(),
             })
         })?;
         let mut results = Vec::new();
@@ -2377,6 +2493,8 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let access_count: i64 = row.get(12).unwrap_or(0);
         let last_accessed_at: Option<String> = row.get(13).ok().flatten();
         let reasoning: String = row.get(14).unwrap_or_default();
+        let graph_revision: i64 = row.get(15).unwrap_or(0);
+        let compaction_id: String = row.get(16).unwrap_or_default();
         Ok(DagNode {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
@@ -2393,6 +2511,8 @@ fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
             access_count,
             last_accessed_at,
             reasoning,
+            graph_revision,
+            compaction_id,
         })
     }
 }
@@ -2592,8 +2712,8 @@ mod tests {
             db.create_and_store("test", &msgs).unwrap();
         }
 
-        // Checkpoint should succeed
-        assert!(db.wal_checkpoint().is_ok());
+        // Checkpoint should succeed without panicking
+        db.wal_checkpoint().expect("WAL checkpoint should succeed after writes");
     }
 
     // ── P3: Unified search ───────────────────────────────────────────

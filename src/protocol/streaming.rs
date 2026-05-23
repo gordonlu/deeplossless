@@ -86,9 +86,7 @@ use std::collections::HashMap;
 /// Partially assembled tool call during streaming.
 #[derive(Debug, Clone)]
 struct PartialToolCall {
-    #[allow(dead_code)]
     id: String,
-    #[allow(dead_code)]
     name: String,
     arguments: String,
 }

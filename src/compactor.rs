@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::dag::{DagEngine, DagConfig, DagNode};
@@ -9,18 +10,26 @@ use crate::summarizer::{Summarizer, SummarizerConfig};
 pub enum CompactCommand {
     CompressGroup { conv_id: i64, node_ids: Vec<i64> },
     ReviewAndCompact { conv_id: i64, context_window: usize },
-    /// Incremental sliding-window compaction: compress oldest leaves
-    /// when count exceeds window_size, keeping recent ones uncompressed.
     SlideAndCompact { conv_id: i64, window_size: usize, context_window: usize },
+    Ping,
     Shutdown,
 }
 
 /// Events sent back from the compaction worker to the main thread.
 #[derive(Debug)]
 pub enum CompactEvent {
-    GroupCompressed { conv_id: i64, new_node_id: i64, level: u8, tokens_saved: i64 },
-    BelowThreshold,
-    Error { message: String },
+    GroupCompressed { conv_id: i64, new_node_id: i64, level: u8, tokens_saved: i64, latency_ms: u64, summarizer_level: u8 },
+    /// Compaction completed for a conversation (per-command summary).
+    CompactionCompleted { conv_id: i64, groups: u32, tokens_saved: i64, latency_ms: u64, failures: u32 },
+    BelowThreshold { conv_id: i64, reason: &'static str },
+    Error { message: String, conv_id: Option<i64> },
+    /// Response to health ping.
+    Pong,
+}
+impl CompactEvent {
+    pub fn below(conv_id: i64, reason: &'static str) -> Self {
+        CompactEvent::BelowThreshold { conv_id, reason }
+    }
 }
 
 /// Configuration for the compaction loop.
@@ -31,6 +40,12 @@ pub struct CompactorConfig {
     pub soft_threshold_pct: f64,
     pub hard_threshold_pct: f64,
     pub group_size: usize,
+    /// Weight for position-age in leaf scoring (0-1). Default: 0.4.
+    pub age_weight: f64,
+    /// Weight for token density in leaf scoring (0-1). Default: 0.2.
+    pub token_density_weight: f64,
+    /// Weight for novelty in leaf scoring (0-1). Default: 0.4.
+    pub novelty_weight: f64,
 }
 
 impl Default for CompactorConfig {
@@ -41,8 +56,267 @@ impl Default for CompactorConfig {
             soft_threshold_pct: 0.80,
             hard_threshold_pct: 0.95,
             group_size: 8,
+            age_weight: 0.4,
+            token_density_weight: 0.2,
+            novelty_weight: 0.4,
         }
     }
+}
+
+/// Accumulated compaction telemetry for operator visibility (P1).
+#[derive(Debug, Default, Clone)]
+pub struct CompactionMetrics {
+    pub total_compactions: u64,
+    pub total_groups: u64,
+    pub total_tokens_saved: i64,
+    pub total_llm_calls: u64,
+    pub total_fallbacks: u64,
+    pub total_failures: u64,
+    pub last_latency_ms: u64,
+}
+
+// ── Compaction planning types ─────────────────────────────────────────
+
+/// Token-budget-aware threshold calculator (P0-6).
+/// Decoupled from the compactor to allow independent tuning and testing.
+#[derive(Debug, Clone)]
+pub struct CompactionBudget {
+    pub soft_limit: i64,
+    pub hard_limit: i64,
+    pub group_size: usize,
+}
+
+impl CompactionBudget {
+    pub fn new(context_window: usize, soft_pct: f64, hard_pct: f64, group_size: usize) -> Self {
+        Self {
+            soft_limit: (context_window as f64 * soft_pct) as i64,
+            hard_limit: (context_window as f64 * hard_pct) as i64,
+            group_size,
+        }
+    }
+
+    /// True when compaction is strongly recommended (above hard limit).
+    pub fn is_critical(&self, total_tokens: i64) -> bool {
+        total_tokens >= self.hard_limit
+    }
+
+    /// True when compaction should be considered (above soft limit or many leaves).
+    pub fn is_advisory(&self, total_tokens: i64, leaf_count: usize) -> bool {
+        total_tokens >= self.soft_limit || leaf_count >= self.group_size * 2
+    }
+}
+
+/// Explicit compaction priority: 0.0 (skip) to 1.0 (urgent).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct CompactionScore(pub f64);
+
+/// A planned compaction operation on a group of nodes.
+#[derive(Debug, Clone)]
+pub struct CompactionGroup {
+    pub node_ids: Vec<i64>,
+    pub score: CompactionScore,
+    pub strategy: CompactionStrategy,
+}
+
+/// What kind of compaction to apply to this group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionStrategy {
+    /// Standard: group raw leaves into a summary (level 1).
+    Summarize,
+    /// Slide-window: compact oldest leaves outside the window.
+    SlideWindow { window_size: usize },
+    /// Merge: refine existing summaries into a higher-level node.
+    Merge,
+}
+
+/// Planned compaction for a single pass over a conversation.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    pub conv_id: i64,
+    pub budget: CompactionBudget,
+    pub groups: Vec<CompactionGroup>,
+    pub leaves: Vec<DagNode>,
+    pub total_tokens: i64,
+}
+
+impl CompactionPlan {
+    pub fn should_compact(&self) -> bool {
+        self.budget.is_critical(self.total_tokens) || self.budget.is_advisory(self.total_tokens, self.leaves.len())
+    }
+}
+
+// ── Planner ───────────────────────────────────────────────────────────
+
+/// Compaction planner: analyzes DAG state and produces a prioritized plan.
+///
+/// Separates the decision of **what** to compact from **how** to compact
+/// it (P0-1). Uses an explicit scoring model instead of heuristic threshold
+/// hacks (P0-4).
+#[derive(Debug, Clone)]
+pub struct CompactionPlanner {
+    config: CompactorConfig,
+}
+
+impl CompactionPlanner {
+    pub fn new(config: CompactorConfig) -> Self {
+        Self { config }
+    }
+
+    /// Produce a compaction plan for `conv_id` given the current DAG state.
+    /// Returns an empty plan (no groups) when no compaction is needed.
+    pub fn plan(&self, dag: &DagEngine, conv_id: i64, context_window: usize) -> anyhow::Result<CompactionPlan> {
+        let budget = CompactionBudget::new(
+            context_window,
+            self.config.soft_threshold_pct,
+            self.config.hard_threshold_pct,
+            self.config.group_size,
+        );
+
+        let total_tokens = dag.total_tokens(conv_id)?;
+        let leaves = dag.get_leaves(conv_id)?;
+        let leaf_count = leaves.len();
+
+        if leaf_count < 2 || (!budget.is_critical(total_tokens) && !budget.is_advisory(total_tokens, leaf_count)) {
+            return Ok(CompactionPlan {
+                conv_id, budget, groups: Vec::new(), leaves, total_tokens,
+            });
+        }
+
+        let groups = self.build_groups(&leaves, &budget);
+
+        Ok(CompactionPlan { conv_id, budget, groups, leaves, total_tokens })
+    }
+
+    /// Check whether a conversation's topology has changed since `last_leaf_count`
+    /// was recorded — i.e., whether a re-plan is warranted (P0-11 dirty-region).
+    pub fn is_dirty(&self, dag: &DagEngine, conv_id: i64, last_leaf_count: usize) -> anyhow::Result<bool> {
+        let current = dag.get_leaves(conv_id)?.len();
+        Ok(current != last_leaf_count || current >= self.config.group_size * 2)
+    }
+
+    /// Build compaction groups from leaves using explicit scoring.
+    fn build_groups(&self, leaves: &[DagNode], budget: &CompactionBudget) -> Vec<CompactionGroup> {
+        // Score each leaf
+        let texts: Vec<&str> = leaves.iter().map(|n| n.summary.as_str()).collect();
+        let novelty = novelty_score_for_group(&texts);
+
+        let mut scored: Vec<(i64, CompactionScore)> = leaves
+            .iter()
+            .enumerate()
+            .map(|(position, node)| {
+                let score = self.score_leaf(node, position, leaves.len(), novelty);
+                (node.id, score)
+            })
+            .collect();
+
+        // Sort by score descending (most compressible first)
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Group the top-scoring nodes
+        let node_ids: Vec<i64> = scored
+            .into_iter()
+            .take(budget.group_size)
+            .map(|(id, _)| id)
+            .collect();
+
+        if node_ids.len() < 2 {
+            return Vec::new();
+        }
+
+        vec![CompactionGroup {
+            node_ids,
+            score: CompactionScore(novelty),
+            strategy: CompactionStrategy::Summarize,
+        }]
+    }
+
+    /// Score a single leaf node for compaction priority.
+    ///
+    /// Factors:
+    /// - **Position age**: older (lower-index) leaves score higher (compress oldest first)
+    /// - **Token density**: high token count relative to position → more to save
+    /// - **Novelty**: low novelty vs. peers → more redundant → higher compress priority
+    ///
+    /// Returns 0.0 (keep as-is) to 1.0 (compress immediately).
+    fn score_leaf(&self, node: &DagNode, position: usize, total: usize, novelty: f64) -> CompactionScore {
+        if total <= 1 {
+            return CompactionScore(0.0);
+        }
+
+        // Older leaves (lower position / larger total) = higher priority
+        let age_factor = 1.0 - (position as f64 / total as f64);
+
+        // High token count = more urgent to compress
+        let token_factor = (node.token_count as f64 / 500.0).min(1.0);
+
+        // Low novelty = redundant = safe to compress
+        let novelty_factor = 1.0 - novelty;
+
+        let w = &self.config;
+        let raw = w.age_weight * age_factor
+            + w.token_density_weight * token_factor
+            + w.novelty_weight * novelty_factor;
+        CompactionScore(raw.clamp(0.0, 1.0))
+    }
+
+    /// Build groups using sliding-window strategy.
+    pub fn plan_slide_window(
+        &self,
+        dag: &DagEngine,
+        conv_id: i64,
+        window_size: usize,
+        context_window: usize,
+    ) -> anyhow::Result<CompactionPlan> {
+        let budget = CompactionBudget::new(
+            context_window,
+            self.config.soft_threshold_pct,
+            self.config.hard_threshold_pct,
+            self.config.group_size,
+        );
+
+        let total_tokens = dag.total_tokens(conv_id).unwrap_or(0);
+        let leaves = dag.get_leaves(conv_id)?;
+        let leaf_count = leaves.len();
+
+        if leaf_count <= window_size {
+            return Ok(CompactionPlan {
+                conv_id, budget, groups: Vec::new(), leaves, total_tokens,
+            });
+        }
+
+        if total_tokens < budget.hard_limit && leaf_count < window_size * 2 {
+            return Ok(CompactionPlan {
+                conv_id, budget, groups: Vec::new(), leaves, total_tokens,
+            });
+        }
+
+        let compact_count = (leaf_count - window_size).min(8);
+        let node_ids: Vec<i64> = leaves.iter().take(compact_count).map(|n| n.id).collect();
+
+        if node_ids.len() < 2 {
+            return Ok(CompactionPlan {
+                conv_id, budget, groups: Vec::new(), leaves, total_tokens,
+            });
+        }
+
+        Ok(CompactionPlan {
+            conv_id,
+            budget,
+            groups: vec![CompactionGroup {
+                node_ids,
+                score: CompactionScore(0.5),
+                strategy: CompactionStrategy::SlideWindow { window_size },
+            }],
+            total_tokens,
+            leaves,
+        })
+    }
+}
+
+/// Compute novelty score for a group of leaf texts.
+/// Wrapper around the trigram-based novelty_score for use in the scoring model.
+fn novelty_score_for_group(texts: &[&str]) -> f64 {
+    novelty_score(texts)
 }
 
 /// Async compaction coordinator.
@@ -57,7 +331,11 @@ pub struct Compactor {
 }
 
 impl Compactor {
-    pub fn spawn(db: Arc<Database>, config: CompactorConfig) -> Self {
+    pub fn new(
+        db: Arc<Database>,
+        config: CompactorConfig,
+        tasks: Option<&std::sync::Arc<crate::runtime::BackgroundTasks>>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(32);
 
@@ -88,7 +366,13 @@ impl Compactor {
             }
         };
 
-        tokio::spawn(compactor_supervisor(cmd_rx, event_tx, dag, summarizer, config.clone()));
+        let worker_handle = tokio::spawn(compactor_supervisor(cmd_rx, event_tx, dag, summarizer, config.clone()));
+
+        // Register with BackgroundTasks for lifecycle supervision (P0 shutdown gap fix).
+        // BackgroundTasks now owns the handle — compactor no longer stores it.
+        if let Some(tasks) = tasks {
+            tasks.register_handle(worker_handle);
+        }
 
         Self { cmd_tx, event_rx, config }
     }
@@ -107,6 +391,18 @@ impl Compactor {
     }
 
     pub fn config(&self) -> &CompactorConfig { &self.config }
+
+    /// Health check: sends a Ping through the command channel and waits for Pong.
+    /// Times out after 500ms. Returns true if worker is alive.
+    pub async fn health_ping(&mut self) -> bool {
+        if self.cmd_tx.send(CompactCommand::Ping).await.is_err() {
+            return false;
+        }
+        matches!(
+            tokio::time::timeout(Duration::from_millis(500), self.event_rx.recv()).await,
+            Ok(Some(CompactEvent::Pong))
+        )
+    }
 }
 
 /// Compute novelty score for a set of messages relative to each other.
@@ -242,17 +538,29 @@ async fn compact_worker(
     summarizer: Summarizer,
     config: CompactorConfig,
 ) {
+    let planner = CompactionPlanner::new(config.clone());
+    // Dirty-region tracking (P0-11): skip re-planning when DAG topology unchanged.
+    let mut last_leaf_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             CompactCommand::Shutdown => break,
+            CompactCommand::Ping => {
+                if event_tx.send(CompactEvent::Pong).await.is_err() {
+                    tracing::warn!(target: "deeplossless::compactor", "event receiver dropped on ping");
+                }
+            }
             CompactCommand::ReviewAndCompact { conv_id, context_window } => {
-                review_and_compact(conv_id, context_window, &dag, &summarizer, &config, &event_tx).await;
+                review_and_compact(conv_id, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts).await;
             }
             CompactCommand::CompressGroup { conv_id, node_ids } => {
+                // Direct group compression bypasses the planner (caller-specified nodes).
+                // Clear dirty-region tracking so next ReviewAndCompact re-scans.
+                last_leaf_counts.remove(&conv_id);
                 compress_group(conv_id, node_ids, &dag, &summarizer, &event_tx).await;
             }
             CompactCommand::SlideAndCompact { conv_id, window_size, context_window } => {
-                slide_and_compact(conv_id, window_size, context_window, &dag, &summarizer, &event_tx).await;
+                slide_and_compact(conv_id, window_size, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts).await;
             }
         }
     }
@@ -263,57 +571,80 @@ async fn review_and_compact(
     context_window: usize,
     dag: &DagEngine,
     summarizer: &Summarizer,
-    config: &CompactorConfig,
+    planner: &CompactionPlanner,
     event_tx: &mpsc::Sender<CompactEvent>,
+    last_leaf_counts: &mut std::collections::HashMap<i64, usize>,
 ) {
-    let total = match dag.total_tokens(conv_id) {
-        Ok(t) => t,
-        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("total_tokens: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
+    // Dirty-region tracking (P0-11): skip if topology unchanged.
+    let prev_count = last_leaf_counts.get(&conv_id).copied().unwrap_or(0);
+    match planner.is_dirty(dag, conv_id, prev_count) {
+        Ok(false) => {
+            // Topology unchanged and below threshold — skip.
+            if event_tx.send(CompactEvent::below(conv_id, "dirty_skip")).await.is_err() {
+                tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+            }
+            return;
+        }
+        Err(e) => {
+            if event_tx.send(CompactEvent::Error { message: format!("planner: {e}"), conv_id: None }).await.is_err() {
+                tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let plan = match planner.plan(dag, conv_id, context_window) {
+        Ok(p) => p,
+        Err(e) => {
+            if event_tx.send(CompactEvent::Error { message: format!("plan: {e}"), conv_id: None }).await.is_err() {
+                tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+            }
+            return;
+        }
     };
 
-    let leaves = match dag.get_leaves(conv_id) {
-        Ok(l) => l,
-        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
-    };
+    // Record the current leaf count for next dirty check.
+    last_leaf_counts.insert(conv_id, plan.leaves.len());
 
-    let leaf_count = leaves.len();
-    if leaf_count < 2 {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
+    if !plan.should_compact() {
+        if event_tx.send(CompactEvent::below(conv_id, "budget_ok")).await.is_err() {
+            tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+        }
         return;
     }
 
-    // Entropy-aware threshold adjustment: novel content gets preserved,
-    // redundant content gets compacted more aggressively.
-    let texts: Vec<&str> = leaves.iter().take(config.group_size).map(|n| n.summary.as_str()).collect();
-    let novelty = novelty_score(&texts);
-    let adj_soft = if novelty > 0.7 { 0.90 } else if novelty < 0.3 { 0.60 } else { config.soft_threshold_pct };
-    let adj_hard = if novelty > 0.7 { 0.98 } else if novelty < 0.3 { 0.85 } else { config.hard_threshold_pct };
+    let cmd_start = std::time::Instant::now();
 
-    let soft = (context_window as f64 * adj_soft) as i64;
-    let hard_limit = (context_window as f64 * adj_hard) as i64;
+    for group in &plan.groups {
+        let text: String = plan.leaves.iter()
+            .filter(|n| group.node_ids.contains(&n.id))
+            .map(|n| n.summary.as_str())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
 
-    let soft_trigger = leaf_count >= config.group_size * 2 && total >= soft;
+        if text.is_empty() {
+            continue;
+        }
 
-    if total < hard_limit && !soft_trigger {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
-        return;
+        let old_tc: i64 = plan.leaves.iter()
+            .filter(|n| group.node_ids.contains(&n.id))
+            .map(|n| n.token_count)
+            .sum();
+
+        do_compress(conv_id, group.node_ids.clone(), text, old_tc, dag, summarizer, event_tx).await;
     }
 
-    let group: Vec<_> = leaves.iter().take(config.group_size).map(|n| n.id).collect();
-    if group.len() < 2 {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
-        return;
+    // Per-command summary (P1 metrics)
+    if event_tx.send(CompactEvent::CompactionCompleted {
+        conv_id,
+        groups: plan.groups.len() as u32,
+        tokens_saved: 0,
+        latency_ms: cmd_start.elapsed().as_millis() as u64,
+        failures: 0,
+    }).await.is_err() {
+        tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
     }
-
-    let text = leaves.iter()
-        .take(config.group_size)
-        .map(|n| n.summary.as_str())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
-
-    let old_tc: i64 = leaves.iter().take(config.group_size).map(|n| n.token_count).sum();
-
-    do_compress(conv_id, group, text, old_tc, dag, summarizer, event_tx).await;
 }
 
 async fn compress_group(
@@ -325,11 +656,11 @@ async fn compress_group(
 ) {
     let leaves = match dag.get_leaves(conv_id) {
         Ok(l) => l,
-        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
+        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}"), conv_id: None }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
     };
     let nodes: Vec<&DagNode> = leaves.iter().filter(|n| node_ids.contains(&n.id)).collect();
     if nodes.len() < 2 {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
+        if event_tx.send(CompactEvent::below(conv_id, "too_few_nodes")).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
         return;
     }
 
@@ -347,41 +678,51 @@ async fn slide_and_compact(
     context_window: usize,
     dag: &DagEngine,
     summarizer: &Summarizer,
+    planner: &CompactionPlanner,
     event_tx: &mpsc::Sender<CompactEvent>,
+    last_leaf_counts: &mut std::collections::HashMap<i64, usize>,
 ) {
-    let leaves = match dag.get_leaves(conv_id) {
-        Ok(l) => l,
-        Err(e) => { if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}") }).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); } return; }
+    let plan = match planner.plan_slide_window(dag, conv_id, window_size, context_window) {
+        Ok(p) => p,
+        Err(e) => {
+            if event_tx.send(CompactEvent::Error { message: format!("plan: {e}"), conv_id: None }).await.is_err() {
+                tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+            }
+            return;
+        }
     };
 
-    if leaves.len() <= window_size {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
+    // Record leaf count for dirty tracking.
+    last_leaf_counts.insert(conv_id, plan.leaves.len());
+
+    if !plan.should_compact() {
+        if event_tx.send(CompactEvent::below(conv_id, "windowsize_ok")).await.is_err() {
+            tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+        }
         return;
     }
 
-    let total = dag.total_tokens(conv_id).unwrap_or(0);
-    let hard_limit = (context_window as f64 * 0.95) as i64;
-    if total < hard_limit && leaves.len() < window_size * 2 {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
-        return;
+    for group in &plan.groups {
+        let leaves = match dag.get_leaves(conv_id) {
+            Ok(l) => l,
+            Err(e) => {
+                if event_tx.send(CompactEvent::Error { message: format!("get_leaves: {e}"), conv_id: None }).await.is_err() {
+                    tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
+                }
+                continue;
+            }
+        };
+
+        let compact_count = group.node_ids.len();
+        let text = leaves.iter()
+            .take(compact_count)
+            .map(|n| n.summary.as_str())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        let old_tc: i64 = leaves.iter().take(compact_count).map(|n| n.token_count).sum();
+
+        do_compress(conv_id, group.node_ids.clone(), text, old_tc, dag, summarizer, event_tx).await;
     }
-
-    // Compact the oldest half of leaves outside the window
-    let compact_count = (leaves.len() - window_size).min(8);
-    let oldest: Vec<i64> = leaves.iter().take(compact_count).map(|n| n.id).collect();
-    if oldest.len() < 2 {
-        if event_tx.send(CompactEvent::BelowThreshold).await.is_err() { tracing::warn!(target: "deeplossless::compactor", "event receiver dropped"); }
-        return;
-    }
-
-    let text = leaves.iter()
-        .take(compact_count)
-        .map(|n| n.summary.as_str())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
-    let old_tc: i64 = leaves.iter().take(compact_count).map(|n| n.token_count).sum();
-
-    do_compress(conv_id, oldest, text, old_tc, dag, summarizer, event_tx).await;
 }
 
 async fn do_compress(
@@ -393,38 +734,59 @@ async fn do_compress(
     summarizer: &Summarizer,
     event_tx: &mpsc::Sender<CompactEvent>,
 ) {
-    let compressed_text = compress_code_blocks(&text);
-    match summarizer.summarize_escalate(&compressed_text).await {
-        Ok((summary, level)) => {
-            let tc = crate::tokenizer::count(&summary) as i64;
-            let dag_level = level.to_dag_level();
-            // Extract snippets before compression to preserve precision (#10)
-            let source = node_ids.first().map(|id| id.to_string()).unwrap_or_default();
-            let snippets = crate::snippet::extract_with_source(&text, &source);
-            match dag.compress_group_with_snippets(conv_id, &node_ids, &summary, tc, dag_level, &snippets) {
-                Ok(node) => {
-                    if event_tx.send(CompactEvent::GroupCompressed {
-                        conv_id,
-                        new_node_id: node.id,
-                        level: node.level,
-                        tokens_saved: old_tc - tc,
-                    }).await.is_err() {
-                        tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
-                    }
-                }
-                Err(e) => {
-                    if event_tx.send(CompactEvent::Error { message: format!("compress_group: {e}") }).await.is_err() {
-                        tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
-                    }
-                }
+    let _r = do_compress_inner(conv_id, &node_ids, &text, old_tc, dag, summarizer).await;
+    match _r {
+        Ok((tokens_saved, new_node_id, level, summarizer_level, latency_ms)) => {
+            if event_tx.send(CompactEvent::GroupCompressed {
+                conv_id,
+                new_node_id,
+                level,
+                tokens_saved,
+                latency_ms,
+                summarizer_level,
+            }).await.is_err() {
+                tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
             }
         }
         Err(e) => {
-            if event_tx.send(CompactEvent::Error { message: format!("summarize: {e}") }).await.is_err() {
+            if event_tx.send(CompactEvent::Error {
+                message: format!("{e}"),
+                conv_id: Some(conv_id),
+            }).await.is_err() {
                 tracing::warn!(target: "deeplossless::compactor", "event receiver dropped");
             }
         }
     }
+}
+
+async fn do_compress_inner(
+    conv_id: i64,
+    node_ids: &[i64],
+    text: &str,
+    old_tc: i64,
+    dag: &DagEngine,
+    summarizer: &Summarizer,
+) -> anyhow::Result<(i64, i64, u8, u8, u64)> {
+    let start = std::time::Instant::now();
+    let compressed_text = compress_code_blocks(text);
+    let result = summarizer.summarize_escalate(&compressed_text).await?;
+    let tc = crate::tokenizer::count(&result.text) as i64;
+    let dag_level = result.dag_level;
+    let summarizer_level = result.level.to_dag_level();
+    let source = node_ids.first().map(|id| id.to_string()).unwrap_or_default();
+    let mut snippets = crate::snippet::extract_with_source(text, &source);
+    let orig_len = snippets.len();
+    snippets.retain(|s| text.contains(&s.content));
+    if snippets.len() < orig_len {
+        tracing::warn!(
+            target: "deeplossless::compactor",
+            dropped = orig_len - snippets.len(),
+            "snippets failed consistency check — removed"
+        );
+    }
+    let node = dag.compress_group_with_snippets(conv_id, node_ids, &result.text, tc, dag_level, &snippets)?;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    Ok((old_tc - tc, node.id, node.level, summarizer_level, latency_ms))
 }
 
 /// Supervisor that restarts the worker on panic, making compaction
@@ -489,13 +851,13 @@ mod tests {
             ..Default::default()
         };
 
-        let mut compactor = Compactor::spawn(db, config);
+        let mut compactor = Compactor::new(db, config, None);
         let event = compactor
             .command(CompactCommand::ReviewAndCompact { conv_id: 1, context_window: 100_000 })
             .await;
 
         match event {
-            Some(CompactEvent::BelowThreshold) => {}
+            Some(CompactEvent::BelowThreshold { .. }) => {}
             other => panic!("expected BelowThreshold, got {:?}", other),
         }
     }

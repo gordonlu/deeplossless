@@ -18,7 +18,9 @@
 //!   invalidates sibling branches), partial completion tolerance.
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 // ── Span identity ─────────────────────────────────────────────────────
 
@@ -26,14 +28,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanId(pub String);
 
+static SPAN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl SpanId {
     pub fn new() -> Self {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let rand = fast_random_u16();
-        Self(format!("sp_{ts:x}_{rand:x}"))
+        let n = SPAN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(format!("sp_{n:x}"))
     }
 
     pub fn root() -> Self {
@@ -51,23 +51,12 @@ impl Default for SpanId {
     }
 }
 
+static GROUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Generate a simple parallel group ID, unique within a conversation.
 pub fn group_id(conv_id: i64, turn_index: usize) -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let rand = fast_random_u16();
-    format!("pg_{conv_id}_{turn_index}_{ts:x}_{rand:x}")
-}
-
-fn fast_random_u16() -> u16 {
-    // Simple non-cryptographic random from wall-clock jitter
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    (n ^ (n >> 16)) as u16
+    let n = GROUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("pg_{conv_id}_{turn_index}_{n:x}")
 }
 
 // ── Span mode ─────────────────────────────────────────────────────────
@@ -89,13 +78,16 @@ impl SpanMode {
         }
     }
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
+}
+
+impl FromStr for SpanMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "sequential" => Some(Self::Sequential),
-            "parallel" => Some(Self::Parallel),
-            "join" => Some(Self::Join),
-            _ => None,
+            "sequential" => Ok(Self::Sequential),
+            "parallel" => Ok(Self::Parallel),
+            "join" => Ok(Self::Join),
+            _ => Err(format!("unknown SpanMode: {s}")),
         }
     }
 }
@@ -234,10 +226,14 @@ pub struct ForkJoinTracker {
     pub completed_at: Option<String>,
     /// DAG node ID of the join node (set on completion).
     pub join_dag_node_id: Option<i64>,
+    /// Wall-clock deadline for timeout enforcement (set from governance).
+    #[serde(skip)]
+    pub deadline: Option<Instant>,
 }
 
 impl ForkJoinTracker {
     /// Create a new tracker for a parallel group. This is the **fork** phase.
+    /// Deduplicates branches with duplicate `tool_call_id`.
     pub fn fork(
         conv_id: i64,
         turn_index: usize,
@@ -246,8 +242,10 @@ impl ForkJoinTracker {
         governance: ParallelGovernance,
     ) -> Self {
         let gid = group_id(conv_id, turn_index);
+        let mut seen_ids = std::collections::HashSet::new();
         let branches: Vec<ParallelBranch> = tool_calls
             .iter()
+            .filter(|tc| seen_ids.insert(&tc.call_id))
             .map(|tc| {
                 let span = parent_span.child(SpanMode::Parallel).with_group(gid.clone());
                 ParallelBranch {
@@ -261,6 +259,12 @@ impl ForkJoinTracker {
             })
             .collect();
 
+        let deadline = if governance.timeout_secs > 0.0 {
+            Some(Instant::now() + std::time::Duration::from_secs_f64(governance.timeout_secs))
+        } else {
+            None
+        };
+
         Self {
             group_id: gid,
             conv_id,
@@ -271,6 +275,7 @@ impl ForkJoinTracker {
             created_at: iso_now(),
             completed_at: None,
             join_dag_node_id: None,
+            deadline,
         }
     }
 
@@ -279,9 +284,15 @@ impl ForkJoinTracker {
         self.branches.len()
     }
 
-    /// Check if all branches are in a terminal state.
+    /// Returns `true` if the wall-clock deadline has passed.
+    pub fn is_expired(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Check if all branches are in a terminal state (or deadline expired).
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
+            || self.is_expired()
             || self.branches.iter().all(|b| matches!(b.status, BranchStatus::Completed | BranchStatus::Failed | BranchStatus::TimedOut))
     }
 
@@ -292,8 +303,11 @@ impl ForkJoinTracker {
             .iter()
             .filter(|b| matches!(b.status, BranchStatus::Completed | BranchStatus::Failed | BranchStatus::TimedOut))
             .count();
-        if terminal == 0 {
+        if terminal == 0 && !self.is_expired() {
             return false;
+        }
+        if terminal > 0 && self.is_expired() {
+            return true;
         }
         if self.governance.allow_partial && terminal > 0 {
             return true;
@@ -307,57 +321,70 @@ impl ForkJoinTracker {
     }
 
     /// Update a branch's status from an execution unit.
+    /// Returns an error if `tool_call_id` is unknown or the transition is illegal.
     pub fn record_branch_result(
         &mut self,
         tool_call_id: &str,
         exec_unit_id: i64,
         outcome: &crate::execution::ExecutionOutcome,
-    ) {
-        if let Some(branch) = self.branches.iter_mut().find(|b| b.tool_call_id == tool_call_id) {
-            branch.execution_unit_id = Some(exec_unit_id);
-            branch.status = match outcome {
-                crate::execution::ExecutionOutcome::Success
-                | crate::execution::ExecutionOutcome::CacheHit
-                | crate::execution::ExecutionOutcome::Replayed => BranchStatus::Completed,
-                crate::execution::ExecutionOutcome::RecoveredFailure
-                | crate::execution::ExecutionOutcome::Blocked => {
-                    branch.error = Some("tool execution failed".into());
-                    BranchStatus::Failed
-                }
-                crate::execution::ExecutionOutcome::Stale => BranchStatus::TimedOut,
-            };
+    ) -> anyhow::Result<()> {
+        let branch = self.branches.iter_mut().find(|b| b.tool_call_id == tool_call_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool_call_id: {tool_call_id}"))?;
+        let new_status = match outcome {
+            crate::execution::ExecutionOutcome::Success
+            | crate::execution::ExecutionOutcome::CacheHit
+            | crate::execution::ExecutionOutcome::Replayed => BranchStatus::Completed,
+            crate::execution::ExecutionOutcome::RecoveredFailure
+            | crate::execution::ExecutionOutcome::Blocked => BranchStatus::Failed,
+            crate::execution::ExecutionOutcome::Stale => BranchStatus::TimedOut,
+        };
+        // Validate state transition: only Pending/Running can transition to terminal
+        match (branch.status, new_status) {
+            (BranchStatus::Pending, _) | (BranchStatus::Running, _) => {},
+            _ => anyhow::bail!("invalid branch transition: {:?} -> {:?}", branch.status, new_status),
         }
+        branch.execution_unit_id = Some(exec_unit_id);
+        branch.status = new_status;
+        if matches!(new_status, BranchStatus::Failed) {
+            branch.error = Some("tool execution failed".into());
+        }
+        Ok(())
     }
 
     /// Mark a branch as failed due to timeout.
-    pub fn timeout_branch(&mut self, tool_call_id: &str) {
-        if let Some(branch) = self.branches.iter_mut().find(|b| b.tool_call_id == tool_call_id) {
-            branch.status = BranchStatus::TimedOut;
-            branch.error = Some("timeout".into());
+    /// Returns an error if `tool_call_id` is unknown or the branch is already terminal.
+    pub fn timeout_branch(&mut self, tool_call_id: &str) -> anyhow::Result<()> {
+        let branch = self.branches.iter_mut().find(|b| b.tool_call_id == tool_call_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool_call_id: {tool_call_id}"))?;
+        match branch.status {
+            BranchStatus::Pending | BranchStatus::Running => {},
+            _ => anyhow::bail!("cannot timeout branch in state {:?}", branch.status),
         }
+        branch.status = BranchStatus::TimedOut;
+        branch.error = Some("timeout".into());
+        Ok(())
     }
 
     /// Complete the join phase. Returns the computed HappensBefore edges
     /// that should be inserted into the lineage_edges table.
-    pub fn complete(&mut self, join_node_id: i64) -> Vec<HappensBeforeEdge> {
+    /// Can only be called once; returns an error on double-completion.
+    pub fn complete(&mut self, join_node_id: i64) -> anyhow::Result<Vec<HappensBeforeEdge>> {
+        if let Some(ref completed_at) = self.completed_at {
+            anyhow::bail!("already completed at {completed_at}");
+        }
         self.completed_at = Some(iso_now());
         self.join_dag_node_id = Some(join_node_id);
 
-        // Emit HappensBefore edges:
-        //   - All branches in this group are concurrent (no ordering between them)
-        //   - Each branch happens-before the join node
-        //   - The parent span happens-before the group
         let mut edges = Vec::new();
         for branch in &self.branches {
             if let Some(eid) = branch.execution_unit_id {
-                // branch execution happens-before join node
                 edges.push(HappensBeforeEdge {
                     from_id: eid,
                     to_id: join_node_id,
                 });
             }
         }
-        edges
+        Ok(edges)
     }
 }
 
@@ -488,10 +515,10 @@ mod tests {
         let mut tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
         assert!(!tracker.is_completed());
 
-        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success);
+        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success).unwrap();
         assert!(!tracker.is_completed());
 
-        tracker.record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success);
+        tracker.record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success).unwrap();
         assert!(tracker.is_completed());
     }
 
@@ -503,7 +530,7 @@ mod tests {
             ToolCallInfo { name: "read".into(), call_id: "c2".into() },
         ];
         let mut tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
-        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::RecoveredFailure);
+        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::RecoveredFailure).unwrap();
 
         // With fail_fast=true, should_force_join returns true
         assert!(tracker.should_force_join());
@@ -517,10 +544,10 @@ mod tests {
             ToolCallInfo { name: "read".into(), call_id: "c2".into() },
         ];
         let mut tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
-        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success);
-        tracker.record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success);
+        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success).unwrap();
+        tracker.record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success).unwrap();
 
-        let edges = tracker.complete(42);
+        let edges = tracker.complete(42).unwrap();
         // Both branches happen-before the join node
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().any(|e| e.from_id == 10 && e.to_id == 42));
@@ -540,10 +567,10 @@ mod tests {
 
     #[test]
     fn span_mode_roundtrip() {
-        assert_eq!(SpanMode::from_str("sequential"), Some(SpanMode::Sequential));
-        assert_eq!(SpanMode::from_str("parallel"), Some(SpanMode::Parallel));
-        assert_eq!(SpanMode::from_str("join"), Some(SpanMode::Join));
-        assert_eq!(SpanMode::from_str("unknown"), None);
+        assert_eq!(SpanMode::from_str("sequential").unwrap(), SpanMode::Sequential);
+        assert_eq!(SpanMode::from_str("parallel").unwrap(), SpanMode::Parallel);
+        assert_eq!(SpanMode::from_str("join").unwrap(), SpanMode::Join);
+        assert!(SpanMode::from_str("unknown").is_err());
     }
 
     #[test]

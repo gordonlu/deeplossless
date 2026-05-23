@@ -48,6 +48,53 @@ pub struct FileObservation {
     pub size_bytes: usize,
     pub line_count: usize,
     pub observed_at: String,
+    /// Type of observation: what triggered this snapshot (P1).
+    #[serde(default)]
+    pub kind: ObservationKind,
+}
+
+/// What triggered this file observation (P1: typed observation kinds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ObservationKind {
+    /// Initial observation — no prior version exists.
+    #[default]
+    Initial,
+    /// Content changed since last observation.
+    ContentChanged,
+    /// Semantic structure changed (AST) but content identical.
+    SemanticChanged,
+    /// Periodic refresh (TTL expiry).
+    Refresh,
+    /// Manual refresh triggered by user/agent.
+    Manual,
+}
+
+impl ObservationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ContentChanged => "content_changed",
+            Self::SemanticChanged => "semantic_changed",
+            Self::Refresh => "refresh",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl FileObservation {
+    /// Check if this observation is stale (older than `max_age_secs`).
+    /// Returns true if the observation's `observed_at` timestamp is more than
+    /// `max_age_secs` behind the current time (P1: stale observation policy).
+    pub fn is_stale(&self, max_age_secs: i64) -> bool {
+        let now = chrono::Utc::now();
+        match chrono::DateTime::parse_from_rfc3339(&self.observed_at) {
+            Ok(obs_time) => {
+                let age = now.signed_duration_since(obs_time);
+                age.num_seconds() > max_age_secs
+            }
+            Err(_) => true, // unparseable timestamp → treat as stale
+        }
+    }
 }
 
 /// Structured diff between two observations.
@@ -64,6 +111,15 @@ pub struct ObservationDiff {
 }
 
 // ── Language detection ─────────────────────────────────────────────────
+
+/// Canonicalize file path for stable identity across platforms (P0).
+/// Normalizes backslash→forward slash, removes trailing separators,
+/// and collapses redundant components.
+pub fn canonicalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
 
 /// Guess language from file path extension.
 pub fn detect_language(path: &str) -> Option<String> {
@@ -451,6 +507,7 @@ fn normalize_import(imp: &str) -> String {
 
 /// Create a FileObservation from path + content.
 pub fn observe_file(path: &str, content: &str) -> FileObservation {
+    let canonical = canonicalize_path(path);
     let ast = extract_ast(path, content);
     let content_hash = {
         let h = Sha256::digest(content.as_bytes());
@@ -460,13 +517,14 @@ pub fn observe_file(path: &str, content: &str) -> FileObservation {
     let line_count = content.lines().count();
 
     FileObservation {
-        path: path.to_string(),
+        path: canonical,
         content_hash,
         semantic_hash,
         ast,
         size_bytes: content.len(),
         line_count,
         observed_at: chrono::Utc::now().to_rfc3339(),
+        kind: ObservationKind::Initial,
     }
 }
 
@@ -514,6 +572,7 @@ pub const MIGRATION: &str = "
         ast_json        TEXT NOT NULL DEFAULT '{}',
         size_bytes      INTEGER NOT NULL DEFAULT 0,
         line_count      INTEGER NOT NULL DEFAULT 0,
+        kind            TEXT NOT NULL DEFAULT 'initial',
         created_at      TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_file_obs_path ON file_observations(path);

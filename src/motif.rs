@@ -31,6 +31,38 @@ pub struct ExecutionMotif {
     pub execution_unit_ids: Vec<i64>,
     /// Conversation IDs where this motif appeared.
     pub conversation_ids: Vec<i64>,
+    /// ISO-8601 timestamp of most recent occurrence (P1: decay/aging).
+    #[serde(default)]
+    pub last_seen_at: String,
+    /// Recency weight (0.0-1.0): newer motifs score higher. Computed as
+    /// 1.0 / (1 + age_days) decay function.
+    #[serde(default)]
+    pub recency_weight: f64,
+}
+
+impl ExecutionMotif {
+    /// Compute recency weight from the last seen timestamp and a reference
+    /// "now" timestamp (both ISO-8601). Returns 1.0 if timestamps are invalid.
+    pub fn compute_recency(&mut self, now: &str) {
+        let age_days = parse_age_days(&self.last_seen_at, now);
+        self.recency_weight = 1.0 / (1.0 + age_days);
+    }
+}
+
+/// Parse the age in days between two ISO-8601 timestamps.
+fn parse_age_days(seen: &str, now: &str) -> f64 {
+    if seen.is_empty() { return 0.0; }
+    // Simple parse: take the date portion (YYYY-MM-DD)
+    let parse_date = |s: &str| -> Option<(i32, u32, u32)> {
+        let parts: Vec<&str> = s.split('T').next()?.split('-').collect();
+        if parts.len() != 3 { return None; }
+        Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+    };
+    let (sy, sm, sd) = match parse_date(seen) { Some(v) => v, None => return 0.0 };
+    let (ny, nm, nd) = match parse_date(now) { Some(v) => v, None => return 0.0 };
+    let seen_days = sy as f64 * 365.0 + sm as f64 * 30.0 + sd as f64;
+    let now_days = ny as f64 * 365.0 + nm as f64 * 30.0 + nd as f64;
+    (now_days - seen_days).max(0.0)
 }
 
 /// Configuration for motif extraction.
@@ -95,8 +127,10 @@ impl MotifExtractor {
             tool_sequences.insert(conv_id, seq);
         }
 
-        // Step 2: Generate n-grams and count occurrences
-        let mut ngram_counts: HashMap<Vec<String>, NgramStats> = HashMap::new();
+        // Step 2: Generate n-grams and count occurrences.
+        // Uses joined string key instead of Vec<String> to avoid per-window
+        // allocation (P0-15). Null (\u{1}) separator prevents collision.
+        let mut ngram_counts: HashMap<String, NgramStats> = HashMap::new();
 
         for (&conv_id, seq) in &tool_sequences {
             if seq.len() < self.config.min_ngram {
@@ -104,39 +138,39 @@ impl MotifExtractor {
             }
             for n in self.config.min_ngram..=self.config.max_ngram.min(seq.len()) {
                 for window in seq.windows(n) {
-                    let key: Vec<String> = window.iter().map(|(_, t)| t.clone()).collect();
-                    if key.iter().any(|t| t.is_empty()) {
+                    let tool_names: Vec<&str> = window.iter().map(|(_, t)| t.as_str()).collect();
+                    if tool_names.iter().any(|t| t.is_empty()) {
                         continue;
                     }
+                    let key = tool_names.join("\u{1}");
                     let entry = ngram_counts.entry(key).or_insert_with(|| NgramStats {
                         occurrence_count: 0,
                         success_count: 0,
                         total_tokens: 0,
-                        execution_unit_ids: vec![],
+                        execution_unit_ids: HashSet::new(),
                         conversation_ids: HashSet::new(),
                     });
                     entry.occurrence_count += 1;
                     entry.conversation_ids.insert(conv_id);
 
-                    // Take unit IDs directly from the current window
-                    let matched_ids: Vec<i64> = window.iter().map(|(id, _)| *id).collect();
-                    entry.execution_unit_ids.extend(matched_ids);
+                    // Collect unit IDs via HashSet to avoid duplicates (P0-11)
+                    for (id, _) in window {
+                        entry.execution_unit_ids.insert(*id);
+                    }
                 }
             }
         }
 
-        // Step 3: Count successes and tokens per motif
+        // Step 3: Hoist unit_map — build once, not per-motif (P0-1)
+        let unit_map: HashMap<i64, &crate::execution::ExecutionUnit> = unit_groups
+            .values()
+            .flatten()
+            .map(|u| (u.id, u))
+            .collect();
+
         for stats in ngram_counts.values_mut() {
-            // Get unit outcomes from the IDs
             let mut success_count = 0usize;
             let mut total_tokens = 0i64;
-
-            // Build a map of unit_id → unit for quick lookup
-            let unit_map: HashMap<i64, &crate::execution::ExecutionUnit> = unit_groups
-                .values()
-                .flatten()
-                .map(|u| (u.id, u))
-                .collect();
 
             for &uid in &stats.execution_unit_ids {
                 if let Some(u) = unit_map.get(&uid) {
@@ -147,8 +181,7 @@ impl MotifExtractor {
                     ) {
                         success_count += 1;
                     }
-                    // Rough token estimate from tool result length
-                    total_tokens += (u.tool_result.len() / 4) as i64;
+                    total_tokens += crate::tokenizer::count(&u.tool_result) as i64;
                 }
             }
             stats.success_count = success_count;
@@ -156,13 +189,14 @@ impl MotifExtractor {
         }
 
         // Step 4: Filter and build motifs
-        let total_units: usize = unit_groups.values().map(|v| v.len()).sum();
+        let total_occurrences: usize = ngram_counts.values().map(|s| s.occurrence_count).sum();
         let mut motifs = Vec::new();
 
         for (key, stats) in ngram_counts {
             if stats.occurrence_count < self.config.min_occurrences {
                 continue;
             }
+            // Success rate: ratio of successful units within motif matches (P0-10)
             let success_rate = if !stats.execution_unit_ids.is_empty() {
                 stats.success_count as f64 / stats.execution_unit_ids.len() as f64
             } else {
@@ -178,26 +212,30 @@ impl MotifExtractor {
                 0.0
             };
 
-            let confidence = (stats.occurrence_count as f64 / total_units.max(1) as f64)
+            // Confidence: normalized by total occurrences, not total units (P0-12)
+            let confidence = (stats.occurrence_count as f64 / total_occurrences.max(1) as f64)
                 .min(1.0);
 
             let mut conv_ids: Vec<i64> = stats.conversation_ids.into_iter().collect();
             conv_ids.sort();
 
-            let mut eids = stats.execution_unit_ids.clone();
+            let mut eids: Vec<i64> = stats.execution_unit_ids.into_iter().collect();
             eids.sort();
-            eids.dedup();
+
+            let (pattern_key, chain) = pattern_key_from_chain(&key);
 
             motifs.push(ExecutionMotif {
                 id: 0,
-                pattern_key: key.join("."),
-                tool_chain: key,
+                pattern_key,
+                tool_chain: chain,
                 occurrence_count: stats.occurrence_count,
                 success_rate,
                 avg_token_cost,
                 confidence,
                 execution_unit_ids: eids,
                 conversation_ids: conv_ids,
+                last_seen_at: chrono::Utc::now().to_rfc3339(),
+                recency_weight: 1.0,
             });
         }
 
@@ -208,7 +246,7 @@ impl MotifExtractor {
 
     /// Convert a slice of execution units to (id, tool_name) pairs.
     fn to_tool_sequence(&self, units: &[crate::execution::ExecutionUnit]) -> Vec<(i64, String)> {
-        units.iter().map(|u| (u.id, u.tool_name.clone())).collect()
+        units.iter().map(|u| (u.id, canonicalize_tool_name(&u.tool_name))).collect()
     }
 
     /// Deduplicate consecutive identical tool names, keeping the first unit ID.
@@ -223,13 +261,32 @@ impl MotifExtractor {
     }
 }
 
+/// Convert a joined pattern key back to a tool chain Vec.
+fn pattern_key_from_chain(key: &str) -> (String, Vec<String>) {
+    let chain: Vec<String> = key.split('\u{1}').map(|s| s.to_string()).collect();
+    (key.to_string(), chain)
+}
+
+/// Canonicalize tool name for stable motif identity across provider aliases (P1).
+/// Collapses known synonyms to a single canonical form.
+fn canonicalize_tool_name(name: &str) -> String {
+    match name {
+        "search_content" | "grep" | "rg" | "search" => "grep".into(),
+        "read_file" | "read" | "cat" | "view" => "read_file".into(),
+        "write_to_file" | "write_file" | "edit" | "edit_file" => "edit_file".into(),
+        "execute_command" | "exec" | "bash" | "run" => "execute_command".into(),
+        "list_files" | "ls" | "dir" | "glob" => "list_files".into(),
+        other => other.to_string(),
+    }
+}
+
 // ── Internal stats accumulator ─────────────────────────────────────────
 
 struct NgramStats {
     occurrence_count: usize,
     success_count: usize,
     total_tokens: i64,
-    execution_unit_ids: Vec<i64>,
+    execution_unit_ids: HashSet<i64>,
     conversation_ids: HashSet<i64>,
 }
 
@@ -253,11 +310,12 @@ pub fn extract_motifs_from_db(
     Ok(extractor.extract(&unit_groups))
 }
 
-/// Find execution units that match a given motif pattern.
+/// Find execution unit IDs that match a given motif pattern.
+/// Returns unit IDs instead of cloned units to avoid large allocations (P1-13).
 pub fn find_motif_matches(
     units: &[crate::execution::ExecutionUnit],
     motif: &ExecutionMotif,
-) -> Vec<crate::execution::ExecutionUnit> {
+) -> Vec<i64> {
     let extractor = MotifExtractor::new(MotifConfig::default());
     let seq = extractor.to_tool_sequence(units);
 
@@ -268,19 +326,21 @@ pub fn find_motif_matches(
     let chain = &motif.tool_chain;
     let seq_tools: Vec<&str> = seq.iter().map(|(_, t)| t.as_str()).collect();
     let chain_strs: Vec<&str> = chain.iter().map(|s| s.as_str()).collect();
-    let mut matches = Vec::new();
+    let mut matched_ids = HashSet::new();
 
     for start in 0..=seq_tools.len().saturating_sub(chain.len()) {
         if &seq_tools[start..start + chain.len()] == chain_strs.as_slice() {
             for i in start..start + chain.len() {
-                if i < units.len() {
-                    matches.push(units[i].clone());
+                if let Some(unit) = units.get(i) {
+                    matched_ids.insert(unit.id);
                 }
             }
         }
     }
 
-    matches
+    let mut result: Vec<i64> = matched_ids.into_iter().collect();
+    result.sort();
+    result
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -436,6 +496,8 @@ mod tests {
             confidence: 0.5,
             execution_unit_ids: vec![],
             conversation_ids: vec![1],
+            last_seen_at: String::new(),
+            recency_weight: 1.0,
         };
 
         let units = vec![
@@ -447,7 +509,7 @@ mod tests {
         ];
 
         let matched = find_motif_matches(&units, &motif);
-        assert_eq!(matched.len(), 4, "two motif matches × 2 units each = 4");
+        assert_eq!(matched.len(), 4, "two motif matches × 2 unique unit IDs each = 4");
     }
 
     #[test]
