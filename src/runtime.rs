@@ -57,6 +57,74 @@ pub enum RuntimeProfile {
     Custom,
 }
 
+// ── Audit / Snapshot Policy Configuration ───────────────────────────
+
+/// Controls when audit events are written to `execution_events` and `dag_events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditMode {
+    /// No audit events written — only essential `execution_units` and `dag_nodes`.
+    /// Replay falls back to full event log replay (slower but functional).
+    Off,
+    /// Buffer recent audit events in-memory. On failure, flush buffer + error
+    /// to the audit log. Best for production — zero overhead on success paths.
+    OnError,
+    /// Always write audit events. Maximum observability, highest write overhead.
+    Full,
+}
+
+/// Controls when execution snapshots are taken automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotMode {
+    /// No automatic snapshots. Snapshots only via POST API.
+    Off,
+    /// Auto-snapshot at semantic boundaries: after compaction, retry escalation,
+    /// failure recovery, and cancellation.
+    Auto,
+    /// Snapshots only via POST API (current behavior).
+    Manual,
+}
+
+/// Top-level policy configuration combining audit and snapshot modes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePolicyConfig {
+    pub audit_mode: AuditMode,
+    pub snapshot_mode: SnapshotMode,
+    /// How many recent events to buffer in OnError mode before flushing on failure.
+    pub onerror_ring_size: usize,
+    /// Snapshot budget for auto-snapshots.
+    #[serde(default)]
+    pub snapshot_budget: crate::snapshot::SnapshotBudget,
+}
+
+impl Default for RuntimePolicyConfig {
+    fn default() -> Self {
+        Self {
+            audit_mode: AuditMode::Full,
+            snapshot_mode: SnapshotMode::Manual,
+            onerror_ring_size: 50,
+            snapshot_budget: crate::snapshot::SnapshotBudget::default(),
+        }
+    }
+}
+
+impl AuditMode {
+    pub fn should_write_audit(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+    pub fn is_onerror(&self) -> bool {
+        matches!(self, Self::OnError)
+    }
+}
+
+impl SnapshotMode {
+    pub fn should_auto_snapshot(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+    pub fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual)
+    }
+}
+
 impl RuntimeProfile {
     pub fn as_str(&self) -> &'static str {
         match self {

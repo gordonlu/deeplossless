@@ -437,9 +437,18 @@ impl DagEngine {
             }
         }
 
-        // Post-compaction integrity audit (P0-12)
-        if let Err(e) = self.verify_compaction_integrity(&node, source_ids) {
-            tracing::warn!(target: "deeplossless::dag", error = %e, "post-compaction integrity check failed");
+        // Post-compaction integrity audit (only in Full audit mode)
+        if self.db.policy_config.read().map(|c| c.audit_mode.should_write_audit()).unwrap_or(true) {
+            if let Err(e) = self.verify_compaction_integrity(&node, source_ids) {
+                tracing::warn!(target: "deeplossless::dag", error = %e, "post-compaction integrity check failed");
+            }
+        }
+
+        // Auto-snapshot on semantic boundary (compaction) if snapshot mode is Auto
+        if self.db.policy_config.read().map(|c| c.snapshot_mode.should_auto_snapshot()).unwrap_or(false) {
+            if let Err(e) = self.auto_snapshot_on_compaction(conv_id, &node) {
+                tracing::warn!(target: "deeplossless::dag", "auto-snapshot after compaction failed: {e}");
+            }
         }
 
         // Best-effort provenance computation
@@ -1185,6 +1194,35 @@ impl DagEngine {
         }
         writeln!(out, "}}")?;
         Ok(out)
+    }
+
+    /// Take an auto-snapshot after compaction when SnapshotMode is Auto.
+    /// Creates an Ephemeral-tier snapshot with the current DAG state.
+    fn auto_snapshot_on_compaction(&self, conv_id: i64, node: &DagNode) -> anyhow::Result<()> {
+        let version_id = self.db.create_memory_version(
+            None, "compaction", &format!("auto-snapshot after compaction to level {}", node.level),
+            Some(node.id),
+        )?;
+        let snapshot_data = serde_json::json!({
+            "conv_id": conv_id,
+            "dag_root_id": node.id,
+            "level": node.level,
+            "source_count": node.child_ids.len(),
+            "revision": self.current_revision().0,
+        });
+        let data_str = serde_json::to_string(&snapshot_data)?;
+        let boundary_hash = crate::snapshot::compute_boundary_hash(&[(0_i64, &data_str)], 1);
+        let integrity_hash = crate::snapshot::compute_chain_hash(&[(0_i64, &data_str)]);
+        self.db.take_snapshot(
+            0, version_id, 0, &data_str, data_str.len() as i64, None,
+            0, &boundary_hash, &integrity_hash,
+        )?;
+        // Enforce budget to prevent unbounded snapshot growth
+        let budget = self.db.policy_config.read()
+            .map(|c| c.snapshot_budget.clone())
+            .unwrap_or_default();
+        let _ = self.db.enforce_snapshot_budget(&budget);
+        Ok(())
     }
 }
 

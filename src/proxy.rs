@@ -444,7 +444,14 @@ async fn responses(
         }
     };
 
-    // 5. Handle streaming vs non-streaming
+    // 5. Handle non-200 upstream status — propagate error, don't wrap in SSE
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return json_error(status, "UPSTREAM_ERROR", body);
+    }
+
+    // 6. Handle streaming vs non-streaming
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
@@ -759,6 +766,10 @@ async fn chat_completions(
     };
 
     let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return json_error(status, "UPSTREAM_ERROR", body);
+    }
     let content_type = resp
         .headers()
         .get("content-type")

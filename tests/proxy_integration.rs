@@ -7,6 +7,7 @@
 //! and streaming conversion.
 
 use axum::{routing::post, Json, Router};
+use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,31 @@ use tokio::sync::oneshot;
 // ── Shared test helpers ──────────────────────────────────────────────────
 
 type CapturedRequest = Arc<Mutex<Option<Value>>>;
+
+/// Start a mock upstream that returns a specific HTTP status and JSON body
+/// for every POST /v1/chat/completions request, regardless of the request body.
+async fn start_mock_upstream_with_status(
+    status: u16, body: Value,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let app = Router::new().route("/v1/chat/completions",
+        post(move |_: Json<Value>| {
+            let body = body.clone();
+            async move {
+                (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), Json(body))
+            }
+        })
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { rx.await.ok(); })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
 
 /// Start a mock upstream server. The `reply_fn` decides what JSON to return.
 /// The `captured` (if provided) gets populated with the received Chat Completions body.
@@ -1122,4 +1148,625 @@ async fn parallel_group_detection_and_join() {
     // ── 4. Verify governance worked: both branches succeeded ──────────
     assert_eq!(units[0].outcome.as_str(), "success");
     assert_eq!(units[1].outcome.as_str(), "success");
+}
+
+#[tokio::test]
+async fn concurrent_3_tool_execution_creates_happens_before() {
+    // Verify that 3 truly concurrent tool executions produce correct
+    // parallel_group metadata, HappensBefore edges, and a join DAG node
+    // when results arrive out of order (different execution delays).
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "concurrent_3").await;
+    let db = state.storage.db.clone();
+
+    // Create conversation
+    let conv_id = db.create_and_store("concurrent_test", &json!([
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "Check three files."}
+    ])).unwrap();
+    let replay_session_id = format!("rs_{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+
+    // Root span shared by all parallel branches
+    let root_span = deeplossless::parallel::ExecutionSpan::root_span();
+
+    // Three tool calls to execute concurrently
+    let tools = vec![
+        deeplossless::parallel::ToolCallInfo { name: "grep".into(), call_id: "tc_a".into() },
+        deeplossless::parallel::ToolCallInfo { name: "read_file".into(), call_id: "tc_b".into() },
+        deeplossless::parallel::ToolCallInfo { name: "list_files".into(), call_id: "tc_c".into() },
+    ];
+
+    // Fork tracker — assigns span IDs, establishes group_id and parent_span
+    let tracker = deeplossless::parallel::ForkJoinTracker::fork(
+        conv_id, 0, &root_span, &tools,
+        deeplossless::parallel::ParallelGovernance::default(),
+    );
+    let group_id = tracker.group_id.clone();
+    let parent_span_id_str = tracker.parent_span.span_id.0.clone();
+    assert_eq!(tracker.branch_count(), 3, "should have 3 branches for 3 tool calls");
+
+    // Extract per-branch metadata before spawning
+    let branch_metas: Vec<(String, String, String)> = tracker.branches.iter()
+        .map(|b| (b.tool_call_id.clone(), b.span_id.0.clone(), b.tool_name.clone()))
+        .collect();
+
+    // ── Spawn 3 concurrent tool execution tasks with staggered delays ──
+    let db_arc = db.clone();
+    let tasks: Vec<_> = branch_metas.into_iter().enumerate().map(|(i, (tool_call_id, span_id, tool_name))| {
+        let db2 = db_arc.clone();
+        let gid = group_id.clone();
+        let psid = parent_span_id_str.clone();
+        let rsid = replay_session_id.clone();
+        let tcid = tool_call_id.clone();
+        // Staggered delays so results arrive out of order (30ms, 60ms, 90ms)
+        let delay_ms = 30 * (i as u64 + 1);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+            let exec_id = tokio::task::spawn_blocking(move || {
+                db2.store_execution_unit_with_span(
+                    conv_id,
+                    &format!("Reasoning for {tool_name}"),
+                    &tool_name,
+                    r#"{"path":"src/main.rs"}"#,
+                    &format!("Result of {tool_name}"),
+                    "All good.",
+                    "success",
+                    &[],
+                    &span_id,
+                    &psid,
+                    "parallel",
+                    &gid,
+                    &tcid,
+                    &rsid,
+                )
+            }).await.unwrap().unwrap();
+
+            (exec_id, tool_call_id, "success".to_string())
+        })
+    }).collect();
+
+    // Collect results — order depends on staggered delays, not insertion order
+    let mut results: Vec<(i64, String, String)> = Vec::new();
+    for task in tasks {
+        results.push(task.await.unwrap());
+    }
+    assert_eq!(results.len(), 3, "all 3 tool tasks should complete");
+
+    // ── Record results in ForkJoinTracker (sequential, post-concurrent) ──
+    let mut tracker = tracker;
+    for (exec_id, tool_call_id, outcome_str) in &results {
+        let outcome = deeplossless::execution::ExecutionOutcome::from_str(outcome_str)
+            .unwrap_or(deeplossless::execution::ExecutionOutcome::Success);
+        tracker.record_branch_result(tool_call_id, *exec_id, &outcome).unwrap();
+    }
+
+    assert!(tracker.should_force_join(), "all 3 branches complete → should_force_join");
+
+    // ── Create join DAG node ──
+    let join_summary = format!("Parallel group {group_id} (3 branches)");
+    let join_node = db.insert_join_atomic(conv_id, &join_summary, 0, &[], &[]).unwrap();
+    assert!(join_node.is_join, "join node should be marked is_join");
+
+    // ── Complete tracker → HappensBefore edges ──
+    let hb_edges = tracker.complete(join_node.id).unwrap();
+    assert_eq!(hb_edges.len(), 3, "should have 3 HappensBefore edges (one per branch)");
+
+    // Persist edges to lineage_edges (no FK constraint to dag_nodes, correct
+    // for execution-to-execution HappensBefore relationships).
+    for hb in &hb_edges {
+        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before").unwrap();
+    }
+
+    // ── Assertions ──
+
+    // 1. All 3 execution units have correct parallel metadata
+    let units = db.get_execution_units(conv_id, 10).unwrap();
+    assert_eq!(units.len(), 3, "should have 3 execution units");
+
+    for (exec_id, tc_id, _) in &results {
+        let unit = units.iter().find(|u| u.id == *exec_id)
+            .unwrap_or_else(|| panic!("execution unit {exec_id} should exist"));
+        assert_eq!(unit.span_mode, "parallel", "unit {tc_id} should have span_mode=parallel");
+        assert_eq!(unit.parallel_group, group_id, "unit {tc_id} should share group_id");
+        assert_eq!(unit.parent_span_id, parent_span_id_str, "unit {tc_id} should share parent_span_id");
+        assert!(!unit.span_id.is_empty(), "unit {tc_id} should have a span_id");
+        assert_eq!(unit.outcome.as_str(), "success", "unit {tc_id} should have success outcome");
+    }
+
+    // 2. Unique span_ids
+    let span_ids: std::collections::HashSet<&str> = units.iter().map(|u| u.span_id.as_str()).collect();
+    assert_eq!(span_ids.len(), 3, "each unit should have a unique span_id");
+
+    // 3. HappensBefore edges in lineage_edges — 3 edges, each from an execution unit to the join node
+    let lineage = db.get_lineage_to(join_node.id).unwrap();
+    let hb_to_join: Vec<_> = lineage.into_iter()
+        .filter(|(_, _, kind)| kind == "happens_before")
+        .collect();
+    assert_eq!(hb_to_join.len(), 3, "should have exactly 3 HappensBefore edges to join node");
+
+    for (from_id, to_id, kind) in &hb_to_join {
+        assert_eq!(*kind, "happens_before", "edge kind should be happens_before");
+        assert!(
+            results.iter().any(|(eid, _, _)| eid == from_id),
+            "from_id {from_id} should be an execution unit ID",
+        );
+        assert_eq!(*to_id, join_node.id, "to_id should be the join node ID");
+    }
+
+    // 4. Join DAG node persisted correctly
+    let stored_join = db.get_node(join_node.id).unwrap()
+        .expect("join node should exist in DB");
+    assert!(stored_join.is_join, "stored node should be marked is_join");
+    assert!(stored_join.summary.contains("Parallel group"), "join summary should mention parallel group");
+    assert_eq!(stored_join.level, 0, "join node level should be 0");
+}
+
+// ── Upstream fault injection tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn chat_completions_upstream_500_propagates_to_client() {
+    // When upstream returns HTTP 500, the proxy should propagate the status.
+    let (addr, _shutdown) = start_mock_upstream_with_status(
+        500, json!({"error": {"message": "Internal server error", "type": "server_error"}}),
+    ).await;
+    let state = build_proxy_state(addr, "upstream_500_cc").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("Authorization", "Bearer sk-test")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "test"}],
+            "stream": false,
+        }))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status().as_u16(), 500,
+        "upstream 500 should be propagated to client");
+    let body = resp.text().await.unwrap();
+    assert!(!body.is_empty(), "error response should have a body");
+}
+
+#[tokio::test]
+async fn responses_upstream_500_does_not_crash_proxy() {
+    // When upstream returns HTTP 500 to a streaming responses() request,
+    // the proxy must not crash. Documents the gap that responses() currently
+    // returns 200 OK regardless of upstream status.
+    let (addr, _shutdown) = start_mock_upstream_with_status(
+        500, json!({"error": {"message": "Internal server error", "type": "server_error"}}),
+    ).await;
+    let state = build_proxy_state(addr, "upstream_500_resp").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("Authorization", "Bearer sk-test")
+        .header("Accept", "text/event-stream")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "input": "test",
+        }))
+        .send().await;
+
+    // Proxy must not crash — response may be 502 if network fails,
+    // 200 with SSE body if passthrough succeeds, or 500 if internal error.
+    // The key invariant: no panic, no hang, no unhandled error.
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            // Even if status is 200, the body should contain the error
+            // from the upstream (this is the gap to fix in responses())
+            assert!(
+                body.contains("error") || body.contains("Internal server error")
+                    || status.as_u16() >= 400,
+                "upstream 500 must be reflected in status or body: status={status}, body={body}"
+            );
+        }
+        Err(e) => {
+            // Network error is acceptable if proxy times out or refuses
+            assert!(
+                e.is_connect() || e.is_timeout() || e.is_request(),
+                "unexpected error type from proxy: {e}"
+            );
+        }
+    }
+}
+
+// ── Parallel execution failure paths ─────────────────────────────────────
+
+#[tokio::test]
+async fn concurrent_3_tool_with_1_failure_and_fail_fast() {
+    // Three concurrent tool calls: 2 succeed, 1 is Blocked. With fail_fast=true,
+    // the join should trigger on the first failure.
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "partial_fail").await;
+    let db = state.storage.db.clone();
+
+    let conv_id = db.create_and_store("partial_fail_test", &json!([
+        {"role": "system", "content": "Agent."},
+        {"role": "user", "content": "Check files."}
+    ])).unwrap();
+    let replay_session_id = format!("pf_{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+
+    let root_span = deeplossless::parallel::ExecutionSpan::root_span();
+    let tools = vec![
+        deeplossless::parallel::ToolCallInfo { name: "grep".into(), call_id: "tc_x".into() },
+        deeplossless::parallel::ToolCallInfo { name: "read_file".into(), call_id: "tc_y".into() },
+        deeplossless::parallel::ToolCallInfo { name: "list_files".into(), call_id: "tc_z".into() },
+    ];
+
+    let tracker = deeplossless::parallel::ForkJoinTracker::fork(
+        conv_id, 0, &root_span, &tools,
+        deeplossless::parallel::ParallelGovernance::default(),
+    );
+    let group_id = tracker.group_id.clone();
+    let parent_span_id_str = tracker.parent_span.span_id.0.clone();
+
+    // Which branch will fail (index 1 = tc_y = read_file)
+    let fail_tool_call_id = "tc_y".to_string();
+
+    let branch_metas: Vec<(String, String, String)> = tracker.branches.iter()
+        .map(|b| (b.tool_call_id.clone(), b.span_id.0.clone(), b.tool_name.clone()))
+        .collect();
+
+    let db_arc = db.clone();
+    let tasks: Vec<_> = branch_metas.into_iter().enumerate().map(|(i, (tool_call_id, span_id, tool_name))| {
+        let db2 = db_arc.clone();
+        let gid = group_id.clone();
+        let psid = parent_span_id_str.clone();
+        let rsid = replay_session_id.clone();
+        let is_fail = tool_call_id == fail_tool_call_id;
+        let outcome = if is_fail { "blocked".to_string() } else { "success".to_string() };
+        let delay_ms = 20 * (i as u64 + 1); // 20, 40, 60ms
+        let tcid = tool_call_id.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let result_text = if is_fail { "Tool call blocked — file in use".to_string() } else { format!("Result {tool_name}") };
+            let reasoning_after = if is_fail { "Recovery attempted but failed.".to_string() } else { "Ok.".to_string() };
+            let outcome_c = outcome.clone();
+            let exec_id = tokio::task::spawn_blocking(move || {
+                db2.store_execution_unit_with_span(
+                    conv_id,
+                    &format!("Reasoning {tool_name}"),
+                    &tool_name,
+                    r#"{"path":"src/main.rs"}"#,
+                    &result_text,
+                    &reasoning_after,
+                    &outcome_c,
+                    &[],
+                    &span_id,
+                    &psid,
+                    "parallel",
+                    &gid,
+                    &tcid,
+                    &rsid,
+                )
+            }).await.unwrap().unwrap();
+            (exec_id, tool_call_id, outcome)
+        })
+    }).collect();
+
+    let mut results: Vec<(i64, String, String)> = Vec::new();
+    for task in tasks {
+        results.push(task.await.unwrap());
+    }
+
+    // Record results in tracker
+    let mut tracker = tracker;
+    for (exec_id, tool_call_id, outcome_str) in &results {
+        let outcome = deeplossless::execution::ExecutionOutcome::from_str(outcome_str)
+            .unwrap_or(deeplossless::execution::ExecutionOutcome::Success);
+        tracker.record_branch_result(tool_call_id, *exec_id, &outcome).unwrap();
+    }
+
+    // With fail_fast=true, should_force_join must return true
+    // when at least one branch is Failed/Blocked.
+    assert!(tracker.should_force_join(),
+        "fail_fast=true + 1 blocked branch → should force join");
+
+    // Create join DAG node
+    let join_summary = format!("Parallel group {group_id} (3 branches, 1 blocked)");
+    let join_node = db.insert_join_atomic(conv_id, &join_summary, 0, &[], &[]).unwrap();
+
+    // Complete and persist HappensBefore edges
+    let hb_edges = tracker.complete(join_node.id).unwrap();
+    // Failed branches also create edges since execution_unit_id is set
+    assert_eq!(hb_edges.len(), 3,
+        "all 3 branches produce happens-before edges (including failed)");
+
+    for hb in &hb_edges {
+        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before").unwrap();
+    }
+
+    // ── Verify ──
+    let units = db.get_execution_units(conv_id, 10).unwrap();
+    assert_eq!(units.len(), 3);
+
+    let blocked_units: Vec<_> = units.iter().filter(|u| u.outcome.as_str() == "blocked").collect();
+    assert_eq!(blocked_units.len(), 1, "exactly 1 unit should be blocked");
+    assert_eq!(blocked_units[0].span_mode, "parallel");
+    assert_eq!(blocked_units[0].parallel_group, group_id);
+
+    let success_units: Vec<_> = units.iter().filter(|u| u.outcome.as_str() == "success").collect();
+    assert_eq!(success_units.len(), 2, "exactly 2 units should succeed");
+
+    // HappensBefore edges
+    let lineage = db.get_lineage_to(join_node.id).unwrap();
+    let hb_count = lineage.iter().filter(|(_, _, k)| k == "happens_before").count();
+    assert_eq!(hb_count, 3, "3 happens-before edges to join node");
+
+    // Join node
+    let stored_join = db.get_node(join_node.id).unwrap().unwrap();
+    assert!(stored_join.is_join);
+}
+
+// ── Audit mode tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn audit_mode_onerror_buffers_and_flushes_on_failure() {
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "audit_onerror").await;
+    let db = state.storage.db.clone();
+
+    // Switch to OnError mode
+    {
+        let mut cfg = db.policy_config.write().unwrap();
+        cfg.audit_mode = deeplossless::runtime::AuditMode::OnError;
+        cfg.onerror_ring_size = 10;
+    }
+
+    let conv_id = db.create_and_store("audit_onerror_test", &json!([
+        {"role": "system", "content": "Agent."},
+        {"role": "user", "content": "test"}
+    ])).unwrap();
+
+    // Store 3 successful execution units — should be buffered, NOT in DB
+    for i in 0..3 {
+        db.store_execution_unit(
+            conv_id,
+            &format!("reasoning_{i}"),
+            "grep",
+            r#"{"pattern":"test"}"#,
+            &format!("result_{i}"),
+            "ok",
+            "success",
+            &[],
+        ).unwrap();
+    }
+
+    // Verify no audit events written for successful units
+    let events = db.get_execution_events_by_conv(conv_id, 10).unwrap();
+    assert_eq!(events.len(), 0,
+        "OnError mode: successful units should NOT write execution_events");
+
+    // Store a failed unit — should flush buffer + write this event
+    db.store_execution_unit(
+        conv_id,
+        "reasoning_fail",
+        "read_file",
+        r#"{"path":"nonexistent"}"#,
+        "Error: file not found",
+        "recovery failed",
+        "blocked",
+        &[],
+    ).unwrap();
+
+    // Now execution_events should have content (the failed event)
+    let events_after = db.get_execution_events_by_conv(conv_id, 20).unwrap();
+    assert!(!events_after.is_empty(),
+        "OnError mode: failed unit should flush buffer + write event");
+}
+
+#[tokio::test]
+async fn audit_mode_off_writes_no_execution_events() {
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "audit_off").await;
+    let db = state.storage.db.clone();
+
+    // Switch to Off mode
+    {
+        let mut cfg = db.policy_config.write().unwrap();
+        cfg.audit_mode = deeplossless::runtime::AuditMode::Off;
+    }
+
+    let conv_id = db.create_and_store("audit_off_test", &json!([
+        {"role": "system", "content": "Agent."},
+        {"role": "user", "content": "test"}
+    ])).unwrap();
+
+    // Store execution units
+    for i in 0..5 {
+        db.store_execution_unit(
+            conv_id,
+            &format!("reasoning_{i}"),
+            "grep",
+            r#"{"pattern":"test"}"#,
+            &format!("result_{i}"),
+            "ok",
+            "success",
+            &[],
+        ).unwrap();
+    }
+
+    // Verify NO execution_events written
+    let events = db.get_execution_events_by_conv(conv_id, 10).unwrap();
+    assert_eq!(events.len(), 0,
+        "AuditMode::Off: no execution_events should be written");
+
+    // Verify execution_units ARE still written
+    let units = db.get_execution_units(conv_id, 10).unwrap();
+    assert_eq!(units.len(), 5,
+        "execution_units should still be written in Off mode");
+}
+
+// ── ForkJoinTracker timeout branch ────────────────────────────────────────
+
+#[tokio::test]
+async fn fork_join_tracker_timeout_branch_transitions_correctly() {
+    // Verify that timeout_branch() transitions a Pending branch to TimedOut,
+    // and that should_force_join reacts to the timeout with fail_fast.
+    let root_span = deeplossless::parallel::ExecutionSpan::root_span();
+    let tools = vec![
+        deeplossless::parallel::ToolCallInfo { name: "grep".into(), call_id: "tc_t1".into() },
+        deeplossless::parallel::ToolCallInfo { name: "read_file".into(), call_id: "tc_t2".into() },
+    ];
+
+    let mut tracker = deeplossless::parallel::ForkJoinTracker::fork(
+        1, 0, &root_span, &tools,
+        deeplossless::parallel::ParallelGovernance::default(), // fail_fast=true
+    );
+
+    // Mark one branch as timed out
+    tracker.timeout_branch("tc_t1").unwrap();
+
+    // With fail_fast=true, a TimedOut branch should trigger force_join
+    assert!(tracker.should_force_join(),
+        "fail_fast + 1 timed out branch → should force join");
+
+    let timed_out_branch = tracker.branches.iter()
+        .find(|b| b.tool_call_id == "tc_t1").unwrap();
+    assert!(matches!(timed_out_branch.status,
+        deeplossless::parallel::BranchStatus::TimedOut),
+        "branch should be TimedOut");
+    assert!(timed_out_branch.error.as_deref() == Some("timeout"),
+        "error message should be 'timeout'");
+
+    // The other branch should still be Pending
+    let pending_branch = tracker.branches.iter()
+        .find(|b| b.tool_call_id == "tc_t2").unwrap();
+    assert!(matches!(pending_branch.status,
+        deeplossless::parallel::BranchStatus::Pending),
+        "other branch should remain Pending");
+}
+
+// ── Upstream malformed response tests ─────────────────────────────────────
+
+#[tokio::test]
+async fn responses_upstream_malformed_json_returns_502() {
+    // When the upstream returns a non-JSON body, the responses() non-streaming
+    // path must return 502 (BAD_GATEWAY) rather than panicking on parse.
+    // Use a raw-string response that is NOT valid JSON.
+    let app = Router::new().route("/v1/chat/completions", post(move |_: Json<Value>| async move {
+        (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain")], "this is not json")
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap();
+    });
+
+    let state = build_proxy_state(addr, "malformed").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("Authorization", "Bearer sk-test")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "input": "test",
+        }))
+        .send().await.unwrap();
+
+    assert!(resp.status().as_u16() >= 400,
+        "malformed upstream body should produce error, got {}", resp.status());
+    drop(tx);
+}
+
+// ── SSE stream disconnect test ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn proxy_handles_sse_stream_disconnect_gracefully() {
+    // When the upstream sends partial SSE content then disconnects,
+    // the proxy must close the stream cleanly (no panic, stream ends with [DONE]).
+    let partial_sse_body = "data: {\"id\":\"evt-001\",\"choices\":[{\"delta\":{\"content\":\"partial response\"}}]}\n\n";
+    let body = partial_sse_body.to_string();
+    let app = Router::new().route("/v1/chat/completions", post(move |_: Json<Value>| {
+        let body = body.clone();
+        async move {
+            // Return the partial SSE as a complete response body (not streamed)
+            (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { rx.await.ok(); })
+            .await.unwrap();
+    });
+
+    let state = build_proxy_state(addr, "sse_disconnect").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("Authorization", "Bearer sk-test")
+        .header("Accept", "text/event-stream")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "test"}],
+            "stream": true,
+        }))
+        .send().await.unwrap();
+
+    let body = resp.text().await.unwrap();
+    // Stream should end cleanly — no panic propagated to client
+    assert!(body.contains("[DONE]") || body.contains("\"partial response\""),
+        "stream should end cleanly, got: {}", &body[..body.len().min(500)]);
+    drop(tx); // cleanup
+}
+
+// ── Snapshot budget enforcement ────────────────────────────────────────────
+
+#[tokio::test]
+async fn enforce_snapshot_budget_evicts_excess_l0_snapshots() {
+    // Insert more L0 (Ephemeral) snapshots than the budget allows,
+    // then verify enforcement evicts the excess.
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "snap_budget").await;
+    let db = state.storage.db.clone();
+
+    // Insert 5 L0 snapshots (budget is 100, but we test explicit enforcement)
+    for i in 0..5 {
+        db.take_snapshot(
+            i + 1, // execution_id
+            0, // memory_version_id
+            0, // tier: Ephemeral
+            &format!("{{\"snap\": {i}}}"),
+            100, // size_bytes
+            None, // retention_ttl
+            0, "", "",
+        ).unwrap();
+    }
+
+    // Enforce with a restrictive budget: max 2 hot L0 snapshots
+    let restrictive = deeplossless::snapshot::SnapshotBudget {
+        max_hot_snapshots: 2,
+        max_structural_per_execution: 1,
+        max_full_snapshots: 1,
+        max_total_size_bytes: 10 * 1024 * 1024,
+    };
+    let evicted = db.enforce_snapshot_budget(&restrictive).unwrap();
+    assert!(evicted > 0, "should evict at least 1 L0 snapshot");
+
+    // Verify remaining L0 count ≤ budget
+    let conn = db.writer_lock().lock().unwrap();
+    let remaining: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM execution_snapshots WHERE tier = 0",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert!(remaining <= 2, "L0 snapshots should be ≤ max_hot_snapshots (2), got {remaining}");
 }

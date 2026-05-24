@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::AppState;
-use crate::runtime::{BackgroundTasks, RateLimiter, RuntimeProfile, ExecutionCycle};
+use crate::runtime::{BackgroundTasks, RateLimiter, RuntimeProfile, ExecutionCycle, RuntimePolicyConfig};
 
 /// Configuration derived from CLI args.
 pub struct CoordinatorConfig {
@@ -15,6 +15,8 @@ pub struct CoordinatorConfig {
     pub runtime_profile: String,
     pub dry_run: bool,
     pub log_dir: Option<String>,
+    /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
+    pub policy_config: RuntimePolicyConfig,
 }
 
 /// Assembles and owns all runtime services.
@@ -27,9 +29,11 @@ pub struct RuntimeCoordinator {
 impl RuntimeCoordinator {
     pub async fn build(cfg: CoordinatorConfig) -> anyhow::Result<Self> {
         let upstream = cfg.upstream.clone();
+        let policy_config = cfg.policy_config.clone();
         let db = Arc::new(
             crate::db::Database::builder()
                 .path(&cfg.db_path)
+                .policy_config(policy_config)
                 .build()
                 .await?,
         );

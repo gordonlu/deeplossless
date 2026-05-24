@@ -1,9 +1,19 @@
 use rusqlite::Connection;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::dag::DagNode;
+
+/// A buffered audit event for OnError mode.
+struct PendingAuditEvent {
+    event_kind: String,
+    event_payload: String,
+    seq_no: i64,
+    conv_id: Option<i64>,
+    epoch_ms: i64,
+}
 
 /// Result from unified search across messages, summaries, and snippets.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -33,12 +43,14 @@ const DEFAULT_DB_PATH: &str = "~/.deeplossless/lcm.db";
 /// ```
 pub struct DatabaseBuilder {
     path: PathBuf,
+    policy_config: Option<crate::runtime::RuntimePolicyConfig>,
 }
 
 impl Default for DatabaseBuilder {
     fn default() -> Self {
         Self {
             path: PathBuf::from(DEFAULT_DB_PATH),
+            policy_config: None,
         }
     }
 }
@@ -54,9 +66,18 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Set the runtime policy config (audit/snapshot modes).
+    pub fn policy_config(mut self, config: crate::runtime::RuntimePolicyConfig) -> Self {
+        self.policy_config = Some(config);
+        self
+    }
+
     /// Open the database, creating parent directories and running migrations.
     pub async fn build(self) -> anyhow::Result<Database> {
-        Database::open(&self.path).await
+        match self.policy_config {
+            Some(config) => Database::open_with_config(&self.path, &config).await,
+            None => Database::open(&self.path).await,
+        }
     }
 }
 
@@ -72,6 +93,12 @@ pub struct Database {
     writer: Mutex<Connection>,
     write_count: AtomicU64,
     tool_cache_l1: crate::tool_cache::L1HotCache,
+    /// Runtime policy config (audit mode, snapshot mode). Read via RwLock
+    /// so it can be updated at runtime without rebuilding the database.
+    pub policy_config: std::sync::Arc<std::sync::RwLock<crate::runtime::RuntimePolicyConfig>>,
+    /// Ring buffer for AuditMode::OnError. Stores pending audit events;
+    /// flushed to DB when an error outcome is detected.
+    onerror_buffer: Mutex<VecDeque<PendingAuditEvent>>,
 }
 
 /// Run a WAL checkpoint every N writes to limit WAL file growth.
@@ -83,6 +110,10 @@ impl Database {
     }
 
     async fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with_config(path, &crate::runtime::RuntimePolicyConfig::default()).await
+    }
+
+    async fn open_with_config(path: &Path, config: &crate::runtime::RuntimePolicyConfig) -> anyhow::Result<Self> {
         let expanded = shellexpand::full(&path.to_string_lossy())
             .map(|c| c.to_string())
             .unwrap_or_else(|_| path.to_string_lossy().to_string());
@@ -109,11 +140,14 @@ impl Database {
             read_pool.push(Mutex::new(rconn));
         }
 
+        let config_arc = std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
         let db = Self {
             read_pool,
             writer: Mutex::new(writer),
             write_count: AtomicU64::new(0),
             tool_cache_l1: crate::tool_cache::L1HotCache::default(),
+            policy_config: config_arc,
+            onerror_buffer: Mutex::new(VecDeque::with_capacity(config.onerror_ring_size)),
         };
         db.migrate()?;
         Ok(db)
@@ -123,6 +157,63 @@ impl Database {
     fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         let idx = self.write_count.load(Ordering::Relaxed) as usize % self.read_pool.len();
         self.read_pool[idx].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Get the current audit mode from policy config.
+    fn audit_mode(&self) -> crate::runtime::AuditMode {
+        self.policy_config.read()
+            .map(|c| c.audit_mode)
+            .unwrap_or(crate::runtime::AuditMode::Full)
+    }
+
+    /// Buffer a pending audit event for OnError mode.
+    fn buffer_audit_event(&self, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64) {
+        if let Ok(mut buf) = self.onerror_buffer.lock() {
+            let max = self.policy_config.read()
+                .map(|c| c.onerror_ring_size)
+                .unwrap_or(50);
+            if buf.len() >= max {
+                buf.pop_front();
+            }
+            buf.push_back(PendingAuditEvent {
+                event_kind: event_kind.to_string(),
+                event_payload: event_payload.to_string(),
+                seq_no,
+                conv_id,
+                epoch_ms,
+            });
+        }
+    }
+
+    /// Flush the OnError buffer to the execution_events table
+    /// using an already-held writer connection (avoids reentrant lock).
+    fn flush_onerror_buffer_with_conn(&self, conn: &Connection) {
+        let events: Vec<PendingAuditEvent> = {
+            let mut buf = match self.onerror_buffer.lock() {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            buf.drain(..).collect()
+        };
+        if events.is_empty() {
+            return;
+        }
+        for ev in &events {
+            if let Err(e) = conn.execute(
+                "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms) VALUES (NULL, ?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![ev.event_kind, ev.event_payload, ev.seq_no, ev.conv_id, ev.epoch_ms],
+            ) {
+                tracing::warn!(target: "deeplossless::db", "onerror buffer flush failed: {e}");
+            }
+        }
+    }
+
+    /// Flush the OnError buffer (acquires writer lock itself).
+    /// Use `flush_onerror_buffer_with_conn` when a writer lock is already held.
+    #[allow(dead_code)]
+    fn flush_onerror_buffer(&self) {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_onerror_buffer_with_conn(&conn);
     }
 
     /// Run a WAL checkpoint to prevent the WAL file from growing
@@ -813,12 +904,14 @@ impl Database {
             }
         }
 
-        // Record event for audit trail
-        if let Err(e) = tx.execute(
-            "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES ('compress', ?1, ?2, '{}')",
-            rusqlite::params![new_id, conversation_id],
-        ) {
-            tracing::warn!(target: "deeplossless::db", "event log insert failed: {e}");
+        // Record event for audit trail (only in Full audit mode)
+        if self.audit_mode().should_write_audit() {
+            if let Err(e) = tx.execute(
+                "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES ('compress', ?1, ?2, '{}')",
+                rusqlite::params![new_id, conversation_id],
+            ) {
+                tracing::warn!(target: "deeplossless::db", "event log insert failed: {e}");
+            }
         }
 
         tx.commit()?;
@@ -891,7 +984,11 @@ impl Database {
     }
 
     /// Append an event to the DAG event log for audit and rollback.
+    /// Respects AuditMode: only writes in Full mode.
     pub fn record_event(&self, event_type: &str, node_id: i64, conv_id: i64, payload: &str) -> anyhow::Result<()> {
+        if !self.audit_mode().should_write_audit() {
+            return Ok(());
+        }
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO dag_events (event_type, node_id, conv_id, payload) VALUES (?1, ?2, ?3, ?4)",
@@ -980,25 +1077,60 @@ impl Database {
         )?;
         let exec_id = conn.last_insert_rowid();
 
-        // Append-only event log (authoritative audit source)
-        let payload = serde_json::json!({
-            "tool_name": tool_name,
-            "outcome": outcome,
-            "span_id": span_id,
-            "parent_span_id": parent_span_id,
-            "span_mode": span_mode,
-            "parallel_group": parallel_group,
-        });
-        conn.execute(
-            "INSERT INTO execution_events (execution_id, event_kind, event_payload, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, conv_id, epoch_ms, replay_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                exec_id, "execution_completed",
-                &serde_json::to_string(&payload).unwrap_or_default(),
-                span_id, parent_span_id, span_mode, parallel_group,
-                tool_call_id, conv_id, epoch_ms, replay_session_id,
-            ],
-        )?;
+        // Conditional append-only event log (authoritative audit source)
+        match self.audit_mode() {
+            crate::runtime::AuditMode::Full => {
+                let payload = serde_json::json!({
+                    "tool_name": tool_name,
+                    "outcome": outcome,
+                    "span_id": span_id,
+                    "parent_span_id": parent_span_id,
+                    "span_mode": span_mode,
+                    "parallel_group": parallel_group,
+                });
+                conn.execute(
+                    "INSERT INTO execution_events (execution_id, event_kind, event_payload, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, conv_id, epoch_ms, replay_session_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        exec_id, "execution_completed",
+                        &serde_json::to_string(&payload).unwrap_or_default(),
+                        span_id, parent_span_id, span_mode, parallel_group,
+                        tool_call_id, conv_id, epoch_ms, replay_session_id,
+                    ],
+                )?;
+            }
+            crate::runtime::AuditMode::OnError => {
+                let payload = serde_json::json!({
+                    "tool_name": tool_name,
+                    "outcome": outcome,
+                    "span_id": span_id,
+                    "parent_span_id": parent_span_id,
+                    "span_mode": span_mode,
+                    "parallel_group": parallel_group,
+                });
+                let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+                // If this is a failure outcome, flush buffer + write current event
+                if outcome == "blocked" || outcome == "recovered" {
+                    // Use the already-held connection to avoid reentrant lock
+                    self.flush_onerror_buffer_with_conn(&conn);
+                    conn.execute(
+                        "INSERT INTO execution_events (execution_id, event_kind, event_payload, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, conv_id, epoch_ms, replay_session_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        rusqlite::params![
+                            exec_id, "execution_completed",
+                            &payload_str,
+                            span_id, parent_span_id, span_mode, parallel_group,
+                            tool_call_id, conv_id, epoch_ms, replay_session_id,
+                        ],
+                    )?;
+                } else {
+                    self.buffer_audit_event("execution_completed", &payload_str, epoch_ms, Some(conv_id), epoch_ms);
+                }
+            }
+            crate::runtime::AuditMode::Off => {
+                // Skip entirely — no audit events written
+            }
+        }
 
         Ok(exec_id)
     }
@@ -1469,13 +1601,26 @@ impl Database {
     /// Store a single execution event. Append-only — never updated.
     /// Called from stream handlers as events flow through the proxy.
     /// `epoch_ms` is a Unix timestamp in milliseconds for stable ordering.
+    /// Respects AuditMode: Full writes immediately, OnError buffers, Off skips.
     pub fn store_execution_event(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64) -> anyhow::Result<i64> {
-        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms],
-        )?;
-        Ok(conn.last_insert_rowid())
+        match self.audit_mode() {
+            crate::runtime::AuditMode::Full => {
+                let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+                conn.execute(
+                    "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms],
+                )?;
+                Ok(conn.last_insert_rowid())
+            }
+            crate::runtime::AuditMode::OnError => {
+                self.buffer_audit_event(event_kind, event_payload, seq_no, conv_id, epoch_ms);
+                // Return a synthetic ID — buffer entries don't have DB IDs
+                Ok(-(seq_no.wrapping_abs()))
+            }
+            crate::runtime::AuditMode::Off => {
+                Ok(0)
+            }
+        }
     }
 
     #[allow(clippy::type_complexity)]

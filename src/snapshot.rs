@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: i32 = 1;
 
 /// Snapshot budget — prevents unbounded storage growth.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotBudget {
     /// Hard limit on total snapshot storage (bytes). Default 100 MB.
     pub max_total_size_bytes: u64,

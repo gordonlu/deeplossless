@@ -54,6 +54,18 @@ struct Cli {
     #[arg(long)]
     log_dir: Option<String>,
 
+    /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
+    #[arg(long, default_value = "full")]
+    audit_mode: String,
+
+    /// Snapshot mode: auto (trigger at semantic boundaries), manual (POST API only), off.
+    #[arg(long, default_value = "manual")]
+    snapshot_mode: String,
+
+    /// OnError ring buffer size — how many recent events to buffer before flushing on failure.
+    #[arg(long, default_value = "50")]
+    onerror_ring_size: usize,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -186,6 +198,16 @@ async fn main() -> anyhow::Result<()> {
         return run_translate(&file);
     }
 
+    let audit_mode = match cli.audit_mode.as_str() {
+        "off" | "Off" => deeplossless::runtime::AuditMode::Off,
+        "onerror" | "on_error" | "OnError" => deeplossless::runtime::AuditMode::OnError,
+        _ => deeplossless::runtime::AuditMode::Full,
+    };
+    let snapshot_mode = match cli.snapshot_mode.as_str() {
+        "off" | "Off" => deeplossless::runtime::SnapshotMode::Off,
+        "auto" | "Auto" => deeplossless::runtime::SnapshotMode::Auto,
+        _ => deeplossless::runtime::SnapshotMode::Manual,
+    };
     let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
         upstream: cli.upstream,
         db_path: cli.db_path,
@@ -196,6 +218,12 @@ async fn main() -> anyhow::Result<()> {
         runtime_profile: cli.runtime_profile,
         dry_run: cli.dry_run,
         log_dir: cli.log_dir,
+        policy_config: deeplossless::runtime::RuntimePolicyConfig {
+            audit_mode,
+            snapshot_mode,
+            onerror_ring_size: cli.onerror_ring_size,
+            ..Default::default()
+        },
     };
     let coordinator = deeplossless::runtime_coordinator::RuntimeCoordinator::build(cfg).await?;
     let upstream = coordinator.state.upstream.clone();
