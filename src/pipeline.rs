@@ -423,8 +423,11 @@ impl ChatPipeline {
     /// Tool results are "external capability" — optional memory, not
     /// planning authority. Uses retrieval hints (first 2 items, truncated)
     /// to avoid planner interference from full context dumps.
+    /// Inject LCM context as a user message with `[lcm]` prefix.
+    /// Tool role requires a paired assistant tool_call (DeepSeek rejects
+    /// synthetic tool messages). User role is safe — the model treats it as
+    /// additional context rather than a tool execution record.
     fn inject_context(body: &mut serde_json::Value, ctx_text: &str) {
-        // Truncate to first 2 non-empty lines as retrieval hints
         let hint: String = ctx_text.lines()
             .filter(|l| !l.trim().is_empty())
             .take(2)
@@ -432,11 +435,9 @@ impl ChatPipeline {
             .join("\n");
         if let Some(arr) = body["messages"].as_array_mut() {
             arr.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": "lcm_memory",
-                "name": "lcm_memory",
+                "role": "user",
                 "content": format!(
-                    "[cached retrieval hint — use GET /v1/lcm/grep for full context]\n{hint}"
+                    "[lcm] cached context — GET /v1/lcm/grep for full retrieval\n{hint}"
                 ),
             }));
         }
