@@ -400,7 +400,7 @@ impl DagEngine {
 
         // Idempotency: reuse existing summary for same sources (P0-9)
         if let Some(existing) = self.db.find_by_compaction_id(&cid)? {
-            tracing::info!(target: "deeplossless::dag", compaction_id = %cid, "idempotent compaction: reuse node {}", existing.id);
+            tracing::debug!(target: "deeplossless::dag", compaction_id = %cid, "idempotent compaction: reuse node {}", existing.id);
             return Ok(existing);
         }
 
