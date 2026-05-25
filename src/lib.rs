@@ -140,6 +140,7 @@ pub struct AppState {
     pub dry_run: bool,
     pub log_dir: Option<String>,
     pub record: Option<String>,
+    pub passthrough: bool,
 }
 
 impl AppState {

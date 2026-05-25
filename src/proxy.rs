@@ -809,6 +809,46 @@ async fn chat_completions(
     let model = crate::session::model_name(&req_body);
     let streaming = crate::session::is_streaming(&req_body);
 
+    // Pure passthrough: zero processing. Forward upstream URL, method, body, headers.
+    // For isolating protocol bugs — when this works but the full pipeline doesn't.
+    if state.passthrough && streaming {
+        let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
+        let resp = state.runtime.client.post(&upstream_url)
+            .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
+            .header("Content-Type", "application/json")
+            .body(body.clone())
+            .send().await;
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                let headers = r.headers().clone();
+                let byte_stream = r.bytes_stream();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let mut stream = byte_stream;
+                    while let Some(chunk) = stream.next().await {
+                        if let Ok(c) = chunk {
+                            if tx.send(Ok::<_, std::convert::Infallible>(c)).is_err() { break; }
+                        }
+                    }
+                });
+                let stream = UnboundedReceiverStream::new(rx);
+                let mut response = Response::new(Body::from_stream(stream));
+                *response.status_mut() = status;
+                for (k, v) in headers.iter() {
+                    if k != "transfer-encoding" {
+                        response.headers_mut().insert(k.clone(), v.clone());
+                    }
+                }
+                return response;
+            }
+            Err(e) => {
+                metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}"));
+            }
+        }
+    }
+
     // Run the chat pipeline (fingerprint → store → compact → assemble → inject)
     let pipeline = crate::pipeline::ChatPipeline::new(&state);
     let injected_body = match pipeline.process(model, &req_body).await {

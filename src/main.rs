@@ -60,6 +60,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     record: Option<String>,
 
+    /// Pure byte-level passthrough — no pipeline, no context injection,
+    /// no reasoning capture, no header modification. Identical to direct
+    /// DeepSeek at the HTTP level. For isolating protocol bugs.
+    #[arg(long)]
+    passthrough: bool,
+
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
     audit_mode: String,
@@ -263,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
         dry_run: cli.dry_run,
         log_dir: cli.log_dir,
         record: cli.record,
+        passthrough: cli.passthrough,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,
