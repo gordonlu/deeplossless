@@ -141,6 +141,8 @@ pub struct AppState {
     pub log_dir: Option<String>,
     pub record: Option<String>,
     pub passthrough: bool,
+    pub no_pipeline: bool,
+    pub no_header_mod: bool,
 }
 
 impl AppState {

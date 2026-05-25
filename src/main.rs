@@ -66,6 +66,16 @@ pub(crate) struct Cli {
     #[arg(long)]
     passthrough: bool,
 
+    /// Skip context injection only (still captures reasoning, modifies headers).
+    /// For isolating whether DAG context injection causes the hang.
+    #[arg(long)]
+    no_pipeline: bool,
+
+    /// Use upstream headers as-is (skip cache-control, x-accel-buffering, charset).
+    /// For isolating whether header modification causes the hang.
+    #[arg(long)]
+    no_header_mod: bool,
+
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
     audit_mode: String,
@@ -270,6 +280,8 @@ async fn main() -> anyhow::Result<()> {
         log_dir: cli.log_dir,
         record: cli.record,
         passthrough: cli.passthrough,
+        no_pipeline: cli.no_pipeline,
+        no_header_mod: cli.no_header_mod,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

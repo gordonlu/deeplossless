@@ -17,6 +17,8 @@ pub struct CoordinatorConfig {
     pub log_dir: Option<String>,
     pub record: Option<String>,
     pub passthrough: bool,
+    pub no_pipeline: bool,
+    pub no_header_mod: bool,
     /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
     pub policy_config: RuntimePolicyConfig,
 }
@@ -108,6 +110,8 @@ impl RuntimeCoordinator {
             log_dir: cfg.log_dir,
             record: cfg.record,
             passthrough: cfg.passthrough,
+            no_pipeline: cfg.no_pipeline,
+            no_header_mod: cfg.no_header_mod,
         };
 
         Ok(Self { state, tasks })

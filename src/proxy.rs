@@ -850,12 +850,16 @@ async fn chat_completions(
     }
 
     // Run the chat pipeline (fingerprint → store → compact → assemble → inject)
-    let pipeline = crate::pipeline::ChatPipeline::new(&state);
-    let injected_body = match pipeline.process(model, &req_body).await {
+    let injected_body = if state.no_pipeline {
+        req_body.clone()
+    } else {
+        let pipeline = crate::pipeline::ChatPipeline::new(&state);
+        match pipeline.process(model, &req_body).await {
         Ok(out) => out.injected_body,
         Err(e) => {
             warn!("pipeline error: {e}, falling back to passthrough");
             req_body.clone()
+        }
         }
     };
 
@@ -957,8 +961,10 @@ async fn chat_completions(
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
         response.headers_mut().insert("content-type", content_type);
-        response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
-        response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
+        if !state.no_header_mod {
+            response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
+            response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
+        }
         response
     } else {
         match resp.bytes().await {
