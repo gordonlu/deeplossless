@@ -420,16 +420,25 @@ impl ChatPipeline {
         }
     }
 
-    /// Inject `<lcm_context>` as a tool-role message. Tool results occupy the
-    /// model's "external capability" latent space — they are treated as optional
-    /// external memory, not as planning authority. This avoids polluting the
-    /// planner/reasoning trajectory that system/user injection causes.
+    /// Inject LCM context as a tool-role message from `lcm_memory`.
+    /// Tool results are "external capability" — optional memory, not
+    /// planning authority. Uses retrieval hints (first 2 items, truncated)
+    /// to avoid planner interference from full context dumps.
     fn inject_context(body: &mut serde_json::Value, ctx_text: &str) {
+        // Truncate to first 2 non-empty lines as retrieval hints
+        let hint: String = ctx_text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
         if let Some(arr) = body["messages"].as_array_mut() {
             arr.push(serde_json::json!({
                 "role": "tool",
-                "tool_call_id": "lcm_context",
-                "content": ctx_text,
+                "tool_call_id": "lcm_memory",
+                "name": "lcm_memory",
+                "content": format!(
+                    "[cached retrieval hint — use GET /v1/lcm/grep for full context]\n{hint}"
+                ),
             }));
         }
     }
