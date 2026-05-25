@@ -358,12 +358,8 @@ impl ChatPipeline {
         let query = req_body["messages"].as_array()
             .and_then(|arr| arr.iter().rev().find(|m| m["role"] == "user"))
             .and_then(|m| m["content"].as_str());
-        // DAG context injection DISABLED by default for Chat Completions.
-    // <lcm_context> in system messages changes the model's reasoning
-    // trajectory — it's prompt injection, not transparent optimization.
-    // This causes tool-calling agents to skip tools, derail planning,
-    // or enter unexpected reasoning paths. LCM endpoints remain available
-    // for agents that explicitly query them. Enable via --lcm-context.
+        // LCM context appended as user message (not system prompt) — safe for
+    // tool-call agents. Disabled by default; enable via --lcm-context.
     if self.lcm_context
             && let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query) {
             if !dag_ctx.is_empty() {
@@ -424,21 +420,17 @@ impl ChatPipeline {
         }
     }
 
-    /// Inject `<lcm_context>` block only into the first system message
-    /// to avoid prompt drift from repeated injection.
-    /// `ctx_text` is the pre-rendered block from `render_dag_context`,
-    /// which already includes the `<lcm_context>`...`</lcm_context>` tags.
+    /// Inject `<lcm_context>` as a tool-role message. Tool results occupy the
+    /// model's "external capability" latent space — they are treated as optional
+    /// external memory, not as planning authority. This avoids polluting the
+    /// planner/reasoning trajectory that system/user injection causes.
     fn inject_context(body: &mut serde_json::Value, ctx_text: &str) {
         if let Some(arr) = body["messages"].as_array_mut() {
-            for msg in arr.iter_mut() {
-                if msg["role"] == "system" {
-                    let existing = msg["content"].as_str().unwrap_or("");
-                    msg["content"] = serde_json::json!(
-                        format!("{}\n\n{}", existing, ctx_text)
-                    );
-                    break;
-                }
-            }
+            arr.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "lcm_context",
+                "content": ctx_text,
+            }));
         }
     }
 }

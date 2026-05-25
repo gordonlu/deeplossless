@@ -849,16 +849,28 @@ async fn chat_completions(
         }
     }
 
-    // Pipeline runs in background — does NOT modify the request body.
-    // Context and reasoning injection are disabled by default.
-    if !state.no_pipeline {
+    // Pipeline: always run for storage. Only modify request body when
+    // --lcm-context is enabled (context appended as user message).
+    let injected_body = if state.lcm_context && !state.no_pipeline {
         let pipeline = crate::pipeline::ChatPipeline::new(&state);
-        let body = req_body.clone();
-        let model_owned = model.to_string();
-        tokio::task::spawn(async move {
-            let _ = pipeline.process(&model_owned, &body).await;
-        });
-    }
+        match pipeline.process(model, &req_body).await {
+            Ok(out) => out.injected_body,
+            Err(e) => {
+                warn!("pipeline error: {e}, falling back to passthrough");
+                req_body.clone()
+            }
+        }
+    } else {
+        if !state.no_pipeline {
+            let pipeline = crate::pipeline::ChatPipeline::new(&state);
+            let body = req_body.clone();
+            let model_owned = model.to_string();
+            tokio::task::spawn(async move {
+                let _ = pipeline.process(&model_owned, &body).await;
+            });
+        }
+        req_body.clone()
+    };
 
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
@@ -867,7 +879,7 @@ async fn chat_completions(
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
-        .json(&req_body)
+        .json(&injected_body)
         .send()
         .await
     {

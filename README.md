@@ -76,6 +76,13 @@ cargo test --test simulated_session -- --nocapture
 | `--summarizer-model` | `deepseek-v4-pro` | Model for background summarization |
 | `--dry-run` | disabled | Save request bodies, skip upstream |
 | `--log-dir` | disabled | Per-request JSON logging |
+| `--record` | disabled | Record raw request/response for protocol debugging |
+| `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |
+| `--tls-key` | auto-generated | Custom TLS private key (PEM) |
+| `--lcm-context` | disabled | Enable DAG context injection (for LCM-aware agents) |
+
+TLS is always on. A self-signed certificate is auto-generated at `~/.deeplossless/`.
+Run `deeplossless trust` once to configure it.
 
 Set via `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`.
 
@@ -83,7 +90,7 @@ Set via `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`.
 
 ```bash
 # 1. Start the proxy
-deeplossless --api-key sk-...
+deeplossless
 
 # 2. Codex config (~/.codex/config.toml)
 [model_providers.localproxy]
@@ -91,13 +98,17 @@ name = "deeplossless"
 base_url = "https://localhost:8080/v1"
 wire_api = "responses"
 
-# 3. Run
+# 3. Trust the certificate (once)
+deeplossless trust
+
+# 4. Run
 codex
 ```
 
-Protocol translation, tool cache interception, and context injection work
-transparently. Manual agent hooks require Codex-side integration.
-See [Technical Reference](docs/tech-reference.md#codex--deepseek-detailed) for details.
+Protocol translation and tool cache interception work transparently.
+DAG context injection is disabled by default — use `--lcm-context` to enable
+it for agents that understand LCM format. Manual agent hooks require
+Codex-side integration.
 
 ## Session Report
 
