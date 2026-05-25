@@ -1008,8 +1008,9 @@ async fn chat_completions(
                 *response.status_mut() = status;
                 response.headers_mut().insert("content-type", content_type);
                 if let Some(cid) = conv_id {
-                    response.headers_mut().insert("x-deeplossless-conv-id", cid.to_string().parse().expect("static header"));
+                    response.headers_mut().insert("x-deeplossless-conv", cid.to_string().parse().expect("static header"));
                 }
+                response.headers_mut().insert("x-deeplossless-lcm", "GET /v1/lcm/grep/{conv_id}?query= — search past context; GET /v1/lcm/cache?tool=&args= — check tool cache; GET /v1/lcm/status/{conv_id} — DAG health".parse().expect("static header"));
                 response
             }
             Err(e) => {
