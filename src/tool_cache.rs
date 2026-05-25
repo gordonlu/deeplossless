@@ -343,45 +343,11 @@ pub fn transform_result(tool_name: &str, raw_result: &str) -> String {
     match kind {
         ToolKind::ReadFile => {
             let line_count = raw_result.lines().count();
-            let snippets = crate::snippet::extract(raw_result);
-            let symbols: Vec<String> = snippets
-                .iter()
-                .filter(|s| matches!(s.snippet_type, crate::snippet::SnippetType::CodeBlock))
-                .map(|s| s.content.clone())
-                .collect();
-            let paths: Vec<String> = snippets
-                .iter()
-                .filter(|s| matches!(s.snippet_type, crate::snippet::SnippetType::FilePath))
-                .map(|s| s.content.clone())
-                .collect();
-            let parts: Vec<&str> = symbols.iter().map(|s| s.as_str())
-                .chain(paths.iter().map(|s| s.as_str()))
-                .take(8)
-                .collect();
-            if parts.is_empty() {
-                format!("[cached] {line_count} lines")
-            } else {
-                format!("[cached] {line_count} lines, includes: {}", parts.join("; "))
-            }
+            format!("[cached] {line_count} lines")
         }
         ToolKind::ListFiles => {
-            let interesting: Vec<&str> = raw_result
-                .lines()
-                .filter(|l| {
-                    let trimmed = l.trim();
-                    !trimmed.starts_with('.')
-                        && !trimmed.contains("node_modules")
-                        && !trimmed.contains("target/")
-                        && !trimmed.contains(".git/")
-                        && !trimmed.is_empty()
-                })
-                .take(15)
-                .collect();
-            if interesting.len() < raw_result.lines().count() {
-                format!("[cached] {} entries (top 15): {}", raw_result.lines().count(), interesting.join(", "))
-            } else {
-                format!("[cached] {} entries: {}", interesting.len(), interesting.join(", "))
-            }
+            let count = raw_result.lines().filter(|l| !l.trim().is_empty()).count();
+            format!("[cached] {count} entries")
         }
         _ => raw_result.to_string(),
     }
@@ -754,7 +720,7 @@ mod tests {
     // ── Transform ─────────────────────────────────────────────────────
 
     #[test]
-    fn transform_read_file_extracts_symbols() {
+    fn transform_read_file_counts_lines() {
         let result = transform_result("read_file", "pub fn foo() {\n    let x = 1;\n}\n\npub struct Bar {\n    x: i32,\n}\n\nfn baz() {}");
         assert!(result.starts_with("[cached]"));
         assert!(result.contains("lines"));
@@ -766,12 +732,14 @@ mod tests {
     }
 
     #[test]
-    fn transform_list_files_filters_noise() {
+    fn transform_list_files_counts_entries() {
         let result = transform_result("list_files", "src/main.rs\nsrc/lib.rs\n.git/config\nnode_modules/react/index.js\nCargo.toml");
+        assert!(result.starts_with("[cached]"));
+        assert!(result.contains("entries"));
+        // Must NOT leak raw content — only show count
+        assert!(!result.contains("src/main.rs"));
         assert!(!result.contains(".git"));
         assert!(!result.contains("node_modules"));
-        assert!(result.contains("src/main.rs"));
-        assert!(result.starts_with("[cached]"));
     }
 
     #[test]
