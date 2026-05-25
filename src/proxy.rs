@@ -901,7 +901,6 @@ async fn chat_completions(
         response.headers_mut().insert("content-type", content_type);
         response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
         response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
-        response.headers_mut().insert("connection", "close".parse().expect("static header parse"));
         response
     } else {
         match resp.bytes().await {
