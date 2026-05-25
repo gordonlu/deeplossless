@@ -623,6 +623,7 @@ async fn responses(
                 "output_index": 0, "content_index": content_parts.len().saturating_sub(1),
                 "part": text_part
             });
+            let resp_status = if usage_buf.is_some() { "completed" } else { "incomplete" };
             let usage_json = usage_buf.map(|v| serde_json::json!({
                 "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
                 "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
@@ -632,7 +633,7 @@ async fn responses(
                 "type": "response.completed",
                 "response": {
                     "id": resp_id, "object": "response", "created_at": now,
-                    "status": "completed", "model": model,
+                    "status": resp_status, "model": model,
                     "output": [item_json],
                     "usage": usage_json
                 }
@@ -656,7 +657,7 @@ async fn responses(
             if store_response {
                 let resp_obj = serde_json::json!({
                     "id": resp_id, "object": "response", "created_at": now,
-                    "status": "completed", "model": model,
+                    "status": resp_status, "model": model,
                     "output": [{
                         "id": msg_id, "type": "message", "status": "completed",
                         "role": "assistant",
