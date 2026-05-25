@@ -895,6 +895,8 @@ async fn chat_completions(
             if !reasoning.is_empty() {
                 let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
             }
+            tracing::debug!(target: "deeplossless::stream",
+                chunk_count=reasoning.len(), "STREAM CLOSED — task dropped, channel sender dropped, body EOF");
         });
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
