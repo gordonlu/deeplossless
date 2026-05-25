@@ -2,7 +2,13 @@
 
 deeplossless is a transparent proxy that sits between you (the AI coding agent) and the DeepSeek API. It automatically caches tool results, compresses long conversations, detects failure patterns, and injects relevant context — without changing any of your code.
 
-**If you are an AI agent reading this:** start deeplossless, point your API client at it, and proceed normally. Everything below is either automatic or optional.
+**If you are an AI agent reading this:** install [SKILL.md](SKILL.md) to your skills
+directory. It contains the exact commands to discover and query LCM endpoints.
+
+**Quick install:**
+```bash
+cp SKILL.md ~/.deepseek/skills/deeplossless.md
+```
 
 ---
 
