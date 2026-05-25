@@ -563,6 +563,17 @@ impl Database {
     }
 
     /// Find a conversation by session fingerprint, or create one.
+    /// Look up a conversation by fingerprint without creating. Returns None if not found.
+    pub fn find_conversation_by_fingerprint(&self, fingerprint: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.read_conn();
+        let id = conn.query_row(
+            "SELECT id FROM conversations WHERE session_id = ?1 LIMIT 1",
+            rusqlite::params![fingerprint],
+            |row| row.get(0),
+        ).ok();
+        Ok(id)
+    }
+
     pub fn find_or_create_conversation(&self, fingerprint: &str, model: &str) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Try to find existing conversation

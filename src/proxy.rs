@@ -267,7 +267,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{response_id}", get(responses_retrieve))
-        .route("/v1/lcm/grep/{conv_id}", get(lcm_grep))
+        .route("/v1/lcm/grep/{conv_id}", get(lcm_grep_by_id))
+        .route("/v1/lcm/grep", get(lcm_grep_by_fingerprint))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
@@ -1047,7 +1048,7 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
 
 // ── LCM retrieval endpoints ────────────────────────────────────────────
 
-async fn lcm_grep(
+async fn lcm_grep_by_id(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(conv_id): Path<i64>,
@@ -1068,6 +1069,39 @@ async fn lcm_grep(
         Err(e) => {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}"))
         }
+    }
+}
+
+/// LCM grep by conversation fingerprint (UUID or session key).
+/// Supports non-integer conversation identifiers that OpenCode generates.
+async fn lcm_grep_by_fingerprint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
+    let fingerprint = params.get("fingerprint").map(|s| s.as_str()).unwrap_or("");
+
+    // Resolve fingerprint to internal conversation ID
+    let conv_id = if let Ok(Some(id)) = state.storage.db.find_conversation_by_fingerprint(fingerprint) {
+        id
+    } else if let Ok(id) = fingerprint.parse::<i64>() {
+        id
+    } else {
+        return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "conversation not found");
+    };
+
+    match state.storage.db.search_unified(conv_id, query) {
+        Ok(results) => Json(json!({
+            "conversation_id": conv_id,
+            "query": query,
+            "total": results.len(),
+            "matches": results,
+        })).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
     }
 }
 
