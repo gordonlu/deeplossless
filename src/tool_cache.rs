@@ -343,11 +343,27 @@ pub fn transform_result(tool_name: &str, raw_result: &str) -> String {
     match kind {
         ToolKind::ReadFile => {
             let line_count = raw_result.lines().count();
-            format!("[cached] {line_count} lines")
+            let preview: String = raw_result.lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(3)
+                .map(|l| l.trim().chars().take(80).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if preview.is_empty() {
+                format!("[cached] {line_count} lines")
+            } else {
+                format!("[cached] {line_count} lines:\n{preview}")
+            }
         }
         ToolKind::ListFiles => {
             let count = raw_result.lines().filter(|l| !l.trim().is_empty()).count();
-            format!("[cached] {count} entries")
+            let preview: String = raw_result.lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(5)
+                .map(|l| l.trim().chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("[cached] {count} entries:\n{preview}")
         }
         _ => raw_result.to_string(),
     }
@@ -732,14 +748,25 @@ mod tests {
     }
 
     #[test]
-    fn transform_list_files_counts_entries() {
+    fn transform_list_files_bounded_preview() {
         let result = transform_result("list_files", "src/main.rs\nsrc/lib.rs\n.git/config\nnode_modules/react/index.js\nCargo.toml");
-        assert!(result.starts_with("[cached]"));
-        assert!(result.contains("entries"));
-        // Must NOT leak raw content — only show count
-        assert!(!result.contains("src/main.rs"));
-        assert!(!result.contains(".git"));
-        assert!(!result.contains("node_modules"));
+        assert!(result.starts_with("[cached]"), "got: {result}");
+        assert!(result.contains("entries"), "got: {result}");
+        // Preview shows first 5 non-empty lines — bounded, not parsed
+        assert!(result.contains("src/main.rs"), "preview should show first lines: {result}");
+        assert!(result.contains("Cargo.toml"), "preview should show first lines: {result}");
+    }
+
+    #[test]
+    fn transform_read_file_bounded_preview() {
+        let content = "line1\nline2\nline3\nline4\nline5\nline6";
+        let result = transform_result("read_file", content);
+        assert!(result.starts_with("[cached]"), "got: {result}");
+        assert!(result.contains("lines"), "got: {result}");
+        // Shows first 3 non-empty lines as preview
+        assert!(result.contains("line1"), "preview should show first lines: {result}");
+        // Line 6 should NOT appear (only first 3 lines)
+        assert!(!result.contains("line6"), "preview should be bounded: {result}");
     }
 
     #[test]
