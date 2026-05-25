@@ -130,7 +130,7 @@ fn process_events(
             let epoch_ms = crate::execution::next_logical_seq();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = db2.store_execution_event(None, kind, &payload, sn, Some(0), epoch_ms) {
-                    tracing::warn!(target: "deeplossless", "execution event store failed: {e}");
+                    tracing::debug!(target: "deeplossless", "execution event store failed: {e}");
                 }
             });
             seq += 1;
@@ -166,7 +166,7 @@ fn process_events(
         let epoch_ms = crate::execution::next_logical_seq();
         tokio::task::spawn_blocking(move || {
             if let Err(e) = db2.store_execution_event(None, &kind, &payload, sn, Some(0), epoch_ms) {
-                tracing::warn!(target: "deeplossless", "execution event store failed: {e}");
+                tracing::debug!(target: "deeplossless", "execution event store failed: {e}");
             }
         });
         seq += 1;
