@@ -154,6 +154,9 @@ pub fn stream_event_from_chat(data: &str) -> Vec<StreamEvent> {
     if let Some(content) = delta["content"].as_str() {
         return vec![StreamEvent::TextDelta { text: content.to_string() }];
     }
+    if let Some(reasoning) = delta["reasoning_content"].as_str() {
+        return vec![StreamEvent::ReasoningDelta { text: reasoning.to_string() }];
+    }
     if let Some(tool_calls) = delta["tool_calls"].as_array()
         && let Some(tc) = tool_calls.first() {
         let index = tc["index"].as_u64().unwrap_or(0) as usize;
@@ -199,6 +202,7 @@ pub fn stream_event_to_responses(event: &StreamEvent) -> String {
         StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments } => json!({"type": "response.function_call_arguments.done", "item_id": call_id, "name": name, "arguments": arguments}).to_string(),
         StreamEvent::OutputItemAdded { index, item_type } => json!({"type": "response.output_item.added", "output_index": index, "item": {"type": item_type}}).to_string(),
         StreamEvent::OutputItemDone { index } => json!({"type": "response.output_item.done", "output_index": index}).to_string(),
+        StreamEvent::ReasoningDelta { text } => json!({"type": "response.reasoning.delta", "delta": text}).to_string(),
         StreamEvent::Done { usage, .. } => json!({"type": "response.completed", "response": {"usage": {"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens}}}).to_string(),
         StreamEvent::Error { message, code } => json!({"type": "error", "error": {"type": "server_error", "code": code.as_deref().unwrap_or("unknown"), "message": message}}).to_string(),
         _ => String::new(),

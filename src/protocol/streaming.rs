@@ -72,6 +72,10 @@ pub fn to_chat_completions_sse(event: &StreamEvent) -> String {
                 "object": "chat.completion.chunk",
             })
         },
+        StreamEvent::ReasoningDelta { text } => json!({
+            "choices": [{"delta": {"reasoning_content": text}, "index": 0}],
+            "object": "chat.completion.chunk",
+        }),
         StreamEvent::Error { message, code } => json!({"error": {"message": message, "code": code}}),
         _ => json!({"choices": [{"delta": {}, "index": 0}]}),
     };
