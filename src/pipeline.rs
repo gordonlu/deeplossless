@@ -247,7 +247,7 @@ impl ChatPipeline {
                     if !unit.tool_call_id.is_empty() {
                         for tracker in &mut active_trackers {
                             if let Err(e) = tracker.record_branch_result(&unit.tool_call_id, exec_id, &unit.outcome) {
-                                tracing::warn!(target: "deeplossless::pipeline", "record_branch_result: {e}");
+                                tracing::debug!(target: "deeplossless::pipeline", "record_branch_result: {e}");
                             }
                         }
                     }
