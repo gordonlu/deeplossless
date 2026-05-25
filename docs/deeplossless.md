@@ -30,7 +30,7 @@ Requirements: Rust 1.85+, SQLite (bundled).
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 deeplossless
-# Listening on http://127.0.0.1:8080
+# Listening on https://localhost:8080
 ```
 
 Optional flags:
@@ -45,14 +45,14 @@ Optional flags:
 
 ### 2. Connect your agent
 
-Point any OpenAI-compatible client to `http://127.0.0.1:8080/v1`.
+Point any OpenAI-compatible client to `https://localhost:8080/v1`.
 
 **Codex** (Responses API):
 ```toml
 # ~/.codex/config.toml
 [model_providers.localproxy]
 name = "deeplossless"
-base_url = "http://127.0.0.1:8080/v1"
+base_url = "https://localhost:8080/v1"
 wire_api = "responses"
 env_key = "DEEPSEEK_API_KEY"
 ```
@@ -63,7 +63,7 @@ env_key = "DEEPSEEK_API_KEY"
   "provider": {
     "deeplossless": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1" }
+      "options": { "baseURL": "https://localhost:8080/v1" }
     }
   }
 }
@@ -71,7 +71,7 @@ env_key = "DEEPSEEK_API_KEY"
 
 **Any OpenAI-compatible client**:
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_BASE_URL=https://localhost:8080/v1
 export OPENAI_API_KEY=sk-...
 ```
 
@@ -115,7 +115,7 @@ deeplossless
 ### Step 3 — Non-streaming chat
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+curl -s https://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Say hello in one word"}]}' \
@@ -127,7 +127,7 @@ Should return a simple greeting.
 ### Step 4 — Streaming chat
 
 ```bash
-curl -sN http://127.0.0.1:8080/v1/chat/completions \
+curl -sN https://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Count to 3"}],"stream":true}'
@@ -138,7 +138,7 @@ Should output SSE chunks (`data: {...}`) ending with `data: [DONE]`.
 ### Step 5 — Responses API (Codex path)
 
 ```bash
-curl -sN http://127.0.0.1:8080/v1/responses \
+curl -sN https://localhost:8080/v1/responses \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
@@ -151,7 +151,7 @@ Should output Responses API SSE events (`event: response.created`, etc.).
 ### Step 6 — Runtime stats
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/lcm/runtime/stats \
+curl -s https://localhost:8080/v1/lcm/runtime/stats \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   | jq .
 ```
@@ -185,7 +185,7 @@ The runtime can reduce token consumption by:
 
 Monitor savings with:
 ```bash
-curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
+curl https://localhost:8080/v1/lcm/runtime/stats | jq .
 ```
 
 ## More

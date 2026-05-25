@@ -66,8 +66,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "50")]
     onerror_ring_size: usize,
 
-    /// TLS certificate path (PEM). Enables HTTPS when both --tls-cert and --tls-key are set.
-    /// Use `mkcert localhost 127.0.0.1 ::1` to generate trusted local certificates.
+    /// TLS certificate path (PEM). Uses auto-generated self-signed cert by default.
     #[arg(long)]
     tls_cert: Option<String>,
 
@@ -124,7 +123,7 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("  Start the proxy:");
     println!("    deeplossless --api-key sk-...");
     println!("  Then check:");
-    println!("    curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .\n");
+    println!("    curl https://localhost:8080/v1/lcm/runtime/stats | jq .\n");
     println!("  Benchmarks (no API key needed):");
     println!("    cargo test --test long_session_benchmark -- --nocapture\n");
     let _ = std::fs::remove_file(&demo_db_path);
@@ -248,29 +247,37 @@ async fn main() -> anyhow::Result<()> {
 
     // SSE connections are long-lived — graceful shutdown would hang forever.
     // Handle signal ourselves: brief drain, then exit.
-    if let (Some(cert), Some(key)) = (cli.tls_cert.as_ref(), cli.tls_key.as_ref()) {
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
-        tracing::info!("TLS enabled — HTTPS on {addr_str} (HTTP/2 + ALPN)");
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_handle.shutdown();
-        });
-        axum_server::bind_rustls(addr, tls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
-    } else {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let server = axum::serve(listener, app);
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutdown signal received, exiting…");
+    let tls_dir = shellexpand::tilde("~/.deeplossless").to_string();
+    let _ = std::fs::create_dir_all(&tls_dir);
+    let default_cert = format!("{tls_dir}/cert.pem");
+    let default_key = format!("{tls_dir}/key.pem");
+
+    let (tls_cert_path, tls_key_path) =
+        if let (Some(c), Some(k)) = (cli.tls_cert.as_ref(), cli.tls_key.as_ref()) {
+            (c.clone(), k.clone())
+        } else {
+            // Auto-generate self-signed cert — generated once, reused on restart.
+            if !std::path::Path::new(&default_cert).exists() {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
+                std::fs::write(&default_cert, cert.cert.pem())?;
+                std::fs::write(&default_key, cert.key_pair.serialize_pem())?;
+                tracing::info!("self-signed cert generated at {tls_dir}/");
             }
-            _ = server => {}
-        }
-    }
+            (default_cert, default_key)
+        };
+
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
+    tracing::info!("TLS enabled — HTTPS on {addr_str}");
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_handle.shutdown();
+    });
+    axum_server::bind_rustls(addr, tls_config)
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await?;
     coordinator.shutdown(std::time::Duration::from_secs(2)).await;
 
     tracing::info!("deeplossless stopped");

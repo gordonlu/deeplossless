@@ -46,10 +46,10 @@ cargo build --release
 
 ### For Claude Code / Codex / Cursor / etc.
 
-Set the base URL to `http://127.0.0.1:8080/v1` and use any model name — deeplossless forwards to upstream:
+Set the base URL to `https://localhost:8080/v1` and use any model name — deeplossless forwards to upstream:
 
 ```
-Base URL:  http://127.0.0.1:8080/v1
+Base URL:  https://localhost:8080/v1
 Model:     deepseek-v4-flash  (or any valid DeepSeek model)
 API Key:   sk-...              (same key passed to deeplossless)
 ```
@@ -61,7 +61,7 @@ API Key:   sk-...              (same key passed to deeplossless)
 {
   "apiKeyHelper": null,
   "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080/v1",
+    "ANTHROPIC_BASE_URL": "https://localhost:8080/v1",
     "ANTHROPIC_API_KEY": "sk-..."
   }
 }
@@ -71,15 +71,15 @@ API Key:   sk-...              (same key passed to deeplossless)
 
 **Generic OpenAI-compatible client** (most agents use this):
 ```json
-{ "baseURL": "http://127.0.0.1:8080/v1" }
+{ "baseURL": "https://localhost:8080/v1" }
 ```
 
 **cURL test** — verify it works:
 ```bash
-curl http://127.0.0.1:8080/health
+curl https://localhost:8080/health
 # → "healthy"
 
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+curl -s https://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"1+1"}]}'
@@ -98,7 +98,7 @@ deeplossless forwards to `https://api.deepseek.com` by default. Store the direct
 
 ```
 DIRECT = "https://api.deepseek.com/v1/chat/completions"
-PROXY  = "http://127.0.0.1:8080/v1/chat/completions"
+PROXY  = "https://localhost:8080/v1/chat/completions"
 ```
 
 ### Startup health check
@@ -106,7 +106,7 @@ PROXY  = "http://127.0.0.1:8080/v1/chat/completions"
 Before routing any request through deeplossless, probe it:
 
 ```
-GET http://127.0.0.1:8080/health
+GET https://localhost:8080/health
 ```
 
 If the response is not `healthy` within 2 seconds: **use DIRECT for everything. Do not attempt to start deeplossless yourself.** The user may have intentionally stopped it.
@@ -277,8 +277,8 @@ For LCM endpoints (cache, grep, plan, failure, etc.), deeplossless checks an opt
 When setting up an agent to use deeplossless:
 
 1. [ ] Start deeplossless: `deeplossless --api-key $KEY &`
-2. [ ] Health check: `curl http://127.0.0.1:8080/health` → `healthy`
-3. [ ] Set base URL: `http://127.0.0.1:8080/v1` (must include `/v1`)
+2. [ ] Health check: `curl https://localhost:8080/health` → `healthy`
+3. [ ] Set base URL: `https://localhost:8080/v1` (must include `/v1`)
 4. [ ] Send a test request: `POST /v1/chat/completions` → valid JSON response
 5. [ ] Done. Everything else is automatic.
 
@@ -289,7 +289,7 @@ When setting up an agent to use deeplossless:
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | Connection refused | deeplossless not running | Fall back to DIRECT (see §3). Do not attempt to start it. |
-| 404 on `/chat/completions` | Base URL missing `/v1` | Use `http://127.0.0.1:8080/v1` |
+| 404 on `/chat/completions` | Base URL missing `/v1` | Use `https://localhost:8080/v1` |
 | 401 Unauthorized | API key not passed | Include `Authorization: Bearer sk-...` in first request |
 | 502 Bad Gateway | Upstream API unreachable | Fall back to DIRECT (see §3). Upstream may be down or rate-limited. |
 | Proxy hangs / timeout | deeplossless blocked on DB or upstream | Fall back to DIRECT (see §3). Do not retry. |

@@ -1,6 +1,6 @@
 [package]
 name = "deeplossless"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -49,6 +49,7 @@ shellexpand = "3"
 thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
+rcgen = "0.13"
 
 # AST parsing
 tree-sitter = "0.24"

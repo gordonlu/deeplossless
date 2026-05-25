@@ -24,7 +24,7 @@ cargo install deeplossless
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 deeplossless
-# 监听 http://127.0.0.1:8080
+# 监听 https://localhost:8080
 ```
 
 可选参数：
@@ -39,14 +39,14 @@ deeplossless
 
 ### 2. 连接你的 Agent
 
-将任意 OpenAI 兼容客户端指向 `http://127.0.0.1:8080/v1`。
+将任意 OpenAI 兼容客户端指向 `https://localhost:8080/v1`。
 
 **Codex**（Responses API）：
 ```toml
 # ~/.codex/config.toml
 [model_providers.localproxy]
 name = "deeplossless"
-base_url = "http://127.0.0.1:8080/v1"
+base_url = "https://localhost:8080/v1"
 wire_api = "responses"
 env_key = "DEEPSEEK_API_KEY"
 ```
@@ -57,7 +57,7 @@ env_key = "DEEPSEEK_API_KEY"
   "provider": {
     "deeplossless": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1" }
+      "options": { "baseURL": "https://localhost:8080/v1" }
     }
   }
 }
@@ -65,7 +65,7 @@ env_key = "DEEPSEEK_API_KEY"
 
 **任意 OpenAI 兼容客户端**：
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_BASE_URL=https://localhost:8080/v1
 export OPENAI_API_KEY=sk-...
 ```
 
@@ -106,7 +106,7 @@ deeplossless
 ### 第 3 步 — 非流式对话
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+curl -s https://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"用一个词打招呼"}]}' \
@@ -118,7 +118,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ### 第 4 步 — 流式对话
 
 ```bash
-curl -sN http://127.0.0.1:8080/v1/chat/completions \
+curl -sN https://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"数到3"}],"stream":true}'
@@ -129,7 +129,7 @@ curl -sN http://127.0.0.1:8080/v1/chat/completions \
 ### 第 5 步 — Responses API（Codex 路径）
 
 ```bash
-curl -sN http://127.0.0.1:8080/v1/responses \
+curl -sN https://localhost:8080/v1/responses \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
@@ -142,7 +142,7 @@ curl -sN http://127.0.0.1:8080/v1/responses \
 ### 第 6 步 — 运行时统计
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/lcm/runtime/stats \
+curl -s https://localhost:8080/v1/lcm/runtime/stats \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   | jq .
 ```
@@ -174,7 +174,7 @@ deeplossless --port 8081
 
 监控节省情况：
 ```bash
-curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
+curl https://localhost:8080/v1/lcm/runtime/stats | jq .
 ```
 
 ## 更多信息

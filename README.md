@@ -9,7 +9,7 @@ and the DeepSeek API.
 ```bash
 cargo install deeplossless
 deeplossless --api-key sk-...
-# Point any OpenAI-compatible client at http://127.0.0.1:8080/v1
+# Point any OpenAI-compatible client at https://localhost:8080/v1
 ```
 
 Long context windows are not memory. Repeated inference is waste.
@@ -29,7 +29,7 @@ deeplossless
 # Or let the proxy extract your key from the first request
 ```
 
-OpenAI-compatible clients: point `base_url` to `http://127.0.0.1:8080/v1`.
+OpenAI-compatible clients: point `base_url` to `https://localhost:8080/v1`.
 
 ## What It Does
 
@@ -88,7 +88,7 @@ deeplossless --api-key sk-...
 # 2. Codex config (~/.codex/config.toml)
 [model_providers.localproxy]
 name = "deeplossless"
-base_url = "http://127.0.0.1:8080/v1"
+base_url = "https://localhost:8080/v1"
 wire_api = "responses"
 
 # 3. Run
@@ -102,7 +102,7 @@ See [Technical Reference](docs/tech-reference.md#codex--deepseek-detailed) for d
 ## Session Report
 
 ```bash
-curl http://127.0.0.1:8080/v1/lcm/runtime/report?label=fix+build
+curl https://localhost:8080/v1/lcm/runtime/report?label=fix+build
 ```
 
 ```
