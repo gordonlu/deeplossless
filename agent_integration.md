@@ -14,7 +14,7 @@ Single command. Replace `sk-...` with whatever API key you have:
 deeplossless --api-key $DEEPSEEK_API_KEY
 ```
 
-All defaults are sane: listens on `127.0.0.1:8080`, stores DB at `~/.deeplossless/lcm.db`.
+All defaults are sane: HTTPS on `127.0.0.1:8080` (self-signed cert auto-generated), DB at `~/.deeplossless/lcm.db`. Run `deeplossless trust` once to trust the certificate.
 
 If `deeplossless` is not on PATH, build it:
 
@@ -37,6 +37,12 @@ cargo build --release
 | `--rate-limit` | `100` | Max requests/second |
 | `--log-dir` | (none) | JSONL request logging |
 | `--dry-run` | (off) | Mock mode, no upstream calls |
+| `--lcm-context` | disabled | DAG context as retrieval hints (lcm_memory tool role) |
+| `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |
+| `--tls-key` | auto-generated | Custom TLS private key (PEM) |
+
+TLS (HTTPS) is always enabled. A self-signed certificate is auto-generated.
+Run `deeplossless trust` once to configure it, or pass custom certs with the flags above.
 
 ---
 
