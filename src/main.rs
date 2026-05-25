@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Inference-aware execution runtime for AI coding agents")]
-struct Cli {
+pub(crate) struct Cli {
     /// Listen address
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -65,6 +65,15 @@ struct Cli {
     /// OnError ring buffer size — how many recent events to buffer before flushing on failure.
     #[arg(long, default_value = "50")]
     onerror_ring_size: usize,
+
+    /// TLS certificate path (PEM). Enables HTTPS when both --tls-cert and --tls-key are set.
+    /// Use `mkcert localhost 127.0.0.1 ::1` to generate trusted local certificates.
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// TLS private key path (PEM).
+    #[arg(long)]
+    tls_key: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -230,26 +239,63 @@ async fn main() -> anyhow::Result<()> {
 
     let app = coordinator.router();
 
-    let addr = format!("{}:{}", cli.host, cli.port);
-    tracing::info!("deeplossless v{} listening on {addr} (built {})",
+    let addr: std::net::SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
+    let addr_str = addr.to_string();
+    tracing::info!("deeplossless v{} listening on {addr_str} (built {})",
         env!("CARGO_PKG_VERSION"),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-    tracing::info!("upstream: {}", upstream);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("upstream: {upstream}");
 
     // SSE connections are long-lived — graceful shutdown would hang forever.
     // Handle signal ourselves: brief drain, then exit.
-    let server = axum::serve(listener, app);
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received, exiting…");
+    if let (Some(cert), Some(key)) = (cli.tls_cert.as_ref(), cli.tls_key.as_ref()) {
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+        tracing::info!("TLS enabled — HTTPS on {addr_str} (HTTP/2 + ALPN)");
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_handle.shutdown();
+        });
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let server = axum::serve(listener, app);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutdown signal received, exiting…");
+            }
+            _ = server => {}
         }
-        _ = server => {}
     }
     coordinator.shutdown(std::time::Duration::from_secs(2)).await;
 
     tracing::info!("deeplossless stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn tls_flags_accepted() {
+        let args = Cli::try_parse_from([
+            "deeplossless", "--tls-cert", "/tmp/c.pem", "--tls-key", "/tmp/k.pem",
+        ]).unwrap();
+        assert_eq!(args.tls_cert.as_deref(), Some("/tmp/c.pem"));
+        assert_eq!(args.tls_key.as_deref(), Some("/tmp/k.pem"));
+    }
+
+    #[test]
+    fn tls_flags_optional() {
+        let args = Cli::try_parse_from(["deeplossless"]).unwrap();
+        assert!(args.tls_cert.is_none());
+        assert!(args.tls_key.is_none());
+    }
 }
