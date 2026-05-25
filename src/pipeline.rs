@@ -382,14 +382,14 @@ impl ChatPipeline {
             }
         }
 
-        // Only inject reasoning_content when we have actual captured content.
-        // Empty string injection tells DeepSeek "reasoning existed but was lost",
-        // which triggers abnormally long thinking chains.
-        let invalid = crate::assistant_validation::validate_request_messages(&injected);
-        if invalid > 0 {
-            tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
-        }
-        self.inject_reasoning_content(&mut injected);
+        // Reasoning injection disabled — modifying request body changes model
+    // reasoning trajectory. OpenCode and other agents handle reasoning_content
+    // correctly in their own message construction. Our injection, even with
+    // real content, can cause tool-call lifecycle disruption.
+    let invalid = crate::assistant_validation::validate_request_messages(&injected);
+    if invalid > 0 {
+        tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
+    }
 
         Ok(PipelineOutput { conv_id, injected_body: injected })
     }
@@ -398,6 +398,7 @@ impl ChatPipeline {
     /// `reasoning_content`, inject captured reasoning_content from the
     /// previous response. Only injects when actual content is available.
     /// Empty strings cause DeepSeek to enter confused thinking mode.
+    #[allow(dead_code)]
     fn inject_reasoning_content(&self, body: &mut serde_json::Value) {
         let model = body["model"].as_str().unwrap_or("").to_string();
         let Some(messages) = body["messages"].as_array_mut() else { return };

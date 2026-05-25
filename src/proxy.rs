@@ -849,19 +849,16 @@ async fn chat_completions(
         }
     }
 
-    // Run the chat pipeline (fingerprint → store → compact → assemble → inject)
-    let injected_body = if state.no_pipeline {
-        req_body.clone()
-    } else {
+    // Pipeline runs in background — does NOT modify the request body.
+    // Context and reasoning injection are disabled by default.
+    if !state.no_pipeline {
         let pipeline = crate::pipeline::ChatPipeline::new(&state);
-        match pipeline.process(model, &req_body).await {
-        Ok(out) => out.injected_body,
-        Err(e) => {
-            warn!("pipeline error: {e}, falling back to passthrough");
-            req_body.clone()
-        }
-        }
-    };
+        let body = req_body.clone();
+        let model_owned = model.to_string();
+        tokio::task::spawn(async move {
+            let _ = pipeline.process(&model_owned, &body).await;
+        });
+    }
 
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
@@ -870,7 +867,7 @@ async fn chat_completions(
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
-        .json(&injected_body)
+        .json(&req_body)
         .send()
         .await
     {
@@ -897,14 +894,14 @@ async fn chat_completions(
         let stream = UnboundedReceiverStream::new(rx);
         // Protocol recorder — raw bytes, no parsing. Compare with direct DeepSeek.
         let record_dir = state.record.clone();
-        let record_body = if record_dir.is_some() { Some(injected_body.clone()) } else { None };
+        let record_body = if record_dir.is_some() { Some(req_body.clone()) } else { None };
         // Capture reasoning_content for multi-turn continuity.
         let reasoning_db = state.storage.db.clone();
         let reasoning_key = {
-            let msgs = injected_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            let msgs = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
             let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
                 .and_then(|m| m["content"].as_str()).unwrap_or("");
-            let model = injected_body["model"].as_str().unwrap_or("");
+            let model = req_body["model"].as_str().unwrap_or("");
             format!("reasoning:{model}:{}", last_user.chars().take(80).collect::<String>())
         };
         tokio::spawn(async move {
