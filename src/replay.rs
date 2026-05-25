@@ -326,11 +326,10 @@ pub fn assert_replay_valid(
             StreamEvent::ToolCallStart { name, .. } if name.is_empty() => {
                 errors.push(format!("seq {seq}: ToolCallStart with empty name"));
             }
-            StreamEvent::Done { incomplete, error_reason, .. } => {
-                if *incomplete && error_reason.is_none() {
-                    errors.push(format!("seq {seq}: Done marked incomplete but no error_reason"));
-                }
+            StreamEvent::Done { incomplete: true, error_reason: None, .. } => {
+                errors.push(format!("seq {seq}: Done marked incomplete but no error_reason"));
             }
+            StreamEvent::Done { .. } => {}
             _ => {}
         }
     }

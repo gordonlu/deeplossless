@@ -1911,12 +1911,11 @@ async fn multi_turn_reasoning_tool_continuity() {
             let msgs = req["messages"].as_array().unwrap();
             let last_assistant = msgs.iter().rev().find(|m| m["role"] == "assistant");
             // Verify reasoning_content is present on tool-call message
-            if let Some(msg) = last_assistant {
-                if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| !a.is_empty()) == Some(true) {
-                    if msg.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.is_empty()) != Some(false) {
-                        return (StatusCode::BAD_REQUEST, "missing reasoning_content").into_response();
-                    }
-                }
+            if let Some(msg) = last_assistant
+                && msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| !a.is_empty()) == Some(true)
+                && msg.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.is_empty()) != Some(false)
+            {
+                return (StatusCode::BAD_REQUEST, "missing reasoning_content").into_response();
             }
             let stream = futures::stream::iter(vec![
                 Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(

@@ -1383,7 +1383,6 @@ impl Database {
         Ok((units, dag))
     }
 
-    /// Atomically store a file observation (P0 transactional snapshot).
     // ── Reasoning Store (v0.5.0) ──────────────────────────────────────
 
     /// Store reasoning_content for multi-turn conversation continuity.
@@ -1407,6 +1406,7 @@ impl Database {
         Ok(result)
     }
 
+    /// Atomically store a file observation (P0 transactional snapshot).
     pub fn store_file_observation(
         &self,
         obs: &crate::file_observation::FileObservation,
