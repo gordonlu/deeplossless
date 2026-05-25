@@ -160,13 +160,18 @@ pub fn response_from_chat(body: &serde_json::Value) -> CanonicalResponse {
             });
         }
     }
+    let reasoning_trace = msg["reasoning_content"].as_str().map(|text| ReasoningTrace {
+        text: text.to_string(),
+        summarized: false,
+        tokens: None,
+    });
     let finish = choice["finish_reason"].as_str().unwrap_or("stop");
     CanonicalResponse {
         id: body["id"].as_str().unwrap_or("").to_string(),
         model: body["model"].as_str().unwrap_or("").to_string(),
         status: match finish { "stop" => ResponseStatus::Completed, _ => ResponseStatus::Incomplete },
         output,
-        reasoning_trace: None,
+        reasoning_trace,
         usage: Usage {
             prompt_tokens: body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             completion_tokens: body["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
