@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -98,6 +99,7 @@ pub struct ChatPipeline {
     db: Arc<Database>,
     dag: Arc<DagEngine>,
     compactor: Arc<Mutex<Compactor>>,
+    reasoning_store: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl ChatPipeline {
@@ -106,6 +108,7 @@ impl ChatPipeline {
             db: state.storage.db.clone(),
             dag: state.storage.dag.clone(),
             compactor: state.compactor.clone(),
+            reasoning_store: state.storage.reasoning_store.clone(),
         }
     }
 
@@ -380,25 +383,26 @@ impl ChatPipeline {
         // Ensure reasoning_content is present on tool-call messages.
         // OpenCode and other clients may omit this field, but DeepSeek
         // requires it for multi-turn thinking-mode continuity.
-        Self::inject_reasoning_content(&mut injected);
+        self.inject_reasoning_content(&mut injected);
 
         Ok(PipelineOutput { conv_id, injected_body: injected })
     }
 
     /// For any assistant message that has `tool_calls` but is missing
-    /// `reasoning_content`, inject an empty string. Without this, DeepSeek
-    /// returns 400: "The reasoning_content in the thinking mode must be
-    /// passed back to the API."
-    fn inject_reasoning_content(body: &mut serde_json::Value) {
+    /// `reasoning_content`, inject captured reasoning_content from the
+    /// previous response. Falls back to empty string if not captured.
+    fn inject_reasoning_content(&self, body: &mut serde_json::Value) {
         let Some(messages) = body["messages"].as_array_mut() else { return };
+        let fp = crate::session::fingerprint(messages, 3);
+        let stored = self.reasoning_store.lock().ok().and_then(|s| s.get(&fp).cloned());
         for msg in messages.iter_mut() {
             if msg["role"] != "assistant" { continue; }
             if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }
             if msg.get("tool_calls").is_none() { continue; }
-            // Has tool_calls but no reasoning_content — inject empty
             if msg.get("reasoning_content").is_none() {
-                msg["reasoning_content"] = serde_json::json!("");
-                tracing::debug!(target: "deeplossless::pipeline", "injected reasoning_content for tool-call message");
+                let rc = stored.as_deref().unwrap_or("");
+                msg["reasoning_content"] = serde_json::json!(rc);
+                tracing::debug!(target: "deeplossless::pipeline", len=rc.len(), "injected reasoning_content for tool-call message");
             }
         }
     }

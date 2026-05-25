@@ -839,19 +839,48 @@ async fn chat_completions(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
+        // Capture reasoning_content for multi-turn continuity.
+        // DeepSeek requires it on tool-call messages in subsequent requests.
+        let reasoning_store = state.storage.reasoning_store.clone();
+        let conv_fp = crate::session::fingerprint(
+            injected_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3,
+        );
         tokio::spawn(async move {
             let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+            let mut reasoning = String::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
-                        if tx.send(Ok::<_, std::convert::Infallible>(c)).is_err() {
+                        // Forward raw bytes immediately
+                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).is_err() {
                             break;
+                        }
+                        // Side-channel: extract reasoning_content from SSE
+                        let s = String::from_utf8_lossy(&c);
+                        buf.push_str(&s);
+                        while let Some(pos) = buf.find('\n') {
+                            let line = buf[..pos].trim().to_string();
+                            buf = buf[pos + 1..].to_string();
+                            if let Some(data_line) = line.strip_prefix("data: ") {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line) {
+                                    if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
+                                        reasoning.push_str(rc);
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => {
                         warn!("stream error: {e}");
                         break;
                     }
+                }
+            }
+            // Store captured reasoning_content for next request
+            if !reasoning.is_empty() {
+                if let Ok(mut store) = reasoning_store.lock() {
+                    store.insert(conv_fp, reasoning);
                 }
             }
         });
