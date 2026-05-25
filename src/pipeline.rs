@@ -361,8 +361,8 @@ impl ChatPipeline {
         // LCM context appended as user message (not system prompt) — safe for
     // tool-call agents. Disabled by default; enable via --lcm-context.
     if self.lcm_context
-            && let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query) {
-            if !dag_ctx.is_empty() {
+            && let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query)
+            && !dag_ctx.is_empty() {
                 let mut ctx_text = render_dag_context(&dag_ctx);
                 if let Ok(claims) = self.db.list_all_file_claims()
                     && !claims.is_empty() {
@@ -376,7 +376,6 @@ impl ChatPipeline {
                     }
                 Self::inject_context(&mut injected, &ctx_text);
             }
-        }
 
         // Reasoning injection disabled — modifying request body changes model
     // reasoning trajectory. OpenCode and other agents handle reasoning_content

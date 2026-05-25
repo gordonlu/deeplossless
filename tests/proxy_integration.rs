@@ -142,6 +142,11 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         summarizer_model: "deepseek-v4-flash".into(),
         dry_run: false,
         log_dir: None,
+        record: None,
+        passthrough: false,
+        no_pipeline: false,
+        no_header_mod: false,
+        lcm_context: false,
     }
 }
 
