@@ -76,6 +76,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     no_header_mod: bool,
 
+    /// Enable DAG context injection into system messages. Off by default —
+    /// LCM context changes model reasoning trajectory and breaks tool-call
+    /// agents. Only enable for agents that explicitly understand LCM format.
+    #[arg(long)]
+    lcm_context: bool,
+
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
     audit_mode: String,
@@ -282,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
         passthrough: cli.passthrough,
         no_pipeline: cli.no_pipeline,
         no_header_mod: cli.no_header_mod,
+        lcm_context: cli.lcm_context,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

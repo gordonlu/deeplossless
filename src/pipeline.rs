@@ -98,6 +98,7 @@ pub struct ChatPipeline {
     db: Arc<Database>,
     dag: Arc<DagEngine>,
     compactor: Arc<Mutex<Compactor>>,
+    lcm_context: bool,
 }
 
 impl ChatPipeline {
@@ -106,6 +107,7 @@ impl ChatPipeline {
             db: state.storage.db.clone(),
             dag: state.storage.dag.clone(),
             compactor: state.compactor.clone(),
+            lcm_context: state.lcm_context,
         }
     }
 
@@ -356,13 +358,18 @@ impl ChatPipeline {
         let query = req_body["messages"].as_array()
             .and_then(|arr| arr.iter().rev().find(|m| m["role"] == "user"))
             .and_then(|m| m["content"].as_str());
-        if let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query) {
+        // DAG context injection DISABLED by default for Chat Completions.
+    // <lcm_context> in system messages changes the model's reasoning
+    // trajectory — it's prompt injection, not transparent optimization.
+    // This causes tool-calling agents to skip tools, derail planning,
+    // or enter unexpected reasoning paths. LCM endpoints remain available
+    // for agents that explicitly query them. Enable via --lcm-context.
+    if self.lcm_context
+            && let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query) {
             if !dag_ctx.is_empty() {
                 let mut ctx_text = render_dag_context(&dag_ctx);
-                // Append active file conflicts so agents can avoid stepping on each other
                 if let Ok(claims) = self.db.list_all_file_claims()
                     && !claims.is_empty() {
-                        // Replace closing tag, add conflicts, re-add closing tag
                         ctx_text = ctx_text.trim_end_matches("</lcm_context>\n").to_string();
                         use std::fmt::Write;
                         let _ = writeln!(ctx_text, "  ── Active File Claims ──");
@@ -373,15 +380,14 @@ impl ChatPipeline {
                     }
                 Self::inject_context(&mut injected, &ctx_text);
             }
-        } else {
-            tracing::debug!(target: "deeplossless::pipeline", conv_id, "DAG context assembly failed");
         }
 
-        // Validate and fix assistant messages before forwarding.
-        // DeepSeek thinking mode requires reasoning_content on tool-call messages.
+        // Only inject reasoning_content when we have actual captured content.
+        // Empty string injection tells DeepSeek "reasoning existed but was lost",
+        // which triggers abnormally long thinking chains.
         let invalid = crate::assistant_validation::validate_request_messages(&injected);
         if invalid > 0 {
-            tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields, attempting fix");
+            tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
         }
         self.inject_reasoning_content(&mut injected);
 
@@ -390,7 +396,8 @@ impl ChatPipeline {
 
     /// For any assistant message that has `tool_calls` but is missing
     /// `reasoning_content`, inject captured reasoning_content from the
-    /// previous response. Falls back to empty string if not captured.
+    /// previous response. Only injects when actual content is available.
+    /// Empty strings cause DeepSeek to enter confused thinking mode.
     fn inject_reasoning_content(&self, body: &mut serde_json::Value) {
         let model = body["model"].as_str().unwrap_or("").to_string();
         let Some(messages) = body["messages"].as_array_mut() else { return };
@@ -404,9 +411,14 @@ impl ChatPipeline {
             if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }
             if msg.get("tool_calls").is_none() { continue; }
             if msg.get("reasoning_content").is_none() {
-                let rc = stored.as_deref().unwrap_or("");
-                msg["reasoning_content"] = serde_json::json!(rc);
-                tracing::debug!(target: "deeplossless::pipeline", len=rc.len(), "injected reasoning_content for tool-call message");
+                // Only inject if we have actual captured reasoning. Empty string
+                // triggers DeepSeek into thinking mode with no context → slow + hang.
+                if let Some(rc) = &stored {
+                    if !rc.is_empty() {
+                        msg["reasoning_content"] = serde_json::json!(rc);
+                        tracing::debug!(target: "deeplossless::pipeline", len=rc.len(), "injected reasoning_content");
+                    }
+                }
             }
         }
     }

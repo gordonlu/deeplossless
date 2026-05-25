@@ -143,6 +143,7 @@ pub struct AppState {
     pub passthrough: bool,
     pub no_pipeline: bool,
     pub no_header_mod: bool,
+    pub lcm_context: bool,
 }
 
 impl AppState {
