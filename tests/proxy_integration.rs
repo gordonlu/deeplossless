@@ -8,6 +8,7 @@
 
 use axum::{routing::post, Json, Router};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -1734,4 +1735,235 @@ async fn reasoning_content_stream_passthrough() {
     assert!(body.contains("I need to think about this carefully"), "reasoning text should be present: {body}");
     assert!(body.contains("The answer is 42"), "regular content should be present: {body}");
     assert!(body.contains("[DONE]"), "should end with [DONE]");
+}
+
+// ── Error path tests ──
+
+#[tokio::test]
+async fn upstream_500_returns_error_not_hang() {
+    let app = Router::new().route("/v1/chat/completions", post(|| async {
+        (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+    let state = build_proxy_state(addr, "upstream_500").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
+        .send().await.unwrap();
+    assert!(!resp.status().is_success(), "should return error, got {}", resp.status());
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("error"), "body should contain error: {body}");
+}
+
+#[tokio::test]
+async fn upstream_400_passes_through() {
+    let app = Router::new().route("/v1/chat/completions", post(|| async {
+        (StatusCode::BAD_REQUEST, json!({"error":{"message":"bad input"}}).to_string())
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+    let state = build_proxy_state(addr, "upstream_400").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn non_streaming_200_returns_json() {
+    let app = Router::new().route("/v1/chat/completions", post(|| async {
+        (StatusCode::OK, json!({"choices":[{"message":{"content":"ok"}}]}).to_string())
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+    let state = build_proxy_state(addr, "nonstream_200").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
+        .send().await.unwrap();
+    assert!(resp.status().is_success());
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["choices"][0]["message"]["content"], "ok");
+}
+
+#[tokio::test]
+async fn stream_truncated_no_done_still_closes() {
+    let app = Router::new().route("/v1/chat/completions", post(|| async {
+        let stream = futures::stream::iter(vec![
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}],\"usage\":null}\n\n"
+            )),
+        ]);
+        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream))
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+    let state = build_proxy_state(addr, "truncated").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}))
+        .timeout(std::time::Duration::from_secs(3))
+        .send().await.unwrap();
+    assert!(resp.status().is_success());
+    let body = tokio::time::timeout(std::time::Duration::from_secs(2), resp.text())
+        .await.expect("response must complete within 2s").unwrap_or_default();
+    assert!(body.contains("partial"), "should receive partial data: {body}");
+}
+
+#[tokio::test]
+async fn upstream_unreachable_returns_502() {
+    let dead_addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    };
+    let state = build_proxy_state(dead_addr, "unreachable").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
+        .timeout(std::time::Duration::from_secs(3))
+        .send().await.unwrap();
+    assert!(!resp.status().is_success(), "should return error for unreachable upstream");
+}
+
+#[tokio::test]
+async fn client_invalid_json_returns_400() {
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(upstream_addr, "invalid_json").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .header("content-type", "application/json")
+        .body("not json {{{")
+        .timeout(std::time::Duration::from_secs(3))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "invalid JSON should return 400");
+}
+
+#[tokio::test]
+async fn upstream_html_instead_of_sse_does_not_hang() {
+    // Upstream returns HTML error page instead of SSE — proxy must forward and close.
+    let app = Router::new().route("/v1/chat/completions", post(|| async {
+        (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/html")], "<html><body>gateway timeout</body></html>")
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+    let state = build_proxy_state(addr, "html_upstream").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}))
+        .timeout(std::time::Duration::from_secs(3))
+        .send().await.unwrap();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(2), resp.text())
+        .await.expect("must complete within 2s").unwrap_or_default();
+    assert!(!body.is_empty(), "should return something, not hang");
+}
+
+#[tokio::test]
+async fn multi_turn_reasoning_tool_continuity() {
+    // Simulate thinking-mode tool call round-trip: assistant with reasoning_content
+    // makes a tool call, result comes back, next request includes reasoning_content.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            let req = body.0.clone();
+            *cap.lock().unwrap() = Some(req.clone());
+            let msgs = req["messages"].as_array().unwrap();
+            let last_assistant = msgs.iter().rev().find(|m| m["role"] == "assistant");
+            // Verify reasoning_content is present on tool-call message
+            if let Some(msg) = last_assistant {
+                if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| !a.is_empty()) == Some(true) {
+                    if msg.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.is_empty()) != Some(false) {
+                        return (StatusCode::BAD_REQUEST, "missing reasoning_content").into_response();
+                    }
+                }
+            }
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "reasoning_continuity").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+
+    // Turn 1: send a request that triggers reasoning + tool call
+    let _r1 = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"search for foo"}],"stream":true}))
+        .send().await.unwrap().text().await.unwrap();
+
+    // Turn 2: send the tool result WITH reasoning_content (as pipeline should inject)
+    let r2 = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "model":"deepseek-v4-flash",
+            "messages":[
+                {"role":"user","content":"search for foo"},
+                {"role":"assistant","content":null,"reasoning_content":"I need to search.","tool_calls":[{"id":"c1","type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"foo\"}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"found foo at line 42"}
+            ],
+            "stream":true
+        }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send().await.unwrap();
+
+    assert!(r2.status().is_success(), "multi-turn with reasoning should succeed, got {}", r2.status());
+    let body = r2.text().await.unwrap();
+    assert!(body.contains("[DONE]"), "stream should complete: {body}");
 }
