@@ -654,6 +654,16 @@ async fn responses(
             ));
             // Persist the response so GET /v1/responses/{id} returns real data,
             // and Codex's previous_response_id continuity can work incrementally.
+            // Persist reasoning for multi-turn continuity
+            if !content.reasoning.is_empty() {
+                let reason_key = format!("reasoning:{model}:{msg_id}");
+                let reason_db = db.clone();
+                let reason_text = content.reasoning.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = reason_db.store_reasoning(&reason_key, &reason_text);
+                });
+            }
+
             if store_response {
                 let resp_obj = serde_json::json!({
                     "id": resp_id, "object": "response", "created_at": now,
@@ -841,10 +851,15 @@ async fn chat_completions(
         let stream = UnboundedReceiverStream::new(rx);
         // Capture reasoning_content for multi-turn continuity.
         // DeepSeek requires it on tool-call messages in subsequent requests.
+        // Keyed by last user message + model to avoid fingerprint collision.
         let reasoning_db = state.storage.db.clone();
-        let conv_fp = crate::session::fingerprint(
-            injected_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3,
-        );
+        let reasoning_key = {
+            let msgs = injected_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
+                .and_then(|m| m["content"].as_str()).unwrap_or("");
+            let model = injected_body["model"].as_str().unwrap_or("");
+            format!("reasoning:{model}:{}", &last_user[..last_user.len().min(80)])
+        };
         tokio::spawn(async move {
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -876,7 +891,7 @@ async fn chat_completions(
                 }
             }
             if !reasoning.is_empty() {
-                let _ = reasoning_db.store_reasoning(&conv_fp, &reasoning);
+                let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
             }
         });
         let mut response = Response::new(Body::from_stream(stream));

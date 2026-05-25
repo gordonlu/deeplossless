@@ -392,9 +392,12 @@ impl ChatPipeline {
     /// `reasoning_content`, inject captured reasoning_content from the
     /// previous response. Falls back to empty string if not captured.
     fn inject_reasoning_content(&self, body: &mut serde_json::Value) {
+        let model = body["model"].as_str().unwrap_or("").to_string();
         let Some(messages) = body["messages"].as_array_mut() else { return };
-        let fp = crate::session::fingerprint(messages, 3);
-        let stored = self.db.get_reasoning(&fp).ok().flatten();
+        let last_user = messages.iter().rev().find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str()).unwrap_or("");
+        let key = format!("reasoning:{model}:{}", &last_user[..last_user.len().min(80)]);
+        let stored = self.db.get_reasoning(&key).ok().flatten();
         for msg in messages.iter_mut() {
             if msg["role"] != "assistant" { continue; }
             if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }

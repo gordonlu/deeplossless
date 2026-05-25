@@ -101,10 +101,10 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                     }
                 }
             }
-            messages.push(Message { role, parts, meta });
+            messages.push(Message { role, parts, meta, reasoning: None });
         }
     } else if let Some(s) = body["input"].as_str() {
-        messages.push(Message { role: Role::User, parts: vec![ContentPart::Text { text: s.to_string() }], meta: None });
+        messages.push(Message { role: Role::User, parts: vec![ContentPart::Text { text: s.to_string() }], meta: None, reasoning: None });
     }
 
     let response_format = body["text"]["format"].as_object()

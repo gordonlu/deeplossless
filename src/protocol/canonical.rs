@@ -169,6 +169,10 @@ pub struct Message {
     pub parts: Vec<ContentPart>,
     #[serde(default)]
     pub meta: Option<MessageMeta>,
+    /// Reasoning/thinking trace for this message (multi-turn continuity).
+    /// Required for DeepSeek thinking-mode tool-call round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningTrace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

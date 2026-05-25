@@ -79,7 +79,7 @@ pub fn request_from_chat(body: &serde_json::Value) -> CanonicalRequest {
                 }
                 meta = Some(MessageMeta { tool_call_id: tc_id, tool_calls: vec![] });
             }
-            Message { role, parts, meta }
+            Message { role, parts, meta, reasoning: None }
         }).collect())
         .unwrap_or_default();
 
