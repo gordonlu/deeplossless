@@ -541,6 +541,12 @@ async fn compact_worker(
     let planner = CompactionPlanner::new(config.clone());
     // Dirty-region tracking (P0-11): skip re-planning when DAG topology unchanged.
     let mut last_leaf_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    // Compaction cooldown: skip repeated compaction for same conversation within 30s.
+    let mut last_compacted: std::collections::HashMap<i64, std::time::Instant> = std::collections::HashMap::new();
+    const COMPACTION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Periodically prune expired cooldown entries
+    let mut cooldown_prune_counter: u64 = 0;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -551,6 +557,18 @@ async fn compact_worker(
                 }
             }
             CompactCommand::ReviewAndCompact { conv_id, context_window } => {
+                // Cooldown: skip if compacted this conversation within 30s
+                if let Some(last) = last_compacted.get(&conv_id) {
+                    if last.elapsed() < COMPACTION_COOLDOWN {
+                        continue;
+                    }
+                }
+                last_compacted.insert(conv_id, std::time::Instant::now());
+                // Periodic prune: clear expired entries every 50 triggers
+                cooldown_prune_counter += 1;
+                if cooldown_prune_counter % 50 == 0 {
+                    last_compacted.retain(|_, t| t.elapsed() < COMPACTION_COOLDOWN);
+                }
                 review_and_compact(conv_id, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts).await;
             }
             CompactCommand::CompressGroup { conv_id, node_ids } => {
