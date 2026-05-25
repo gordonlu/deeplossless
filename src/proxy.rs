@@ -773,12 +773,6 @@ async fn list_models() -> Response {
                     "supports_reasoning": true,
                     "supports_thinking": true,
                     "max_context_tokens": 1_000_000
-                },
-                "lcm_endpoints": {
-                    "conversation": "GET /v1/lcm/current",
-                    "search": "GET /v1/lcm/grep/{conv_id}?query=",
-                    "cache": "GET /v1/lcm/cache?tool=&args=",
-                    "status": "GET /v1/lcm/status/{conv_id}"
                 }
             },
             {
@@ -797,12 +791,6 @@ async fn list_models() -> Response {
                     "supports_streaming": true,
                     "supports_reasoning": true,
                     "max_context_tokens": 1_000_000
-                },
-                "lcm_endpoints": {
-                    "conversation": "GET /v1/lcm/current",
-                    "search": "GET /v1/lcm/grep/{conv_id}?query=",
-                    "cache": "GET /v1/lcm/cache?tool=&args=",
-                    "status": "GET /v1/lcm/status/{conv_id}"
                 }
             }
         ]
