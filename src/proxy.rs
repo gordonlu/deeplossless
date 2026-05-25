@@ -724,6 +724,8 @@ async fn responses_retrieve(
 /// OpenAI-compatible model list. OpenCode and other clients query this to
 /// discover supported models and their capabilities (reasoning, context, etc.).
 async fn list_models() -> Response {
+    // Redundant context window fields — the "OpenAI-compatible" ecosystem
+    // has no unified schema. Different clients read different field names.
     Json(json!({
         "object": "list",
         "data": [
@@ -731,6 +733,9 @@ async fn list_models() -> Response {
                 "id": "deepseek-v4-pro",
                 "object": "model",
                 "owned_by": "deepseek",
+                "context_window": 1_000_000,
+                "max_context_tokens": 1_000_000,
+                "max_input_tokens": 1_000_000,
                 "capabilities": {
                     "supports_tool_calls": true,
                     "supports_streaming": true,
@@ -742,6 +747,9 @@ async fn list_models() -> Response {
                 "id": "deepseek-v4-flash",
                 "object": "model",
                 "owned_by": "deepseek",
+                "context_window": 1_000_000,
+                "max_context_tokens": 1_000_000,
+                "max_input_tokens": 1_000_000,
                 "capabilities": {
                     "supports_tool_calls": true,
                     "supports_streaming": true,

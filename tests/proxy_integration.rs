@@ -1792,6 +1792,10 @@ async fn models_endpoint_lists_deepseek_models() {
     let pro = models.iter().find(|m| m["id"] == "deepseek-v4-pro").unwrap();
     assert_eq!(pro["capabilities"]["supports_reasoning"], true);
     assert_eq!(pro["capabilities"]["max_context_tokens"], 1_000_000);
+    // Redundant compatibility fields
+    assert_eq!(pro["context_window"], 1_000_000);
+    assert_eq!(pro["max_context_tokens"], 1_000_000);
+    assert_eq!(pro["max_input_tokens"], 1_000_000);
 }
 
 #[tokio::test]
