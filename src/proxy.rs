@@ -599,10 +599,18 @@ async fn responses(
             }
 
             // Build lifecycle events using serde_json for proper escaping
-            let part_json = serde_json::json!({
+            let mut content_parts: Vec<serde_json::Value> = Vec::new();
+            // Include reasoning content when present (required for tool-call multi-turn continuity)
+            if !content.reasoning.is_empty() {
+                content_parts.push(serde_json::json!({
+                    "type": "reasoning", "text": content.reasoning
+                }));
+            }
+            let text_part = serde_json::json!({
                 "type": "output_text", "text": content.text, "annotations": []
             });
-            let content_json = serde_json::json!([&part_json]);
+            content_parts.push(text_part.clone());
+            let content_json = serde_json::json!(content_parts);
             let item_json = serde_json::json!({
                 "id": msg_id, "type": "message", "status": "completed",
                 "role": "assistant", "content": content_json
@@ -612,7 +620,8 @@ async fn responses(
             });
             let content_part_done = serde_json::json!({
                 "type": "response.content_part.done", "item_id": msg_id,
-                "output_index": 0, "content_index": 0, "part": part_json
+                "output_index": 0, "content_index": content_parts.len().saturating_sub(1),
+                "part": text_part
             });
             let usage_json = usage_buf.map(|v| serde_json::json!({
                 "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
@@ -651,7 +660,7 @@ async fn responses(
                     "output": [{
                         "id": msg_id, "type": "message", "status": "completed",
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": content.text, "annotations": []}]
+                        "content": content_parts
                     }],
                     "usage": usage_json
                 });
