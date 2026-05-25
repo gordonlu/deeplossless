@@ -194,8 +194,15 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
 /// Install the self-signed certificate as system-trusted.
 /// Copies cert to the system CA directory and updates the trust store.
 fn run_trust() -> anyhow::Result<()> {
-    let tls_dir = shellexpand::tilde("~/.deeplossless").to_string();
-    let cert_path = format!("{tls_dir}/cert.pem");
+    // When run via sudo, $HOME points to /root. Use SUDO_USER to find
+    // the real user's home directory instead.
+    let user_home = std::env::var("SUDO_USER").ok()
+        .and_then(|u| {
+            let path = format!("/home/{u}");
+            if std::path::Path::new(&path).exists() { Some(path) } else { None }
+        })
+        .unwrap_or_else(|| shellexpand::tilde("~").to_string());
+    let cert_path = format!("{user_home}/.deeplossless/cert.pem");
     if !std::path::Path::new(&cert_path).exists() {
         anyhow::bail!("No certificate found at {cert_path}. Start deeplossless first to generate one.");
     }
