@@ -212,7 +212,15 @@ fn run_trust() -> anyhow::Result<()> {
         std::fs::copy(&cert_path, dest)?;
         std::process::Command::new("update-ca-certificates").status()?;
         println!("Certificate installed to system CA store.");
-        println!("Node.js/OpenCode may still need: export NODE_EXTRA_CA_CERTS={cert_path}");
+        // Auto-add NODE_EXTRA_CA_CERTS to shell config for Node.js/OpenCode
+        let bashrc = format!("{user_home}/.bashrc");
+        let export_line = format!("export NODE_EXTRA_CA_CERTS={cert_path}\n");
+        if let Ok(existing) = std::fs::read_to_string(&bashrc) {
+            if !existing.contains(&export_line) {
+                let _ = std::fs::write(&bashrc, existing + &export_line);
+            }
+        }
+        println!("Added NODE_EXTRA_CA_CERTS to {bashrc}. Restart your terminal.");
     }
     #[cfg(target_os = "macos")]
     {
