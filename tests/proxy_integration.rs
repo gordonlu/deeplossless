@@ -1770,3 +1770,78 @@ async fn enforce_snapshot_budget_evicts_excess_l0_snapshots() {
     ).unwrap();
     assert!(remaining <= 2, "L0 snapshots should be ≤ max_hot_snapshots (2), got {remaining}");
 }
+
+#[tokio::test]
+async fn models_endpoint_lists_deepseek_models() {
+    // GET /v1/models should return a standard OpenAI-compatible model list.
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(upstream_addr, "models_test").await;
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{proxy_addr}/v1/models"))
+        .send().await.unwrap();
+    assert!(resp.status().is_success());
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["object"], "list");
+    let models = json["data"].as_array().unwrap();
+    assert!(models.iter().any(|m| m["id"] == "deepseek-v4-pro"), "should list v4-pro: {json}");
+    assert!(models.iter().any(|m| m["id"] == "deepseek-v4-flash"), "should list v4-flash: {json}");
+    // Verify capabilities
+    let pro = models.iter().find(|m| m["id"] == "deepseek-v4-pro").unwrap();
+    assert_eq!(pro["capabilities"]["supports_reasoning"], true);
+    assert_eq!(pro["capabilities"]["max_context_tokens"], 1_000_000);
+}
+
+#[tokio::test]
+async fn reasoning_content_stream_passthrough() {
+    // Upstream sends reasoning_content in delta — client should receive it.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I need to think about this carefully.\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"The answer is 42\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":15,\"total_tokens\":20}}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "reasoning_passthrough").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "model": "deepseek-v4-pro",
+            "messages": [{"role":"user","content":"What is the answer?"}],
+            "stream": true,
+            "reasoning_effort": "high",
+        }))
+        .send().await.unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    // Reasoning content should reach the client
+    assert!(body.contains("reasoning_content"), "reasoning_content should pass through: {body}");
+    assert!(body.contains("I need to think about this carefully"), "reasoning text should be present: {body}");
+    assert!(body.contains("The answer is 42"), "regular content should be present: {body}");
+    assert!(body.contains("[DONE]"), "should end with [DONE]");
+}

@@ -212,3 +212,34 @@ pub fn stream_event_to_responses(event: &StreamEvent) -> String {
 use std::sync::atomic::{AtomicU64, Ordering};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn monotonic_id() -> String { format!("{:016x}", ID_COUNTER.fetch_add(1, Ordering::Relaxed)) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_reasoning_content_from_sse() {
+        let data = r#"{"choices":[{"delta":{"reasoning_content":"Let me think about this."},"index":0}]}"#;
+        let events = stream_event_from_chat(data);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ReasoningDelta { text } => assert!(text.contains("Let me think")),
+            other => panic!("expected ReasoningDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_content_before_reasoning() {
+        // content takes priority over reasoning_content — standard delta
+        let data = r#"{"choices":[{"delta":{"content":"Hello"},"index":0}]}"#;
+        let events = stream_event_from_chat(data);
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_delta_returns_empty() {
+        let data = r#"{"choices":[{"delta":{},"index":0}]}"#;
+        let events = stream_event_from_chat(data);
+        assert!(events.is_empty());
+    }
+}
