@@ -428,7 +428,12 @@ impl ChatPipeline {
     /// synthetic tool messages). User role is safe — the model treats it as
     /// additional context rather than a tool execution record.
     fn inject_context(body: &mut serde_json::Value, ctx_text: &str) {
-        let hint: String = ctx_text.lines()
+        // Strip XML wrapper — context is now a user message, not system prompt
+        let clean = ctx_text
+            .trim_start_matches("<lcm_context>\n")
+            .trim_end_matches("</lcm_context>\n")
+            .trim();
+        let hint: String = clean.lines()
             .filter(|l| !l.trim().is_empty())
             .take(2)
             .collect::<Vec<_>>()
@@ -437,7 +442,7 @@ impl ChatPipeline {
             arr.push(serde_json::json!({
                 "role": "user",
                 "content": format!(
-                    "[lcm] cached context — GET /v1/lcm/grep for full retrieval\n{hint}"
+                    "[lcm] cached context (GET /v1/lcm/grep for full retrieval):\n{hint}"
                 ),
             }));
         }
