@@ -10,9 +10,9 @@
 //! - Replay does NOT modify any state — pure read
 //! - Replay always works from events; snapshots are acceleration only
 
-use crate::protocol::canonical::{CapabilityAdapter, ProviderCapabilities, StreamEvent};
+use crate::protocol::canonical::{CapabilityAdapter, StreamEvent};
 #[cfg(test)]
-use crate::protocol::canonical::{ReasoningMode, Usage};
+use crate::protocol::canonical::{ProviderCapabilities, ReasoningMode, Usage};
 use crate::snapshot;
 
 /// Current replay event envelope schema version.
