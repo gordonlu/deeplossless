@@ -89,6 +89,9 @@ enum Commands {
         /// Path to a JSON file containing a Responses API request body
         file: String,
     },
+    /// Install the self-signed TLS certificate as system-trusted.
+    /// After running this, HTTPS clients won't show certificate errors.
+    Trust,
 }
 
 async fn run_demo() -> anyhow::Result<()> {
@@ -188,6 +191,38 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install the self-signed certificate as system-trusted.
+/// Copies cert to the system CA directory and updates the trust store.
+fn run_trust() -> anyhow::Result<()> {
+    let tls_dir = shellexpand::tilde("~/.deeplossless").to_string();
+    let cert_path = format!("{tls_dir}/cert.pem");
+    if !std::path::Path::new(&cert_path).exists() {
+        anyhow::bail!("No certificate found at {cert_path}. Start deeplossless first to generate one.");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dest = "/usr/local/share/ca-certificates/deeplossless.crt";
+        std::fs::copy(&cert_path, dest)?;
+        std::process::Command::new("update-ca-certificates").status()?;
+        println!("Certificate installed. Restart your terminal or run:");
+        println!("  export NODE_EXTRA_CA_CERTS={cert_path}");
+        println!("  opencode  # or your agent");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("security")
+            .args(["add-trusted-cert", "-d", "-k", "/Library/Keychains/System.keychain", &cert_path])
+            .status()?;
+        println!("Certificate installed to system keychain.");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        println!("Automatic trust installation is not supported on this OS.");
+        println!("Set NODE_EXTRA_CA_CERTS={cert_path} in your environment.");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -205,6 +240,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(Commands::Translate { file }) = cli.command {
         return run_translate(&file);
+    }
+    if matches!(cli.command, Some(Commands::Trust)) {
+        return run_trust();
     }
 
     let audit_mode = match cli.audit_mode.as_str() {
@@ -269,6 +307,9 @@ async fn main() -> anyhow::Result<()> {
 
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
     tracing::info!("TLS enabled — HTTPS on {addr_str}");
+    if cli.tls_cert.is_none() {
+        tracing::info!("Self-signed cert — run `deeplossless trust` once to trust it, or `export NODE_EXTRA_CA_CERTS={tls_cert_path}`");
+    }
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
