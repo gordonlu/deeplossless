@@ -236,16 +236,16 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Graceful shutdown: signal → drain → cleanup
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("shutdown signal received, draining requests…");
-        })
-        .await?;
-
-    // Signal background tasks and wait with timeout
-    coordinator.shutdown(std::time::Duration::from_secs(15)).await;
+    // SSE connections are long-lived — graceful shutdown would hang forever.
+    // Handle signal ourselves: brief drain, then exit.
+    let server = axum::serve(listener, app);
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown signal received, exiting…");
+        }
+        _ = server => {}
+    }
+    coordinator.shutdown(std::time::Duration::from_secs(2)).await;
 
     tracing::info!("deeplossless stopped");
 
