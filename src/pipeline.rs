@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -99,7 +98,6 @@ pub struct ChatPipeline {
     db: Arc<Database>,
     dag: Arc<DagEngine>,
     compactor: Arc<Mutex<Compactor>>,
-    reasoning_store: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl ChatPipeline {
@@ -108,7 +106,6 @@ impl ChatPipeline {
             db: state.storage.db.clone(),
             dag: state.storage.dag.clone(),
             compactor: state.compactor.clone(),
-            reasoning_store: state.storage.reasoning_store.clone(),
         }
     }
 
@@ -380,9 +377,12 @@ impl ChatPipeline {
             tracing::debug!(target: "deeplossless::pipeline", conv_id, "DAG context assembly failed");
         }
 
-        // Ensure reasoning_content is present on tool-call messages.
-        // OpenCode and other clients may omit this field, but DeepSeek
-        // requires it for multi-turn thinking-mode continuity.
+        // Validate and fix assistant messages before forwarding.
+        // DeepSeek thinking mode requires reasoning_content on tool-call messages.
+        let invalid = crate::assistant_validation::validate_request_messages(&injected);
+        if invalid > 0 {
+            tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields, attempting fix");
+        }
         self.inject_reasoning_content(&mut injected);
 
         Ok(PipelineOutput { conv_id, injected_body: injected })
@@ -394,7 +394,7 @@ impl ChatPipeline {
     fn inject_reasoning_content(&self, body: &mut serde_json::Value) {
         let Some(messages) = body["messages"].as_array_mut() else { return };
         let fp = crate::session::fingerprint(messages, 3);
-        let stored = self.reasoning_store.lock().ok().and_then(|s| s.get(&fp).cloned());
+        let stored = self.db.get_reasoning(&fp).ok().flatten();
         for msg in messages.iter_mut() {
             if msg["role"] != "assistant" { continue; }
             if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }

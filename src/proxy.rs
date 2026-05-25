@@ -841,7 +841,7 @@ async fn chat_completions(
         let stream = UnboundedReceiverStream::new(rx);
         // Capture reasoning_content for multi-turn continuity.
         // DeepSeek requires it on tool-call messages in subsequent requests.
-        let reasoning_store = state.storage.reasoning_store.clone();
+        let reasoning_db = state.storage.db.clone();
         let conv_fp = crate::session::fingerprint(
             injected_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3,
         );
@@ -852,11 +852,9 @@ async fn chat_completions(
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
-                        // Forward raw bytes immediately
                         if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).is_err() {
                             break;
                         }
-                        // Side-channel: extract reasoning_content from SSE
                         let s = String::from_utf8_lossy(&c);
                         buf.push_str(&s);
                         while let Some(pos) = buf.find('\n') {
@@ -877,11 +875,8 @@ async fn chat_completions(
                     }
                 }
             }
-            // Store captured reasoning_content for next request
             if !reasoning.is_empty() {
-                if let Ok(mut store) = reasoning_store.lock() {
-                    store.insert(conv_fp, reasoning);
-                }
+                let _ = reasoning_db.store_reasoning(&conv_fp, &reasoning);
             }
         });
         let mut response = Response::new(Body::from_stream(stream));

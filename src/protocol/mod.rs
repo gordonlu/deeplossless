@@ -49,6 +49,10 @@ pub use canonical::{
     ToolDef,
     ToolInvocation,
     Usage,
+    ProviderCapabilities,
+    ToolStreamingMode,
+    ReasoningMode,
+    StructuredOutputMode,
 };
 
 /// Provider capability registry: maps upstream model names to local equivalents.
@@ -86,6 +90,28 @@ impl ModelRegistry {
 
     /// Resolve an upstream model name to the local equivalent.
     /// Returns `(local_model, matched)` where `matched` is true if a rule applied.
+    /// Return provider capabilities for a model. All DeepSeek V4 models support
+    /// reasoning/thinking — required for correct replay and protocol assertions.
+    pub fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        let m = model.to_lowercase();
+        if m.contains("deepseek") {
+            ProviderCapabilities {
+                tool_streaming: ToolStreamingMode::Parallel,
+                reasoning: ReasoningMode::Full,
+                structured_output: StructuredOutputMode::JsonSchema,
+                multimodal: false,
+            }
+        } else {
+            // Generic OpenAI-compatible — conservative defaults
+            ProviderCapabilities {
+                tool_streaming: ToolStreamingMode::Parallel,
+                reasoning: ReasoningMode::Hidden,
+                structured_output: StructuredOutputMode::JsonSchema,
+                multimodal: false,
+            }
+        }
+    }
+
     pub fn resolve(&self, model: &str) -> (String, bool) {
         let m = model.trim().to_lowercase();
         if m.is_empty() || m == "auto" {

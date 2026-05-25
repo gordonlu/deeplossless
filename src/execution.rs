@@ -789,6 +789,13 @@ pub const EVENT_MIGRATION_ALTER_V5: &str = "
     ALTER TABLE execution_events ADD COLUMN parallel_group TEXT NOT NULL DEFAULT '';";
 
 /// ALTER TABLE migration for execution_events (v0.6 — audit P0 columns).
+pub const REASONING_STORE_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS reasoning_store (
+        conv_fingerprint    TEXT PRIMARY KEY,
+        reasoning_content   TEXT NOT NULL DEFAULT '',
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+    );";
+
 pub const EVENT_MIGRATION_ALTER_V6: &str = "
     ALTER TABLE execution_events ADD COLUMN tool_call_id TEXT NOT NULL DEFAULT '';
     ALTER TABLE execution_events ADD COLUMN conv_id INTEGER NOT NULL DEFAULT 0;

@@ -128,7 +128,6 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
             db,
             dag,
             response_store: deeplossless::response_store::ResponseStore::default(),
-            reasoning_store: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         },
         compactor,
         runtime: deeplossless::RuntimeServices {

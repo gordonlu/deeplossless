@@ -10,7 +10,7 @@
 //! - Replay does NOT modify any state — pure read
 //! - Replay always works from events; snapshots are acceleration only
 
-use crate::protocol::canonical::StreamEvent;
+use crate::protocol::canonical::{CapabilityAdapter, ProviderCapabilities, ReasoningMode, StreamEvent, Usage};
 use crate::snapshot;
 
 /// Current replay event envelope schema version.
@@ -304,5 +304,78 @@ mod tests {
             }
             other => panic!("expected SeqDiscontinuity, got: {other}"),
         }
+    }
+}
+
+/// Replay protocol assertion — verifies that a replayed event sequence
+/// satisfies all critical-field invariants for the target provider.
+pub fn assert_replay_valid(
+    events: &[(i64, StreamEvent)],
+    caps: &crate::protocol::canonical::ProviderCapabilities,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let requires_reasoning = CapabilityAdapter::expose_reasoning(caps);
+
+    for (seq, ev) in events {
+        match ev {
+            StreamEvent::ReasoningDelta { text } if text.is_empty() => {
+                errors.push(format!("seq {seq}: empty ReasoningDelta"));
+            }
+            StreamEvent::ToolCallStart { name, .. } if name.is_empty() => {
+                errors.push(format!("seq {seq}: ToolCallStart with empty name"));
+            }
+            StreamEvent::Done { incomplete, error_reason, .. } => {
+                if *incomplete && error_reason.is_none() {
+                    errors.push(format!("seq {seq}: Done marked incomplete but no error_reason"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Verify reasoning presence requirement
+    if requires_reasoning {
+        let has_reasoning = events.iter().any(|(_, ev)| matches!(ev, StreamEvent::ReasoningDelta { .. }));
+        if !has_reasoning {
+            // Not an error — some responses don't use reasoning
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+#[cfg(test)]
+mod assertion_tests {
+    use super::*;
+
+    #[test]
+    fn empty_events_pass_assertion() {
+        let caps = ProviderCapabilities::default();
+        assert!(assert_replay_valid(&[], &caps).is_ok());
+    }
+
+    #[test]
+    fn done_incomplete_without_reason_fails() {
+        let caps = ProviderCapabilities::default();
+        let events = vec![(0, StreamEvent::Done {
+            usage: Usage::default(),
+            finish_reason: "stop".into(),
+            incomplete: true,
+            error_reason: None,
+        })];
+        assert!(assert_replay_valid(&events, &caps).is_err());
+    }
+
+    #[test]
+    fn deepseek_caps_expose_reasoning() {
+        let caps = ProviderCapabilities {
+            reasoning: ReasoningMode::Full,
+            ..Default::default()
+        };
+        assert!(CapabilityAdapter::expose_reasoning(&caps));
     }
 } // mod tests

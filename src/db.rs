@@ -517,6 +517,9 @@ impl Database {
         // v0.5.0: file observations for structured file caching
         conn.execute_batch(crate::file_observation::MIGRATION)?;
 
+        // v0.5.0: reasoning store for multi-turn continuity
+        conn.execute_batch(crate::execution::REASONING_STORE_MIGRATION)?;
+
         // v0.5.0: tool_call_id for parallel group matching
         let has_tool_call_id: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_call_id'")
@@ -1381,6 +1384,29 @@ impl Database {
     }
 
     /// Atomically store a file observation (P0 transactional snapshot).
+    // ── Reasoning Store (v0.5.0) ──────────────────────────────────────
+
+    /// Store reasoning_content for multi-turn conversation continuity.
+    pub fn store_reasoning(&self, conv_fingerprint: &str, reasoning: &str) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT OR REPLACE INTO reasoning_store (conv_fingerprint, reasoning_content, updated_at) VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params![conv_fingerprint, reasoning],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve stored reasoning_content for a conversation.
+    pub fn get_reasoning(&self, conv_fingerprint: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.read_conn();
+        let result = conn.query_row(
+            "SELECT reasoning_content FROM reasoning_store WHERE conv_fingerprint = ?1",
+            rusqlite::params![conv_fingerprint],
+            |row| row.get(0),
+        ).ok();
+        Ok(result)
+    }
+
     pub fn store_file_observation(
         &self,
         obs: &crate::file_observation::FileObservation,
