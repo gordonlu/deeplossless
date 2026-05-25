@@ -888,6 +888,13 @@ async fn chat_completions(
         req_body.clone()
     };
 
+    // Resolve conversation ID for response header — lightweight fingerprint lookup
+    let conv_id: Option<i64> = {
+        let msgs_arr = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+        let fp = crate::session::fingerprint(msgs_arr, 3);
+        state.storage.db.find_conversation_by_fingerprint(&fp).ok().flatten()
+    };
+
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
     let resp = match state.runtime
@@ -986,6 +993,9 @@ async fn chat_completions(
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
         response.headers_mut().insert("content-type", content_type);
+        if let Some(cid) = conv_id {
+            response.headers_mut().insert("x-deeplossless-conv", cid.to_string().parse().expect("static header"));
+        }
         if !state.no_header_mod {
             response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
             response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
@@ -997,6 +1007,9 @@ async fn chat_completions(
                 let mut response = Response::new(Body::from(bytes));
                 *response.status_mut() = status;
                 response.headers_mut().insert("content-type", content_type);
+                if let Some(cid) = conv_id {
+                    response.headers_mut().insert("x-deeplossless-conv-id", cid.to_string().parse().expect("static header"));
+                }
                 response
             }
             Err(e) => {
