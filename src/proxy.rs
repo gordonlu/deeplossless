@@ -37,21 +37,33 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
         }
     }
 
-    // Upstream reachability — lightweight HEAD
+    // Upstream reachability — lightweight HEAD with 3s timeout
     let upstream = state.upstream.trim_end_matches('/');
-    match state.runtime.client.head(upstream).send().await {
-        Ok(resp) => checks["upstream"] = json!(format!("reachable (http {})", resp.status())),
-        Err(e) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.runtime.client.head(upstream).send(),
+    ).await {
+        Ok(Ok(resp)) => checks["upstream"] = json!(format!("reachable (http {})", resp.status())),
+        Ok(Err(e)) => {
             healthy = false;
             checks["upstream"] = json!(format!("unreachable: {e}"));
         }
+        Err(_) => {
+            healthy = false;
+            checks["upstream"] = json!("timeout");
+        }
     }
 
-    // Compactor liveness — send a no-op command to check responsiveness
-    {
-        let mut compactor = state.compactor.lock().await;
-        let alive = compactor.drain_events().is_empty(); // just check if channel is alive
-        checks["compactor"] = json!(if alive { "ok" } else { "no events" });
+    // Compactor liveness — 1s timeout on lock
+    match tokio::time::timeout(std::time::Duration::from_secs(1), state.compactor.lock()).await {
+        Ok(mut compactor) => {
+            let alive = compactor.drain_events().is_empty();
+            checks["compactor"] = json!(if alive { "ok" } else { "no events" });
+        }
+        Err(_) => {
+            healthy = false;
+            checks["compactor"] = json!("lock timeout");
+        }
     }
 
     let status_code = if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
