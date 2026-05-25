@@ -211,9 +211,8 @@ fn run_trust() -> anyhow::Result<()> {
         let dest = "/usr/local/share/ca-certificates/deeplossless.crt";
         std::fs::copy(&cert_path, dest)?;
         std::process::Command::new("update-ca-certificates").status()?;
-        println!("Certificate installed. Restart your terminal or run:");
-        println!("  export NODE_EXTRA_CA_CERTS={cert_path}");
-        println!("  opencode  # or your agent");
+        println!("Certificate installed to system CA store.");
+        println!("Node.js/OpenCode may still need: export NODE_EXTRA_CA_CERTS={cert_path}");
     }
     #[cfg(target_os = "macos")]
     {
