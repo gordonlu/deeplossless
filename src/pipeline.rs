@@ -396,7 +396,8 @@ impl ChatPipeline {
         let Some(messages) = body["messages"].as_array_mut() else { return };
         let last_user = messages.iter().rev().find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str()).unwrap_or("");
-        let key = format!("reasoning:{model}:{}", &last_user[..last_user.len().min(80)]);
+        let truncated: String = last_user.chars().take(80).collect();
+        let key = format!("reasoning:{model}:{truncated}");
         let stored = self.db.get_reasoning(&key).ok().flatten();
         for msg in messages.iter_mut() {
             if msg["role"] != "assistant" { continue; }

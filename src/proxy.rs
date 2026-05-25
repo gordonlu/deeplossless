@@ -860,7 +860,7 @@ async fn chat_completions(
             let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
                 .and_then(|m| m["content"].as_str()).unwrap_or("");
             let model = injected_body["model"].as_str().unwrap_or("");
-            format!("reasoning:{model}:{}", &last_user[..last_user.len().min(80)])
+            format!("reasoning:{model}:{}", last_user.chars().take(80).collect::<String>())
         };
         tokio::spawn(async move {
             let mut byte_stream = resp.bytes_stream();
