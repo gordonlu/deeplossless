@@ -185,6 +185,13 @@ These endpoints let you get more value. Call them if it makes sense for your wor
 
 ### Before each turn: inject context
 
+First, discover the current conversation ID:
+```
+GET /v1/lcm/current
+→ { "conversation_id": 8 }
+```
+
+Then query past context with the conversation ID:
 ```
 GET /v1/lcm/grep/{conv_id}?query=<user question>
 → { "matches": [{ "excerpt": "...", "node_id": 42 }] }

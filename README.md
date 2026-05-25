@@ -106,9 +106,18 @@ codex
 ```
 
 Protocol translation and tool cache interception work transparently.
-DAG context injection is disabled by default — use `--lcm-context` to enable
-it for agents that understand LCM format. Manual agent hooks require
-Codex-side integration.
+DAG context injection is disabled by default — `--lcm-context` enables
+retrieval hints with the conversation ID for LCM endpoint queries.
+Manual agent hooks require Codex-side integration.
+
+### Discovering LCM endpoints
+
+AI agents can discover the current conversation ID via:
+```bash
+curl https://localhost:8080/v1/lcm/current -H "Authorization: Bearer $DEEPSEEK_API_KEY"
+# → {"conversation_id": 8}
+```
+Then query past context: `GET /v1/lcm/grep/{id}?query=<terms>`
 
 ## Session Report
 
