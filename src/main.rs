@@ -231,7 +231,9 @@ async fn main() -> anyhow::Result<()> {
     let app = coordinator.router();
 
     let addr = format!("{}:{}", cli.host, cli.port);
-    tracing::info!("deeplossless listening on {addr}");
+    tracing::info!("deeplossless v{} listening on {addr} (built {})",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
     tracing::info!("upstream: {}", upstream);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
