@@ -314,8 +314,9 @@ async fn main() -> anyhow::Result<()> {
 
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
     tracing::info!("TLS enabled — HTTPS on {addr_str}");
-    if cli.tls_cert.is_none() {
-        tracing::info!("Self-signed cert — run `deeplossless trust` once to trust it, or `export NODE_EXTRA_CA_CERTS={tls_cert_path}`");
+    if cli.tls_cert.is_none()
+        && !std::path::Path::new("/usr/local/share/ca-certificates/deeplossless.crt").exists() {
+        tracing::info!("Self-signed cert — run `sudo deeplossless trust` once, then restart your terminal");
     }
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
