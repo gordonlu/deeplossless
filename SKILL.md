@@ -1,71 +1,49 @@
-# deeplossless — Inference-aware execution memory for AI coding agents
+# deeplossless — execution memory for this coding session
 
-You are connected through deeplossless, a local proxy that adds execution
-memory, tool caching, and context retrieval to your DeepSeek API connection.
+You are connected through deeplossless. It adds context search, tool caching,
+and session memory to your API connection.
 
-## Discover your conversation ID
-
-Every response includes an `x-deeplossless-conv` header with your conversation
-ID. You can also query it:
+## How to discover your conversation
 
 ```bash
 curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" https://localhost:8080/v1/lcm/current
-# → {"conversation_id": 8}
 ```
 
-## Search past execution context
+The response includes `conversation_id`. Use it for all queries below.
+
+## Search past context
 
 ```bash
 curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-  "https://localhost:8080/v1/lcm/grep/{conv_id}?query=<search terms>"
+  "https://localhost:8080/v1/lcm/grep/{id}?query=<search>"
 ```
 
-Returns relevant past messages, summaries, and code snippets.
+## Tool cache
 
-## Check tool cache before executing
-
+Before executing grep/search/read_file, check if the result is cached:
 ```bash
 curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-  "https://localhost:8080/v1/lcm/cache?tool=grep&args=<json>"
-# → {"hit": true, "result": "src/main.rs:42 found foo"}
+  "https://localhost:8080/v1/lcm/cache?tool=<name>&args=<json>"
 ```
+If `hit: true`, use `result` directly — skip execution.
 
-If `hit: true`, use the cached result instead of executing the tool.
-
-## Store tool results for future reuse
-
+After executing a tool, store the result:
 ```bash
 curl -sk -X POST -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"tool":"grep","args":"{\"pattern\":\"foo\"}","result":"src/main.rs:42","files":"[\"src/main.rs\"]"}' \
+  -d '{"tool":"<name>","args":"<json>","result":"<output>","files":"[\"<path>\"]"}' \
   https://localhost:8080/v1/lcm/cache/put
 ```
 
-## DAG health and status
+## Session stats
 
 ```bash
-curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-  "https://localhost:8080/v1/lcm/status/{conv_id}"
+curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" https://localhost:8080/v1/lcm/runtime/stats
 ```
 
-## Runtime metrics
+## Notes
 
-```bash
-curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-  https://localhost:8080/v1/lcm/runtime/stats
-```
-
-## Session report
-
-```bash
-curl -sk -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-  "https://localhost:8080/v1/lcm/runtime/report?label=my+session&turns=50"
-```
-
-## Connection info
-
-- Base URL: `https://localhost:8080/v1` (must include `/v1`)
-- API key: same as passed to deeplossless
-- Health check: `curl -sk https://localhost:8080/health`
-- Models: `deepseek-v4-pro` (1M context), `deepseek-v4-flash` (1M context)
-- TLS: self-signed cert, use `-k` flag or run `deeplossless trust`
+- All endpoints need `Authorization: Bearer $DEEPSEEK_API_KEY`
+- Use `-k` flag — TLS cert is self-signed (or run `deeplossless trust` once)
+- Base API URL is `https://localhost:8080/v1`
+- Models: `deepseek-v4-pro` / `deepseek-v4-flash` (both 1M context)
