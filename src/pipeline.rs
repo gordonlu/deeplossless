@@ -278,7 +278,7 @@ impl ChatPipeline {
                             &unit.tool_result,
                             &[], &[], None,
                         );
-                        tracing::info!(target: "deeplossless::pipeline",
+                        tracing::debug!(target: "deeplossless::pipeline",
                             conv_id, tool = %unit.tool_name,
                             "auto-recorded failure pattern");
                     }
