@@ -94,6 +94,7 @@ pub mod snippet;
 pub mod summarizer;
 pub mod tokenizer;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, Notify};
@@ -115,6 +116,9 @@ pub struct StorageServices {
     pub db: Arc<db::Database>,
     pub dag: Arc<dag::DagEngine>,
     pub response_store: response_store::ResponseStore,
+    /// Stores reasoning_content from streaming responses for multi-turn
+    /// tool-call continuity. Keyed by last assistant message fingerprint.
+    pub reasoning_store: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 /// Shared application state — split along service boundaries.

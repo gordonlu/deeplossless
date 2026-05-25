@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -91,6 +92,7 @@ impl RuntimeCoordinator {
                 db,
                 dag,
                 response_store: crate::response_store::ResponseStore::default(),
+                reasoning_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
             },
             compactor,
             runtime: crate::RuntimeServices {

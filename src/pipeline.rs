@@ -377,7 +377,30 @@ impl ChatPipeline {
             tracing::debug!(target: "deeplossless::pipeline", conv_id, "DAG context assembly failed");
         }
 
+        // Ensure reasoning_content is present on tool-call messages.
+        // OpenCode and other clients may omit this field, but DeepSeek
+        // requires it for multi-turn thinking-mode continuity.
+        Self::inject_reasoning_content(&mut injected);
+
         Ok(PipelineOutput { conv_id, injected_body: injected })
+    }
+
+    /// For any assistant message that has `tool_calls` but is missing
+    /// `reasoning_content`, inject an empty string. Without this, DeepSeek
+    /// returns 400: "The reasoning_content in the thinking mode must be
+    /// passed back to the API."
+    fn inject_reasoning_content(body: &mut serde_json::Value) {
+        let Some(messages) = body["messages"].as_array_mut() else { return };
+        for msg in messages.iter_mut() {
+            if msg["role"] != "assistant" { continue; }
+            if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }
+            if msg.get("tool_calls").is_none() { continue; }
+            // Has tool_calls but no reasoning_content — inject empty
+            if msg.get("reasoning_content").is_none() {
+                msg["reasoning_content"] = serde_json::json!("");
+                tracing::debug!(target: "deeplossless::pipeline", "injected reasoning_content for tool-call message");
+            }
+        }
     }
 
     /// Inject `<lcm_context>` block only into the first system message
