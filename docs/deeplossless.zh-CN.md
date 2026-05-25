@@ -99,14 +99,15 @@ export DEEPSEEK_API_KEY=sk-...
 deeplossless
 
 # 预期输出：
-# deeplossless listening on 127.0.0.1:8080
+# deeplossless v0.5.1 listening on 127.0.0.1:8080
+# TLS enabled — HTTPS on 127.0.0.1:8080
 # upstream: https://api.deepseek.com
 ```
 
 ### 第 3 步 — 非流式对话
 
 ```bash
-curl -s https://localhost:8080/v1/chat/completions \
+curl -sk https://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"用一个词打招呼"}]}' \
@@ -142,7 +143,7 @@ curl -sN https://localhost:8080/v1/responses \
 ### 第 6 步 — 运行时统计
 
 ```bash
-curl -s https://localhost:8080/v1/lcm/runtime/stats \
+curl -sk https://localhost:8080/v1/lcm/runtime/stats \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   | jq .
 ```

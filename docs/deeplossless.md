@@ -108,14 +108,23 @@ export DEEPSEEK_API_KEY=sk-...
 deeplossless
 
 # Expected output:
-# deeplossless listening on 127.0.0.1:8080
-# upstream: https://api.deepseek.com
+# deeplossless v0.5.1 listening on 127.0.0.1:8080
+# TLS enabled — HTTPS on 127.0.0.1:8080
 ```
 
-### Step 3 — Non-streaming chat
+### Step 3 — Trust the certificate (once)
 
 ```bash
-curl -s https://localhost:8080/v1/chat/completions \
+deeplossless trust
+# Add this line to your shell config:
+#   export NODE_EXTRA_CA_CERTS=/home/gordon/.deeplossless/cert.pem
+# Then restart your terminal.
+```
+
+### Step 4 — Non-streaming chat
+
+```bash
+curl -sk https://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   -d '{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Say hello in one word"}]}' \
@@ -124,7 +133,7 @@ curl -s https://localhost:8080/v1/chat/completions \
 
 Should return a simple greeting.
 
-### Step 4 — Streaming chat
+### Step 5 — Streaming chat
 
 ```bash
 curl -sN https://localhost:8080/v1/chat/completions \
@@ -151,7 +160,7 @@ Should output Responses API SSE events (`event: response.created`, etc.).
 ### Step 6 — Runtime stats
 
 ```bash
-curl -s https://localhost:8080/v1/lcm/runtime/stats \
+curl -sk https://localhost:8080/v1/lcm/runtime/stats \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
   | jq .
 ```
