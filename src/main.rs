@@ -194,45 +194,22 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
 /// Install the self-signed certificate as system-trusted.
 /// Copies cert to the system CA directory and updates the trust store.
 fn run_trust() -> anyhow::Result<()> {
-    // When run via sudo, $HOME points to /root. Use SUDO_USER to find
-    // the real user's home directory instead.
-    let user_home = std::env::var("SUDO_USER").ok()
-        .and_then(|u| {
-            let path = format!("/home/{u}");
-            if std::path::Path::new(&path).exists() { Some(path) } else { None }
-        })
-        .unwrap_or_else(|| shellexpand::tilde("~").to_string());
-    let cert_path = format!("{user_home}/.deeplossless/cert.pem");
+    let cert_dir = shellexpand::tilde("~/.deeplossless").to_string();
+    let cert_path = format!("{cert_dir}/cert.pem");
     if !std::path::Path::new(&cert_path).exists() {
-        anyhow::bail!("No certificate found at {cert_path}. Start deeplossless first to generate one.");
+        anyhow::bail!("No cert at {cert_path}. Run deeplossless first to generate one.");
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "windows")]
     {
-        let dest = "/usr/local/share/ca-certificates/deeplossless.crt";
-        std::fs::copy(&cert_path, dest)?;
-        std::process::Command::new("update-ca-certificates").status()?;
-        println!("Certificate installed to system CA store.");
-        // Auto-add NODE_EXTRA_CA_CERTS to shell config for Node.js/OpenCode
-        let bashrc = format!("{user_home}/.bashrc");
-        let export_line = format!("export NODE_EXTRA_CA_CERTS={cert_path}\n");
-        if let Ok(existing) = std::fs::read_to_string(&bashrc) {
-            if !existing.contains(&export_line) {
-                let _ = std::fs::write(&bashrc, existing + &export_line);
-            }
-        }
-        println!("Added NODE_EXTRA_CA_CERTS to {bashrc}. Restart your terminal.");
+        println!("Run this in an admin terminal:");
+        println!("  setx NODE_EXTRA_CA_CERTS {}\\\\.deeplossless\\\\cert.pem", std::env::var("USERPROFILE").unwrap_or_default());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
-        std::process::Command::new("security")
-            .args(["add-trusted-cert", "-d", "-k", "/Library/Keychains/System.keychain", &cert_path])
-            .status()?;
-        println!("Certificate installed to system keychain.");
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        println!("Automatic trust installation is not supported on this OS.");
-        println!("Set NODE_EXTRA_CA_CERTS={cert_path} in your environment.");
+        println!("Add this line to your shell config (~/.bashrc, ~/.zshrc, etc.):");
+        println!("  export NODE_EXTRA_CA_CERTS={cert_path}");
+        println!();
+        println!("Then restart your terminal or run: source ~/.bashrc");
     }
     Ok(())
 }
@@ -322,8 +299,8 @@ async fn main() -> anyhow::Result<()> {
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
     tracing::info!("TLS enabled — HTTPS on {addr_str}");
     if cli.tls_cert.is_none()
-        && !std::path::Path::new("/usr/local/share/ca-certificates/deeplossless.crt").exists() {
-        tracing::info!("Self-signed cert — run `sudo deeplossless trust` once, then restart your terminal");
+        && std::env::var("NODE_EXTRA_CA_CERTS").is_err() {
+        tracing::info!("Run `deeplossless trust` once to configure HTTPS certificate trust.");
     }
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
