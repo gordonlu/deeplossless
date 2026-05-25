@@ -54,6 +54,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     log_dir: Option<String>,
 
+    /// Record raw request/response bytes for protocol debugging.
+    /// Writes `<dir>/req_N.json` and `<dir>/rsp_N.txt` per request — no
+    /// parsing, no reserialization. Diff these against direct DeepSeek traces.
+    #[arg(long)]
+    record: Option<String>,
+
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
     audit_mode: String,
@@ -256,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         runtime_profile: cli.runtime_profile,
         dry_run: cli.dry_run,
         log_dir: cli.log_dir,
+        record: cli.record,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

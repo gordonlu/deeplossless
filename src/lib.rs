@@ -139,6 +139,7 @@ pub struct AppState {
     pub summarizer_model: String,
     pub dry_run: bool,
     pub log_dir: Option<String>,
+    pub record: Option<String>,
 }
 
 impl AppState {

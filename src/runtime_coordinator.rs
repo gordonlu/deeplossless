@@ -15,6 +15,7 @@ pub struct CoordinatorConfig {
     pub runtime_profile: String,
     pub dry_run: bool,
     pub log_dir: Option<String>,
+    pub record: Option<String>,
     /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
     pub policy_config: RuntimePolicyConfig,
 }
@@ -104,6 +105,7 @@ impl RuntimeCoordinator {
             summarizer_model: cfg.summarizer_model,
             dry_run: cfg.dry_run,
             log_dir: cfg.log_dir,
+            record: cfg.record,
         };
 
         Ok(Self { state, tasks })

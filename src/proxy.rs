@@ -851,9 +851,10 @@ async fn chat_completions(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
+        // Protocol recorder — raw bytes, no parsing. Compare with direct DeepSeek.
+        let record_dir = state.record.clone();
+        let record_body = if record_dir.is_some() { Some(injected_body.clone()) } else { None };
         // Capture reasoning_content for multi-turn continuity.
-        // DeepSeek requires it on tool-call messages in subsequent requests.
-        // Keyed by last user message + model to avoid fingerprint collision.
         let reasoning_db = state.storage.db.clone();
         let reasoning_key = {
             let msgs = injected_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
@@ -863,12 +864,23 @@ async fn chat_completions(
             format!("reasoning:{model}:{}", last_user.chars().take(80).collect::<String>())
         };
         tokio::spawn(async move {
+            // Protocol recorder: write raw request/response for diffing
+            let _rec = record_dir.as_ref().map(|dir| {
+                let _ = std::fs::create_dir_all(dir);
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                if let Some(body) = &record_body {
+                    let _ = std::fs::write(format!("{dir}/req_{ts}.json"), serde_json::to_string_pretty(body).unwrap_or_default());
+                }
+                (dir.clone(), ts)
+            });
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut reasoning = String::new();
+            let mut all_bytes: Vec<u8> = Vec::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
+                        all_bytes.extend_from_slice(&c);
                         if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).is_err() {
                             break;
                         }
@@ -894,6 +906,10 @@ async fn chat_completions(
             }
             if !reasoning.is_empty() {
                 let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
+            }
+            // Write recorded response bytes
+            if let Some((ref dir, ts)) = _rec {
+                let _ = std::fs::write(format!("{dir}/rsp_{ts}.txt"), &all_bytes);
             }
             tracing::debug!(target: "deeplossless::stream",
                 chunk_count=reasoning.len(), "STREAM CLOSED — task dropped, channel sender dropped, body EOF");
