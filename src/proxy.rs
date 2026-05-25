@@ -706,7 +706,6 @@ async fn responses(
                 let mut response = Response::new(Body::from(serde_json::to_string(&responses_body).unwrap_or_default()));
                 *response.status_mut() = StatusCode::OK;
                 response.headers_mut().insert("content-type", "application/json".parse().expect("static header"));
-                response.headers_mut().insert("connection", "close".parse().expect("static header"));
                 response
             }
             Err(e) => {
@@ -910,7 +909,6 @@ async fn chat_completions(
                 let mut response = Response::new(Body::from(bytes));
                 *response.status_mut() = status;
                 response.headers_mut().insert("content-type", content_type);
-                response.headers_mut().insert("connection", "close".parse().expect("static header parse"));
                 response
             }
             Err(e) => {
