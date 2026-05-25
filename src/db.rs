@@ -2317,6 +2317,7 @@ impl Database {
 
         if use_fts5 {
             let fts_query = Self::fts5_query(query);
+            // Phase A: FTS5 on messages (fast, BM25-scored)
             let sql = "
                 SELECT messages_fts.rowid AS id, 'message' AS source, role AS label,
                        substr(messages.content, 1, 500) AS excerpt,
@@ -2327,6 +2328,7 @@ impl Database {
                 ORDER BY score
                 LIMIT 30
             ";
+            let mut seen = std::collections::HashSet::new();
             if let Ok(mut stmt) = conn.prepare(sql)
                 && let Ok(rows) = stmt.query_map(
                     rusqlite::params![fts_query, conv_id],
@@ -2343,8 +2345,43 @@ impl Database {
                 )
             {
                 let mut results: Vec<UnifiedSearchResult> = rows.filter_map(|r| r.ok()).collect();
+                for r in &results {
+                    seen.insert((r.source.clone(), r.id));
+                }
+                results.sort_by(|a, b| a.bm25_score.partial_cmp(&b.bm25_score).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Phase B: also search dag_nodes summaries with LIKE (summaries have
+                // richest semantic content but no FTS5 index). Combine with FTS5 results
+                // instead of returning early — Bug 1 fix.
+                let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
+                let summary_sql = "
+                    SELECT id, 'summary' AS source, CAST(level AS TEXT) AS label,
+                           substr(summary, 1, 500) AS excerpt, token_count
+                    FROM dag_nodes
+                    WHERE conversation_id = ?1 AND summary LIKE ?2 ESCAPE '\\' AND deleted = 0
+                    ORDER BY token_count DESC
+                    LIMIT 15
+                ";
+                if let Ok(mut sstmt) = conn.prepare(summary_sql)
+                    && let Ok(srows) = sstmt.query_map(rusqlite::params![conv_id, pattern], |row| {
+                        Ok(UnifiedSearchResult {
+                            id: row.get(0)?,
+                            source: "summary".to_string(),
+                            label: row.get::<_, String>(2).unwrap_or_default(),
+                            excerpt: row.get::<_, String>(3).unwrap_or_default(),
+                            token_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                            bm25_score: None,
+                        })
+                    })
+                {
+                    for sr in srows.filter_map(|r| r.ok()) {
+                        if seen.insert((sr.source.clone(), sr.id)) {
+                            results.push(sr);
+                        }
+                    }
+                }
+
                 if !results.is_empty() {
-                    results.sort_by(|a, b| a.bm25_score.partial_cmp(&b.bm25_score).unwrap_or(std::cmp::Ordering::Equal));
                     return Ok(results);
                 }
             }
@@ -3174,4 +3211,58 @@ mod tests {
         assert!(rendered.contains("── Recent Messages ──"), "should have recent messages tier");
         assert!(rendered.contains("← sources:"), "should show source provenance");
     }
+
+    /// Bug reproduction: FTS5 search path only searches messages, not summaries.
+    /// A summary node's content is invisible to search_unified for English queries.
+    #[tokio::test]
+    async fn search_unified_must_return_summaries_for_english_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::builder().path(dir.path().join("s1.db")).build().await.unwrap());
+        let conv_id = db.create_and_store("test", &serde_json::json!([
+            {"role": "user", "content": "What is the wifi password?"}
+        ])).unwrap();
+
+        // Store a summary with content NOT present in any message
+        db.insert_summary_atomic(conv_id, 1, "The wifi password is hunter2", 5, &[], &[], "").unwrap();
+
+        // Search for unique summary content — should find the summary
+        let results = db.search_unified(conv_id, "hunter2").unwrap();
+        let has_summary = results.iter().any(|r| r.source == "summary");
+        assert!(has_summary,
+            "BUG: FTS5 path returns only messages, summary 'hunter2' is invisible. Got {} results: {:?}",
+            results.len(), results.iter().map(|r| format!("{}:{}", r.source, r.excerpt)).collect::<Vec<_>>());
+    }
+
+    /// Bug reproduction: search_unified returns message IDs, but assemble_context
+    /// calls get_node(id) which only queries dag_nodes — message IDs resolve to None.
+    #[tokio::test]
+    async fn assemble_context_query_boost_must_resolve_to_dag_nodes() {
+        use crate::dag::DagEngine;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::builder().path(dir.path().join("s2.db")).build().await.unwrap());
+        let dag = DagEngine::builder().max_level(3).recent_messages(5).build(db.clone());
+        // Store messages — these create dag leaf nodes automatically
+        let conv_id = db.create_and_store("test", &serde_json::json!([
+            {"role": "user", "content": "Find all Rust structs in the codebase."},
+            {"role": "assistant", "content": "I found Config, Database, and AppState."},
+            {"role": "user", "content": "Show me Config."}
+        ])).unwrap();
+        // Manually create leaves (normally done by pipeline)
+        dag.insert_leaf(conv_id, "Find all Rust structs in the codebase.", 8).unwrap();
+        dag.insert_leaf(conv_id, "I found Config, Database, and AppState.", 10).unwrap();
+        dag.insert_leaf(conv_id, "Show me Config.", 4).unwrap();
+        // Compress first two into a summary
+        dag.compress_group(conv_id, &[1, 2], "User asked about Rust structs, assistant found Config, Database, AppState.", 12, 1).unwrap();
+
+        // assemble_context with a query — step 3 query boost should find the summary
+        let ctx = dag.assemble_context(conv_id, 500, Some("Config Database AppState")).unwrap();
+        // The compressed summary should be findable via the query
+        let has_summary = ctx.iter().any(|n| n.level > 0);
+        assert!(has_summary,
+            "BUG: assemble_context query boost can't resolve search results to DAG nodes. Context has {} nodes: {:?}",
+            ctx.len(), ctx.iter().map(|n| format!("L{}:{}", n.level, &n.summary[..n.summary.len().min(60)])).collect::<Vec<_>>());
+    }
+
+    // Bug 3: tool messages (role="tool") were not given DAG leaf nodes
+    // by the pipeline. Fixed in src/pipeline.rs. Tested in proxy_integration.
 }

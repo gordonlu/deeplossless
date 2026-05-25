@@ -101,7 +101,8 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                     }
                 }
             }
-            messages.push(Message { role, parts, meta, reasoning: None });
+            let reasoning = item["reasoning_content"].as_str().map(|s| ReasoningTrace { text: s.to_string(), summarized: false, tokens: None });
+            messages.push(Message { role, parts, meta, reasoning });
         }
     } else if let Some(s) = body["input"].as_str() {
         messages.push(Message { role: Role::User, parts: vec![ContentPart::Text { text: s.to_string() }], meta: None, reasoning: None });

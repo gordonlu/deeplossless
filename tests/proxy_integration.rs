@@ -1971,3 +1971,139 @@ async fn multi_turn_reasoning_tool_continuity() {
     let body = r2.text().await.unwrap();
     assert!(body.contains("[DONE]"), "stream should complete: {body}");
 }
+
+// ── Bug 3: tool messages must become DAG leaf nodes ──────────────────────
+
+#[tokio::test]
+async fn pipeline_creates_leaf_nodes_for_tool_messages() {
+    // Run the pipeline on a conversation with tool messages and verify
+    // that tool result content appears in DAG leaf nodes.
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "tool_leaves").await;
+    let db = state.storage.db.clone();
+
+    let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
+
+    let req_body = json!({
+        "model": "deepseek-v4-flash",
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "read main.rs"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"main.rs\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "fn main() { println!(\"hello\"); }"},
+            {"role": "assistant", "content": "The file contains a hello world program."}
+        ],
+    });
+
+    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    let conv_id = output.conv_id;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let nodes = db.get_all_dag_nodes(conv_id).unwrap();
+    let leaves: Vec<_> = nodes.iter().filter(|n| n.is_leaf).collect();
+    assert!(!leaves.is_empty(), "pipeline should create leaf nodes");
+
+    let tool_leaves: Vec<_> = leaves.iter().filter(|n| n.summary.contains("fn main")).collect();
+    assert!(!tool_leaves.is_empty(),
+        "BUG: tool messages don't create leaf nodes. {} total leaves: {:?}",
+        leaves.len(),
+        leaves.iter().map(|n| &n.summary[..n.summary.len().min(60)]).collect::<Vec<_>>());
+}
+
+// ── End-to-end LCM context capture: store → compress → grep → assemble ──
+
+#[tokio::test]
+async fn lcm_context_capture_after_compression_with_mock_upstream() {
+    // Full lifecycle: mock upstream → pipeline stores messages → manual
+    // compaction creates summary → grep finds summary content →
+    // assemble_context injects the summary into context.
+    let (_upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(_upstream_addr, "lcm_e2e").await;
+    let db = state.storage.db.clone();
+    let dag = state.storage.dag.clone();
+
+    // Run pipeline with enough messages to create meaningful DAG leaves
+    let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
+    let req_body = json!({
+        "model": "deepseek-v4-flash",
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Where is the database connection configured?"},
+            {"role": "assistant", "content": "I'll search for DB connection config."},
+            {"role": "user", "content": "Also show me the API key handling code."},
+            {"role": "assistant", "content": "Looking at both. The DB connection is in db.rs line 80. The API key is read from env DEEPSEEK_API_KEY in main.rs line 25."},
+            {"role": "user", "content": "What about rate limiting?"},
+            {"role": "assistant", "content": "Rate limiting is configured via the --rate-limit CLI flag, default 100 req/s, enforced in runtime_coordinator.rs."},
+        ],
+    });
+
+    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    let conv_id = output.conv_id;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify leaves were created
+    let nodes = db.get_all_dag_nodes(conv_id).unwrap();
+    let leaves: Vec<_> = nodes.iter().filter(|n| n.is_leaf).collect();
+    assert!(leaves.len() >= 3, "should have at least 3 leaf nodes, got {}", leaves.len());
+
+    // Manually compress user+assistant pair into a summary (simulates compactor)
+    let user_msgs: Vec<_> = leaves.iter()
+        .filter(|n| n.summary.contains("database") || n.summary.contains("DB connection") || n.summary.contains("API key"))
+        .collect();
+    assert!(user_msgs.len() >= 2, "should find messages about DB and API key");
+    let source_ids: Vec<i64> = user_msgs.iter().map(|n| n.id).collect();
+    dag.compress_group(conv_id, &source_ids,
+        "The database connection is configured in db.rs using SQLite WAL mode. The API key is read from DEEPSEEK_API_KEY environment variable in main.rs.",
+        18, 1,
+    ).unwrap();
+
+    // ── 1. grep must find the summary content ──
+    let results = db.search_unified(conv_id, "SQLite WAL mode").unwrap();
+    let summary_hits: Vec<_> = results.iter().filter(|r| r.source == "summary").collect();
+    assert!(!summary_hits.is_empty(),
+        "grep must find summary content 'SQLite WAL mode'. Got {} total results: {:?}",
+        results.len(), results.iter().map(|r| format!("{}:{}", r.source, &r.excerpt[..r.excerpt.len().min(50)])).collect::<Vec<_>>());
+
+    // ── 2. assemble_context must include the summary in query boost ──
+    let ctx = dag.assemble_context(conv_id, 500, Some("SQLite WAL mode")).unwrap();
+    let has_compressed = ctx.iter().any(|n| n.level > 0 && n.summary.contains("SQLite WAL"));
+    assert!(has_compressed,
+        "assemble_context must return compressed summary for relevant query. Got {} nodes: {:?}",
+        ctx.len(), ctx.iter().map(|n| format!("L{}:{}", n.level, &n.summary[..n.summary.len().min(50)])).collect::<Vec<_>>());
+
+    // ── 3. context rendering is valid ──
+    let rendered = deeplossless::pipeline::render_dag_context(&ctx);
+    assert!(rendered.contains("── Summaries ──"), "should render summaries tier");
+    assert!(rendered.contains("SQLite WAL"), "summary content should appear in rendered output: {}", &rendered[..rendered.len().min(300)]);
+}
+
+/// Verify that reasoning_content survives the Responses API → Chat Completions
+/// translation round-trip. Regression test for Bug HIGH-7.
+#[test]
+fn responses_to_chat_translation_preserves_reasoning_content() {
+    use deeplossless::protocol::responses;
+    use deeplossless::protocol::chat_completions;
+    use serde_json::json;
+
+    let req_body = json!({
+        "model": "deepseek-v4-pro",
+        "input": [
+            {"role": "user", "content": "implement factorial"},
+            {"role": "assistant", "content": "I'll write a recursive function",
+             "reasoning_content": "The user wants factorial. Recursive is cleaner for this."},
+            {"role": "tool", "tool_call_id": "call_1",
+             "content": "fn factorial(n: u64) -> u64 { if n <= 1 { 1 } else { n * factorial(n-1) } }"},
+        ],
+        "tools": [{"type": "function", "name": "write_file", "description": "Write a file"}],
+    });
+
+    let canonical = responses::request_from_responses(&req_body);
+    let chat = chat_completions::request_to_chat(&canonical);
+
+    let msgs = chat["messages"].as_array().unwrap();
+    let assistant_msg = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+    assert!(assistant_msg.get("reasoning_content").and_then(|v| v.as_str()).is_some(),
+        "reasoning_content must survive Responses→Chat translation, got {:?}", assistant_msg);
+}

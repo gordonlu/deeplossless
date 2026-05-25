@@ -91,12 +91,12 @@ fn check_tool_cache(
             if si == ai {
                 let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments_delta);
                 match db.tool_cache_get(&cname, &args_hash) {
-                    Ok(Some((result, _hits))) => {
+                    Ok(Some((ref result, _hits))) => {
                         if let Ok(mut c) = cycle.lock() {
                             #[allow(deprecated)]
                             c.record_cache_hit(name);
                         }
-                        let transformed = crate::tool_cache::transform_result(name, &result);
+                        let transformed = crate::tool_cache::transform_result(name, result);
                         tracing::info!(target: "deeplossless",
                             tool=name, %args_hash, raw_len=result.len(), transformed_len=transformed.len(),
                             "cache hit — intercepting tool call");

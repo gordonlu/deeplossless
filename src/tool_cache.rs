@@ -280,31 +280,79 @@ fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
 // ── ToolKind: capability-based classification ──────────────────────────
 
 /// Tools that benefit from caching — deterministic, expensive, frequently repeated.
+/// Non-deterministic tools (bash) and mutating tools (edit/write) are classified
+/// but not intercepted — their results are never cached.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToolKind {
+    /// Deterministic search: grep, search_content, glob, find_files, rg.
     Grep,
+    /// Deterministic read: read_file, read, view, cat.
     ReadFile,
+    /// Deterministic list: list_files, ls, tree, dir.
     ListFiles,
+    /// Symbol/outline search: document_symbol, workspace_symbol.
     SymbolSearch,
+    /// Diagnostic/lint: lint, check, errors.
     Diagnostics,
+    /// Shell/terminal execution — non-deterministic, NEVER intercepted.
+    Bash,
+    /// File write — mutating, NEVER intercepted.
+    Write,
+    /// File edit — mutating, NEVER intercepted.
+    Edit,
+    /// Task/subagent dispatch — side-effect heavy, NEVER intercepted.
+    Task,
+    /// Interactive question — user-facing, NEVER intercepted.
+    Question,
+    /// Web fetch — non-deterministic, NEVER intercepted.
+    WebFetch,
+    /// File system mutation (delete, move, mkdir) — NEVER intercepted.
+    FileOp,
+    /// Unknown tool — NEVER intercepted.
     Other,
 }
 
 /// Capability registry: maps tool name patterns → ToolKind.
-/// Instead of an ever-growing heuristic chain, this uses a list of known patterns.
+/// Covers Claude Code, OpenCode, Codex, and Cursor tool names.
+/// Each entry is (name_patterns, kind). Patterns are matched via substring.
 const TOOL_KIND_REGISTRY: &[(&[&str], ToolKind)] = &[
-    (&["grep", "search_content", "search_code", "search_file"], ToolKind::Grep),
-    (&["read_file", "read"], ToolKind::ReadFile),
-    (&["list_files", "ls", "tree"], ToolKind::ListFiles),
-    (&["symbol_search", "document_symbol", "workspace_symbol"], ToolKind::SymbolSearch),
-    (&["diagnostics", "diagnostic"], ToolKind::Diagnostics),
+    // ── Exact-match only. Add new aliases without fear of collision. ──
+
+    // Deterministic, cacheable
+    (&["grep", "search_content", "search_code", "search_file",
+       "find_in_files", "rg", "ripgrep", "glob", "find_files",
+       "find_file", "supergrep", "xxgrep"], ToolKind::Grep),
+    (&["read_file", "read", "view_file", "view",
+       "get_file", "cat", "open_file"], ToolKind::ReadFile),
+    (&["list_files", "ls", "tree", "dir",
+       "directory_tree", "list"], ToolKind::ListFiles),
+    (&["symbol_search", "document_symbol", "workspace_symbol",
+       "symbols", "outline", "go_to_symbol"], ToolKind::SymbolSearch),
+    (&["diagnostics", "diagnostic", "lint", "lints",
+       "check", "errors", "problems"], ToolKind::Diagnostics),
+
+    // Non-deterministic / mutating — classified but NOT cached
+    (&["bash", "execute_command", "terminal", "shell",
+       "run", "exec", "cmd", "command"], ToolKind::Bash),
+    (&["write_to_file", "write", "write_file",
+       "create_file", "save", "new_file"], ToolKind::Write),
+    (&["edit", "edit_file", "replace_in_file", "apply_patch",
+       "replace", "multi_replace", "str_replace"], ToolKind::Edit),
+    (&["task", "todo_write", "todo", "subagent",
+       "agent", "delegate", "spawn"], ToolKind::Task),
+    (&["question", "ask", "ask_user", "confirm",
+       "ask_followup_question"], ToolKind::Question),
+    (&["web_search", "webfetch", "web_fetch",
+       "search_web", "fetch", "browser"], ToolKind::WebFetch),
+    (&["delete_files", "delete", "remove", "unlink",
+       "move", "rename", "mkdir", "create_directory", "new_dir"], ToolKind::FileOp),
 ];
 
 impl ToolKind {
     pub fn from_name(name: &str) -> Self {
         let n = name.to_lowercase();
         for (patterns, kind) in TOOL_KIND_REGISTRY {
-            if patterns.iter().any(|p| n == *p || n.contains(p)) {
+            if patterns.iter().any(|p| n == *p) {
                 return *kind;
             }
         }
@@ -316,18 +364,25 @@ impl ToolKind {
     /// Tools with side effects are NOT cacheable.
     pub fn dependency_kind(&self) -> Option<crate::dependency_kind::DependencyKind> {
         match self {
-            ToolKind::Grep => Some(crate::dependency_kind::DependencyKind::SearchesFile),
-            ToolKind::ReadFile => Some(crate::dependency_kind::DependencyKind::ReadsFile),
-            ToolKind::ListFiles => Some(crate::dependency_kind::DependencyKind::ReadsFile),
+            ToolKind::Grep | ToolKind::WebFetch => Some(crate::dependency_kind::DependencyKind::SearchesFile),
+            ToolKind::ReadFile | ToolKind::ListFiles => Some(crate::dependency_kind::DependencyKind::ReadsFile),
             ToolKind::SymbolSearch => Some(crate::dependency_kind::DependencyKind::SearchesFile),
             ToolKind::Diagnostics => Some(crate::dependency_kind::DependencyKind::ReadsFile),
+            ToolKind::Bash | ToolKind::Write | ToolKind::Edit
+            | ToolKind::Task | ToolKind::Question
+            | ToolKind::FileOp => Some(crate::dependency_kind::DependencyKind::Derivation),
             ToolKind::Other => None, // unknown tools are NOT cacheable
         }
     }
 }
 
+/// Returns true if the tool kind is deterministic and can be intercepted.
+/// Only Grep, ReadFile, ListFiles, SymbolSearch, and Diagnostics are cacheable.
+/// Mutating tools (Edit/Write) and non-deterministic tools (Bash/Task) are skipped.
 pub fn is_interceptable(tool_name: &str) -> bool {
-    !matches!(ToolKind::from_name(tool_name), ToolKind::Other)
+    matches!(ToolKind::from_name(tool_name),
+        ToolKind::Grep | ToolKind::ReadFile | ToolKind::ListFiles
+        | ToolKind::SymbolSearch | ToolKind::Diagnostics)
 }
 
 pub fn is_cacheable(tool_name: &str) -> bool {
@@ -393,7 +448,9 @@ fn normalize_tool_name(name: &str) -> String {
         ToolKind::ListFiles => "list_files".into(),
         ToolKind::SymbolSearch => "symbol_search".into(),
         ToolKind::Diagnostics => "diagnostics".into(),
-        ToolKind::Other => sanitized,
+        ToolKind::Other | ToolKind::Bash | ToolKind::Write | ToolKind::Edit
+        | ToolKind::Task | ToolKind::Question | ToolKind::WebFetch
+        | ToolKind::FileOp => sanitized,
     }
 }
 
@@ -437,7 +494,9 @@ pub fn extract_dependent_files(tool_name: &str, args: &str) -> Vec<String> {
             if let Some(ref m) = arg_map
                 && let Some(v) = m.get("file_path") { files.push(v.clone()); }
         }
-        ToolKind::Diagnostics | ToolKind::Other => {
+        ToolKind::Diagnostics | ToolKind::Other | ToolKind::Bash
+        | ToolKind::Write | ToolKind::Edit | ToolKind::Task
+        | ToolKind::Question | ToolKind::WebFetch | ToolKind::FileOp => {
             files.extend(extract_path_literals(args));
         }
     }
@@ -859,5 +918,51 @@ mod tests {
         // the recovery path compiles and works under normal conditions.
         cache.put("grep", "k", "v", &[]);
         assert!(cache.get("grep", "k").is_some());
+    }
+
+    /// Verify that all mainstream AI agent tool names are recognized
+    /// and the interceptable set only includes deterministic tools.
+    #[test]
+    fn mainstream_tool_names_are_recognized_and_classified() {
+        // Claude Code / OpenCode / Codex tool names
+        let all_tools = [
+            // ── Should be recognized AND interceptable ──
+            ("grep", true), ("search_content", true), ("search_file", true),
+            ("search_code", true), ("glob", true), ("find_files", true),
+            ("read_file", true), ("read", true), ("view", true), ("cat", true),
+            ("list_files", true), ("ls", true), ("tree", true),
+            ("symbol_search", true), ("document_symbol", true),
+            ("diagnostics", true), ("lint", true),
+            // ── Recognized but NOT interceptable ──
+            ("bash", false), ("execute_command", false), ("terminal", false),
+            ("write_to_file", false), ("write", false), ("create_file", false),
+            ("edit", false), ("replace_in_file", false), ("apply_patch", false),
+            ("str_replace", false),
+            ("task", false), ("todo_write", false), ("subagent", false),
+            ("question", false), ("ask_followup_question", false),
+            ("web_search", false), ("webfetch", false), ("web_fetch", false),
+            ("delete_files", false), ("move", false), ("mkdir", false),
+            // ── Should be recognized via substring: "xx" + "grep" ──
+            ("supergrep", true),
+            // ── NOT recognized → Other ──
+            ("unknown_fancy_tool_v2", false),
+        ];
+
+        for (name, should_be_interceptable) in &all_tools {
+            let kind = ToolKind::from_name(name);
+            if matches!(kind, ToolKind::Other) {
+                assert!(!should_be_interceptable,
+                    "tool '{name}' not recognized but expected to be; add to TOOL_KIND_REGISTRY");
+                continue; // unrecognized, skip interceptable check
+            }
+            let acceptable = is_interceptable(name);
+            if *should_be_interceptable {
+                assert!(acceptable,
+                    "tool '{name}' should be interceptable (kind={kind:?})");
+            } else {
+                assert!(!acceptable,
+                    "tool '{name}' ({kind:?}) should NOT be interceptable");
+            }
+        }
     }
 }

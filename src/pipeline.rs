@@ -146,10 +146,10 @@ impl ChatPipeline {
             if let Some(arr) = msgs.as_array() {
                 for msg in arr {
                     let role = msg["role"].as_str().unwrap_or("");
-                    if role == "user" || role == "assistant" {
-                        let raw_tokens = crate::tokenizer::count_content_raw(msg) + overhead;
-                        let tc = crate::tokenizer::correct(raw_tokens, correction) as i64;
+                    if role == "user" || role == "assistant" || role == "tool" {
                         let summary = msg["content"].to_string().chars().take(200).collect::<String>();
+                        let raw_tokens = crate::tokenizer::count(&summary) + overhead;
+                        let tc = crate::tokenizer::correct(raw_tokens, correction) as i64;
                         if let Err(e) = dag.insert_leaf(conv_id, &summary, tc) {
                             tracing::warn!(target: "deeplossless::pipeline", "failed to create DAG leaf: {e}");
                         }

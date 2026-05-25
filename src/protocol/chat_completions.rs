@@ -125,6 +125,10 @@ pub fn request_to_chat(req: &CanonicalRequest) -> serde_json::Value {
         if role == "tool"
             && let Some(ref meta) = msg.meta
                 && let Some(ref tc_id) = meta.tool_call_id { m["tool_call_id"] = json!(tc_id); }
+        if role == "assistant"
+            && let Some(ref r) = msg.reasoning {
+                m["reasoning_content"] = json!(r.text);
+            }
         msgs.push(m);
     }
     let mut body = json!({"model": req.model, "messages": msgs, "stream": req.stream});

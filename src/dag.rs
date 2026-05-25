@@ -823,10 +823,15 @@ impl DagEngine {
         }
 
         // 3. If query provided, boost with scored retrieval results
+        // Only use results with valid DAG node IDs (source != "message").
+        // Message IDs map to the messages table, not dag_nodes, so get_node() returns None.
         if let Some(q) = query
             && let Ok(search_results) = self.db.search_unified(conv_id, q)
         {
             for sr in search_results.iter().take(5) {
+                if sr.source == "message" {
+                    continue; // message IDs are not valid dag_node IDs
+                }
                 if injected_ids.contains(&sr.id) {
                     continue;
                 }
