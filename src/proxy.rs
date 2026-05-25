@@ -736,10 +736,15 @@ async fn list_models() -> Response {
                 "context_window": 1_000_000,
                 "max_context_tokens": 1_000_000,
                 "max_input_tokens": 1_000_000,
+                "supports_reasoning": true,
+                "supports_thinking": true,
+                "reasoning": true,
+                "thinking": true,
                 "capabilities": {
                     "supports_tool_calls": true,
                     "supports_streaming": true,
                     "supports_reasoning": true,
+                    "supports_thinking": true,
                     "max_context_tokens": 1_000_000
                 }
             },
@@ -750,6 +755,10 @@ async fn list_models() -> Response {
                 "context_window": 1_000_000,
                 "max_context_tokens": 1_000_000,
                 "max_input_tokens": 1_000_000,
+                "supports_reasoning": true,
+                "supports_thinking": true,
+                "reasoning": true,
+                "thinking": true,
                 "capabilities": {
                     "supports_tool_calls": true,
                     "supports_streaming": true,
