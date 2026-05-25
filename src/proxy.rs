@@ -129,7 +129,7 @@ fn process_events(
             let sn = seq;
             let epoch_ms = crate::execution::next_logical_seq();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = db2.store_execution_event(None, kind, &payload, sn, None, epoch_ms) {
+                if let Err(e) = db2.store_execution_event(None, kind, &payload, sn, Some(0), epoch_ms) {
                     tracing::warn!(target: "deeplossless", "execution event store failed: {e}");
                 }
             });
@@ -251,6 +251,7 @@ fn write_log(log_dir: Option<&str>, entry: &LogEntry) {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{response_id}", get(responses_retrieve))
@@ -709,6 +710,38 @@ async fn responses_retrieve(
     tracing::warn!(target: "deeplossless",
         %response_id, "response retrieve miss");
     json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("response '{response_id}' not found"))
+}
+
+/// OpenAI-compatible model list. OpenCode and other clients query this to
+/// discover supported models and their capabilities (reasoning, context, etc.).
+async fn list_models() -> Response {
+    Json(json!({
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-v4-pro",
+                "object": "model",
+                "owned_by": "deepseek",
+                "capabilities": {
+                    "supports_tool_calls": true,
+                    "supports_streaming": true,
+                    "supports_reasoning": true,
+                    "max_context_tokens": 1_000_000
+                }
+            },
+            {
+                "id": "deepseek-v4-flash",
+                "object": "model",
+                "owned_by": "deepseek",
+                "capabilities": {
+                    "supports_tool_calls": true,
+                    "supports_streaming": true,
+                    "supports_reasoning": true,
+                    "max_context_tokens": 1_000_000
+                }
+            }
+        ]
+    })).into_response()
 }
 
 async fn chat_completions(

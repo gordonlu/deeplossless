@@ -436,6 +436,8 @@ impl Database {
         )?;
 
         // v0.7: execution units — agent memory atoms
+        // Add span/parallel columns to existing databases before index creation
+        let _ = conn.execute_batch(crate::execution::MIGRATION_ALTER_V5);
         conn.execute_batch(crate::execution::MIGRATION)?;
         // v0.7: code diff memory
         conn.execute_batch(crate::execution::CODE_CHANGE_MIGRATION)?;
