@@ -839,100 +839,21 @@ async fn chat_completions(
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
-        let db = state.storage.db.clone();
-        let cycle = state.runtime.cycle.clone();
-        let log_dir = state.log_dir.clone();
-        let upstream_status = status.as_u16();
-        let start = std::time::Instant::now();
-        let log_model = model.to_string();
-        let log_body = body.clone();
-        let shutdown = state.runtime.shutdown_notify.clone();
         tokio::spawn(async move {
-            if shutdown.notified().now_or_never().is_some() { return; }
             let mut byte_stream = resp.bytes_stream();
-            let mut buf = String::new();
-            let mut usage_buf: Option<serde_json::Value> = None;
-            let mut assembler = crate::protocol::streaming::StreamAssembler::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
-                        let s = String::from_utf8_lossy(&c);
-                        buf.push_str(&s);
-                        while let Some(pos) = buf.find('\n') {
-                            let line = buf[..pos].trim().to_string();
-                            buf = buf[pos + 1..].to_string();
-                            if let Some(data_line) = line.strip_prefix("data: ") {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
-                                    && v.get("usage").is_some() {
-                                        usage_buf = Some(v.clone());
-                                    }
-                                for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
-                                    if matches!(event, StreamEvent::Done { .. }) {
-                                        let flush_events = assembler.flush();
-                                        if !process_events(flush_events, db.clone(), &cycle, &tx, None, false) { break; }
-                                        continue;
-                                    }
-                                    let assembled = assembler.feed(event);
-                                    if !process_events(assembled, db.clone(), &cycle, &tx, None, false) { break; }
-                                }
-                            }
+                        if tx.send(Ok::<_, std::convert::Infallible>(c)).is_err() {
+                            break;
                         }
                     }
-                    Err(e) => { warn!("stream error: {e}"); break; }
+                    Err(e) => {
+                        warn!("stream error: {e}");
+                        break;
+                    }
                 }
             }
-            // Flush remaining assembler state (stream may have ended without Done)
-            {
-                let flush_events = assembler.flush();
-                process_events(flush_events, db.clone(), &cycle, &tx, None, false);
-            }
-            // Emit incomplete Done if stream ended without a proper finish_reason
-            if usage_buf.is_none() {
-                let err_done = serde_json::json!({
-                    "choices": [{"delta": {}, "index": 0, "finish_reason": "length"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    "object": "chat.completion.chunk",
-                });
-                let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!("data: {err_done}\n\n"))));
-            } else if let Some(ref v) = usage_buf {
-                let usage = serde_json::json!({
-                    "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-                    "usage": v["usage"],
-                    "object": "chat.completion.chunk",
-                });
-                let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!("data: {usage}\n\n"))));
-            }
-            // Write session log
-            if log_dir.is_some() {
-                let content = assembler.finish();
-                let input_tokens_est = crate::tokenizer::count(&log_body);
-                let output_tokens = usage_buf.as_ref()
-                    .and_then(|v| v["usage"]["completion_tokens"].as_u64())
-                    .unwrap_or(0);
-                let cache_hits = cycle.lock().ok().map(|c| c.metrics.cache_hits).unwrap_or(0);
-                let body_json: Option<serde_json::Value> = serde_json::from_str(&log_body).ok();
-                let msg_count = body_json.as_ref().and_then(|v| v["messages"].as_array()).map(|a| a.len()).unwrap_or(0);
-                let tools_count = body_json.as_ref().and_then(|v| v["tools"].as_array()).map(|a| a.len()).unwrap_or(0);
-                write_log(log_dir.as_deref(), &LogEntry {
-                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
-                    endpoint: "chat_completions",
-                    model: log_model,
-                    request_body_kb: log_body.len() as f64 / 1024.0,
-                    input_tokens_est,
-                    output_tokens,
-                    output_text_len: content.text.len(),
-                    cache_hits,
-                    msg_count,
-                    tools_count,
-                    instructions_len: 0,
-                    instr_hash: "-".into(),
-                    prompt_cache_key: "-".into(),
-                    upstream_status,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    error: if upstream_status >= 400 { Some(format!("HTTP {upstream_status}")) } else { None },
-                });
-            }
-            let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")));
         });
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = status;
