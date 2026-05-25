@@ -374,7 +374,7 @@ impl ChatPipeline {
                         }
                         let _ = writeln!(ctx_text, "</lcm_context>");
                     }
-                Self::inject_context(&mut injected, &ctx_text);
+                Self::inject_context(&mut injected, &ctx_text, conv_id);
             }
 
         // Reasoning injection disabled — modifying request body changes model
@@ -427,8 +427,7 @@ impl ChatPipeline {
     /// Tool role requires a paired assistant tool_call (DeepSeek rejects
     /// synthetic tool messages). User role is safe — the model treats it as
     /// additional context rather than a tool execution record.
-    fn inject_context(body: &mut serde_json::Value, ctx_text: &str) {
-        // Strip XML wrapper — context is now a user message, not system prompt
+    fn inject_context(body: &mut serde_json::Value, ctx_text: &str, conv_id: i64) {
         let clean = ctx_text
             .trim_start_matches("<lcm_context>\n")
             .trim_end_matches("</lcm_context>\n")
@@ -442,7 +441,7 @@ impl ChatPipeline {
             arr.push(serde_json::json!({
                 "role": "user",
                 "content": format!(
-                    "[lcm] cached context (GET /v1/lcm/grep for full retrieval):\n{hint}"
+                    "[lcm] query past context: GET /v1/lcm/grep/{conv_id}?query=<terms>\n{hint}"
                 ),
             }));
         }
