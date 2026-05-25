@@ -880,7 +880,9 @@ async fn chat_completions(
             let body = req_body.clone();
             let model_owned = model.to_string();
             tokio::task::spawn(async move {
-                let _ = pipeline.process(&model_owned, &body).await;
+                if let Err(e) = pipeline.process(&model_owned, &body).await {
+                    tracing::warn!(target: "deeplossless::pipeline", "background pipeline failed: {e}");
+                }
             });
         }
         req_body.clone()
