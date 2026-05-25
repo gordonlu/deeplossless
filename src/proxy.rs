@@ -269,6 +269,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/responses/{response_id}", get(responses_retrieve))
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep_by_id))
         .route("/v1/lcm/grep", get(lcm_grep_by_fingerprint))
+        .route("/v1/lcm/current", get(lcm_current_conv))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
@@ -1102,6 +1103,22 @@ async fn lcm_grep_by_fingerprint(
             "matches": results,
         })).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
+    }
+}
+
+/// Return the most recent conversation ID for the current session.
+/// AI agents can use this to discover which conversation to query via LCM endpoints.
+async fn lcm_current_conv(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    match state.storage.db.last_conversation_id() {
+        Ok(Some(id)) => Json(json!({"conversation_id": id})).into_response(),
+        Ok(None) => Json(json!({"conversation_id": null, "hint": "No conversations yet. Make a request first."})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 

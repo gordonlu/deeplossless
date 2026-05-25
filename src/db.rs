@@ -563,6 +563,17 @@ impl Database {
     }
 
     /// Find a conversation by session fingerprint, or create one.
+    /// Return the most recent conversation ID.
+    pub fn last_conversation_id(&self) -> anyhow::Result<Option<i64>> {
+        let conn = self.read_conn();
+        let id = conn.query_row(
+            "SELECT id FROM conversations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).ok();
+        Ok(id)
+    }
+
     /// Look up a conversation by fingerprint without creating. Returns None if not found.
     pub fn find_conversation_by_fingerprint(&self, fingerprint: &str) -> anyhow::Result<Option<i64>> {
         let conn = self.read_conn();
