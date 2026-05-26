@@ -1,5 +1,10 @@
 <img src="asset/banner.png" alt="DeepLossless" width="100%">
 
+[![Crates.io](https://img.shields.io/crates/v/deeplossless)](https://crates.io/crates/deeplossless)
+[![CI](https://github.com/gordonlu/deeplossless/actions/workflows/rust.yml/badge.svg)](https://github.com/gordonlu/deeplossless/actions/workflows/rust.yml)
+[![License](https://img.shields.io/crates/l/deeplossless)](https://github.com/gordonlu/deeplossless/blob/master/LICENSE)
+[![MSRV](https://img.shields.io/badge/rust-1.85+-orange)](https://rust-lang.org)
+
 # deeplossless
 
 An **inference-aware coding runtime** that reduces repeated work in long AI
@@ -149,7 +154,7 @@ curl https://localhost:8080/v1/lcm/runtime/report?label=fix+build
 
 ## Requirements
 
-- Rust 1.80+
+- Rust 1.85+
 - DeepSeek API key (for proxy mode; benchmarks run without)
 
 ## License
