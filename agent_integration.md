@@ -17,6 +17,10 @@ cp SKILL.md ~/.config/opencode/skills/deeplossless.md
 
 # OpenClaw
 cp SKILL.md ~/.openclaw/skills/deeplossless.md
+# OpenClaw config (~/.openclaw/config.yaml or env):
+#   model_provider: openai_compatible
+#   base_url: https://localhost:8080/v1
+#   api_key: $DEEPSEEK_API_KEY
 
 # Any agent — copy to its skills directory
 ```
