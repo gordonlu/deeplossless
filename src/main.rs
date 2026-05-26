@@ -8,9 +8,14 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
-    /// Listen port
+    /// Listen port (HTTPS)
     #[arg(long, default_value = "8080")]
     port: u16,
+
+    /// Plain HTTP port for localhost agents (0 = disabled).
+    /// Sandboxed agents (OpenClaw, etc.) may not trust self-signed certs.
+    #[arg(long, default_value = "8081")]
+    http_port: u16,
 
     /// Upstream DeepSeek API base URL
     #[arg(long, default_value = "https://api.deepseek.com")]
@@ -335,16 +340,43 @@ async fn main() -> anyhow::Result<()> {
         && std::env::var("NODE_EXTRA_CA_CERTS").is_err() {
         tracing::info!("Run `deeplossless trust` once to configure HTTPS certificate trust.");
     }
-    let handle = axum_server::Handle::new();
-    let shutdown_handle = handle.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        shutdown_handle.shutdown();
-    });
-    axum_server::bind_rustls(addr, tls_config)
-        .handle(handle)
-        .serve(app.into_make_service())
-        .await?;
+
+    // Plain HTTP for sandboxed agents that can't trust self-signed certs (OpenClaw, etc.)
+    if cli.http_port > 0 && cli.http_port != cli.port {
+        let http_addr: std::net::SocketAddr = format!("127.0.0.1:{}", cli.http_port).parse()?;
+        let http_app = app.clone();
+        tracing::info!("HTTP on {http_addr} (for sandboxed local agents)");
+        let tls_handle = axum_server::Handle::new();
+        let tls_shutdown = tls_handle.clone();
+        let http_handle = axum_server::Handle::new();
+        let http_shutdown = http_handle.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tls_shutdown.shutdown();
+            http_shutdown.shutdown();
+        });
+        let http_server = axum_server::bind(http_addr)
+            .handle(http_handle)
+            .serve(http_app.into_make_service());
+        let tls_server = axum_server::bind_rustls(addr, tls_config)
+            .handle(tls_handle)
+            .serve(app.into_make_service());
+        tokio::select! {
+            _ = http_server => {},
+            _ = tls_server => {},
+        }
+    } else {
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_handle.shutdown();
+        });
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+    }
     coordinator.shutdown(std::time::Duration::from_secs(2)).await;
 
     tracing::info!("deeplossless stopped");
