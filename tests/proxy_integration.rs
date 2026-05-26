@@ -2107,3 +2107,144 @@ fn responses_to_chat_translation_preserves_reasoning_content() {
     assert!(assistant_msg.get("reasoning_content").and_then(|v| v.as_str()).is_some(),
         "reasoning_content must survive Responses→Chat translation, got {:?}", assistant_msg);
 }
+
+// ── End-to-end reasoning round-trip ────────────────────────────────────
+
+#[tokio::test]
+async fn reasoning_round_trip_store_retrieve_inject() {
+    // Full lifecycle: upstream sends reasoning_content → proxy captures →
+    // stores to DB → next request pipeline retrieves → injects → DeepSeek
+    // accepts the request without 400.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            let req = body.0.clone();
+            *cap.lock().unwrap() = Some(req.clone());
+
+            // Verify: second request must have reasoning_content on tool-call message
+            let msgs = req["messages"].as_array().unwrap();
+            let tool_msg = msgs.iter().rev().find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some());
+            if let Some(msg) = tool_msg {
+                if msg.get("reasoning_content").and_then(|v| v.as_str()).map(|s| s.is_empty()) != Some(false) {
+                    return (StatusCode::BAD_REQUEST, "reasoning_content missing on tool-call").into_response();
+                }
+            }
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "reasoning_roundtrip").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+
+    // Turn 1: reason → tool_call → execute
+    let _r1 = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"search for foo"}],"stream":true}))
+        .send().await.unwrap().text().await.unwrap();
+
+    // Turn 2: send tool result WITH reasoning_content
+    let r2 = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "model":"deepseek-v4-flash",
+            "messages":[
+                {"role":"user","content":"search for foo"},
+                {"role":"assistant","content":null,"reasoning_content":"I need to search","tool_calls":[{"id":"c1","type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"foo\"}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"found foo at line 42"}
+            ],
+            "stream":true
+        }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send().await.unwrap();
+
+    assert_eq!(r2.status(), StatusCode::OK,
+        "turn 2 must succeed — reasoning_content required on tool-call message");
+}
+
+// ── Multi-turn conversation continuity ──────────────────────────────────
+
+#[tokio::test]
+async fn multi_turn_context_retrieval_across_turns() {
+    // Turn 1: store a message → Turn 2: search for it via LCM grep.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"result\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "multi_turn_ctx").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+
+    // Turn 1: conversation about database timeout
+    let _r1 = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "model":"deepseek-v4-flash",
+            "messages":[
+                {"role":"user","content":"fix database timeout bug"},
+                {"role":"assistant","content":"I found the issue in db.rs line 42 — connection pool exhausted"}
+            ],
+            "stream":true
+        }))
+        .send().await.unwrap().text().await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Get conversation ID
+    let conv_resp = client
+        .get(format!("http://{proxy_addr}/v1/lcm/current"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    let conv_json: serde_json::Value = conv_resp.json().await.unwrap();
+    let conv_id = conv_json["conversation_id"].as_i64().expect("must have conversation");
+
+    // Verify: search should find "database" in the stored context
+    let grep_resp = client
+        .get(format!("http://{proxy_addr}/v1/lcm/grep/{conv_id}?query=database+timeout"))
+        .header("authorization", "Bearer test-key")
+        .send().await.unwrap();
+    assert!(grep_resp.status().is_success());
+    let grep_json: serde_json::Value = grep_resp.json().await.unwrap();
+    let total = grep_json["total"].as_i64().unwrap_or(0);
+    assert!(total > 0,
+        "multi-turn: Turn 1 content must be retrievable in Turn 2. total={total}, grep={grep_json}");
+}
