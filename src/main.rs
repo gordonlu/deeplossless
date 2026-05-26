@@ -76,6 +76,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     no_pipeline: bool,
 
+    /// Override DAG soft threshold (0.0–1.0). Default 0.80 = compact at 80% of
+    /// context window. Set 0.01 for testing compaction with small conversations.
+    #[arg(long)]
+    dag_threshold: Option<f64>,
+
     /// Use upstream headers as-is (skip cache-control, x-accel-buffering, charset).
     /// For isolating whether header modification causes the hang.
     #[arg(long)]
@@ -280,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         _ => deeplossless::runtime::SnapshotMode::Manual,
     };
     let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
+        dag_threshold: cli.dag_threshold,
         upstream: cli.upstream,
         db_path: cli.db_path,
         api_key: cli.api_key,

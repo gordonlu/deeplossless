@@ -6,6 +6,7 @@ use crate::runtime::{BackgroundTasks, RateLimiter, RuntimeProfile, ExecutionCycl
 
 /// Configuration derived from CLI args.
 pub struct CoordinatorConfig {
+    pub dag_threshold: Option<f64>,
     pub upstream: String,
     pub db_path: String,
     pub api_key: Option<String>,
@@ -42,10 +43,13 @@ impl RuntimeCoordinator {
                 .build()
                 .await?,
         );
-        let dag = Arc::new(
-            crate::dag::DagEngine::builder()
-                .build(db.clone()),
-        );
+        let dag_builder = crate::dag::DagEngine::builder();
+        let dag_builder = if let Some(t) = cfg.dag_threshold {
+            dag_builder.soft_threshold(t)
+        } else {
+            dag_builder
+        };
+        let dag = Arc::new(dag_builder.build(db.clone()));
 
         let initial_api_key = cfg.api_key.clone()
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
