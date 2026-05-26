@@ -342,38 +342,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Plain HTTP for sandboxed agents that can't trust self-signed certs (OpenClaw, etc.)
+    let tls_handle = axum_server::Handle::new();
+    let _signal_guard = {
+        let tls_h = tls_handle.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tls_h.shutdown();
+        })
+    };
+
     if cli.http_port > 0 && cli.http_port != cli.port {
         let http_addr: std::net::SocketAddr = format!("127.0.0.1:{}", cli.http_port).parse()?;
         let http_app = app.clone();
-        tracing::info!("HTTP on {http_addr} (for sandboxed local agents)");
-        let tls_handle = axum_server::Handle::new();
-        let tls_shutdown = tls_handle.clone();
         let http_handle = axum_server::Handle::new();
-        let http_shutdown = http_handle.clone();
+        let http_h = http_handle.clone();
+        let tls_h = tls_handle.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            tls_shutdown.shutdown();
-            http_shutdown.shutdown();
+            http_h.shutdown();
+            tls_h.shutdown();
         });
+        tracing::info!("HTTP on {http_addr} (for sandboxed local agents)");
         let http_server = axum_server::bind(http_addr)
             .handle(http_handle)
             .serve(http_app.into_make_service());
         let tls_server = axum_server::bind_rustls(addr, tls_config)
             .handle(tls_handle)
             .serve(app.into_make_service());
-        tokio::select! {
-            _ = http_server => {},
-            _ = tls_server => {},
-        }
+        tokio::try_join!(http_server, tls_server)?;
     } else {
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_handle.shutdown();
-        });
         axum_server::bind_rustls(addr, tls_config)
-            .handle(handle)
+            .handle(tls_handle)
             .serve(app.into_make_service())
             .await?;
     }
