@@ -8,7 +8,7 @@ Connected through deeplossless — context search, tool caching, session memory.
 (grep, read_file, list_files, search, diagnostics, symbol_search).
 
 ```bash
-curl -sk  \
+curl -sk \
   "https://localhost:8080/v1/lcm/cache?tool=<name>&args=<json>"
 ```
 Response: `{"hit": true, "result": "..."}` → use `result`, skip execution.
@@ -33,12 +33,18 @@ curl -sk  https://localhost:8080/v1/lcm/current
 # → {"conversation_id": 8}
 ```
 
-## Search past context
+## Search past context (current session)
 
 ```bash
-curl -sk  \
-  "https://localhost:8080/v1/lcm/grep/{id}?query=<search>"
+curl -sk "https://localhost:8080/v1/lcm/grep/{id}?query=<search>"
 ```
+
+## Search ALL past sessions (cross-session memory)
+
+```bash
+curl -sk "https://localhost:8080/v1/lcm/global/search?q=<search>&limit=10"
+```
+Returns relevant nodes from every past conversation, not just this session.
 
 ## Session stats
 
