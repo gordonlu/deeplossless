@@ -103,6 +103,9 @@ pub struct SummarizerConfig {
     pub base_timeout_secs: u64,
     /// Max retries per level. Default: 3.
     pub max_retries: u32,
+    /// Hard cap on total LLM summarization calls per process lifetime.
+    /// Each call costs ~3K tokens. Default 500 = ~1.5M tokens max for compaction.
+    pub max_total_calls: u64,
 }
 
 impl Default for SummarizerConfig {
@@ -115,6 +118,7 @@ impl Default for SummarizerConfig {
             reduction_threshold: 0.90,
             base_timeout_secs: 15,
             max_retries: 3,
+            max_total_calls: 500,
         }
     }
 }
@@ -159,6 +163,7 @@ impl SummarizerBuilder {
             config: self.config,
             client: reqwest::Client::new(),
             shutdown_notify: self.shutdown_notify,
+            call_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 }
@@ -174,6 +179,8 @@ pub struct Summarizer {
     /// Optional shutdown signal. When notified, `summarize_escalate` exits
     /// early with `Err(anyhow!("cancelled"))` instead of escalating to L3.
     shutdown_notify: Option<Arc<Notify>>,
+    /// Total LLM summarization calls made in this process. Hard-capped by config.
+    call_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Summarizer {
@@ -188,6 +195,12 @@ impl Summarizer {
     /// - Fatal errors (auth, DNS) on L1 skip L2 — escalate directly to L3.
     /// - Cancellation via `shutdown_notify` aborts escalation immediately.
     pub async fn summarize_escalate(&self, text: &str) -> anyhow::Result<SummaryResult> {
+        // Budget check: cap total LLM calls to prevent runaway token burn
+        let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= self.config.max_total_calls {
+            anyhow::bail!("summarizer budget exhausted ({} calls), falling to L3 deterministic", count);
+        }
+
         // Check shutdown before any work
         if let Some(ref notify) = self.shutdown_notify {
             if Self::is_shutdown(notify) {
