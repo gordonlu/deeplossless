@@ -86,6 +86,14 @@ impl DatabaseBuilder {
 /// Read operations go through a connection pool (round-robin dispatch).
 /// Writes go through a dedicated writer connection serialised by a Mutex.
 /// WAL mode ensures writes don't block reads.
+///
+/// # Invariant: No Mutex held across await
+///
+/// `writer` and `read_pool` use `std::sync::Mutex`.  `MutexGuard` is `!Send`,
+/// so Rust rejects any future that holds a guard across an `.await` point.
+/// All DB methods are synchronous; callers use `spawn_blocking` for async.
+/// Do not add `async fn` methods that lock the writer — that breaks this
+/// compile-time safety guarantee.
 const READ_POOL_SIZE: usize = 8;
 
 pub struct Database {
@@ -93,6 +101,8 @@ pub struct Database {
     writer: Mutex<Connection>,
     write_count: AtomicU64,
     tool_cache_l1: crate::tool_cache::L1HotCache,
+    /// Absolute path to the database file, for WAL health logging.
+    db_path: String,
     /// Runtime policy config (audit mode, snapshot mode). Read via RwLock
     /// so it can be updated at runtime without rebuilding the database.
     pub policy_config: std::sync::Arc<std::sync::RwLock<crate::runtime::RuntimePolicyConfig>>,
@@ -140,16 +150,20 @@ impl Database {
             read_pool.push(Mutex::new(rconn));
         }
 
+        let db_path = expanded.clone();
         let config_arc = std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
         let db = Self {
             read_pool,
             writer: Mutex::new(writer),
             write_count: AtomicU64::new(0),
+            db_path,
             tool_cache_l1: crate::tool_cache::L1HotCache::default(),
             policy_config: config_arc,
             onerror_buffer: Mutex::new(VecDeque::with_capacity(config.onerror_ring_size)),
         };
         db.migrate()?;
+        // Clean up any stale WAL from a previous unclean shutdown
+        let _ = db.wal_checkpoint();
         Ok(db)
     }
 
@@ -216,12 +230,48 @@ impl Database {
         self.flush_onerror_buffer_with_conn(&conn);
     }
 
-    /// Run a WAL checkpoint to prevent the WAL file from growing
-    /// indefinitely under sustained write load.  Call periodically
-    /// (e.g. every N store_messages calls).
+    /// Lightweight liveness check — uses a read connection, no writer lock.
+    /// Safe to call on every health endpoint hit.
+    pub fn ping(&self) -> anyhow::Result<()> {
+        let conn = self.read_conn();
+        conn.execute_batch("SELECT 1;")?;
+        Ok(())
+    }
+
+    fn wal_size_bytes(&self) -> u64 {
+        let wal_path = format!("{}-wal", &self.db_path);
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Run a WAL checkpoint and log health metrics (size, duration).
     pub fn wal_checkpoint(&self) -> anyhow::Result<()> {
+        let wal_bytes_before = self.wal_size_bytes();
+        let t0 = std::time::Instant::now();
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        let wal_bytes_after = self.wal_size_bytes();
+        let writes = self.write_count.load(std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "deeplossless::wal",
+            wal_before_kb = wal_bytes_before / 1024,
+            wal_after_kb = wal_bytes_after / 1024,
+            checkpoint_ms = elapsed_ms,
+            total_writes = writes,
+            "WAL checkpoint");
+        Ok(())
+    }
+
+    /// Graceful shutdown step 1: checkpoint WAL and run optimize.
+    pub fn checkpoint_and_optimize(&self) -> anyhow::Result<()> {
+        let wal_bytes_before = self.wal_size_bytes();
+        let t0 = std::time::Instant::now();
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")?;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        tracing::info!(target: "deeplossless::db",
+            wal_before_kb = wal_bytes_before / 1024,
+            checkpoint_ms = elapsed_ms,
+            "WAL checkpoint + optimize");
         Ok(())
     }
 
@@ -478,10 +528,13 @@ impl Database {
                 file_path       TEXT NOT NULL,
                 operation       TEXT NOT NULL DEFAULT 'edit',
                 claimed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                conv_id         INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent_id, file_path)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_files
                 ON agent_active_files(file_path);")?;
+        // Migration: add conv_id to existing agent_active_files (v0.5.3+)
+        let _ = conn.execute_batch("ALTER TABLE agent_active_files ADD COLUMN conv_id INTEGER NOT NULL DEFAULT 0;");
         // v0.8: failure memory
         conn.execute_batch(crate::execution::FAILURE_MIGRATION)?;
         // v0.3.0: failure pattern environment fingerprint (after table creation)
@@ -575,6 +628,15 @@ impl Database {
     }
 
     /// Look up a conversation by fingerprint without creating. Returns None if not found.
+    pub fn conversation_exists(&self, conv_id: i64) -> bool {
+        let conn = self.read_conn();
+        conn.query_row(
+            "SELECT 1 FROM conversations WHERE id = ?1",
+            rusqlite::params![conv_id],
+            |_| Ok(()),
+        ).is_ok()
+    }
+
     pub fn find_conversation_by_fingerprint(&self, fingerprint: &str) -> anyhow::Result<Option<i64>> {
         let conn = self.read_conn();
         let id = conn.query_row(
@@ -865,6 +927,28 @@ impl Database {
             rusqlite::params![conversation_id, level, summary, token_count, parent_json, child_json, snippet_json, is_join as i32, hash, compaction_id],
         )?;
         let new_id = tx.last_insert_rowid();
+
+        // Update source nodes: add new_id to their parent_ids for DAG symmetry.
+        // Without this, validate_dag reports orphan-parent because source nodes
+        // don't know about the summary node that references them as children.
+        for sid in source_ids {
+            let parent_str: String = tx.query_row(
+                "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            ).unwrap_or_else(|_| "[]".to_string());
+            let mut parents: Vec<i64> = serde_json::from_str(&parent_str).unwrap_or_default();
+            if !parents.contains(&new_id) {
+                parents.push(new_id);
+                let updated = serde_json::to_string(&parents).unwrap_or_default();
+                if let Err(e) = tx.execute(
+                    "UPDATE dag_nodes SET parent_ids = ?1 WHERE id = ?2",
+                    rusqlite::params![updated, sid],
+                ) {
+                    tracing::warn!(target: "deeplossless::db", "parent_ids update failed for node {}: {e}", sid);
+                }
+            }
+        }
 
         // Mirror as typed edges (P3 Graph Model)
         for sid in source_ids {
@@ -1522,6 +1606,16 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a cached tool result. Returns Ok(()) even if no entry existed (idempotent).
+    pub fn tool_cache_delete(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "DELETE FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2",
+            rusqlite::params![tool_name, args_hash],
+        )?;
+        Ok(())
+    }
+
     /// Invalidate cache entries whose dependent files overlap with changed_files.
     /// Uses content-hash comparison when file_hashes are available (v0.3);
     /// falls back to path-based matching for legacy entries.
@@ -1635,15 +1729,31 @@ impl Database {
     }
 
     /// Get the active plan state for a conversation.
-    pub fn get_active_plan(&self, conv_id: i64) -> anyhow::Result<Option<(i64, String, String, String)>> {
+    /// Returns (id, goal, pending_steps, assumptions) with steps/assumptions
+    /// deserialized from their JSON column values.
+    pub fn get_active_plan(&self, conv_id: i64) -> anyhow::Result<Option<(i64, String, serde_json::Value, serde_json::Value)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, goal, pending_steps, assumptions FROM plan_states
              WHERE conversation_id = ?1 AND is_active = 1 ORDER BY id DESC LIMIT 1"
         )?;
         Ok(stmt.query_row(rusqlite::params![conv_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            let pending_str: String = row.get(2)?;
+            let assump_str: String = row.get(3)?;
+            let pending: serde_json::Value = serde_json::from_str(&pending_str).unwrap_or(serde_json::Value::Array(vec![]));
+            let assumptions: serde_json::Value = serde_json::from_str(&assump_str).unwrap_or(serde_json::Value::Array(vec![]));
+            Ok((row.get(0)?, row.get(1)?, pending, assumptions))
         }).ok())
+    }
+
+    /// Deactivate (soft-delete) a plan by ID. Returns true if a row was updated.
+    pub fn deactivate_plan(&self, id: i64) -> anyhow::Result<bool> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = conn.execute(
+            "UPDATE plan_states SET is_active = 0, updated_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(rows > 0)
     }
 
     // ── Execution Events (v0.4.0) ──────────────────────────────────────
@@ -1894,32 +2004,33 @@ impl Database {
 
     /// Claim a file for an agent. Returns Ok(()) if claim succeeds,
     /// Err with conflicting agent_id if another agent already holds the file.
-    pub fn claim_file(&self, agent_id: &str, file_path: &str, operation: &str) -> anyhow::Result<Result<(), String>> {
+    pub fn claim_file(&self, agent_id: &str, file_path: &str, operation: &str, conv_id: i64) -> anyhow::Result<Result<(), String>> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        // Check for existing claim from another agent
+        // Check for existing claim from a different conversation
         let existing: Option<String> = conn.query_row(
-            "SELECT agent_id FROM agent_active_files WHERE file_path = ?1 AND agent_id != ?2",
-            rusqlite::params![file_path, agent_id],
+            "SELECT agent_id FROM agent_active_files WHERE file_path = ?1 AND conv_id != ?2",
+            rusqlite::params![file_path, conv_id],
             |row| row.get(0),
         ).ok();
         if let Some(other_agent) = existing {
             return Ok(Err(other_agent));
         }
         conn.execute(
-            "INSERT OR REPLACE INTO agent_active_files (agent_id, file_path, operation) VALUES (?1, ?2, ?3)",
-            rusqlite::params![agent_id, file_path, operation],
+            "INSERT OR REPLACE INTO agent_active_files (agent_id, file_path, operation, conv_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![agent_id, file_path, operation, conv_id],
         )?;
         Ok(Ok(()))
     }
 
-    /// Release an agent's claim on a file.
-    pub fn release_file(&self, agent_id: &str, file_path: &str) -> anyhow::Result<()> {
+    /// Release an agent's claim on a file. Returns the number of rows deleted
+    /// (0 = file was not claimed — double-release).
+    pub fn release_file(&self, agent_id: &str, file_path: &str) -> anyhow::Result<usize> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
+        let count = conn.execute(
             "DELETE FROM agent_active_files WHERE agent_id = ?1 AND file_path = ?2",
             rusqlite::params![agent_id, file_path],
         )?;
-        Ok(())
+        Ok(count)
     }
 
     /// Release all claims for an agent (on disconnect/session end).
@@ -2302,6 +2413,7 @@ impl Database {
         &self,
         conv_id: i64,
         query: &str,
+        limit: usize,
     ) -> anyhow::Result<Vec<UnifiedSearchResult>> {
         let conn = self.read_conn();
         if query.is_empty() {
@@ -2310,12 +2422,10 @@ impl Database {
 
         let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
 
-        // Try FTS5 MATCH first (supports BM25 scoring, works for English).
-        // FTS5 unicode61 tokenizer fails on mixed CJK/English — detect and fall back.
-        let has_cjk = query.chars().any(|c| c as u32 > 0x2E80);
-        let use_fts5 = !has_cjk;
-
-        if use_fts5 {
+        // Always try FTS5 first.  unicode61 tokenizer can't segment CJK, so
+        // CJK MATCH queries will return empty — we fall through to LIKE below.
+        // For English, FTS5 gives BM25 scoring and proper phrase matching.
+        {
             let fts_query = Self::fts5_query(query);
             // Phase A: FTS5 on messages (fast, BM25-scored)
             let sql = "
@@ -2326,12 +2436,12 @@ impl Database {
                 JOIN messages ON messages.id = messages_fts.rowid
                 WHERE messages_fts MATCH ?1 AND messages.conversation_id = ?2
                 ORDER BY score
-                LIMIT 30
+                LIMIT ?3
             ";
             let mut seen = std::collections::HashSet::new();
             if let Ok(mut stmt) = conn.prepare(sql)
                 && let Ok(rows) = stmt.query_map(
-                    rusqlite::params![fts_query, conv_id],
+                    rusqlite::params![fts_query, conv_id, limit as i64],
                     |row| {
                         Ok(UnifiedSearchResult {
                             id: row.get(0)?,
@@ -2360,10 +2470,11 @@ impl Database {
                     FROM dag_nodes
                     WHERE conversation_id = ?1 AND summary LIKE ?2 ESCAPE '\\' AND deleted = 0
                     ORDER BY token_count DESC
-                    LIMIT 15
+                    LIMIT ?3
                 ";
+                let summary_limit = (limit / 2).max(5) as i64;
                 if let Ok(mut sstmt) = conn.prepare(summary_sql)
-                    && let Ok(srows) = sstmt.query_map(rusqlite::params![conv_id, pattern], |row| {
+                    && let Ok(srows) = sstmt.query_map(rusqlite::params![conv_id, pattern, summary_limit], |row| {
                         Ok(UnifiedSearchResult {
                             id: row.get(0)?,
                             source: "summary".to_string(),
@@ -2410,18 +2521,19 @@ impl Database {
 
             UNION ALL
 
-            SELECT node_id AS id, 'snippet' AS source, source_type AS label,
-                   substr(content, 1, 500) AS excerpt,
+            SELECT s.node_id AS id, 'snippet' AS source, s.source_type AS label,
+                   substr(s.content, 1, 500) AS excerpt,
                    NULL AS token_count
-            FROM snippets_fts
-            WHERE content LIKE ?2 ESCAPE '\\'
+            FROM snippets_fts s
+            JOIN dag_nodes d ON d.id = s.node_id
+            WHERE s.content LIKE ?2 ESCAPE '\\' AND d.conversation_id = ?1 AND d.deleted = 0
 
             ORDER BY id DESC
-            LIMIT 30
+            LIMIT ?3
         ";
 
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params![conv_id, pattern], |row| {
+        let rows = stmt.query_map(rusqlite::params![conv_id, pattern, limit as i64], |row| {
             Ok(UnifiedSearchResult {
                 id: row.get(0)?,
                 source: row.get(1)?,
@@ -2439,16 +2551,25 @@ impl Database {
     }
 
     /// Build a safe FTS5 query string from user input.
-    /// Wraps each word in quotes for phrase matching.
+    /// Multi-word queries are wrapped as FTS5 phrase queries ("a b c" matches
+    /// adjacent tokens).  FTS5 special characters are replaced with spaces.
     fn fts5_query(query: &str) -> String {
-        let escaped = Self::fts_escape(query);
-        if escaped.is_empty() {
+        // If query is already quoted, extract the phrase inside
+        let trimmed = query.trim();
+        let is_quoted = trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 2;
+        let inner = if is_quoted { &trimmed[1..trimmed.len()-1] } else { trimmed };
+        let escaped = Self::fts_escape(inner);
+        let cleaned = escaped.trim();
+        if cleaned.is_empty() {
             return "*".to_string();
         }
-        escaped.split_whitespace()
-            .map(|w| format!("\"{}\"", w.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ")
+        if cleaned.contains(' ') {
+            // Multi-word → FTS5 phrase: "word1 word2" matches adjacent tokens
+            format!("\"{}\"", cleaned)
+        } else {
+            // Single word → FTS5 term
+            format!("\"{}\"", cleaned)
+        }
     }
 
     // ── Embedding vector storage (v0.5) ───────────────────────────────
@@ -2546,18 +2667,18 @@ impl Database {
         &self,
         query: &str,
         limit: usize,
-    ) -> anyhow::Result<Vec<(i64, i64, String)>> {
+    ) -> anyhow::Result<Vec<(i64, i64, String, String)>> {
         let conn = self.read_conn();
         let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT n.id, n.conversation_id, n.summary
+            "SELECT DISTINCT n.id, n.conversation_id, n.summary, substr(n.summary, 1, 200)
              FROM dag_nodes n
              WHERE n.summary LIKE ?1 ESCAPE '\\' AND n.deleted = 0
              ORDER BY n.level DESC, n.access_count DESC, n.id DESC
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
         })?;
         let mut results = Vec::new();
         for row in rows { results.push(row?); }
@@ -2985,23 +3106,23 @@ mod tests {
         db.insert_dag_node_full(conv_id, 1, "fixed port binding error", 15, &[], &[], &snippets, false, false).unwrap();
 
         // Search for "port" — should find the summary
-        let results = db.search_unified(conv_id, "port").unwrap();
+        let results = db.search_unified(conv_id, "port", 20).unwrap();
         assert!(!results.is_empty(), "should find summary containing 'port'");
         let has_summary = results.iter().any(|r| r.source == "summary");
         assert!(has_summary, "should include summary results");
 
         // Search for ".rs" — should find the snippet
-        let results = db.search_unified(conv_id, ".rs").unwrap();
+        let results = db.search_unified(conv_id, ".rs", 20).unwrap();
         let has_snippet = results.iter().any(|r| r.source == "snippet");
         assert!(has_snippet, "should include snippet results");
 
         // Search for "hello" — should find the message
-        let results = db.search_unified(conv_id, "hello").unwrap();
+        let results = db.search_unified(conv_id, "hello", 20).unwrap();
         let has_message = results.iter().any(|r| r.source == "message");
         assert!(has_message, "should include message results");
 
         // Search for nonexistent string
-        let empty = db.search_unified(conv_id, "zzz_nonexistent").unwrap();
+        let empty = db.search_unified(conv_id, "zzz_nonexistent", 20).unwrap();
         assert!(empty.is_empty(), "should find nothing");
     }
 
@@ -3226,7 +3347,7 @@ mod tests {
         db.insert_summary_atomic(conv_id, 1, "The wifi password is hunter2", 5, &[], &[], "").unwrap();
 
         // Search for unique summary content — should find the summary
-        let results = db.search_unified(conv_id, "hunter2").unwrap();
+        let results = db.search_unified(conv_id, "hunter2", 20).unwrap();
         let has_summary = results.iter().any(|r| r.source == "summary");
         assert!(has_summary,
             "BUG: FTS5 path returns only messages, summary 'hunter2' is invisible. Got {} results: {:?}",

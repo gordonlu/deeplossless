@@ -391,9 +391,37 @@ impl Summarizer {
             match result {
                 Ok(resp) => {
                     let status = resp.status();
+                    // Capture headers before reading body (headers are available immediately)
+                    let resp_headers = resp.headers().clone();
+                    let content_length = resp_headers.get("content-length")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    let transfer_encoding = resp_headers.get("transfer-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    let content_type = resp_headers.get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
                     if status.is_success() {
-                        // Typed response parsing (P0-6): structured, catches API changes
-                        match resp.json::<ChatCompletionResponse>().await {
+                        // Read entire body as bytes — single consumer, no double-read risk
+                        let body_bytes = resp.bytes().await.unwrap_or_default();
+                        if body_bytes.is_empty() {
+                            tracing::warn!(
+                                target = "deeplossless::summarizer",
+                                meta = ?meta,
+                                http_status = status.as_u16(),
+                                content_length,
+                                transfer_encoding,
+                                content_type,
+                                "EMPTY RESPONSE BODY — upstream returned 2xx with zero-length body"
+                            );
+                            last_error = Some(anyhow::anyhow!(
+                                "empty response body (status {status}, content-length: {content_length})"
+                            ));
+                            // Don't retry on empty body — escalate to next level
+                            break;
+                        }
+                        match serde_json::from_slice::<ChatCompletionResponse>(&body_bytes) {
                             Ok(parsed) => {
                                 if let Some(content) = parsed.choices.first()
                                     .and_then(|c| c.message.content.as_deref())
@@ -410,10 +438,17 @@ impl Summarizer {
                                 ));
                             }
                             Err(e) => {
+                                let preview: String = String::from_utf8_lossy(&body_bytes)
+                                    .chars().take(500).collect();
                                 tracing::warn!(
                                     target = "deeplossless::summarizer",
                                     meta = ?meta,
                                     error = %e,
+                                    http_status = status.as_u16(),
+                                    content_length,
+                                    transfer_encoding,
+                                    body_preview = %preview,
+                                    body_len = body_bytes.len(),
                                     "response parse error"
                                 );
                                 last_error = Some(anyhow::anyhow!("parse error: {e}"));
@@ -434,15 +469,19 @@ impl Summarizer {
                         last_error = Some(anyhow::anyhow!("HTTP 429 rate limited"));
                         continue;
                     } else {
-                        let body_text = resp.text().await.unwrap_or_default();
+                        let body_bytes = resp.bytes().await.unwrap_or_default();
+                        let preview: String = String::from_utf8_lossy(&body_bytes)
+                            .chars().take(300).collect();
                         tracing::warn!(
                             target = "deeplossless::summarizer",
                             meta = ?meta,
                             http_status = status.as_u16(),
+                            body_len = body_bytes.len(),
+                            body_preview = %preview,
                             "upstream error"
                         );
                         last_error = Some(anyhow::anyhow!(
-                            "HTTP {status}: {body_text}"
+                            "HTTP {status}: {preview}"
                         ));
                     }
                 }

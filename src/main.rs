@@ -81,6 +81,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     dag_threshold: Option<f64>,
 
+    /// Max LLM summarizer calls per session (0 = unlimited). Default 1000.
+    /// Each call costs ~3K tokens. Caps background compaction cost.
+    #[arg(long, default_value = "1000")]
+    summarizer_budget: u64,
+
     /// Use upstream headers as-is (skip cache-control, x-accel-buffering, charset).
     /// For isolating whether header modification causes the hang.
     #[arg(long)]
@@ -286,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
         dag_threshold: cli.dag_threshold,
+        summarizer_budget: cli.summarizer_budget,
         upstream: cli.upstream,
         db_path: cli.db_path,
         api_key: cli.api_key,

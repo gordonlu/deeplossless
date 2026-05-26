@@ -41,6 +41,28 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                 }
                 continue;
             }
+            // Reasoning items attach to the previous assistant message.
+            // Format: {"type": "reasoning", "text": "..."} or
+            //         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "..."}]}
+            if item_type == "reasoning" {
+                let reasoning_text = item["text"].as_str()
+                    .or_else(|| item["summary"].as_array()
+                        .and_then(|s| s.first())
+                        .and_then(|b| b["text"].as_str()))
+                    .unwrap_or("");
+                if !reasoning_text.is_empty() {
+                    if let Some(last) = messages.iter_mut().rev()
+                        .find(|m| m.role == Role::Assistant)
+                    {
+                        last.reasoning = Some(ReasoningTrace {
+                            text: reasoning_text.to_string(),
+                            summarized: false,
+                            tokens: None,
+                        });
+                    }
+                }
+                continue;
+            }
             let role = match role_str {
                 "assistant" => Role::Assistant,
                 "tool" => Role::Tool,

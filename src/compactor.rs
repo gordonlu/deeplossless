@@ -55,7 +55,7 @@ impl Default for CompactorConfig {
             summarizer: SummarizerConfig::default(),
             soft_threshold_pct: 0.80,
             hard_threshold_pct: 0.95,
-            group_size: 8,
+            group_size: 32,
             age_weight: 0.4,
             token_density_weight: 0.2,
             novelty_weight: 0.4,
@@ -102,7 +102,7 @@ impl CompactionBudget {
 
     /// True when compaction should be considered (above soft limit or many leaves).
     pub fn is_advisory(&self, total_tokens: i64, leaf_count: usize) -> bool {
-        total_tokens >= self.soft_limit || leaf_count >= self.group_size * 2
+        total_tokens >= self.soft_limit || leaf_count >= self.group_size * 8
     }
 }
 
@@ -382,6 +382,13 @@ impl Compactor {
         self.event_rx.recv().await
     }
 
+    /// Fire-and-forget command send — does NOT wait for a response.
+    /// Use when the caller doesn't need a synchronous reply, so the
+    /// Mutex is not held while the background worker processes the command.
+    pub async fn send_command(&mut self, cmd: CompactCommand) -> Result<(), ()> {
+        self.cmd_tx.send(cmd).await.map_err(|_| ())
+    }
+
     pub fn drain_events(&mut self) -> Vec<CompactEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
@@ -569,16 +576,43 @@ async fn compact_worker(
                 if cooldown_prune_counter % 50 == 0 {
                     last_compacted.retain(|_, t| t.elapsed() < COMPACTION_COOLDOWN);
                 }
-                review_and_compact(conv_id, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts).await;
+                let t0 = std::time::Instant::now();
+                match tokio::time::timeout(Duration::from_secs(120), review_and_compact(conv_id, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts)).await {
+                    Ok(()) => {}
+                    Err(_elapsed) => {
+                        let _ = event_tx.send(CompactEvent::Error {
+                            conv_id: Some(conv_id),
+                            message: format!("review_and_compact timed out after {}s", t0.elapsed().as_secs()),
+                        }).await;
+                    }
+                }
             }
             CompactCommand::CompressGroup { conv_id, node_ids } => {
                 // Direct group compression bypasses the planner (caller-specified nodes).
                 // Clear dirty-region tracking so next ReviewAndCompact re-scans.
                 last_leaf_counts.remove(&conv_id);
-                compress_group(conv_id, node_ids, &dag, &summarizer, &event_tx).await;
+                let t0 = std::time::Instant::now();
+                match tokio::time::timeout(Duration::from_secs(120), compress_group(conv_id, node_ids, &dag, &summarizer, &event_tx)).await {
+                    Ok(()) => {}
+                    Err(_elapsed) => {
+                        let _ = event_tx.send(CompactEvent::Error {
+                            conv_id: Some(conv_id),
+                            message: format!("compress_group timed out after {}s", t0.elapsed().as_secs()),
+                        }).await;
+                    }
+                }
             }
             CompactCommand::SlideAndCompact { conv_id, window_size, context_window } => {
-                slide_and_compact(conv_id, window_size, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts).await;
+                let t0 = std::time::Instant::now();
+                match tokio::time::timeout(Duration::from_secs(120), slide_and_compact(conv_id, window_size, context_window, &dag, &summarizer, &planner, &event_tx, &mut last_leaf_counts)).await {
+                    Ok(()) => {}
+                    Err(_elapsed) => {
+                        let _ = event_tx.send(CompactEvent::Error {
+                            conv_id: Some(conv_id),
+                            message: format!("slide_and_compact timed out after {}s", t0.elapsed().as_secs()),
+                        }).await;
+                    }
+                }
             }
         }
     }
@@ -848,7 +882,7 @@ mod tests {
     #[test]
     fn compactor_config_defaults() {
         let config = CompactorConfig::default();
-        assert_eq!(config.group_size, 8);
+        assert_eq!(config.group_size, 32);
         assert_eq!(config.soft_threshold_pct, 0.80);
         assert_eq!(config.hard_threshold_pct, 0.95);
     }

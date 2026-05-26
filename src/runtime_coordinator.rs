@@ -7,6 +7,7 @@ use crate::runtime::{BackgroundTasks, RateLimiter, RuntimeProfile, ExecutionCycl
 /// Configuration derived from CLI args.
 pub struct CoordinatorConfig {
     pub dag_threshold: Option<f64>,
+    pub summarizer_budget: u64,
     pub upstream: String,
     pub db_path: String,
     pub api_key: Option<String>,
@@ -59,6 +60,7 @@ impl RuntimeCoordinator {
                 api_key: initial_api_key.clone().unwrap_or_default(),
                 upstream: upstream.clone(),
                 model: cfg.summarizer_model.clone(),
+                max_total_calls: if cfg.summarizer_budget == 0 { u64::MAX } else { cfg.summarizer_budget },
                 ..Default::default()
             },
             ..Default::default()
@@ -150,9 +152,38 @@ impl RuntimeCoordinator {
             .layer(tower_http::limit::RequestBodyLimitLayer::new(20 * 1024 * 1024))
     }
 
-    pub async fn shutdown(&self, timeout: std::time::Duration) {
-        // Signal all background tasks to stop via Notify
+    /// Graceful shutdown following strict ordering:
+    /// 1. stop accepting new requests (caller: axum handle)
+    /// 2. cancel pipeline tasks          ← shutdown_notify
+    /// 3. send compactor shutdown        ← CompactCommand::Shutdown
+    /// 4. await worker join              ← tasks.shutdown()
+    /// 5. checkpoint WAL                 ← db.checkpoint_and_optimize()
+    /// 6. close DB pool                  ← Drop (Arc<Database>)
+    /// 7. exit
+    pub async fn shutdown(self, timeout: std::time::Duration) {
+        // Step 2: cancel pipeline tasks — Notify propagates to all background work
         self.state.runtime.shutdown_notify.notify_waiters();
+        tracing::info!(target: "deeplossless", "shutdown: pipeline tasks cancelled");
+
+        // Step 3: send compactor shutdown — breaks its recv() loop
+        {
+            let mut compactor = self.state.compactor.lock().await;
+            let _ = compactor.send_command(crate::compactor::CompactCommand::Shutdown).await;
+        }
+        tracing::info!(target: "deeplossless", "shutdown: compactor shutdown sent");
+
+        // Step 4: await worker join — all registered handles (compactor, mutation)
         self.tasks.shutdown(timeout).await;
+        tracing::info!(target: "deeplossless", "shutdown: workers joined");
+
+        // Step 5: checkpoint WAL — flush to main DB file
+        let _ = self.state.storage.db.checkpoint_and_optimize();
+        tracing::info!(target: "deeplossless", "shutdown: WAL checkpointed");
+
+        // Step 6: drop state (incl. reqwest client) to close connection pool.
+        // reqwest::Client has internal background tasks that keep the tokio
+        // runtime alive after main returns, causing a visible hang at exit.
+        drop(self.state);
+        tracing::info!(target: "deeplossless", "shutdown: resources released");
     }
 }

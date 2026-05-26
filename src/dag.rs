@@ -398,10 +398,14 @@ impl DagEngine {
     ) -> anyhow::Result<DagNode> {
         let cid = compaction_id(conv_id, source_ids, level);
 
-        // Idempotency: reuse existing summary for same sources (P0-9)
-        if let Some(existing) = self.db.find_by_compaction_id(&cid)? {
-            tracing::debug!(target: "deeplossless::dag", compaction_id = %cid, "idempotent compaction: reuse node {}", existing.id);
-            return Ok(existing);
+        // Idempotency: reuse existing summary for same sources (P0-9).
+        // Only when we have actual source nodes — empty source_ids means this is
+        // a manual compress call that should always produce a new node.
+        if !source_ids.is_empty() {
+            if let Some(existing) = self.db.find_by_compaction_id(&cid)? {
+                tracing::debug!(target: "deeplossless::dag", compaction_id = %cid, "idempotent compaction: reuse node {}", existing.id);
+                return Ok(existing);
+            }
         }
 
         // Revision pinning: snapshot source hashes to detect concurrent mutation (P0-8)
@@ -826,7 +830,7 @@ impl DagEngine {
         // Only use results with valid DAG node IDs (source != "message").
         // Message IDs map to the messages table, not dag_nodes, so get_node() returns None.
         if let Some(q) = query
-            && let Ok(search_results) = self.db.search_unified(conv_id, q)
+            && let Ok(search_results) = self.db.search_unified(conv_id, q, 10)
         {
             for sr in search_results.iter().take(5) {
                 if sr.source == "message" {
@@ -933,7 +937,7 @@ impl DagEngine {
     }
 
     /// Search across all sessions for semantically relevant nodes.
-    pub fn search_cross_session(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(i64, i64, String)>> {
+    pub fn search_cross_session(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(i64, i64, String, String)>> {
         self.db.search_cross_session(query, limit)
     }
 
@@ -1094,6 +1098,23 @@ impl DagEngine {
             }
             self.db.delete_dag_node(node.id)?;
             deleted += 1;
+        }
+        Ok(deleted)
+    }
+
+    /// Rollback: soft-delete the target node and all nodes created after it
+    /// in the same conversation.  Returns the count of deleted nodes.
+    pub fn rollback_to(&self, node_id: i64) -> anyhow::Result<usize> {
+        let target = self.db.get_node(node_id)?
+            .ok_or_else(|| anyhow::anyhow!("node {} not found", node_id))?;
+        let mut deleted = 0usize;
+        // Soft-delete all non-deleted nodes with id >= target_id in the same conversation
+        let all = self.db.get_all_dag_nodes(target.conversation_id)?;
+        for node in &all {
+            if node.id > node_id && !node.deleted {
+                self.db.delete_dag_node(node.id)?;
+                deleted += 1;
+            }
         }
         Ok(deleted)
     }

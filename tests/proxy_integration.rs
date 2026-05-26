@@ -2060,7 +2060,7 @@ async fn lcm_context_capture_after_compression_with_mock_upstream() {
     ).unwrap();
 
     // ── 1. grep must find the summary content ──
-    let results = db.search_unified(conv_id, "SQLite WAL mode").unwrap();
+    let results = db.search_unified(conv_id, "SQLite WAL mode", 20).unwrap();
     let summary_hits: Vec<_> = results.iter().filter(|r| r.source == "summary").collect();
     assert!(!summary_hits.is_empty(),
         "grep must find summary content 'SQLite WAL mode'. Got {} total results: {:?}",

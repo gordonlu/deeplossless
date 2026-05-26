@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json, Router, routing::{get, post},
+    Json, Router, routing::{get, post, delete},
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -28,8 +28,8 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
     let mut healthy = true;
     let mut checks = serde_json::json!({});
 
-    // DB check — fast SELECT 1 on writer connection
-    match state.storage.db.wal_checkpoint() {
+    // DB check — simple ping on a read connection (no writer lock)
+    match state.storage.db.ping() {
         Ok(()) => checks["database"] = json!("ok"),
         Err(e) => {
             healthy = false;
@@ -54,11 +54,10 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
         }
     }
 
-    // Compactor liveness — 1s timeout on lock
-    match tokio::time::timeout(std::time::Duration::from_secs(1), state.compactor.lock()).await {
+    // Compactor liveness — ping worker via channel (500ms timeout)
+    match tokio::time::timeout(std::time::Duration::from_millis(500), state.compactor.lock()).await {
         Ok(mut compactor) => {
-            let alive = compactor.drain_events().is_empty();
-            checks["compactor"] = json!(if alive { "ok" } else { "no events" });
+            checks["compactor"] = json!(if compactor.health_ping().await { "ok" } else { "worker unresponsive" });
         }
         Err(_) => {
             healthy = false;
@@ -274,6 +273,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
         .route("/v1/lcm/similar/{hash}", get(lcm_similar))
+        .route("/v1/lcm/similar", get(lcm_similar_missing_hash))
         .route("/v1/lcm/trace/{node_id}", get(lcm_trace))
         .route("/v1/lcm/global/search", get(lcm_global_search))
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
@@ -289,9 +289,11 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/versions", get(lcm_versions))
         .route("/v1/lcm/cache/put", post(lcm_cache_put))
         .route("/v1/lcm/cache", get(lcm_cache_get))
+        .route("/v1/lcm/cache", delete(lcm_cache_delete))
         .route("/v1/lcm/failure", post(lcm_failure_put))
         .route("/v1/lcm/plan", post(lcm_plan_put))
         .route("/v1/lcm/plan/{conv_id}", get(lcm_plan_get))
+        .route("/v1/lcm/plan", delete(lcm_plan_delete))
         .route("/v1/lcm/file/claim", post(lcm_file_claim))
         .route("/v1/lcm/file/release", post(lcm_file_release))
         .route("/v1/lcm/file/conflicts", get(lcm_file_conflicts))
@@ -1044,8 +1046,8 @@ fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
     // Sandboxed agents (OpenClaw, etc.) can't access host env vars for auth.
     let is_local = headers.get("host")
         .and_then(|v| v.to_str().ok())
-        .map(|h| h.starts_with("127.0.0.1") || h.starts_with("localhost"))
-        .unwrap_or(false);
+        .map(|h| h.starts_with("127.") || h.starts_with("localhost") || h.starts_with("[::1]") || h.starts_with("0.0.0.0"))
+        .unwrap_or(true); // Missing Host header → assume local
     if is_local {
         return true;
     }
@@ -1057,8 +1059,8 @@ fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
     drop(admin);
 
     let expected = get_cached_key(&state.api_key);
-    if expected == "unset" {
-        return true;
+    if expected.is_empty() {
+        return true; // No keys configured → allow all
     }
     check_bearer(headers, &expected)
 }
@@ -1083,7 +1085,8 @@ async fn lcm_grep_by_id(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
-    match state.storage.db.search_unified(conv_id, query) {
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
+    match state.storage.db.search_unified(conv_id, query, limit) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
             "query": query,
@@ -1119,7 +1122,8 @@ async fn lcm_grep_by_fingerprint(
         return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "conversation not found");
     };
 
-    match state.storage.db.search_unified(conv_id, query) {
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
+    match state.storage.db.search_unified(conv_id, query, limit) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
             "query": query,
@@ -1254,17 +1258,26 @@ async fn lcm_stream_context(
 async fn lcm_file_claim(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<HashMap<String, String>>,
+    Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
-    let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
-    let operation = body.get("operation").map(|s| s.as_str()).unwrap_or("edit");
-    match state.storage.db.claim_file(agent_id, file_path, operation) {
-        Ok(Ok(())) => Json(json!({"status": "claimed", "agent_id": agent_id, "file_path": file_path})).into_response(),
-        Ok(Err(conflict_agent)) => json_error(StatusCode::CONFLICT, "CONFLICT", format!("file '{file_path}' held by agent '{conflict_agent}'")),
+    let agent_id = body.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let file_path = body.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    let operation = body.get("operation").and_then(|v| v.as_str()).unwrap_or("edit");
+    let conv_id = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    if file_path.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "file_path is required");
+    }
+    if conv_id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "conv_id must be a positive integer");
+    }
+
+    match state.storage.db.claim_file(agent_id, file_path, operation, conv_id) {
+        Ok(Ok(())) => Json(json!({"status": "claimed", "agent_id": agent_id, "file_path": file_path, "conv_id": conv_id})).into_response(),
+        Ok(Err(conflict_agent)) => json_error(StatusCode::CONFLICT, "CONFLICT", format!("file '{file_path}' held by agent '{conflict_agent}' in another conversation")),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CLAIM_ERROR", format!("{e}")),
     }
 }
@@ -1273,15 +1286,21 @@ async fn lcm_file_claim(
 async fn lcm_file_release(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<HashMap<String, String>>,
+    Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let agent_id = body.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
-    let file_path = body.get("file_path").map(|s| s.as_str()).unwrap_or("");
+    let agent_id = body.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let file_path = body.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+
+    if file_path.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "file_path is required");
+    }
+
     match state.storage.db.release_file(agent_id, file_path) {
-        Ok(()) => Json(json!({"status": "released"})).into_response(),
+        Ok(0) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("no claim found for '{}' by agent '{}'", file_path, agent_id)),
+        Ok(_) => Json(json!({"status": "released", "file_path": file_path})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "RELEASE_ERROR", format!("{e}")),
     }
 }
@@ -1346,6 +1365,27 @@ async fn lcm_cache_get(
     }
 }
 
+/// Delete a cached tool result.
+async fn lcm_cache_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let tool = params.get("tool").map(|s| s.as_str()).unwrap_or("");
+    let args = params.get("args").map(|s| s.as_str()).unwrap_or("");
+    let (_name, hash) = crate::tool_cache::cache_key(tool, args);
+    if tool.is_empty() || hash.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
+    }
+    match state.storage.db.tool_cache_delete(tool, &hash) {
+        Ok(()) => Json(json!({"status": "deleted"})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
+    }
+}
+
 /// Store a failure pattern. Agent calls this after a fix fails.
 async fn lcm_failure_put(
     State(state): State<AppState>,
@@ -1362,7 +1402,13 @@ async fn lcm_failure_put(
 
     if sig.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "signature required"); }
     match state.storage.db.store_failure_pattern(conv_id, sig, fix, why, &assumptions, &files, None) {
-        Ok(id) => Json(json!({"status": "stored", "id": id})).into_response(),
+        Ok(id) => {
+            // Link to runtime metrics so repeated_failures stays accurate
+            if let Ok(mut cycle) = state.runtime.cycle.lock() {
+                cycle.metrics.repeated_failures += 1;
+            }
+            Json(json!({"status": "stored", "id": id})).into_response()
+        }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "FAILURE_ERROR", format!("{e}")),
     }
 }
@@ -1398,6 +1444,26 @@ async fn lcm_plan_get(
             "assumptions": assumptions,
         })).into_response(),
         Ok(None) => Json(json!({"active_plan": null})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
+    }
+}
+
+/// Delete a plan by ID.
+async fn lcm_plan_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let id: i64 = params.get("id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "plan id must be a positive integer");
+    }
+    match state.storage.db.deactivate_plan(id) {
+        Ok(true) => Json(json!({"status": "deleted", "id": id})).into_response(),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("plan {} not found", id)),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
 }
@@ -1589,8 +1655,8 @@ async fn lcm_snapshot_take(
     let size_bytes = data.len() as i64;
     let ttl = body.get("retention_ttl").and_then(|v| v.as_i64());
 
-    if execution_id == 0 {
-        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "execution_id required");
+    if execution_id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "execution_id must be a positive integer");
     }
 
     // Validate tier — fail fast on invalid values
@@ -1669,6 +1735,9 @@ async fn lcm_execution_search(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    if query.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "query parameter 'q' is required");
+    }
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.storage.dag.search_execution_memory(query, limit) {
         Ok(refs) => Json(json!({ "results": refs })).into_response(),
@@ -1688,10 +1757,11 @@ async fn lcm_global_search(
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.storage.dag.search_cross_session(query, limit) {
         Ok(results) => {
-            let items: Vec<Value> = results.iter().map(|(nid, cid, summary)| json!({
+            let items: Vec<Value> = results.iter().map(|(nid, cid, summary, excerpt)| json!({
                 "node_id": nid,
                 "conversation_id": cid,
                 "summary": summary,
+                "excerpt": excerpt,
             })).collect();
             Json(json!({ "results": items })).into_response()
         }
@@ -1706,7 +1776,15 @@ async fn lcm_dag_health(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }    match state.storage.dag.validate_dag(conv_id) {
+    }
+    if conv_id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "conversation_id must be positive");
+    }
+    // Verify the conversation exists before running expensive validation
+    if !state.storage.db.conversation_exists(conv_id) {
+        return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "conversation not found");
+    }
+    match state.storage.dag.validate_dag(conv_id) {
         Ok(issues) => {
             let healthy = issues.is_empty();
             Json(json!({
@@ -1720,6 +1798,17 @@ async fn lcm_dag_health(
     }
 }
 
+/// Return 400 when hash is missing from the path.
+async fn lcm_similar_missing_hash(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "hash is required in path: /v1/lcm/similar/{hash}")
+}
+
 async fn lcm_similar(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1727,7 +1816,11 @@ async fn lcm_similar(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }    match state.storage.db.find_similar_by_hash(&hash) {
+    }
+    if hash.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "hash is required");
+    }
+    match state.storage.db.find_similar_by_hash(&hash) {
         Ok(results) => Json(json!({
             "hash": hash,
             "matches": results.iter().map(|(h, nid, cid, preview)| json!({
@@ -1799,7 +1892,10 @@ struct LcmRangeOp {
 
 #[derive(serde::Deserialize)]
 struct LcmIdOp {
+    #[serde(default)]
     id: i64,
+    #[serde(default, alias = "execution_id")]
+    execution_id: i64,
 }
 
 /// Compress a range of messages into a summary.  Returns the new summary
@@ -1813,24 +1909,39 @@ async fn lcm_compress(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "Context-ReAct requires Authorization header");
     }
-    // Try DAG leaves first, then fall back to raw messages
-    let content: Vec<String> = match state.storage.dag.get_leaves(op.conv_id) {
-        Ok(leaves) if leaves.len() >= 2 => leaves.iter()
-            .skip_while(|n| n.id < op.from)
-            .take_while(|n| n.id <= op.to)
-            .map(|n| n.summary.clone())
-            .collect(),
+    // Collect source nodes from DAG leaves in the requested range.
+    // Fall back to raw messages only if there are no DAG leaves at all.
+    let (text, source_ids, source_level): (String, Vec<i64>, u8) = match state.storage.dag.get_leaves(op.conv_id) {
+        Ok(leaves) if leaves.len() >= 2 => {
+            let in_range: Vec<&crate::dag::DagNode> = leaves.iter()
+                .skip_while(|n| n.id < op.from)
+                .take_while(|n| n.id <= op.to)
+                .collect();
+            if in_range.len() < 2 {
+                return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "need at least 2 leaves in range");
+            }
+            let ids: Vec<i64> = in_range.iter().map(|n| n.id).collect();
+            // New level = max(source levels) + 1, capped at effective max
+            let max_lvl = in_range.iter().map(|n| n.level).max().unwrap_or(0);
+            let level = (max_lvl + 1).min(3);
+            let text = in_range.iter()
+                .map(|n| n.summary.as_str())
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            (text, ids, level)
+        }
         _ => {
-            // Fallback: read from DB directly
             let db = state.storage.dag.db();
             let raw = db.get_messages_in_range(op.conv_id, op.from, op.to);
             match raw {
-                Ok(msgs) if msgs.len() >= 2 => msgs,
+                Ok(msgs) if msgs.len() >= 2 => {
+                    // Raw messages have no DAG node IDs — produce a level-1 summary
+                    (msgs.join("\n---\n"), vec![], 1u8)
+                }
                 _ => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "need at least 2 messages to compress"),
             }
         }
     };
-    let text = content.join("\n---\n");
 
     let summarizer = match crate::summarizer::Summarizer::builder()
         .api_key(&get_cached_key(&state.api_key))
@@ -1847,7 +1958,7 @@ async fn lcm_compress(
             let tc = crate::tokenizer::count(&result.text) as i64;
             let snippets = crate::snippet::extract(&text);
             match state.storage.dag.compress_group_with_snippets(
-                op.conv_id, &[], &result.text, tc, 1, &snippets,
+                op.conv_id, &source_ids, &result.text, tc, source_level, &snippets,
             ) {
                 Ok(node) => Json(json!({
                     "node_id": node.id,
@@ -1891,24 +2002,35 @@ async fn lcm_rollback(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let node = match state.storage.dag.get_node(op.id) {
+    let node_id = if op.id > 0 { op.id } else { op.execution_id };
+    if node_id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "id or execution_id must be positive");
+    }
+    let node = match state.storage.dag.get_node(node_id) {
         Ok(Some(n)) => n,
-        Ok(None) => return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
+        Ok(None) => return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("node {} not found", op.id)),
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     };
-    let children = state.storage.dag.get_children(op.id).unwrap_or_default();
-    Json(json!({
-        "rollback_to": op.id,
-        "summary": node.summary,
-        "level": node.level,
-        "snippets": node.snippets,
-        "children": children.iter().map(|c| json!({
-            "id": c.id,
-            "summary": c.summary,
-            "token_count": c.token_count,
-        })).collect::<Vec<_>>(),
-    }))
-    .into_response()
+    // Actual DAG rollback: soft-delete all nodes created after target, and their
+    // transitive children that depend exclusively on them.
+    match state.storage.dag.rollback_to(node_id) {
+        Ok(deleted) => {
+            let children = state.storage.dag.get_children(node_id).unwrap_or_default();
+            Json(json!({
+                "rollback_to": node_id,
+                "summary": node.summary,
+                "level": node.level,
+                "deleted_nodes": deleted,
+                "children_remaining": children.iter().map(|c| json!({
+                    "id": c.id,
+                    "summary": c.summary,
+                    "token_count": c.token_count,
+                })).collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "ROLLBACK_ERROR", format!("rollback failed: {e}")),
+    }
 }
 
 /// POST /v1/lcm/motifs/{conv_id} — extract execution motifs from a conversation.

@@ -2,6 +2,8 @@
 
 Connected through deeplossless — context search, tool caching, session memory.
 
+**All endpoints below need NO API key. Do not add Authorization headers. Just curl directly.**
+
 ## ⚠️ BEFORE every tool call — check cache first
 
 **Always check the cache before executing** any deterministic tool
@@ -36,15 +38,71 @@ curl -sk  https://localhost:8080/v1/lcm/current
 ## Search past context (current session)
 
 ```bash
-curl -sk "https://localhost:8080/v1/lcm/grep/{id}?query=<search>"
+curl -sk "https://localhost:8080/v1/lcm/grep/{id}?query=<search>&limit=20"
 ```
+Add `&limit=N` to control results (default 20, max ~100). 0 matches is normal for new sessions.
 
 ## Search ALL past sessions (cross-session memory)
 
 ```bash
 curl -sk "https://localhost:8080/v1/lcm/global/search?q=<search>&limit=10"
 ```
-Returns relevant nodes from every past conversation, not just this session.
+Returns `[{node_id, conversation_id, summary, excerpt}]` — `excerpt` is first 200 chars for preview.
+
+## Avoid repeating failed fixes (failure memory)
+
+```bash
+curl -sk -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"conv_id":<id>,"signature":"<error pattern>","attempted_fix":"<what you tried>","why_failed":"<why it failed>"}' \
+  https://localhost:8080/v1/lcm/failure
+```
+
+## Avoid file conflicts between parallel agents
+
+```bash
+# Claim a file before editing
+curl -sk -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"conv_id":<id>,"agent_id":"<name>","file_path":"src/main.rs","operation":"edit"}' \
+  https://localhost:8080/v1/lcm/file/claim
+
+# Release after done
+curl -sk -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"<name>","file_path":"src/main.rs"}' \
+  https://localhost:8080/v1/lcm/file/release
+```
+
+Conflict response: HTTP 409 — another agent holds the file.
+
+## Search execution memory (cross-session bug/tool patterns)
+
+```bash
+curl -sk "https://localhost:8080/v1/lcm/execution/search?q=<search>&limit=10"
+```
+
+## Manage plans
+
+```bash
+# Store a plan
+curl -sk -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"conv_id":<id>,"goal":"<description>","steps":["step1","step2"],"assumptions":["assume1"]}' \
+  https://localhost:8080/v1/lcm/plan
+
+# Get active plan
+curl -sk https://localhost:8080/v1/lcm/plan/{conv_id}
+
+# Delete a plan
+curl -sk -X DELETE "https://localhost:8080/v1/lcm/plan?id=<plan_id>"
+```
+
+## Delete cached results
+
+```bash
+curl -sk -X DELETE "https://localhost:8080/v1/lcm/cache?tool=<name>&args=<json>"
+```
 
 ## Session stats
 
@@ -58,10 +116,10 @@ curl -sk  https://localhost:8080/v1/lcm/runtime/stats
 |----------|-----------------|
 | `GET /health` | `{"status":"healthy"}` |
 | `GET /v1/lcm/current` | `{"conversation_id": <number>}` |
-| `GET /v1/lcm/grep/{id}?query=test` | `{"total": <number>, "matches": [...]}` (0 matches = normal for new session) |
-| `GET /v1/lcm/global/search?q=test&limit=3` | `[...]` (empty array = normal for first use) |
+| `GET /v1/lcm/grep/{id}?query=test&limit=5` | `{"total": <number>, "matches": [...]}` (0 matches = normal for new session) |
+| `GET /v1/lcm/global/search?q=test&limit=3` | `[{"node_id":..., "conversation_id":..., "summary":..., "excerpt":...}]` (empty array = normal for first use) |
 | `GET /v1/lcm/cache?tool=grep&args={}` | `{"hit": false}` (no cache yet = normal) |
-| `GET /v1/lcm/runtime/stats` | `{"cache_hits": 0, "tokens_spent": ..., "profile": "autonomous"}` |
+| `GET /v1/lcm/runtime/stats` | `{"cache_hits": 0, "tokens_spent": ..., "repeated_failures": 0, "profile": "autonomous"}` |
 
 If any endpoint returns connection refused or timeout: deeplossless is not running.
 If `/health` returns `unhealthy`: check the deeplossless terminal for errors.
@@ -72,4 +130,4 @@ If `/health` returns `unhealthy`: check the deeplossless terminal for errors.
 - Base API URL is `https://localhost:8080/v1`
 - Models: `deepseek-v4-pro` / `deepseek-v4-flash` (both 1M context)
 - Cache store `files` param expects JSON string: `"[\"src/main.rs\"]"`
-- No auth needed — deeplossless allows localhost access without API key
+- No API key or Authorization header needed — localhost access is always allowed

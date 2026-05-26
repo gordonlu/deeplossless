@@ -331,27 +331,33 @@ impl ChatPipeline {
         });
 
         // Trigger async compaction review (soft threshold)
-        let mut compactor = self.compactor.lock().await;
-        let _ = compactor
-            .command(CompactCommand::ReviewAndCompact {
-                conv_id,
-                context_window: CONTEXT_WINDOW,
-            })
-            .await;
-        for event in compactor.drain_events() {
-            match event {
-                CompactEvent::GroupCompressed { tokens_saved, .. } => {
-                    tracing::debug!(target: "deeplossless::pipeline", conv_id, tokens_saved, "compaction completed");
+        // Lock held only for send — recv is NOT awaited while holding the lock,
+        // so the compactor Mutex is free during background summarization.
+        let cmd_sent = {
+            let mut compactor = self.compactor.lock().await;
+            compactor
+                .send_command(CompactCommand::ReviewAndCompact {
+                    conv_id,
+                    context_window: CONTEXT_WINDOW,
+                })
+                .await
+        };
+        if cmd_sent.is_ok() {
+            let mut compactor = self.compactor.lock().await;
+            for event in compactor.drain_events() {
+                match event {
+                    CompactEvent::GroupCompressed { tokens_saved, .. } => {
+                        tracing::debug!(target: "deeplossless::pipeline", conv_id, tokens_saved, "compaction completed");
+                    }
+                    CompactEvent::BelowThreshold { .. } => {}
+                    CompactEvent::Error { message, .. } => {
+                        tracing::warn!(target: "deeplossless::pipeline", conv_id, error = %message, "compaction error");
+                    }
+                    CompactEvent::CompactionCompleted { .. } => {}
+                    CompactEvent::Pong => {}
                 }
-                CompactEvent::BelowThreshold { .. } => {}
-                CompactEvent::Error { message, .. } => {
-                    tracing::warn!(target: "deeplossless::pipeline", conv_id, error = %message, "compaction error");
-                }
-                CompactEvent::CompactionCompleted { .. } => {}
-                CompactEvent::Pong => {}
             }
         }
-        drop(compactor);
 
         // Assemble DAG context and inject into system messages
         let mut injected = req_body.clone();

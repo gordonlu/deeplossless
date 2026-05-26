@@ -69,11 +69,28 @@ pub fn replay_execution(
     let mut events = Vec::with_capacity(rows.len());
     let corrupt_count = 0;
 
-    for (_id, _kind, payload, seq_no, _ts) in &rows {
+    for (_id, kind, payload, seq_no, _ts) in &rows {
+        // Try parsing as StreamEvent first (new format: has "type" field).
+        // Fall back to injecting type from event_kind (old format: detail-only payload).
         let stream_event = serde_json::from_str::<StreamEvent>(payload)
-            .map_err(|e| ReplayError::ParseError {
-                seq_no: *seq_no,
-                detail: format!("{e} — payload: {:.200}", payload),
+            .or_else(|_| {
+                // Old format: payload is a detail object without "type".
+                // Inject the event_kind as the type field and re-parse.
+                let mut val: serde_json::Value = serde_json::from_str(payload)
+                    .map_err(|e| ReplayError::ParseError {
+                        seq_no: *seq_no,
+                        detail: format!("payload is not valid JSON: {e}"),
+                    })?;
+                if let Some(obj) = val.as_object_mut()
+                    && !obj.contains_key("type")
+                {
+                    obj.insert("type".to_string(), serde_json::Value::String(kind.clone()));
+                }
+                serde_json::from_value::<StreamEvent>(val)
+                    .map_err(|e| ReplayError::ParseError {
+                        seq_no: *seq_no,
+                        detail: format!("{e} — payload: {:.200}", payload),
+                    })
             })?;
         events.push(ReplayEventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
