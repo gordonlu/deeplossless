@@ -2552,8 +2552,8 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.summary
              FROM dag_nodes n
-             WHERE n.summary LIKE ?1 ESCAPE '\\' AND n.deleted = 0 AND n.level > 0
-             ORDER BY n.access_count DESC, n.id DESC
+             WHERE n.summary LIKE ?1 ESCAPE '\\' AND n.deleted = 0
+             ORDER BY n.level DESC, n.access_count DESC, n.id DESC
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
