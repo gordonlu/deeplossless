@@ -32,7 +32,7 @@ cp SKILL.md ~/.openclaw/skills/deeplossless.md
 Single command. Replace `sk-...` with whatever API key you have:
 
 ```bash
-deeplossless --api-key $DEEPSEEK_API_KEY
+deeplossless
 ```
 
 All defaults are sane: HTTPS on `127.0.0.1:8080` (self-signed cert auto-generated), DB at `~/.deeplossless/lcm.db`. Run `deeplossless trust` once to trust the certificate.
@@ -42,7 +42,7 @@ If `deeplossless` is not on PATH, build it:
 ```bash
 cd <repo-root>
 cargo build --release
-./target/release/deeplossless --api-key $DEEPSEEK_API_KEY
+./target/release/deeplossless
 ```
 
 **Optional flags** (agent can pass these without user input):
@@ -308,12 +308,12 @@ For LCM endpoints (cache, grep, plan, failure, etc.), deeplossless checks an opt
 
 ## 7) Configuration checklist
 
-When setting up an agent to use deeplossless:
+**For the human user** (not the agent):
 
-1. [ ] Start deeplossless: `deeplossless --api-key $KEY &`
-2. [ ] Health check: `curl https://localhost:8080/health` → `healthy`
-3. [ ] Set base URL: `https://localhost:8080/v1` (must include `/v1`)
-4. [ ] Send a test request: `POST /v1/chat/completions` → valid JSON response
+1. [ ] Start deeplossless: `deeplossless` (API key from `$DEEPSEEK_API_KEY` env or first request)
+2. [ ] Health check: `curl -sk https://localhost:8080/health` → `healthy`
+3. [ ] For sandboxed agents (OpenClaw, etc.): use `http://127.0.0.1:8081/v1` (no TLS)
+4. [ ] Set base URL: `https://localhost:8080/v1` (must include `/v1`)
 5. [ ] Done. Everything else is automatic.
 
 ---
