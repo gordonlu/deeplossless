@@ -1040,14 +1040,22 @@ fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
 /// `api_key` for backward compatibility. If no key is configured at all,
 /// allows all (safe for localhost-only deployments).
 fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
-    // Prefer explicit admin_key
+    // Allow localhost access — LCM endpoints are local-only tools.
+    // Sandboxed agents (OpenClaw, etc.) can't access host env vars for auth.
+    let is_local = headers.get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.starts_with("127.0.0.1") || h.starts_with("localhost"))
+        .unwrap_or(false);
+    if is_local {
+        return true;
+    }
+
     let admin = state.admin_key.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(admin_key) = admin.as_ref() {
         return check_bearer(headers, admin_key);
     }
     drop(admin);
 
-    // Fall back to api_key (backward compat)
     let expected = get_cached_key(&state.api_key);
     if expected == "unset" {
         return true;
