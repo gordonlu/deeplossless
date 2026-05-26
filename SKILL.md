@@ -52,6 +52,20 @@ Returns relevant nodes from every past conversation, not just this session.
 curl -sk  https://localhost:8080/v1/lcm/runtime/stats
 ```
 
+## Verify deeplossless is working
+
+| Endpoint | Healthy response |
+|----------|-----------------|
+| `GET /health` | `{"status":"healthy"}` |
+| `GET /v1/lcm/current` | `{"conversation_id": <number>}` |
+| `GET /v1/lcm/grep/{id}?query=test` | `{"total": <number>, "matches": [...]}` (0 matches = normal for new session) |
+| `GET /v1/lcm/global/search?q=test&limit=3` | `[...]` (empty array = normal for first use) |
+| `GET /v1/lcm/cache?tool=grep&args={}` | `{"hit": false}` (no cache yet = normal) |
+| `GET /v1/lcm/runtime/stats` | `{"cache_hits": 0, "tokens_spent": ..., "profile": "autonomous"}` |
+
+If any endpoint returns connection refused or timeout: deeplossless is not running.
+If `/health` returns `unhealthy`: check the deeplossless terminal for errors.
+
 ## Notes
 
 - Use `-k` flag — TLS cert is self-signed (or run `deeplossless trust` once)
