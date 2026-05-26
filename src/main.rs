@@ -355,13 +355,20 @@ async fn main() -> anyhow::Result<()> {
             tls_h.shutdown();
             http_h.shutdown();
         });
-        let http_server = axum_server::bind(http_addr)
-            .handle(http_handle)
-            .serve(http_app.into_make_service());
-        let tls_server = axum_server::bind_rustls(addr, tls_config)
+        // HTTP: spawn in background, don't crash if port is busy
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind(http_addr)
+                .handle(http_handle)
+                .serve(http_app.into_make_service())
+                .await
+            {
+                tracing::warn!("HTTP server stopped: {e}");
+            }
+        });
+        axum_server::bind_rustls(addr, tls_config)
             .handle(tls_handle)
-            .serve(app.into_make_service());
-        tokio::try_join!(http_server, tls_server)?;
+            .serve(app.into_make_service())
+            .await?;
     } else {
         let handle = axum_server::Handle::new();
         let h = handle.clone();
