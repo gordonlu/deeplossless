@@ -1197,6 +1197,41 @@ impl Database {
         )?)
     }
 
+    /// Get system prompts for a session, deduplicating consecutive identical entries.
+    /// Returns (id, content, token_count, stored_at) for each unique system prompt
+    /// in chronological order, skipping repeats that are identical to the previous one.
+    pub fn get_system_prompts_deduped(&self, conv_id: i64) -> anyhow::Result<Vec<(i64, String, i64, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, content, token_count, stored_at
+             FROM messages
+             WHERE conversation_id = ?1 AND role = 'system'
+             ORDER BY id ASC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        let mut last_content: Option<String> = None;
+        for row in rows {
+            let (id, content, tokens, ts) = row?;
+            // Skip if identical to the previous system prompt (consecutive dedup)
+            if let Some(ref last) = last_content {
+                if last == &content {
+                    continue;
+                }
+            }
+            last_content = Some(content.clone());
+            results.push((id, content, tokens, ts));
+        }
+        Ok(results)
+    }
+
     /// Get tool category counts for a conversation by parsing event_payload JSON.
     pub fn get_tool_category_counts(&self, conv_id: i64) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.read_conn();

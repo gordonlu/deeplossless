@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router, routing::{get, post, delete},
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use futures::StreamExt;
@@ -264,6 +265,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/lcm/chat/completions", post(lcm_chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{response_id}", get(responses_retrieve))
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep_by_id))
@@ -272,6 +274,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/sessions", get(lcm_sessions_list))
         .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
         .route("/v1/lcm/sessions/{id}/patches", get(lcm_session_patches))
+        .route("/v1/lcm/sessions/{id}/system-prompt", get(lcm_session_system_prompt))
+        .route("/v1/lcm/inject", post(lcm_context_inject))
+        .route("/v1/lcm/latency", get(lcm_latency_records))
+        .route("/v1/lcm/latency/summary", get(lcm_latency_summary))
         .route("/v1/lcm/cache/stability", get(lcm_cache_stability))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
@@ -445,6 +451,7 @@ async fn responses(
         req_stream, msg_count=req_msgs, upstream_url,
         has_api_key=!api_key.is_empty() && api_key != "unset",
         "sending upstream request");
+    let upstream_start = std::time::Instant::now();
     let resp = match state.runtime
         .client
         .post(&upstream_url)
@@ -455,13 +462,19 @@ async fn responses(
         .await
     {
         Ok(r) => {
+            let latency = upstream_start.elapsed().as_millis() as u64;
+            let code: u16 = r.status().as_u16();
+            metrics::record_latency("responses", code, Some(code), latency, None);
             tracing::debug!(target: "deeplossless", status=%r.status(),
                 content_type=?r.headers().get("content-type"),
+                latency_ms=latency,
                 "upstream response received");
             r
         }
         Err(e) => {
+            let latency = upstream_start.elapsed().as_millis() as u64;
             metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::record_latency("responses", 502, None, latency, Some(format!("{e}")));
             return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
         }
     };
@@ -918,6 +931,7 @@ async fn chat_completions(
 
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
+    let upstream_start = std::time::Instant::now();
     let resp = match state.runtime
         .client
         .post(&upstream_url)
@@ -929,12 +943,17 @@ async fn chat_completions(
     {
         Ok(r) => r,
         Err(e) => {
+            let latency = upstream_start.elapsed().as_millis() as u64;
             metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::record_latency("chat_completions", 502, None, latency, Some(format!("{e}")));
             return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
         }
     };
 
     let status = resp.status();
+    let latency = upstream_start.elapsed().as_millis() as u64;
+    let code: u16 = status.into();
+    metrics::record_latency("chat_completions", code, Some(code), latency, None);
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         return json_error(status, "UPSTREAM_ERROR", body);
@@ -1054,6 +1073,170 @@ async fn chat_completions(
                 json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
             }
         }
+    }
+}
+
+/// POST /v1/lcm/chat/completions — chat completions with automatic context injection.
+/// Same interface as /v1/chat/completions, but assembles DAG context and merges it
+/// into the last user message before forwarding to upstream. Reports context token
+/// usage in the response via custom header `x-lcm-context-tokens`.
+async fn lcm_chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req_body): Json<serde_json::Value>,
+) -> Response {
+    // Auth
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+
+    let model = req_body["model"].as_str().map(map_model).unwrap_or_else(|| "deepseek-chat".to_string());
+    let streaming = req_body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let msgs = req_body["messages"].as_array().cloned().unwrap_or_default();
+    if msgs.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "messages array is empty");
+    }
+
+    // Run pipeline for storage and context assembly
+    let pipeline = crate::pipeline::ChatPipeline::new(&state);
+    let (conv_id, context_text, _context_tokens) = match pipeline.process(&model, &req_body).await {
+        Ok(out) => {
+            // Assemble DAG context for injection
+            let dag = state.storage.dag.clone();
+            let token_budget = req_body.get("lcm_max_tokens").and_then(|v| v.as_u64()).unwrap_or(500).clamp(0, 8000) as usize;
+            let (ctx_text, ctx_tokens) = if token_budget > 0 {
+                let query = msgs.iter().rev().find(|m| m["role"] == "user")
+                    .and_then(|m| m["content"].as_str());
+                match dag.assemble_context(out.conv_id, token_budget, query) {
+                    Ok(nodes) if !nodes.is_empty() => {
+                        let text = crate::pipeline::render_dag_context(&nodes);
+                        let tokens = crate::tokenizer::count(&text);
+                        (text, tokens)
+                    }
+                    _ => (String::new(), 0),
+                }
+            } else {
+                (String::new(), 0)
+            };
+            (Some(out.conv_id), ctx_text, ctx_tokens)
+        }
+        Err(e) => {
+            tracing::warn!(target: "deeplossless::proxy", "pipeline error: {e}, injecting without storage");
+            (None, String::new(), 0)
+        }
+    };
+
+    // Inject context into the last user message
+    let mut injected_body = req_body.clone();
+    let mut context_token_count = 0usize;
+    if !context_text.is_empty() {
+        if let Some(arr) = injected_body["messages"].as_array_mut() {
+            if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
+                let original = last_user["content"].as_str().unwrap_or("").to_string();
+                let merged = if original.is_empty() {
+                    context_text
+                } else {
+                    format!("{context_text}\n\n{original}")
+                };
+                context_token_count = crate::tokenizer::count(&merged) - crate::tokenizer::count(last_user["content"].as_str().unwrap_or(""));
+                last_user["content"] = serde_json::json!(merged);
+            }
+        }
+    }
+
+    // Forward to upstream
+    let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
+    let upstream_start = std::time::Instant::now();
+    let resp = match state.runtime
+        .client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
+        .header("Content-Type", "application/json")
+        .json(&injected_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let latency = upstream_start.elapsed().as_millis() as u64;
+            metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::record_latency("lcm_chat_completions", 502, None, latency, Some(format!("{e}")));
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
+        }
+    };
+
+    let status = resp.status();
+    let latency = upstream_start.elapsed().as_millis() as u64;
+    let code: u16 = status.into();
+    metrics::record_latency("lcm_chat_completions", code, Some(code), latency, None);
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return json_error(status, "UPSTREAM_ERROR", body);
+    }
+
+    if streaming {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = UnboundedReceiverStream::new(rx);
+        let reasoning_db = state.storage.db.clone();
+        let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str()).unwrap_or("");
+        let reasoning_key = format!("reasoning:{}:{}", &model, last_user.chars().take(80).collect::<String>());
+        tokio::spawn(async move {
+            let mut byte_stream = resp.bytes_stream();
+            let mut reasoning = String::new();
+            let mut prompt_tokens: u64 = 0;
+            let mut completion_tokens: u64 = 0;
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(c) => {
+                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).is_err() { break; }
+                        let s = String::from_utf8_lossy(&c);
+                        for line in s.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data == "[DONE]" { break; }
+                                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                    if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
+                                        reasoning.push_str(rc);
+                                    }
+                                    if let Some(u) = v["usage"].as_object() {
+                                        prompt_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        completion_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !reasoning.is_empty() {
+                let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
+            }
+            if let Some(cid) = conv_id {
+                if prompt_tokens > 0 || completion_tokens > 0 {
+                    let usage_db = state.storage.db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = usage_db.accumulate_usage(cid, prompt_tokens, completion_tokens);
+                    });
+                }
+            }
+        });
+        let mut resp = axum::response::Response::new(
+            axum::body::Body::from_stream(stream),
+        );
+        resp.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+        resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
+        resp.headers_mut().insert("x-lcm-context-tokens", context_token_count.to_string().parse().unwrap());
+        resp
+    } else {
+        let mut resp = match resp.text().await {
+            Ok(body) => {
+                (StatusCode::OK, Json(json!(body))).into_response()
+            }
+            Err(e) => json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}")),
+        };
+        resp.headers_mut().insert("x-lcm-context-tokens", context_token_count.to_string().parse().unwrap());
+        resp
     }
 }
 
@@ -1567,6 +1750,35 @@ async fn lcm_cache_get(
     }
 }
 
+/// GET /v1/lcm/latency — recent upstream request latency records.
+async fn lcm_latency_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let records = metrics::get_latency_records(limit);
+    Json(json!({
+        "count": records.len(),
+        "records": records,
+        "summary": metrics::get_latency_summary(),
+    })).into_response()
+}
+
+/// GET /v1/lcm/latency/summary — aggregated latency statistics.
+async fn lcm_latency_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    Json(metrics::get_latency_summary()).into_response()
+}
+
 /// Delete a cached tool result.
 async fn lcm_cache_delete(
     State(state): State<AppState>,
@@ -1612,6 +1824,125 @@ async fn lcm_session_patches(
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
+}
+
+/// GET /v1/lcm/sessions/{id}/system-prompt — system prompt history for a session.
+/// Returns deduplicated consecutive entries (identical repeats collapsed).
+async fn lcm_session_system_prompt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    if id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
+    }
+    match state.storage.db.get_system_prompts_deduped(id) {
+        Ok(rows) => {
+            let items: Vec<Value> = rows.iter().map(|(msg_id, content, tokens, ts)| json!({
+                "id": msg_id,
+                "content": content,
+                "token_count": tokens,
+                "stored_at": ts.replacen(' ', "T", 1) + "Z",
+            })).collect();
+            Json(json!({
+                "session_id": id,
+                "count": items.len(),
+                "prompts": items,
+            })).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// POST /v1/lcm/inject — inject DAG context into the last user message.
+/// Takes a messages array, assembles DAG context for the given conversation,
+/// and appends it to the last `role: "user"` message. Returns the modified
+/// messages with token accounting. Does NOT modify the proxy stream — the
+/// client calls this explicitly before forwarding to any LLM provider.
+#[derive(Deserialize)]
+struct LcmInjectRequest {
+    conv_id: i64,
+    /// The messages array to inject context into. Must contain at least one user message.
+    messages: Vec<serde_json::Value>,
+    /// Optional search query to guide DAG context assembly.
+    query: Option<String>,
+    /// Token budget for context. Default 500, max 8000. Set 0 to skip assembly.
+    max_tokens: Option<usize>,
+}
+async fn lcm_context_inject(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LcmInjectRequest>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    if body.conv_id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "conv_id must be positive");
+    }
+    if body.messages.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "messages array is empty");
+    }
+
+    let mut messages = body.messages;
+    let max_tokens = body.max_tokens.unwrap_or(500).clamp(0, 8000);
+    let mut context_text = String::new();
+    let mut context_tokens = 0usize;
+    let mut node_count = 0usize;
+
+    if max_tokens > 0 {
+        let query = body.query.as_deref();
+        let dag = state.storage.dag.clone();
+        match dag.assemble_context(body.conv_id, max_tokens, query) {
+            Ok(nodes) if !nodes.is_empty() => {
+                context_text = crate::pipeline::render_dag_context(&nodes);
+                context_tokens = crate::tokenizer::count(&context_text);
+                node_count = nodes.len();
+            }
+            Ok(_) => {} // no context found — inject nothing
+            Err(e) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "DAG_ERROR", format!("{e}"));
+            }
+        }
+    }
+
+    let injected = !context_text.is_empty();
+
+    // Inject context into the last user message
+    if injected {
+        if let Some(last_user) = messages.iter_mut().rev().find(|m| m["role"] == "user") {
+            let original = last_user["content"].as_str().unwrap_or("").to_string();
+            let merged = if original.is_empty() {
+                context_text.clone()
+            } else {
+                format!("{context_text}\n\n{original}")
+            };
+            last_user["content"] = serde_json::json!(merged);
+        }
+    }
+
+    let total_tokens: usize = messages.iter()
+        .map(|m| crate::tokenizer::count(m["content"].as_str().unwrap_or("")))
+        .sum();
+
+    Json(json!({
+        "conv_id": body.conv_id,
+        "messages": messages,
+        "context_token_count": context_tokens,
+        "total_token_count": total_tokens,
+        "max_tokens": max_tokens,
+        "node_count": node_count,
+        "injected": injected,
+        "usage": {
+            "context_tokens": context_tokens,
+            "budget": max_tokens,
+            "pct": if max_tokens > 0 { (context_tokens as f64 / max_tokens as f64 * 100.0).round() as u32 } else { 0 },
+            "total": total_tokens,
+        },
+    })).into_response()
 }
 
 /// GET /v1/lcm/cache/stability — system prompt cache stability diagnostics.

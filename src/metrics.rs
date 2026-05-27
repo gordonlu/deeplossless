@@ -4,7 +4,9 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 pub static REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -15,9 +17,84 @@ pub static REQUESTS_5XX: AtomicU64 = AtomicU64::new(0);
 pub static RATE_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
 pub static UPSTREAM_ERRORS: AtomicU64 = AtomicU64::new(0);
 
+/// Per-request latency and outcome record.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LatencyRecord {
+    pub timestamp: String,
+    pub endpoint: String,
+    pub status_code: u16,
+    pub upstream_status: Option<u16>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Ring buffer of recent request latencies. Capacity 1000.
+static LATENCY_RING: std::sync::LazyLock<Mutex<VecDeque<LatencyRecord>>> =
+    std::sync::LazyLock::new(|| Mutex::new(VecDeque::with_capacity(1000)));
+
 fn start_instant() -> &'static Instant {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now)
+}
+
+/// Record a completed upstream request for latency tracking.
+pub fn record_latency(endpoint: &str, status_code: u16, upstream_status: Option<u16>, latency_ms: u64, error: Option<String>) {
+    if let Ok(mut ring) = LATENCY_RING.lock() {
+        let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+        ring.push_back(LatencyRecord {
+            timestamp: ts,
+            endpoint: endpoint.to_string(),
+            status_code,
+            upstream_status,
+            latency_ms,
+            error,
+        });
+        while ring.len() > 1000 {
+            ring.pop_front();
+        }
+    }
+}
+
+/// Get recent latency records.
+pub fn get_latency_records(limit: usize) -> Vec<LatencyRecord> {
+    if let Ok(ring) = LATENCY_RING.lock() {
+        ring.iter().rev().take(limit).cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Get aggregated latency summary.
+pub fn get_latency_summary() -> serde_json::Value {
+    let records = if let Ok(ring) = LATENCY_RING.lock() {
+        ring.iter().cloned().collect::<Vec<_>>()
+    } else {
+        return serde_json::json!({"error": "lock failed"});
+    };
+    let total = records.len();
+    if total == 0 {
+        return serde_json::json!({"total": 0});
+    }
+    let latencies: Vec<u64> = records.iter().map(|r| r.latency_ms).collect();
+    let avg = latencies.iter().sum::<u64>() as f64 / total as f64;
+    let mut sorted = latencies.clone();
+    sorted.sort();
+    let p50 = sorted[total / 2];
+    let p95 = sorted[(total as f64 * 0.95) as usize];
+    let p99 = sorted[(total as f64 * 0.99) as usize];
+    let max = sorted.last().copied().unwrap_or(0);
+    let upstream_errors = records.iter().filter(|r| r.error.is_some()).count();
+    let timeouts = records.iter().filter(|r| r.latency_ms >= 30_000).count();
+    serde_json::json!({
+        "total": total,
+        "avg_ms": (avg * 10.0).round() / 10.0,
+        "p50_ms": p50,
+        "p95_ms": p95,
+        "p99_ms": p99,
+        "max_ms": max,
+        "upstream_errors": upstream_errors,
+        "timeouts_30s_plus": timeouts,
+    })
 }
 
 pub async fn handle_metrics() -> Response {
