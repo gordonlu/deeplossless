@@ -269,6 +269,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep_by_id))
         .route("/v1/lcm/grep", get(lcm_grep_by_fingerprint))
         .route("/v1/lcm/current", get(lcm_current_conv))
+        .route("/v1/lcm/sessions", get(lcm_sessions_list))
+        .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
@@ -1146,6 +1148,59 @@ async fn lcm_current_conv(
     match state.storage.db.last_conversation_id() {
         Ok(Some(id)) => Json(json!({"conversation_id": id})).into_response(),
         Ok(None) => Json(json!({"conversation_id": null, "hint": "No conversations yet. Make a request first."})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/sessions — list recent conversations with event counts.
+async fn lcm_sessions_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
+    match state.storage.db.list_sessions(limit) {
+        Ok(rows) => {
+            let items: Vec<Value> = rows.iter().map(|(id, fp, model, count)| json!({
+                "id": id,
+                "fingerprint": fp,
+                "model": model,
+                "event_count": count,
+            })).collect();
+            Json(json!({"sessions": items})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/sessions/{id}/events — execution events for a session.
+async fn lcm_session_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    if id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
+    }
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
+    match state.storage.db.get_session_events(id, limit) {
+        Ok(rows) => {
+            let items: Vec<Value> = rows.iter().map(|(ev_id, kind, payload, seq, ts)| json!({
+                "id": ev_id,
+                "type": kind,
+                "payload": payload,
+                "seq_no": seq,
+                "timestamp": ts,
+            })).collect();
+            Json(json!({"session_id": id, "events": items, "total": items.len()})).into_response()
+        }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }

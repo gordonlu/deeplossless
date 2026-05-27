@@ -1108,6 +1108,54 @@ impl Database {
         Ok(())
     }
 
+    /// List recent conversations with basic stats for the session selector.
+    pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.fingerprint, c.model,
+                    (SELECT COUNT(*) FROM execution_events WHERE conv_id = c.id) AS event_count
+             FROM conversations c
+             ORDER BY c.id DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Get execution events for a conversation, simplified for the UI.
+    pub fn get_session_events(
+        &self, conv_id: i64, limit: usize,
+    ) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, event_kind, event_payload, seq_no, created_at
+             FROM execution_events
+             WHERE conv_id = ?1
+             ORDER BY epoch_ms DESC, id DESC
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
     /// Get event log for a conversation, ordered by time.
     #[allow(clippy::type_complexity)]
     pub fn get_events(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, Option<i64>, String, String)>> {
