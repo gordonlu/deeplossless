@@ -1112,7 +1112,7 @@ impl Database {
     pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.fingerprint, c.model,
+            "SELECT c.id, c.session_id, c.model,
                     (SELECT COUNT(*) FROM execution_events WHERE conv_id = c.id) AS event_count
              FROM conversations c
              ORDER BY c.id DESC LIMIT ?1"
