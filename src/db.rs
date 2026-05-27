@@ -1131,6 +1131,7 @@ impl Database {
     }
 
     /// Get execution events for a conversation, simplified for the UI.
+    #[allow(clippy::type_complexity)]
     pub fn get_session_events(
         &self, conv_id: i64, limit: usize,
     ) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
