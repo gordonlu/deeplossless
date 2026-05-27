@@ -97,6 +97,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     lcm_context: bool,
 
+    /// Normalize system prompts for cache-friendliness. Replaces timestamps,
+    /// UUIDs, and epoch values with stable markers to preserve DeepSeek
+    /// prefix cache hit rate.  Opt-in — test with your agent first.
+    #[arg(long)]
+    cache_normalize: bool,
+
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
     audit_mode: String,
@@ -306,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
         no_pipeline: cli.no_pipeline,
         no_header_mod: cli.no_header_mod,
         lcm_context: cli.lcm_context,
+        cache_normalize: cli.cache_normalize,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

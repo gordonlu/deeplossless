@@ -22,6 +22,7 @@ pub struct CoordinatorConfig {
     pub no_pipeline: bool,
     pub no_header_mod: bool,
     pub lcm_context: bool,
+    pub cache_normalize: bool,
     /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
     pub policy_config: RuntimePolicyConfig,
 }
@@ -120,6 +121,7 @@ impl RuntimeCoordinator {
             no_pipeline: cfg.no_pipeline,
             no_header_mod: cfg.no_header_mod,
             lcm_context: cfg.lcm_context,
+            cache_normalize: cfg.cache_normalize,
         };
 
         Ok(Self { state, tasks })

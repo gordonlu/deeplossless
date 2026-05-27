@@ -144,6 +144,9 @@ pub struct AppState {
     pub no_pipeline: bool,
     pub no_header_mod: bool,
     pub lcm_context: bool,
+    /// Normalize system prompts for cache-friendliness. Opt-in via
+    /// `--cache-normalize`. Replaces timestamps/UUIDs with stable markers.
+    pub cache_normalize: bool,
 }
 
 impl AppState {

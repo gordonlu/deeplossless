@@ -867,21 +867,30 @@ async fn chat_completions(
         }
     }
 
+    // System prompt normalization: strip timestamps/UUIDs to preserve
+    // DeepSeek prefix cache hit rate.  Timestamps in system prompts break
+    // cache because every request has a different prefix.
+    let body_for_upstream = if state.cache_normalize {
+        normalize_system_prompt(req_body.clone())
+    } else {
+        req_body.clone()
+    };
+
     // Pipeline: always run for storage. Only modify request body when
     // --lcm-context is enabled (context appended as user message).
     let injected_body = if state.lcm_context && !state.no_pipeline {
         let pipeline = crate::pipeline::ChatPipeline::new(&state);
-        match pipeline.process(model, &req_body).await {
+        match pipeline.process(model, &body_for_upstream).await {
             Ok(out) => out.injected_body,
             Err(e) => {
                 warn!("pipeline error: {e}, falling back to passthrough");
-                req_body.clone()
+                body_for_upstream.clone()
             }
         }
     } else {
         if !state.no_pipeline {
             let pipeline = crate::pipeline::ChatPipeline::new(&state);
-            let body = req_body.clone();
+            let body = body_for_upstream.clone();
             let model_owned = model.to_string();
             tokio::task::spawn(async move {
                 if let Err(e) = pipeline.process(&model_owned, &body).await {
@@ -889,7 +898,7 @@ async fn chat_completions(
                 }
             });
         }
-        req_body.clone()
+        body_for_upstream
     };
 
     // Resolve conversation ID for response header — lightweight fingerprint lookup
@@ -1073,6 +1082,90 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
     };
     let bearer = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "));
     bearer == Some(expected)
+}
+
+/// Strip cache-breaking dynamic content from system prompts.
+/// DeepSeek uses prefix-based caching — timestamps, UUIDs, and session IDs
+/// in the system prompt make every request a cache miss.
+///
+/// Only modifies `messages[0]` if its role is "system".
+fn normalize_system_prompt(mut body: serde_json::Value) -> serde_json::Value {
+    let Some(messages) = body["messages"].as_array_mut() else { return body };
+    if messages.is_empty() { return body }
+    if messages[0].get("role").and_then(|v| v.as_str()) != Some("system") { return body }
+    let Some(original) = messages[0].get("content").and_then(|v| v.as_str()) else { return body };
+    if original.is_empty() { return body }
+
+    let cleaned = original.to_string();
+    let mut changes = 0u32;
+
+    // Walk through the string and replace common cache-breakers with stable markers.
+    // We use character-level scanning to avoid adding a regex dependency.
+    let bytes = cleaned.as_bytes();
+    let mut out = String::with_capacity(cleaned.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Try ISO 8601 timestamp: YYYY-MM-DDTHH:MM:SS...
+        if i + 19 <= bytes.len()
+            && bytes[i].is_ascii_digit()
+            && bytes[i+4] == b'-' && bytes[i+7] == b'-'
+            && (bytes[i+10] == b'T' || bytes[i+10] == b' ')
+            && bytes[i+13] == b':' && bytes[i+16] == b':'
+        {
+            // Consume the full timestamp
+            let start = i;
+            i += 19;
+            // Optional fractional seconds
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+            }
+            // Optional timezone
+            if i < bytes.len() && (bytes[i] == b'Z' || bytes[i] == b'+' || bytes[i] == b'-') {
+                i += 1;
+                if bytes[i-1] != b'Z' {
+                    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b':') { i += 1; }
+                }
+            }
+            out.push_str("[ts]");
+            changes += 1;
+            tracing::debug!(target: "deeplossless::cache", range=?start..i, "stripped timestamp");
+            continue;
+        }
+
+        // Try UUID: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (36 chars, hex digits + dashes)
+        if i + 36 <= bytes.len()
+            && bytes[i].is_ascii_hexdigit()
+            && bytes[i+8] == b'-' && bytes[i+13] == b'-'
+            && bytes[i+18] == b'-' && bytes[i+23] == b'-'
+        {
+            let is_uuid = (i..i+36).all(|j| {
+                matches!(bytes[j], b'-' | b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
+            });
+            if is_uuid {
+                out.push_str("[uuid]");
+                i += 36;
+                changes += 2;
+                continue;
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    if cleaned != out {
+        messages[0]["content"] = serde_json::json!(out);
+        tracing::debug!(
+            target: "deeplossless::cache",
+            before = cleaned.len(),
+            after = out.len(),
+            changes,
+            "system prompt normalized for cache"
+        );
+    }
+
+    body
 }
 
 // ── LCM retrieval endpoints ────────────────────────────────────────────
