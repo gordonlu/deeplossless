@@ -85,6 +85,10 @@ cargo test --test simulated_session -- --nocapture
 | `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |
 | `--tls-key` | auto-generated | Custom TLS private key (PEM) |
 | `--lcm-context` | disabled | Enable DAG context injection (for LCM-aware agents) |
+| `--cache-normalize` | off | Strip timestamps/UUIDs from system prompts (↑cache hit rate) |
+| `--dag-threshold` | `0.80` | Compaction trigger (fraction of context window) |
+| `--summarizer-budget` | `1000` | Max LLM summarizer calls per session (0=unlimited) |
+| `--http-port` | `8081` | Plain HTTP port for sandboxed agents |
 
 TLS is always on. A self-signed certificate is auto-generated at `~/.deeplossless/`.
 Run `deeplossless trust` once to configure it.
@@ -127,7 +131,7 @@ Then query past context: `GET /v1/lcm/grep/{id}?query=<terms>&limit=20`
 ## Session Report
 
 ```bash
-curl https://localhost:8080/v1/lcm/runtime/report?label=fix+build
+curl -sk https://localhost:8080/v1/lcm/runtime/report?label=fix+build
 ```
 
 ```
@@ -144,6 +148,17 @@ curl https://localhost:8080/v1/lcm/runtime/report?label=fix+build
 | Efficient | 80% | 2 | 50% | 60% | Daily coding |
 | Exploratory | 50% | 3 | 80% | 80% | Debugging |
 | Autonomous | 30% | 5 | 100% | 95% | Complex tasks |
+
+## WebUI
+
+Execution forensics viewer — see what the AI actually did.
+
+```bash
+git clone https://github.com/gordonlu/deeplossless-ui.git
+cd deeplossless-ui && npm install && npm run dev
+```
+
+Opens at `http://localhost:3000` — connects to a running deeplossless instance.
 
 ## Tech Docs
 
