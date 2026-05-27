@@ -974,6 +974,8 @@ async fn chat_completions(
             let mut buf = String::new();
             let mut reasoning = String::new();
             let mut all_bytes: Vec<u8> = Vec::new();
+            let mut prompt_tokens: u64 = 0;
+            let mut completion_tokens: u64 = 0;
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
@@ -991,6 +993,10 @@ async fn chat_completions(
                                     if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
                                         reasoning.push_str(rc);
                                     }
+                                    if let Some(u) = v["usage"].as_object() {
+                                        prompt_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        completion_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                    }
                                 }
                             }
                         }
@@ -1003,6 +1009,15 @@ async fn chat_completions(
             }
             if !reasoning.is_empty() {
                 let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
+            }
+            // Accumulate token usage from chat completions stream
+            if let Some(cid) = conv_id {
+                if prompt_tokens > 0 || completion_tokens > 0 {
+                    let usage_db = state.storage.db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = usage_db.accumulate_usage(cid, prompt_tokens, completion_tokens);
+                    });
+                }
             }
             // Write recorded response bytes
             if let Some((ref dir, ts)) = _rec {
