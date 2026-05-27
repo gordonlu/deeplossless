@@ -1,4 +1,4 @@
-<img src="asset/banner.png" alt="DeepLossless" width="100%">
+<img src="docs/asset/deeplossless_banner.png" alt="DeepLossless" width="100%">
 
 [![Crates.io](https://img.shields.io/crates/v/deeplossless)](https://crates.io/crates/deeplossless)
 [![CI](https://github.com/gordonlu/deeplossless/actions/workflows/rust.yml/badge.svg)](https://github.com/gordonlu/deeplossless/actions/workflows/rust.yml)
