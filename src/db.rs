@@ -302,10 +302,12 @@ impl Database {
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversations (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id  TEXT NOT NULL,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                model       TEXT NOT NULL
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT NOT NULL,
+                created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                model               TEXT NOT NULL,
+                total_input_tokens  INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -512,6 +514,20 @@ impl Database {
             .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_reasoning_steps {
             conn.execute_batch("ALTER TABLE execution_units ADD COLUMN reasoning_steps TEXT NOT NULL DEFAULT '[]';")?;
+        }
+
+        // v0.6.3: token usage tracking per conversation
+        let has_input_tokens: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name='total_input_tokens'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_input_tokens {
+            conn.execute_batch("ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        let has_output_tokens: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name='total_output_tokens'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
+        if !has_output_tokens {
+            conn.execute_batch("ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0;")?;
         }
 
         // v0.3.0: artifact hashes for content-based cache invalidation
@@ -1109,11 +1125,13 @@ impl Database {
     }
 
     /// List recent conversations with basic stats for the session selector.
-    pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+    #[allow(clippy::type_complexity)]
+    pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<(i64, String, String, i64, i64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.session_id, c.model,
-                    (SELECT COUNT(*) FROM execution_events WHERE conv_id = c.id) AS event_count
+                    (SELECT COUNT(*) FROM execution_events WHERE conv_id = c.id) AS event_count,
+                    c.total_input_tokens + c.total_output_tokens AS total_tokens
              FROM conversations c
              ORDER BY c.id DESC LIMIT ?1"
         )?;
@@ -1123,7 +1141,74 @@ impl Database {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Get tool result messages that contain patch-like content (diff, code changes).
+    pub fn get_session_patches(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT role, substr(content, 1, 4000)
+             FROM messages
+             WHERE conversation_id = ?1
+               AND role = 'tool'
+               AND length(content) > 200
+               AND (content LIKE '%' || char(10) || '+' || '%'
+                 OR content LIKE '%' || char(10) || '-' || '%'
+                 OR content LIKE '%@@ %'
+                 OR content LIKE '%diff %'
+                 OR content LIKE '%modified%'
+                 OR content LIKE '%changed%')
+             ORDER BY id DESC
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows { results.push(row?); }
+        Ok(results)
+    }
+
+    /// Accumulate token usage for a conversation from DeepSeek response data.
+    pub fn accumulate_usage(&self, conv_id: i64, prompt_tokens: u64, completion_tokens: u64) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE conversations SET total_input_tokens = COALESCE(total_input_tokens, 0) + ?1,
+                                    total_output_tokens = COALESCE(total_output_tokens, 0) + ?2
+             WHERE id = ?3",
+            rusqlite::params![prompt_tokens as i64, completion_tokens as i64, conv_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get total execution event count for a conversation.
+    pub fn count_session_events(&self, conv_id: i64) -> anyhow::Result<i64> {
+        let conn = self.read_conn();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM execution_events WHERE conv_id = ?1",
+            rusqlite::params![conv_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Get tool category counts for a conversation by parsing event_payload JSON.
+    pub fn get_tool_category_counts(&self, conv_id: i64) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(event_payload, '$.tool_name') as tool, COUNT(*) as cnt
+             FROM execution_events
+             WHERE conv_id = ?1 AND event_kind = 'execution_completed'
+             GROUP BY tool
+             ORDER BY cnt DESC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id], |row| {
+            Ok((row.get::<_, String>(0).unwrap_or_default(), row.get::<_, i64>(1)?))
         })?;
         let mut results = Vec::new();
         for row in rows { results.push(row?); }
@@ -1140,7 +1225,7 @@ impl Database {
             "SELECT id, event_kind, event_payload, seq_no, created_at
              FROM execution_events
              WHERE conv_id = ?1
-             ORDER BY epoch_ms DESC, id DESC
+             ORDER BY epoch_ms ASC, id ASC
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
@@ -1220,6 +1305,18 @@ impl Database {
         replay_session_id: &str,
     ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // Dedup: skip if we already stored this tool execution.
+        // Prevents re-processing conversation history as execution events.
+        if !tool_call_id.is_empty() {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM execution_units WHERE conv_id = ?1 AND tool_call_id = ?2 AND tool_name = ?3",
+                rusqlite::params![conv_id, tool_call_id, tool_name],
+                |row| row.get(0),
+            ).unwrap_or(false);
+            if exists {
+                return Ok(0); // already stored — skip
+            }
+        }
         let related_json = serde_json::to_string(related_nodes)?;
         let tool_args_json_str = String::new();
         let reasoning_steps_json = "[]".to_string();
@@ -1858,7 +1955,7 @@ impl Database {
                     span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms
              FROM execution_events
              WHERE conv_id = ?1
-             ORDER BY epoch_ms DESC, id DESC
+             ORDER BY epoch_ms ASC, id ASC
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {

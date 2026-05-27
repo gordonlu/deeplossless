@@ -271,6 +271,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/current", get(lcm_current_conv))
         .route("/v1/lcm/sessions", get(lcm_sessions_list))
         .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
+        .route("/v1/lcm/sessions/{id}/patches", get(lcm_session_patches))
         .route("/v1/lcm/cache/stability", get(lcm_cache_stability))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
@@ -480,7 +481,7 @@ async fn responses(
         let db = state.storage.db.clone();
         let cycle = state.runtime.cycle.clone();
         let store_response = store;
-        let request_body = body.clone();
+        let _request_body = body.clone();
         let log_dir = state.log_dir.clone();
         let upstream_status = resp.status().as_u16();
         let start = std::time::Instant::now();
@@ -586,13 +587,15 @@ async fn responses(
             }
             // Upstream [DONE] → finish assembly, get accumulated content
             let content = assembler.finish();
-            let input_tokens_est = crate::tokenizer::count(&request_body);
+            let input_tokens = usage_buf.as_ref()
+                .and_then(|v| v["usage"]["prompt_tokens"].as_u64())
+                .unwrap_or(0);
             let output_tokens = usage_buf.as_ref()
                 .and_then(|v| v["usage"]["completion_tokens"].as_u64())
                 .unwrap_or(0);
             let output_text_len = content.text.len();
             tracing::info!(target: "deeplossless",
-                input_tokens_est, output_tokens, output_text_len,
+                input_tokens, output_tokens, output_text_len,
                 "turn complete");
 
             // Write session log if --log-dir is set
@@ -603,7 +606,7 @@ async fn responses(
                     endpoint: "responses",
                     model: log_model,
                     request_body_kb: log_request_body_kb,
-                    input_tokens_est,
+                    input_tokens_est: input_tokens as usize,
                     output_tokens,
                     output_text_len,
                     cache_hits,
@@ -909,7 +912,6 @@ async fn chat_completions(
         state.storage.db.find_conversation_by_fingerprint(&fp).ok().flatten()
     };
 
-    // Track system prompt cache stability (use original body to avoid clone issues)
     if let Some(cid) = conv_id {
         track_cache_stability(&state, cid, &req_body);
     }
@@ -1286,11 +1288,12 @@ async fn lcm_sessions_list(
     let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
     match state.storage.db.list_sessions(limit) {
         Ok(rows) => {
-            let items: Vec<Value> = rows.iter().map(|(id, fp, model, count)| json!({
+            let items: Vec<Value> = rows.iter().map(|(id, fp, model, count, tokens)| json!({
                 "id": id,
                 "fingerprint": fp,
                 "model": model,
                 "event_count": count,
+                "total_tokens": tokens,
             })).collect();
             Json(json!({"sessions": items})).into_response()
         }
@@ -1311,7 +1314,9 @@ async fn lcm_session_events(
     if id <= 0 {
         return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
     }
-    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let total = state.storage.db.count_session_events(id).unwrap_or(0);
+    let tool_counts = state.storage.db.get_tool_category_counts(id).unwrap_or_default();
     match state.storage.db.get_session_events(id, limit) {
         Ok(rows) => {
             let items: Vec<Value> = rows.iter().map(|(ev_id, kind, payload, seq, ts)| json!({
@@ -1319,9 +1324,14 @@ async fn lcm_session_events(
                 "type": kind,
                 "payload": payload,
                 "seq_no": seq,
-                "timestamp": ts,
+                "timestamp": ts.replacen(' ', "T", 1) + "Z",
             })).collect();
-            Json(json!({"session_id": id, "events": items, "total": items.len()})).into_response()
+            Json(json!({
+                "session_id": id,
+                "events": items,
+                "total": total,
+                "tool_counts": tool_counts.iter().map(|(k, v)| json!({"tool": k, "count": v})).collect::<Vec<_>>(),
+            })).into_response()
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
@@ -1560,6 +1570,32 @@ async fn lcm_cache_delete(
     match state.storage.db.tool_cache_delete(tool, &hash) {
         Ok(()) => Json(json!({"status": "deleted"})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/sessions/{id}/patches — tool results containing patch/diff content.
+async fn lcm_session_patches(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    if id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
+    }
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
+    match state.storage.db.get_session_patches(id, limit) {
+        Ok(rows) => {
+            let items: Vec<Value> = rows.iter().map(|(role, content)| json!({
+                "role": role,
+                "content": content,
+            })).collect();
+            Json(json!({"session_id": id, "patches": items})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 

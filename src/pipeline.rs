@@ -189,6 +189,12 @@ impl ChatPipeline {
                 // Track the last unit ID to populate DependsOn lineage edges
                 let mut last_exec_id: Option<i64> = None;
                 for unit in &units {
+                    // Only store actual tool executions — not message ingestion.
+                    // System/user/assistant messages have empty tool_name and are
+                    // context assembly artifacts, not runtime execution events.
+                    if unit.tool_name.is_empty() {
+                        continue;
+                    }
                     // Find which active tracker this unit belongs to (if any)
                     let (span_id, parent_span_id, span_mode, parallel_group) =
                         if !unit.tool_call_id.is_empty() {
