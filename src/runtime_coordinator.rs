@@ -99,6 +99,7 @@ impl RuntimeCoordinator {
             upstream: cfg.upstream,
             api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
             admin_key: Arc::new(std::sync::Mutex::new(cfg.admin_key)),
+            cache_stability: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             storage: crate::StorageServices {
                 db,
                 dag,

@@ -271,6 +271,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/current", get(lcm_current_conv))
         .route("/v1/lcm/sessions", get(lcm_sessions_list))
         .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
+        .route("/v1/lcm/cache/stability", get(lcm_cache_stability))
         .route("/v1/lcm/expand/{node_id}", get(lcm_expand))
         .route("/v1/lcm/status/{conv_id}", get(lcm_status))
         .route("/v1/lcm/snippets/{node_id}", get(lcm_snippets))
@@ -908,6 +909,11 @@ async fn chat_completions(
         state.storage.db.find_conversation_by_fingerprint(&fp).ok().flatten()
     };
 
+    // Track system prompt cache stability (use original body to avoid clone issues)
+    if let Some(cid) = conv_id {
+        track_cache_stability(&state, cid, &req_body);
+    }
+
     // Forward to upstream
     let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
     let resp = match state.runtime
@@ -1082,6 +1088,29 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
     };
     let bearer = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "));
     bearer == Some(expected)
+}
+
+/// Record a system prompt fingerprint for cache stability tracking.
+/// Keeps the last 20 hashes per conversation.
+fn track_cache_stability(state: &AppState, conv_id: i64, body: &serde_json::Value) {
+    let system_content = body["messages"].as_array()
+        .and_then(|arr| arr.first())
+        .filter(|m| m["role"].as_str() == Some("system"))
+        .and_then(|m| m["content"].as_str());
+
+    let Some(content) = system_content else { return };
+    if content.is_empty() { return }
+
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let short_hash = &hash[..12];
+
+    let mut tracker = state.cache_stability.lock().unwrap_or_else(|e| e.into_inner());
+    let hashes = tracker.entry(conv_id).or_default();
+    hashes.push(short_hash.to_string());
+    if hashes.len() > 20 {
+        hashes.remove(0);
+    }
 }
 
 /// Strip cache-breaking dynamic content from system prompts.
@@ -1532,6 +1561,31 @@ async fn lcm_cache_delete(
         Ok(()) => Json(json!({"status": "deleted"})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
     }
+}
+
+/// GET /v1/lcm/cache/stability — system prompt cache stability diagnostics.
+/// Returns per-conversation hash history and stability metrics.
+async fn lcm_cache_stability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let tracker = state.cache_stability.lock().unwrap_or_else(|e| e.into_inner());
+    let items: Vec<Value> = tracker.iter().map(|(conv_id, hashes)| {
+        let total = hashes.len();
+        let unique = hashes.iter().collect::<std::collections::HashSet<_>>().len();
+        let cache_hit_rate = if total < 2 { 1.0 } else { 1.0 - (unique as f64 - 1.0) / (total as f64 - 1.0).max(1.0) };
+        json!({
+            "conversation_id": conv_id,
+            "samples": total,
+            "unique_hashes": unique,
+            "stability_pct": (cache_hit_rate * 100.0).round() as u32,
+            "recent": hashes.iter().rev().take(5).collect::<Vec<_>>(),
+        })
+    }).collect();
+    Json(json!({"conversations": items})).into_response()
 }
 
 /// Store a failure pattern. Agent calls this after a fix fails.

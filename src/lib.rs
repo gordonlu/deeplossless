@@ -128,6 +128,10 @@ pub struct AppState {
     /// Separate admin key for LCM endpoint authentication.
     pub admin_key: Arc<StdMutex<Option<String>>>,
 
+    /// Cache stability tracker — records system prompt hashes to compute
+    /// prompt cache stability metrics.  Keyed by conversation ID.
+    pub cache_stability: Arc<StdMutex<std::collections::HashMap<i64, Vec<String>>>>,
+
     // ── Storage ──────────────────────────────────────────────────────
     pub storage: StorageServices,
 
