@@ -41,6 +41,11 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
                         m["reasoning_content"] = json!(rc);
                     }
                 }
+                if role == "tool" {
+                    if let Some(tc_id) = msg["tool_call_id"].as_str() {
+                        m["tool_call_id"] = json!(tc_id);
+                    }
+                }
                 messages.push(m);
             } else if let Some(blocks) = content.as_array() {
                 let mut text_parts = Vec::new();
@@ -1051,8 +1056,9 @@ mod tests {
         let mut state = AnthropicSseState::new();
         state.convert(r#"{"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#);
         let r = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"completion_tokens":100,"prompt_tokens":4096,"total_tokens":4196}}"#);
-        assert!(r[0].contains("stop_reason"));
-        assert!(r[0].contains("max_tokens"), "length should map to max_tokens");
+        // r[0] is content_block_stop for the text block; r[1] is message_delta
+        assert!(r[1].contains("stop_reason"));
+        assert!(r[1].contains("max_tokens"), "length should map to max_tokens");
     }
 
     #[test]
@@ -1060,8 +1066,9 @@ mod tests {
         let mut state = AnthropicSseState::new();
         state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
         let r = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":20,"prompt_tokens":10,"total_tokens":30}}"#);
-        assert!(r[0].contains("stop_reason"));
-        assert!(r[0].contains("tool_use"), "tool_calls should map to tool_use");
+        // r[0] is content_block_stop for the tool block; r[1] is message_delta
+        assert!(r[1].contains("stop_reason"));
+        assert!(r[1].contains("tool_use"), "tool_calls should map to tool_use");
     }
 
     #[test]
@@ -1084,15 +1091,12 @@ mod tests {
     #[test]
     fn started_block_indices_ordering() {
         let mut state = AnthropicSseState::new();
-        // Start text (gets index 0)
+        // Start text (gets index 0 from next_block_index)
         state.convert(r#"{"choices":[{"index":0,"delta":{"content":"text"},"finish_reason":null}]}"#);
-        // Start tool (gets index 1 via explicit global index)
-        state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
+        // Start tool call (uses explicit global index 1 — would appear after text in practice)
+        state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
         let indices = state.started_block_indices();
-        // Check they are sorted
-        for w in indices.windows(2) {
-            assert!(w[0] < w[1], "indices must be sorted: {:?}", indices);
-        }
+        assert_eq!(indices, vec![0, 1], "text index 0, tool index 1, sorted");
     }
 
     #[test]
