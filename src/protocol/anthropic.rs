@@ -248,54 +248,73 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
 
 /// Convert DeepSeek Chat Completions non-streaming response → Anthropic format.
 pub fn response_to_anthropic(deepseek: &Value) -> Value {
-    let choice = &deepseek["choices"][0];
+    let choice = match deepseek["choices"].as_array().and_then(|a| a.first()) {
+        Some(c) => c,
+        None => {
+            return json!({
+                "id": format!("msg_{}", chrono::Utc::now().timestamp_millis()),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            });
+        }
+    };
     let message = &choice["message"];
     let content = message["content"].as_str().unwrap_or("");
     let model = deepseek["model"].as_str().unwrap_or("deepseek-v4-pro");
     let usage = &deepseek["usage"];
 
-    let mut response = json!({
+    let mut blocks: Vec<Value> = Vec::new();
+
+    // Text content (if any)
+    if !content.is_empty() {
+        blocks.push(json!({"type": "text", "text": content}));
+    }
+
+    // Tool calls (may coexist with text in DeepSeek responses)
+    if let Some(tool_calls) = message["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let func = &tc["function"];
+            let input: Value = serde_json::from_str(func["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
+            blocks.push(json!({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": func["name"],
+                "input": input,
+            }));
+        }
+    }
+
+    json!({
         "id": format!("msg_{}", chrono::Utc::now().timestamp_millis()),
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": content}],
+        "content": blocks,
         "stop_reason": choice["finish_reason"].as_str().unwrap_or("end_turn"),
         "usage": {
             "input_tokens": usage["prompt_tokens"].as_u64().unwrap_or(0),
             "output_tokens": usage["completion_tokens"].as_u64().unwrap_or(0),
         }
-    });
-
-    // Tool calls
-    if let Some(tool_calls) = message["tool_calls"].as_array() {
-        let blocks: Vec<Value> = tool_calls.iter().map(|tc| {
-            let func = &tc["function"];
-            let input: Value = serde_json::from_str(func["arguments"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
-            json!({
-                "type": "tool_use",
-                "id": tc["id"],
-                "name": func["name"],
-                "input": input,
-            })
-        }).collect();
-        response["content"] = json!(blocks);
-    }
-
-    response
+    })
 }
 
 /// Stateful SSE converter that tracks content block lifecycle so
 /// `content_block_start` for text is emitted before the first text delta.
 #[derive(Default)]
 pub struct AnthropicSseState {
-    text_block_started: bool,
+    text_block_index: Option<usize>,
+    thinking_block_index: Option<usize>,
     tool_use_block_indices: Vec<usize>,
     /// Token usage captured from the finish chunk, for accumulation.
     pub last_input_tokens: u64,
     pub last_output_tokens: u64,
     /// Accumulated reasoning_content from DeepSeek deltas (thinking mode).
     pub reasoning_content: String,
+    /// Next available content block index, monotonically increasing.
+    next_block_index: usize,
 }
 
 impl AnthropicSseState {
@@ -305,7 +324,7 @@ impl AnthropicSseState {
 
     /// Convert a DeepSeek SSE data line into Anthropic SSE event strings.
     /// Maintains state to correctly emit `content_block_start` before the
-    /// first delta of each content type (text or tool_use).
+    /// first delta of each content type (text, thinking, or tool_use).
     pub fn convert(&mut self, data: &str) -> Vec<String> {
         let v: Value = match serde_json::from_str(data) {
             Ok(v) => v,
@@ -316,17 +335,25 @@ impl AnthropicSseState {
 
         // Tool call chunks — may carry id+name (start), arguments (delta), or both
         if let Some(tc) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            for (i, call) in tc.iter().enumerate() {
+            for call in tc.iter() {
                 let name = call["function"]["name"].as_str().unwrap_or("");
                 let id = call["id"].as_str().unwrap_or("");
                 let args = call["function"]["arguments"].as_str().unwrap_or("");
+                // Use DeepSeek's global tool index (from 'index' field), not
+                // the local position in this chunk's tool_calls array.
+                let idx = call.get("index").and_then(|v| v.as_i64()).unwrap_or(self.next_block_index as i64) as usize;
 
                 // New tool call starting → content_block_start
                 if !id.is_empty() {
-                    self.tool_use_block_indices.push(i);
+                    if idx >= self.next_block_index {
+                        self.next_block_index = idx + 1;
+                    }
+                    if !self.tool_use_block_indices.contains(&idx) {
+                        self.tool_use_block_indices.push(idx);
+                    }
                     events.push(format!("event: content_block_start\ndata: {}\n\n", json!({
                         "type": "content_block_start",
-                        "index": i,
+                        "index": idx,
                         "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
                     })));
                 }
@@ -335,7 +362,7 @@ impl AnthropicSseState {
                 if !args.is_empty() {
                     events.push(format!("event: content_block_delta\ndata: {}\n\n", json!({
                         "type": "content_block_delta",
-                        "index": i,
+                        "index": idx,
                         "delta": {"type": "input_json_delta", "partial_json": args}
                     })));
                 }
@@ -343,13 +370,28 @@ impl AnthropicSseState {
             return events;
         }
 
-        // Reasoning content — accumulate for next turn, emit as thinking delta
+        // Reasoning content — accumulate for next turn, emit as thinking delta.
+        // A content_block_start for thinking is emitted before the first delta only.
         if let Some(rc) = delta["reasoning_content"].as_str() {
             if !rc.is_empty() {
                 self.reasoning_content.push_str(rc);
+                let is_first = self.thinking_block_index.is_none();
+                let thinking_idx = self.thinking_block_index.unwrap_or_else(|| {
+                    let idx = self.next_block_index;
+                    self.next_block_index += 1;
+                    self.thinking_block_index = Some(idx);
+                    idx
+                });
+                if is_first {
+                    events.push(format!("event: content_block_start\ndata: {}\n\n", json!({
+                        "type": "content_block_start",
+                        "index": thinking_idx,
+                        "content_block": {"type": "thinking", "thinking": ""}
+                    })));
+                }
                 events.push(format!("event: content_block_delta\ndata: {}\n\n", json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": thinking_idx,
                     "delta": {"type": "thinking_delta", "thinking": rc}
                 })));
             }
@@ -359,17 +401,23 @@ impl AnthropicSseState {
         // Text delta
         if let Some(text) = delta["content"].as_str() {
             if !text.is_empty() {
-                if !self.text_block_started {
-                    self.text_block_started = true;
+                let is_first = self.text_block_index.is_none();
+                let text_idx = self.text_block_index.unwrap_or_else(|| {
+                    let idx = self.next_block_index;
+                    self.next_block_index += 1;
+                    self.text_block_index = Some(idx);
+                    idx
+                });
+                if is_first {
                     events.push(format!("event: content_block_start\ndata: {}\n\n", json!({
                         "type": "content_block_start",
-                        "index": 0,
+                        "index": text_idx,
                         "content_block": {"type": "text", "text": ""}
                     })));
                 }
                 events.push(format!("event: content_block_delta\ndata: {}\n\n", json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": text_idx,
                     "delta": {"type": "text_delta", "text": text}
                 })));
             }
@@ -415,14 +463,19 @@ impl AnthropicSseState {
     /// Whether any content block was started during conversion.
     /// If false after all deltas, the response body was empty.
     pub fn any_block_started(&self) -> bool {
-        self.text_block_started || !self.tool_use_block_indices.is_empty()
+        self.text_block_index.is_some()
+            || self.thinking_block_index.is_some()
+            || !self.tool_use_block_indices.is_empty()
     }
 
-    /// Iterator of block indices that were started (for emitting content_block_stop).
+    /// All content block indices that were started (for emitting content_block_stop).
     pub fn started_block_indices(&self) -> Vec<usize> {
         let mut indices = self.tool_use_block_indices.clone();
-        if self.text_block_started {
-            indices.push(0);
+        if let Some(idx) = self.thinking_block_index {
+            indices.push(idx);
+        }
+        if let Some(idx) = self.text_block_index {
+            indices.push(idx);
         }
         indices.sort();
         indices
@@ -764,5 +817,469 @@ mod tests {
             "system content blocks must be joined");
         assert!(content.contains("You help with software"),
             "all system text blocks must be included");
+    }
+
+    // ── Edge cases for request_to_deepseek ────────────────────────────
+
+    #[test]
+    fn request_with_empty_messages() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": []
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        assert!(msgs.is_empty(), "empty input = empty output");
+    }
+
+    #[test]
+    fn request_with_thinking_blocks() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "think step by step"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Let me reason about this..."},
+                    {"type": "text", "text": "Here is the answer."}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        let content = assistant["content"].as_str().unwrap_or("");
+        assert!(content.contains("[thinking]"), "thinking blocks should be marked");
+        assert!(content.contains("Here is the answer"), "text should follow thinking");
+    }
+
+    #[test]
+    fn request_with_tool_choice_any() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 100,
+            "tool_choice": {"type": "any"},
+            "tools": [{"name": "bash", "input_schema": {"type": "object", "properties": {}}}],
+            "messages": [{"role": "user", "content": "run ls"}]
+        });
+        let ds = request_to_deepseek(&body, None);
+        assert_eq!(ds["tool_choice"], json!("auto"), "\"any\" should map to \"auto\"");
+    }
+
+    #[test]
+    fn request_with_tool_choice_specific_tool() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 100,
+            "tool_choice": {"type": "tool", "name": "bash"},
+            "tools": [{"name": "bash", "input_schema": {"type": "object", "properties": {}}}],
+            "messages": [{"role": "user", "content": "run ls"}]
+        });
+        let ds = request_to_deepseek(&body, None);
+        assert_eq!(ds["tool_choice"]["type"], "function");
+        assert_eq!(ds["tool_choice"]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn request_preserves_top_p_and_stop() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 100,
+            "top_p": 0.9,
+            "stop_sequences": ["\n\n", "Observation:"],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let ds = request_to_deepseek(&body, None);
+        assert_eq!(ds["top_p"], 0.9);
+        assert_eq!(ds["stop"], json!(["\n\n", "Observation:"]));
+    }
+
+    #[test]
+    fn request_thinking_field_sets_reasoning_effort() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 100,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "think hard"}]
+        });
+        let ds = request_to_deepseek(&body, None);
+        assert_eq!(ds["reasoning_effort"], "medium",
+            "thinking field should set reasoning_effort");
+    }
+
+    // ── Edge cases for response_to_anthropic ──────────────────────────
+
+    #[test]
+    fn response_empty_choices_returns_fallback() {
+        let ds = json!({"model": "deepseek", "choices": [], "usage": {}});
+        let anth = response_to_anthropic(&ds);
+        assert_eq!(anth["type"], "message");
+        assert!(anth["content"].as_array().unwrap().is_empty(),
+            "empty choices should produce empty content");
+        assert_eq!(anth["usage"]["input_tokens"], 0);
+    }
+
+    #[test]
+    fn response_with_text_and_tool_calls_merges_both() {
+        let ds = json!({
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me check that file.",
+                    "tool_calls": [{
+                        "id": "call_01",
+                        "function": {"name": "read_file", "arguments": "{\"path\": \"/tmp/x\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+        let anth = response_to_anthropic(&ds);
+        let blocks = anth["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "text + tool_use should both be present");
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0]["text"].as_str().unwrap().contains("Let me check"));
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "call_01");
+    }
+
+    #[test]
+    fn response_with_tool_calls_only_no_text() {
+        let ds = json!({
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "function": {"name": "bash", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+        });
+        let anth = response_to_anthropic(&ds);
+        let blocks = anth["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "only tool_use block");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "bash");
+    }
+
+    // ── Edge cases for AnthropicSseState.convert ──────────────────────
+
+    #[test]
+    fn sse_text_delta_starts_at_sequential_index() {
+        let mut state = AnthropicSseState::new();
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#);
+        // Should be content_block_start + text_delta
+        assert_eq!(r.len(), 2);
+        assert!(r[0].contains(r#""index":0"#), "first content block starts at 0");
+    }
+
+    #[test]
+    fn sse_tool_call_separate_chunks_use_global_index() {
+        let mut state = AnthropicSseState::new();
+        // Chunk 1: first tool call (index 0)
+        let r1 = state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
+        assert!(r1[0].contains(r#""index":0"#), "tool call 0 at index 0");
+        // Chunk 2: second tool call (index 1) — separate chunk
+        let r2 = state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"tc2","function":{"name":"edit","arguments":""}}]},"finish_reason":null}]}"#);
+        assert!(r2[0].contains(r#""index":1"#), "tool call 1 at index 1");
+        // Chunk 3: args for both tools
+        let r3 = state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\""}},{"index":1,"function":{"arguments":"\"file.txt\""}}]},"finish_reason":null}]}"#);
+        assert_eq!(r3.len(), 2, "two argument deltas");
+        // Verify finish emits stops at correct indices
+        let finish = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":10,"prompt_tokens":5,"total_tokens":15}}"#);
+        assert_eq!(finish.len(), 4, "2 stops + message_delta + message_stop");
+        assert!(finish[0].contains(r#""index":0"#), "stop for tool 0");
+        assert!(finish[1].contains(r#""index":1"#), "stop for tool 1");
+    }
+
+    #[test]
+    fn sse_thinking_block_emits_start_then_delta() {
+        let mut state = AnthropicSseState::new();
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."},"finish_reason":null}]}"#);
+        assert_eq!(r.len(), 2, "content_block_start + thinking_delta");
+        assert!(r[0].contains("content_block_start"), "first event is block start");
+        assert!(r[0].contains("thinking"), "block type is thinking");
+        assert!(r[1].contains("thinking_delta"), "delta is thinking_delta");
+    }
+
+    #[test]
+    fn sse_thinking_then_text_use_different_indices() {
+        let mut state = AnthropicSseState::new();
+        // Thinking block
+        state.convert(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"Thinking..."},"finish_reason":null}]}"#);
+        // Text block (should use index 1, not 0)
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{"content":"Answer."},"finish_reason":null}]}"#);
+        assert!(r[0].contains(r#""index":1"#), "text block should use index 1 (not 0)");
+        // Finish should stop both
+        let finish = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":5,"prompt_tokens":3,"total_tokens":8}}"#);
+        assert!(finish[0].contains(r#""index":0"#), "stop for thinking at 0");
+        assert!(finish[1].contains(r#""index":1"#), "stop for text at 1");
+    }
+
+    #[test]
+    fn sse_tool_use_after_thinking_uses_next_index() {
+        let mut state = AnthropicSseState::new();
+        // Thinking
+        state.convert(r#"{"choices":[{"index":0,"delta":{"reasoning_content":"Let me plan..."},"finish_reason":null}]}"#);
+        // Text
+        state.convert(r#"{"choices":[{"index":0,"delta":{"content":"I will search."},"finish_reason":null}]}"#);
+        // Tool call
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
+        assert!(r[0].contains(r#""index":2"#), "tool call uses global index 2");
+    }
+
+    #[test]
+    fn sse_finish_without_any_blocks_started() {
+        let mut state = AnthropicSseState::new();
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":0,"prompt_tokens":0,"total_tokens":0}}"#);
+        // No content_block_stop since no blocks started
+        assert_eq!(r.len(), 2, "message_delta + message_stop only");
+        assert!(r[0].contains("message_delta"));
+    }
+
+    #[test]
+    fn sse_finish_reason_length() {
+        let mut state = AnthropicSseState::new();
+        state.convert(r#"{"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#);
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"completion_tokens":100,"prompt_tokens":4096,"total_tokens":4196}}"#);
+        assert!(r[0].contains("stop_reason"));
+        assert!(r[0].contains("max_tokens"), "length should map to max_tokens");
+    }
+
+    #[test]
+    fn sse_finish_reason_tool_calls() {
+        let mut state = AnthropicSseState::new();
+        state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":20,"prompt_tokens":10,"total_tokens":30}}"#);
+        assert!(r[0].contains("stop_reason"));
+        assert!(r[0].contains("tool_use"), "tool_calls should map to tool_use");
+    }
+
+    #[test]
+    fn sse_malformed_json_returns_empty() {
+        let mut state = AnthropicSseState::new();
+        let r = state.convert("not json at all");
+        assert!(r.is_empty(), "malformed JSON should produce empty result");
+    }
+
+    #[test]
+    fn sse_empty_content_does_not_emit_block_start() {
+        let mut state = AnthropicSseState::new();
+        let r = state.convert(r#"{"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}"#);
+        assert!(r.is_empty(), "empty content string should produce no events");
+        // Subsequent real content should work
+        let r2 = state.convert(r#"{"choices":[{"index":0,"delta":{"content":"real"},"finish_reason":null}]}"#);
+        assert_eq!(r2.len(), 2, "real content still works after empty skip");
+    }
+
+    #[test]
+    fn started_block_indices_ordering() {
+        let mut state = AnthropicSseState::new();
+        // Start text (gets index 0)
+        state.convert(r#"{"choices":[{"index":0,"delta":{"content":"text"},"finish_reason":null}]}"#);
+        // Start tool (gets index 1 via explicit global index)
+        state.convert(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tc1","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#);
+        let indices = state.started_block_indices();
+        // Check they are sorted
+        for w in indices.windows(2) {
+            assert!(w[0] < w[1], "indices must be sorted: {:?}", indices);
+        }
+    }
+
+    #[test]
+    fn any_block_started_false_when_no_blocks() {
+        let state = AnthropicSseState::new();
+        assert!(!state.any_block_started(), "fresh state has no blocks");
+    }
+
+    #[test]
+    fn any_block_started_true_after_text() {
+        let mut state = AnthropicSseState::new();
+        state.convert(r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#);
+        assert!(state.any_block_started(), "text block should register as started");
+    }
+
+    /// Orphan tool message (tool_result without preceding tool_calls) in request.
+    #[test]
+    fn request_orphan_tool_message_preserved() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "what happened?"},
+                {"role": "tool", "tool_call_id": "orphan_01", "content": "result from previous turn"}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let tool_msgs: Vec<_> = msgs.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(tool_msgs.len(), 1, "orphan tool message preserved");
+        assert_eq!(tool_msgs[0]["tool_call_id"], "orphan_01");
+    }
+
+    /// Multiple consecutive assistant messages with tool_calls.
+    #[test]
+    fn request_consecutive_tool_calls_preserved() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "do two things"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tc1", "name": "Grep", "input": {"pattern": "foo"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tc1", "content": "result1"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tc2", "name": "Edit", "input": {"path": "x"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tc2", "content": "result2"}]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let tc_count = msgs.iter().filter(|m| m.get("tool_calls").is_some()).count();
+        assert_eq!(tc_count, 2, "both assistant tool_calls should be preserved");
+    }
+
+    /// Pending tool_calls with content text in the same assistant message
+    /// should strip tool_calls but keep the text.
+    #[test]
+    fn request_pending_tool_with_text_keeps_text() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "search and tell me"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "I'll search for that"},
+                    {"type": "tool_use", "id": "toolu_01", "name": "Grep", "input": {"pattern": "main"}}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert!(assistant.get("tool_calls").is_none(), "pending tool_calls stripped");
+        assert_eq!(assistant["content"], "I'll search for that", "text preserved");
+    }
+
+    /// Response with non-streaming tool_use content.
+    #[test]
+    fn response_with_tool_use_parses_input_json() {
+        let ds = json!({
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "function": {
+                            "name": "bash",
+                            "arguments": "{\"command\": \"ls -la\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+        });
+        let anth = response_to_anthropic(&ds);
+        let blocks = anth["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["input"]["command"], "ls -la");
+    }
+
+    /// Response with malformed tool arguments JSON should not crash.
+    #[test]
+    fn response_tool_arguments_malformed_json_does_not_panic() {
+        let ds = json!({
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "function": {"name": "bash", "arguments": "not valid json"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+        });
+        let anth = response_to_anthropic(&ds);
+        let blocks = anth["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["input"], json!({}),
+            "malformed JSON should fall back to empty object");
+    }
+
+    /// No system prompt at all.
+    #[test]
+    fn request_no_system_prompt_omits_system_message() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let system_count = msgs.iter().filter(|m| m["role"] == "system").count();
+        assert_eq!(system_count, 0, "no system prompt = no system message");
+    }
+
+    /// Reasoning content not injected when cache is None.
+    #[test]
+    fn reasoning_content_not_injected_when_none() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Hi"},
+                {"role": "user", "content": "what's up?"}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let assistants: Vec<_> = msgs.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(assistants.len(), 1, "assistant messages preserved");
+        // No reasoning_content injected since we passed None
+        assert!(assistants[0].get("reasoning_content").is_none(),
+            "no reasoning_content when cache is None");
+    }
+
+    /// Content blocks with only text and tool_results (no tool_use) are flattened correctly.
+    #[test]
+    fn request_tool_result_only_no_tool_use() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "read file"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tc1", "name": "read_file", "input": {"path": "/tmp/x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tc1", "content": "file contents here"}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        // After repair, tool should directly follow tool_calls
+        let tc_pos = msgs.iter().position(|m| m["tool_calls"].is_array()).unwrap();
+        assert_eq!(msgs[tc_pos + 1]["role"], "tool",
+            "tool must immediately follow tool_calls");
+        assert_eq!(msgs[tc_pos + 1]["tool_call_id"], "tc1");
     }
 }
