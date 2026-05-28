@@ -560,7 +560,10 @@ pub const MIGRATION: &str = "
     CREATE INDEX IF NOT EXISTS idx_execution_span
         ON execution_units(span_id);
     CREATE INDEX IF NOT EXISTS idx_execution_parallel
-        ON execution_units(parallel_group);";
+        ON execution_units(parallel_group);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_dedup
+        ON execution_units(conversation_id, tool_call_id)
+        WHERE tool_call_id != '';";
 
 /// ALTER TABLE migration for existing databases (adds span/parallel columns).
 pub const MIGRATION_ALTER_V5: &str = "

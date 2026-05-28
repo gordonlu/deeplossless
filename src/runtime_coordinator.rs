@@ -26,6 +26,9 @@ pub struct CoordinatorConfig {
     pub lcm_context_tokens: u64,
     /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
     pub policy_config: RuntimePolicyConfig,
+
+    /// Workspace root path for stable conversation identity.
+    pub workspace: Option<String>,
 }
 
 /// Assembles and owns all runtime services.
@@ -101,6 +104,7 @@ impl RuntimeCoordinator {
             api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
             admin_key: Arc::new(std::sync::Mutex::new(cfg.admin_key)),
             cache_stability: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reasoning_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             storage: crate::StorageServices {
                 db,
                 dag,
@@ -125,6 +129,7 @@ impl RuntimeCoordinator {
             lcm_context: cfg.lcm_context,
             cache_normalize: cfg.cache_normalize,
             lcm_context_tokens: cfg.lcm_context_tokens,
+            workspace: cfg.workspace.clone(),
         };
 
         Ok(Self { state, tasks })
@@ -154,7 +159,7 @@ impl RuntimeCoordinator {
             .layer(axum::middleware::from_fn(crate::metrics::middleware))
             .layer(tower_http::catch_panic::CatchPanicLayer::new())
             .layer(tower_http::cors::CorsLayer::permissive())
-            .layer(tower_http::limit::RequestBodyLimitLayer::new(20 * 1024 * 1024))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(100 * 1024 * 1024))
     }
 
     /// Graceful shutdown following strict ordering:

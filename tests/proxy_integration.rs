@@ -126,6 +126,7 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         api_key: std::sync::Arc::new(std::sync::Mutex::new(Some("test-key".to_string()))),
         admin_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
         cache_stability: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        reasoning_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         storage: deeplossless::StorageServices {
             db,
             dag,
@@ -150,6 +151,7 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         lcm_context: false,
         cache_normalize: false,
         lcm_context_tokens: 0,
+        workspace: None,
     }
 }
 
@@ -2250,4 +2252,46 @@ async fn multi_turn_context_retrieval_across_turns() {
     let total = grep_json["total"].as_i64().unwrap_or(0);
     assert!(total > 0,
         "multi-turn: Turn 1 content must be retrievable in Turn 2. total={total}, grep={grep_json}");
+}
+
+// ── Execution unit dedup ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn execution_unit_dedup_same_tool_call_id() {
+    let state = build_proxy_state("127.0.0.1:1".parse().unwrap(), "dedup_same").await;
+    let conv_id = state.storage.db.create_and_store("claude", &serde_json::json!([
+        {"role": "user", "content": "test"}
+    ])).unwrap();
+
+    let tc_id = "call_00_test123";
+    let id1 = state.storage.db.store_execution_unit_with_span(
+        conv_id, "", "Grep", "{}", "found matches", "", "success", &[],
+        "span1", "", "", "", tc_id, "rs_test",
+    ).unwrap();
+    let id2 = state.storage.db.store_execution_unit_with_span(
+        conv_id, "", "Grep", "{}", "found matches", "", "success", &[],
+        "span1", "", "", "", tc_id, "rs_test",
+    ).unwrap();
+    assert!(id1 > 0, "first insert must succeed");
+    assert_eq!(id2, 0, "second insert with same tool_call_id must return 0 (dedup'd)");
+}
+
+#[tokio::test]
+async fn execution_unit_dedup_different_tool_call_id() {
+    let state = build_proxy_state("127.0.0.1:1".parse().unwrap(), "dedup_diff").await;
+    let conv_id = state.storage.db.create_and_store("claude", &serde_json::json!([
+        {"role": "user", "content": "test"}
+    ])).unwrap();
+
+    let id1 = state.storage.db.store_execution_unit_with_span(
+        conv_id, "", "Grep", "{}", "matches", "", "success", &[],
+        "s1", "", "", "", "call_01", "rs",
+    ).unwrap();
+    let id2 = state.storage.db.store_execution_unit_with_span(
+        conv_id, "", "Read", "{}", "content", "", "success", &[],
+        "s2", "", "", "", "call_02", "rs",
+    ).unwrap();
+    assert!(id1 > 0);
+    assert!(id2 > 0);
+    assert_ne!(id1, id2, "different tool_call_ids must create separate units");
 }

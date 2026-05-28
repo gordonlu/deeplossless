@@ -265,6 +265,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/anthropic/v1/messages", post(anthropic_messages))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{response_id}", get(responses_retrieve))
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep_by_id))
@@ -274,6 +275,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
         .route("/v1/lcm/sessions/{id}/patches", get(lcm_session_patches))
         .route("/v1/lcm/sessions/{id}/system-prompt", get(lcm_session_system_prompt))
+        .route("/v1/lcm/sessions/{id}/context-pressure", get(lcm_context_pressure))
         .route("/v1/lcm/latency", get(lcm_latency_records))
         .route("/v1/lcm/latency/summary", get(lcm_latency_summary))
         .route("/v1/lcm/cache/stability", get(lcm_cache_stability))
@@ -1435,6 +1437,258 @@ fn normalize_system_prompt(mut body: serde_json::Value) -> serde_json::Value {
     body
 }
 
+/// POST /anthropic/v1/messages — Anthropic Messages API → DeepSeek Chat Completions.
+/// Translates the request format, forwards to upstream, converts response back.
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let t0 = std::time::Instant::now();
+    // Extract API key from x-api-key header (Anthropic convention) or Authorization
+    {
+        let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
+        if key.is_none() {
+            if let Some(ak) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                *key = Some(ak.to_string());
+            } else if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                if let Some(bearer) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+                    *key = Some(bearer.to_string());
+                }
+            }
+        }
+    }
+
+    // Anthropic format keeps system prompt at top level.
+    // Inject it into messages[0] so fingerprint, pipeline, and cache
+    // normalization can all see it. This makes conversation IDs stable.
+    let mut body = body;
+    if let Some(system) = body.get("system") {
+        let system_text = match system {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr.iter()
+                .filter_map(|b| b["text"].as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !system_text.is_empty() {
+            if let Some(arr) = body["messages"].as_array_mut() {
+                let existing_system = arr.first()
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str()) == Some("system");
+                if !existing_system {
+                    arr.insert(0, json!({"role": "system", "content": system_text}));
+                }
+            }
+        }
+        // Remove top-level system to avoid duplication during translation
+        body.as_object_mut().and_then(|o| o.remove("system"));
+    }
+
+    // Normalize system prompt for cache stability
+    let body = if state.cache_normalize {
+        normalize_system_prompt(body)
+    } else {
+        body
+    };
+
+    // Compute fingerprint from workspace path (CLI or git root).
+    // Workspace identity belongs to the runtime layer, not the prompt.
+    let fp = crate::session::fingerprint_anthropic(state.workspace.as_deref());
+    if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+        track_cache_stability(&state, cid, &body);
+    }
+
+    // Pipeline: store messages and create DAG nodes via ChatPipeline.
+    // Reuses the same pipeline as chat_completions — full audit trail,
+    // execution events, parallel detection, and token accumulation.
+    if !state.no_pipeline {
+        let pipeline = crate::pipeline::ChatPipeline::new(&state);
+        let body_clone = body.clone();
+        let body_fp = fp.clone();
+        tokio::task::spawn(async move {
+            if let Err(e) = pipeline.process_with_fp("claude", &body_clone, 1, Some(&body_fp)).await {
+                tracing::warn!(target: "deeplossless::pipeline", "anthropic pipeline failed: {e}");
+            }
+        });
+    }
+
+    // LCM context injection (honor --no-lcm-context flag)
+    let lcm_budget = if state.lcm_context {
+        body.get("lcm_max_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(state.lcm_context_tokens)
+            .clamp(0, 8000) as usize
+    } else {
+        0
+    };
+    let mut body = body;
+    if lcm_budget > 0 {
+        if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+            if let Ok(nodes) = state.storage.dag.assemble_context(cid, lcm_budget, None) {
+                if !nodes.is_empty() {
+                    let ctx_text = crate::pipeline::render_dag_context(&nodes);
+                    if let Some(arr) = body["messages"].as_array_mut() {
+                        if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
+                            let original = last_user["content"].as_str().unwrap_or("").to_string();
+                            last_user["content"] = json!(if original.is_empty() {
+                                ctx_text
+                            } else {
+                                format!("{ctx_text}\n\n{original}")
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Translate Anthropic → DeepSeek Chat Completions
+    let last_reasoning = {
+        let cache = state.reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let rc = cache.get(&fp).cloned();
+        tracing::debug!(target: "deeplossless::anthropic",
+            fp = %fp,
+            has_reasoning = rc.is_some(),
+            reasoning_len = rc.as_ref().map(|r| r.len()).unwrap_or(0),
+            "reasoning cache lookup");
+        rc
+    };
+    let deepseek_body = crate::protocol::anthropic::request_to_deepseek(&body, last_reasoning.as_deref());
+    let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let overhead_ms = t0.elapsed().as_millis();
+
+    // Forward to upstream
+    let upstream_url = format!("{}/v1/chat/completions", state.upstream.trim_end_matches('/'));
+    let body_kb = serde_json::to_string(&deepseek_body).unwrap_or_default().len() as f64 / 1024.0;
+    let orig_kb = serde_json::to_string(&body).unwrap_or_default().len() as f64 / 1024.0;
+    tracing::debug!(target: "deeplossless::anthropic", orig_kb, translated_kb = body_kb, overhead_ms, "request sizes");
+    let upstream_start = std::time::Instant::now();
+    let resp = match state.runtime.client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
+        .header("Content-Type", "application/json")
+        .json(&deepseek_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}"))
+        }
+    };
+
+    let status = resp.status();
+    let latency = upstream_start.elapsed().as_millis() as u64;
+    metrics::record_latency("anthropic", status.as_u16(), Some(status.as_u16()), latency, None);
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return json_error(status, "UPSTREAM_ERROR", body);
+    }
+
+    if streaming {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = UnboundedReceiverStream::new(rx);
+        let reasoning_fp = fp.clone();
+        let reasoning_cache = state.reasoning_cache.clone();
+        tokio::spawn(async move {
+            let mut sse_state = crate::protocol::anthropic::AnthropicSseState::new();
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+            // Send message_start event
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-v4-pro\",\"content\":[],\"usage\":null}}\n\n")
+            ));
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(c) => {
+                        let s = String::from_utf8_lossy(&c);
+                        buf.push_str(&s);
+                        while let Some(pos) = buf.find('\n') {
+                            let line = buf[..pos].trim().to_string();
+                            buf = buf[pos + 1..].to_string();
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data == "[DONE]" { continue; }
+                                for event in sse_state.convert(data) {
+                                    if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event))).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // If upstream didn't send finish_reason (abnormal disconnect), close blocks
+            if sse_state.any_block_started() {
+                for idx in sse_state.started_block_indices() {
+                    let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                        axum::body::Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"))
+                    ));
+                }
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n")
+                ));
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                ));
+            }
+            // Cache reasoning_content for the next turn
+            if !sse_state.reasoning_content.is_empty() {
+                let rc_len = sse_state.reasoning_content.len();
+                let mut cache = reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
+                cache.insert(reasoning_fp.clone(), sse_state.reasoning_content);
+                tracing::debug!(target: "deeplossless::anthropic",
+                    fp = %reasoning_fp, rc_len,
+                    "reasoning cached from stream");
+            }
+        });
+
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
+        response
+    } else {
+        match resp.bytes().await {
+            Ok(bytes) => {
+                let deepseek_resp: Value = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid JSON: {e}")),
+                };
+                // Capture reasoning_content for next turn (thinking mode requirement)
+                let rc = deepseek_resp["choices"][0]["message"]["reasoning_content"]
+                    .as_str().unwrap_or("").to_string();
+                if !rc.is_empty() {
+                    let rc_len = rc.len();
+                    let mut cache = state.reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.insert(fp.clone(), rc);
+                    tracing::debug!(target: "deeplossless::anthropic",
+                        fp = %fp, rc_len,
+                        "reasoning cached from non-streaming response");
+                }
+                let anthropic_resp = crate::protocol::anthropic::response_to_anthropic(&deepseek_resp);
+                // Accumulate token usage for non-streaming path
+                if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+                    let it = deepseek_resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+                    let ot = deepseek_resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+                    if it > 0 || ot > 0 {
+                        let usage_db = state.storage.db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = usage_db.accumulate_usage(cid, it, ot);
+                        });
+                    }
+                }
+                Json(anthropic_resp).into_response()
+            }
+            Err(e) => json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}")),
+        }
+    }
+}
+
 // ── LCM retrieval endpoints ────────────────────────────────────────────
 
 async fn lcm_grep_by_id(
@@ -1891,6 +2145,26 @@ async fn lcm_session_system_prompt(
                 "prompts": items,
             })).into_response()
         }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/sessions/{id}/context-pressure
+/// Returns context pressure analysis for the Context Pressure Dashboard.
+/// Works across all 3 proxy endpoints (chat_completions, responses, anthropic).
+async fn lcm_context_pressure(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    if id <= 0 {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
+    }
+    match state.storage.db.context_pressure_analysis(id) {
+        Ok(data) => Json(data).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }

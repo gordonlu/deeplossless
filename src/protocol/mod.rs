@@ -30,6 +30,7 @@
 //! 6. **Streaming is fully abstracted.** `StreamEvent` enum covers text
 //!    deltas, tool call deltas, reasoning deltas, and completion.
 
+pub mod anthropic;
 pub mod canonical;
 pub mod chat_completions;
 pub mod responses;

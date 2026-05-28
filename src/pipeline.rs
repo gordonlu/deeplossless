@@ -117,18 +117,46 @@ impl ChatPipeline {
         }
     }
 
-    /// Run the full pipeline: resolve conversation, persist messages,
-    /// trigger compaction, assemble DAG context, inject into system messages.
+    /// Run the full pipeline with default prefix_count=3.
     pub async fn process(
         &self,
         model: &str,
         req_body: &serde_json::Value,
     ) -> anyhow::Result<PipelineOutput> {
+        self.process_with_prefix(model, req_body, 3).await
+    }
+
+    /// Run the full pipeline: resolve conversation, persist messages,
+    /// trigger compaction, assemble DAG context, inject into system messages.
+    /// `prefix_count` controls fingerprint stability: 3 for chat_completions
+    /// (system at msg[0]), 1 for Anthropic (system injected at msg[0], stable).
+    /// If `fp_override` is set, use it instead of computing a fingerprint.
+    pub async fn process_with_prefix(
+        &self,
+        model: &str,
+        req_body: &serde_json::Value,
+        prefix_count: usize,
+    ) -> anyhow::Result<PipelineOutput> {
+        self.process_with_fp(model, req_body, prefix_count, None).await
+    }
+
+    /// Like `process_with_prefix` but accepts an optional fingerprint override.
+    /// Anthropic uses a project-key-based fingerprint for cross-restart stability.
+    pub async fn process_with_fp(
+        &self,
+        model: &str,
+        req_body: &serde_json::Value,
+        prefix_count: usize,
+        fp_override: Option<&str>,
+    ) -> anyhow::Result<PipelineOutput> {
         let messages = &req_body["messages"];
         let msgs_arr = messages.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
 
         // Resolve conversation via fingerprint
-        let fp = crate::session::fingerprint(msgs_arr, 3);
+        let fp = match fp_override {
+            Some(f) => f.to_string(),
+            None => crate::session::fingerprint(msgs_arr, prefix_count),
+        };
         let conv_id = self.db.find_or_create_conversation(&fp, model)?;
 
         // Store messages and create DAG leaf nodes (async, non-blocking)

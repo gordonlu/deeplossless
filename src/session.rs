@@ -27,7 +27,7 @@ pub struct NormalizedToolCall {
 pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
     let role = msg["role"].as_str().unwrap_or("unknown").to_string();
     let content = msg["content"].to_string();
-    let tool_call_id = msg["tool_call_id"].as_str().map(|s| s.to_string());
+    let mut tool_call_id = msg["tool_call_id"].as_str().map(|s| s.to_string());
 
     // Extract tool calls from multiple schema variants
     let mut tool_calls = Vec::new();
@@ -58,7 +58,11 @@ pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
                         });
                     }
                 }
-                Some("tool_result") => {}
+                Some("tool_result") => {
+                    if let Some(tid) = block["tool_use_id"].as_str() {
+                        tool_call_id = Some(tid.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -172,16 +176,32 @@ fn strip_dynamic_text(text: &str) -> String {
 ///
 /// The fingerprint is the first 16 hex chars of SHA-256, computed over
 /// the concatenation of `(role, content)` pairs for the prefix messages.
-/// Extract a stable project identifier from system prompt env block.
-/// Looks for "Working directory:" or "Workspace root folder:" lines.
-fn extract_project_key(text: &str) -> String {
+/// Extract a stable project identifier from system prompt or user message.
+/// Tries known directory labels first, then falls back to any absolute path.
+fn extract_project_key(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("Working directory:") || trimmed.starts_with("Workspace root folder:") {
-            return trimmed.to_string();
+        let lower = trimmed.to_lowercase();
+        // Known patterns
+        if lower.starts_with("working directory:")
+        || lower.starts_with("workspace root folder:")
+        || lower.starts_with("workspace folder:")
+        || lower.starts_with("project directory:")
+        || lower.starts_with("primary working directory:")
+        || lower.contains("working directory") && trimmed.contains('/')
+        {
+            return Some(trimmed.to_string());
         }
     }
-    String::new()
+    // Fallback: find any line with an absolute Unix path
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('/') && trimmed.len() > 10 {
+            // Looks like a path: /home/user/project or similar
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
 
 pub fn fingerprint(messages: &[serde_json::Value], prefix_count: usize) -> String {
@@ -191,8 +211,7 @@ pub fn fingerprint(messages: &[serde_json::Value], prefix_count: usize) -> Strin
     if let Some(system) = messages.first() {
         if system.get("role").and_then(|v| v.as_str()) == Some("system") {
             if let Some(content) = system.get("content").and_then(|v| v.as_str()) {
-                let project = extract_project_key(content);
-                if !project.is_empty() {
+                if let Some(project) = extract_project_key(content) {
                     hasher.update(project.as_bytes());
                 }
             }
@@ -215,6 +234,17 @@ pub fn fingerprint(messages: &[serde_json::Value], prefix_count: usize) -> Strin
     }
     let result = hasher.finalize();
     hex::encode(&result[..8]) // first 8 bytes → 16 hex chars
+}
+
+/// Stable fingerprint from workspace path (CLI flag or git root).
+/// No text parsing — workspace identity belongs to the runtime layer.
+pub fn fingerprint_anthropic(workspace: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if let Some(ws) = workspace {
+        hasher.update(ws.as_bytes());
+    }
+    hex::encode(&hasher.finalize()[..8])
 }
 
 /// Extract the model name from a request body.

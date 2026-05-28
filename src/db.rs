@@ -457,6 +457,21 @@ impl Database {
                  ON dag_nodes(compaction_id) WHERE compaction_id != '';"
         )?;
 
+        // Migration: content_hash for dedup (v0.6.6)
+        let has_content_hash = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'content_hash'")
+            .ok()
+            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
+            .is_some();
+        if !has_content_hash {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';")?;
+            // Backfill existing rows with a placeholder — they'll be skipped on re-insert
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup
+                     ON messages(conversation_id, content_hash) WHERE content_hash != '';"
+            )?;
+        }
+
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_conv
                  ON messages(conversation_id);
@@ -696,19 +711,31 @@ impl Database {
                 let token_count = crate::tokenizer::count_content(msg) as i64
                     + crate::tokenizer::MESSAGE_OVERHEAD_TOKENS as i64;
                 let plain = Self::strip_json_markup(&content);
+                // Content hash for dedup — prevents duplicate messages when
+                // the pipeline re-processes full conversation history each turn.
+                let content_hash = {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(role.as_bytes());
+                    h.update(content.as_bytes());
+                    hex::encode(&h.finalize()[..8])
+                };
                 tx.execute(
-                    "INSERT INTO messages (conversation_id, role, content, token_count)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![conv_id, role, content, token_count],
+                    "INSERT OR IGNORE INTO messages (conversation_id, role, content, token_count, content_hash, stored_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+                    rusqlite::params![conv_id, role, content, token_count, content_hash],
                 )?;
-                let msg_id = tx.last_insert_rowid();
-                // Mirror into FTS5 index
-                if let Err(e) = tx.execute(
-                    "INSERT INTO messages_fts (rowid, content, role) VALUES (?1, ?2, ?3)",
+                // Get rowid (works for both new insert and existing row)
+                let msg_id: i64 = tx.query_row(
+                    "SELECT id FROM messages WHERE conversation_id = ?1 AND content_hash = ?2",
+                    rusqlite::params![conv_id, content_hash],
+                    |r| r.get(0),
+                )?;
+                // Mirror into FTS5 index (ignore duplicates from message dedup)
+                let _ = tx.execute(
+                    "INSERT OR REPLACE INTO messages_fts (rowid, content, role) VALUES (?1, ?2, ?3)",
                     rusqlite::params![msg_id, plain, role],
-                ) {
-                    tracing::warn!(target: "deeplossless::db", "fts5 index insert failed: {e}");
-                }
+                );
             }
         }
 
@@ -1358,7 +1385,7 @@ impl Database {
         let epoch_ms = crate::execution::next_logical_seq();
 
         conn.execute(
-            "INSERT INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes, tool_args_json, reasoning_steps, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms, replay_session_id)
+            "INSERT OR IGNORE INTO execution_units (conversation_id, reasoning_before, tool_name, tool_args, tool_result, reasoning_after, outcome, related_nodes, tool_args_json, reasoning_steps, span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms, replay_session_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![
                 conv_id, reasoning_before, tool_name, tool_args, tool_result,
@@ -1367,6 +1394,7 @@ impl Database {
                 tool_call_id, epoch_ms, replay_session_id,
             ],
         )?;
+        if conn.changes() == 0 { return Ok(0); } // duplicate, skipped
         let exec_id = conn.last_insert_rowid();
 
         // Conditional append-only event log (authoritative audit source)
@@ -1641,6 +1669,171 @@ impl Database {
             "SELECT COUNT(*) FROM failure_patterns WHERE conversation_id = ?1",
             rusqlite::params![conv_id], |r| r.get(0))?;
         Ok((leaf_count, summary_count, total_tokens, failure_count))
+    }
+
+    /// Context pressure analysis for a conversation.
+    /// Returns structured data for the Context Pressure Dashboard.
+    pub fn context_pressure_analysis(&self, conv_id: i64) -> anyhow::Result<serde_json::Value> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT role, content, token_count, stored_at
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows: Vec<(String, String, i64, String)> = stmt.query_map(
+            rusqlite::params![conv_id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2).unwrap_or(0),
+                row.get::<_, String>(3)?,
+            )),
+        )?.filter_map(|r| r.ok()).collect();
+
+        if rows.is_empty() {
+            return Ok(serde_json::json!({"conversation_id": conv_id, "empty": true}));
+        }
+
+        // Group messages by stored_at (rounds)
+        let mut rounds: Vec<(String, Vec<&(String, String, i64, String)>)> = Vec::new();
+        for row in &rows {
+            match rounds.last_mut() {
+                Some((ts, msgs)) if ts == &row.3 => msgs.push(row),
+                _ => rounds.push((row.3.clone(), vec![row])),
+            }
+        }
+
+        // Per-message JSON framing overhead (~110 bytes per message for
+        // role field, content wrapper, commas in array, etc.)
+        const MSG_FRAMING_BYTES: usize = 110;
+        // Per-request framing overhead: model, stream, max_tokens, top-level braces
+        const REQ_FRAMING_BYTES: usize = 200;
+
+        // Build timeline with cumulative redundancy
+        let mut timeline_with_redundancy: Vec<serde_json::Value> = Vec::new();
+        let mut seen_content: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut total_content_bytes: usize = 0;
+        let mut redundant_bytes: usize = 0;
+        for (i, (_ts, msgs)) in rounds.iter().enumerate() {
+            let content_bytes: usize = msgs.iter().map(|m| m.1.len()).sum();
+            let framing = msgs.len() * MSG_FRAMING_BYTES + REQ_FRAMING_BYTES;
+            let request_bytes = content_bytes + framing;
+            let tokens: i64 = msgs.iter().map(|m| m.2).sum();
+            for m in msgs {
+                total_content_bytes += m.1.len();
+                // Normalize content for dedup (strip whitespace)
+                let normalized = m.1.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+                if !normalized.is_empty() {
+                    if !seen_content.insert(normalized) {
+                        redundant_bytes += m.1.len();
+                    }
+                }
+            }
+            let redundancy_pct = if total_content_bytes > 0 {
+                (redundant_bytes as f64 / total_content_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            timeline_with_redundancy.push(serde_json::json!({
+                "round": i + 1,
+                "request_bytes": request_bytes,
+                "body_bytes": content_bytes,
+                "message_count": msgs.len(),
+                "estimated_tokens": tokens,
+                "redundancy_pct": (redundancy_pct * 10.0).round() / 10.0,
+            }));
+        }
+
+        // Composition by role
+        let mut tool_bytes: usize = 0;
+        let mut assistant_bytes: usize = 0;
+        let mut user_bytes: usize = 0;
+        let mut system_bytes: usize = 0;
+        for row in &rows {
+            match row.0.as_str() {
+                "tool" => tool_bytes += row.1.len(),
+                "assistant" => assistant_bytes += row.1.len(),
+                "user" => user_bytes += row.1.len(),
+                "system" => system_bytes += row.1.len(),
+                _ => {}
+            }
+        }
+        let total_bytes = tool_bytes + assistant_bytes + user_bytes + system_bytes;
+        let pct = |v: usize| if total_bytes > 0 { ((v as f64 / total_bytes as f64) * 100.0 * 10.0).round() / 10.0 } else { 0.0 };
+        let total_tokens: i64 = rows.iter().map(|r| r.2).sum();
+
+        // Top offenders: largest single messages by content length
+        let mut offenders: Vec<(usize, &str, &str)> = rows.iter()
+            .map(|r| (r.1.len(), r.1.as_str(), r.0.as_str()))
+            .collect();
+        offenders.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+        let top_offenders: Vec<serde_json::Value> = offenders.iter().take(10).map(|(size, content, role)| {
+            let source = Self::identify_content_source(content, role);
+            let impact = if *size > 500_000 { "HIGH" } else if *size > 100_000 { "MED" } else { "LOW" };
+            let preview: String = content.chars().take(200).collect();
+            serde_json::json!({
+                "source": source,
+                "size_bytes": size,
+                "impact": impact,
+                "role": role,
+                "preview": preview,
+            })
+        }).collect();
+
+        // Redundancy summary
+        let tool_output_ratio = pct(tool_bytes);
+        let overall_redundancy = timeline_with_redundancy.last()
+            .and_then(|t| t["redundancy_pct"].as_f64())
+            .unwrap_or(0.0);
+
+        // Total request body estimate: content + framing for all rounds
+        let total_request_bytes: usize = timeline_with_redundancy.iter()
+            .filter_map(|r| r["request_bytes"].as_u64().map(|v| v as usize))
+            .sum();
+        let total_content_bytes_raw: usize = rows.iter().map(|r| r.1.len()).sum();
+
+        // Pressure level based on the user's thresholds
+        let pressure_level = match total_request_bytes {
+            _ if total_request_bytes < 2_000_000 => "healthy",
+            _ if total_request_bytes < 6_000_000 => "elevated",
+            _ if total_request_bytes < 12_000_000 => "degrading",
+            _ if total_request_bytes < 20_000_000 => "critical",
+            _ => "collapse_risk",
+        };
+
+        Ok(serde_json::json!({
+            "conversation_id": conv_id,
+            "pressure_level": pressure_level,
+            "total_request_bytes": total_request_bytes,
+            "total_request_kb": (total_request_bytes as f64 / 1024.0 * 10.0).round() / 10.0,
+            "total_bytes": total_content_bytes_raw,
+            "total_body_kb": (total_content_bytes_raw as f64 / 1024.0 * 10.0).round() / 10.0,
+            "message_count": rows.len(),
+            "estimated_tokens": total_tokens,
+            "redundancy_pct": overall_redundancy,
+            "tool_output_ratio": tool_output_ratio,
+            "round_count": rounds.len(),
+            "composition": {
+                "tool_outputs_pct": pct(tool_bytes),
+                "assistant_msgs_pct": pct(assistant_bytes),
+                "user_msgs_pct": pct(user_bytes),
+                "system_prompt_pct": pct(system_bytes),
+            },
+            "top_offenders": top_offenders,
+            "growth_timeline": timeline_with_redundancy,
+            "semantic_redundancy": {
+                "total_redundant_bytes": redundant_bytes,
+                "total_bytes": total_content_bytes,
+                "description": if overall_redundancy > 50.0 {
+                    "Severe duplication — same content detected across multiple rounds"
+                } else if overall_redundancy > 25.0 {
+                    "Moderate duplication — consider enabling tool cache"
+                } else {
+                    "Low duplication — context is being used efficiently"
+                }
+            }
+        }))
     }
 
     /// Fetch execution scoring data for a conversation.
@@ -2978,6 +3171,55 @@ fn strip_json_markup(content: &str) -> String {
     content.to_string()
 }
 
+/// Identify a human-readable content source from message content and role.
+fn identify_content_source(content: &str, role: &str) -> String {
+    let lower = content.to_lowercase();
+    if role == "tool" {
+        if lower.contains("cargo build") || lower.contains("error[") || lower.contains("warning[") {
+            return "cargo build output".into();
+        }
+        if lower.contains("error: could not compile") {
+            return "compilation error".into();
+        }
+        if lower.contains("diff --git") || lower.contains("@@ -") {
+            return "git diff output".into();
+        }
+        if lower.contains("grep") && (lower.contains("match") || lower.contains("found")) {
+            return "grep results".into();
+        }
+        if lower.contains("test result:") {
+            return "test output".into();
+        }
+        if lower.contains("total ") && (lower.contains("drwx") || lower.contains("-rw")) {
+            return "ls / file listing".into();
+        }
+        if lower.len() > 5000 {
+            if lower.contains("error") || lower.contains("fail") {
+                return "large error output".into();
+            }
+            return "large tool output".into();
+        }
+        if lower.contains("error") || lower.contains("fail") || lower.contains("panic") {
+            return "error output".into();
+        }
+        return "tool output".into();
+    }
+    if role == "assistant" {
+        if lower.contains("tool_use") { return "assistant tool call".into(); }
+        if lower.contains("thinking") { return "assistant thinking".into(); }
+        if content.len() > 2000 { return "large assistant response".into(); }
+        return "assistant message".into();
+    }
+    if role == "user" {
+        if content.len() > 5000 { return "large user message".into(); }
+        return "user message".into();
+    }
+    if role == "system" {
+        return "system prompt".into();
+    }
+    "unknown".into()
+}
+
 /// Compute a semantic fingerprint for a node: SHA-256 of summary text
 /// concatenated with snippet contents, then truncated to 16 hex chars.
 /// Equal hashes mean the summary content is semantically identical
@@ -3137,6 +3379,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(model, "deepseek-v4-flash");
+    }
+
+    #[tokio::test]
+    async fn store_messages_dedup() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("dedup_test.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let messages = serde_json::json!([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hello"}
+        ]);
+
+        let conv_id = db.create_and_store("deepseek-v4-flash", &messages).unwrap();
+        // Store the exact same messages again — should be dedup'd
+        db.store_messages(conv_id, &messages).unwrap();
+        db.store_messages(conv_id, &messages).unwrap();
+
+        let conn = db.writer.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                rusqlite::params![conv_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "duplicate store_messages calls must not create duplicate rows");
+    }
+
+    #[tokio::test]
+    async fn store_messages_partial_dedup() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("partial_dedup_test.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let msgs1 = serde_json::json!([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hello"}
+        ]);
+        let msgs2 = serde_json::json!([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "what is rust?"}
+        ]);
+
+        let conv_id = db.create_and_store("deepseek-v4-flash", &msgs1).unwrap();
+        // Second store has 2 old + 2 new messages
+        db.store_messages(conv_id, &msgs2).unwrap();
+
+        let conn = db.writer.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                rusqlite::params![conv_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4, "only new messages should be added (2 original + 2 new)");
     }
 
     #[tokio::test]

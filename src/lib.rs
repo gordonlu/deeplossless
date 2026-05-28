@@ -131,6 +131,10 @@ pub struct AppState {
     /// Cache stability tracker — records system prompt hashes to compute
     /// prompt cache stability metrics.  Keyed by conversation ID.
     pub cache_stability: Arc<StdMutex<std::collections::HashMap<i64, Vec<String>>>>,
+    /// Reasoning content cache — stores `reasoning_content` from DeepSeek responses
+    /// keyed by fingerprint, so it can be injected into the next turn's request.
+    /// Required by DeepSeek thinking mode: reasoning_content must be passed back.
+    pub reasoning_cache: Arc<StdMutex<std::collections::HashMap<String, String>>>,
 
     // ── Storage ──────────────────────────────────────────────────────
     pub storage: StorageServices,
@@ -153,6 +157,9 @@ pub struct AppState {
     pub cache_normalize: bool,
     /// LCM context injection default budget in tokens (0 = off).
     pub lcm_context_tokens: u64,
+
+    /// Workspace root for stable conversation identity.
+    pub workspace: Option<String>,
 }
 
 impl AppState {

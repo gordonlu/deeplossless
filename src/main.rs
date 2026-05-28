@@ -113,6 +113,11 @@ pub(crate) struct Cli {
     no_cache_normalize: bool,
 
 
+    /// Workspace root path for stable conversation identity.
+    /// Auto-detected via `git rev-parse --show-toplevel` if not set.
+    #[arg(long, env = "DEEPLOSSLESS_WORKSPACE")]
+    workspace: Option<String>,
+
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
     audit_mode: String,
@@ -305,6 +310,21 @@ async fn main() -> anyhow::Result<()> {
         "auto" | "Auto" => deeplossless::runtime::SnapshotMode::Auto,
         _ => deeplossless::runtime::SnapshotMode::Manual,
     };
+    // Resolve workspace: explicit flag → git root → None
+    let workspace = cli.workspace.clone().or_else(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    });
+    if let Some(ref ws) = workspace {
+        tracing::info!(workspace = %ws, "workspace identity");
+    } else {
+        tracing::warn!("no workspace set — use --workspace or run from a git repo for stable conversation identity");
+    }
+
     let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
         dag_threshold: cli.dag_threshold,
         summarizer_budget: cli.summarizer_budget,
@@ -324,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
         lcm_context: cli.lcm_context,
         cache_normalize: !cli.no_cache_normalize,
         lcm_context_tokens: if cli.no_lcm_context { 0 } else { cli.lcm_context_tokens },
+        workspace,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,
