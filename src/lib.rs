@@ -151,6 +151,8 @@ pub struct AppState {
     /// Normalize system prompts for cache-friendliness. Opt-in via
     /// `--cache-normalize`. Replaces timestamps/UUIDs with stable markers.
     pub cache_normalize: bool,
+    /// LCM context injection default budget in tokens (0 = off).
+    pub lcm_context_tokens: u64,
 }
 
 impl AppState {

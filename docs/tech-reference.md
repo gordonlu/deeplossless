@@ -93,6 +93,12 @@ GET  /v1/lcm/execution/search?q=         — Execution memory: bugs, tool chains
 GET  /v1/lcm/runtime/stats               — Runtime metrics (tokens, cache rate, failures)
 GET  /v1/lcm/runtime/report?conv_id=&format= — Session report (markdown or SVG share card)
 GET  /v1/lcm/runtime/debug-dump          — Structured dump for GitHub issues (no user content)
+GET  /v1/lcm/sessions                    — List all conversations
+GET  /v1/lcm/sessions/{id}/events        — Execution events for a session
+GET  /v1/lcm/sessions/{id}/system-prompt — Deduplicated system prompt history
+GET  /v1/lcm/latency                     — Recent upstream latency records
+GET  /v1/lcm/latency/summary             — Aggregated P50/P95/P99 latency
+GET  /v1/lcm/cache/stability             — System prompt cache stability
 ```
 
 ### Replay
@@ -204,7 +210,7 @@ transparently while others require agent-side LCM API integration:
 |---------|:--:|------|
 | Protocol translation (Responses → Chat) | YES | Canonical IR bidirectional translation |
 | Tool Cache Interception | YES | Stream-level: detects tool calls, returns cached results inline |
-| DAG Context Injection | YES | `<lcm_context>` appended to system messages |
+| DAG Context Injection | YES | Merged into last user message (preserves tool chains) |
 | Pipeline Auto-Caching | YES | Tool results extracted from conversation history automatically |
 | Failure Auto-Detection | YES | Pipeline detects error patterns from tool results |
 | Tool Cache (manual) | NO | Codex doesn't query `GET /v1/lcm/cache` |

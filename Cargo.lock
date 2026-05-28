@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "deeplossless"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -463,6 +463,7 @@ dependencies = [
  "criterion",
  "futures",
  "hex",
+ "memchr",
  "rcgen",
  "reqwest",
  "rusqlite",

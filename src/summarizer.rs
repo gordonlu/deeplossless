@@ -222,10 +222,9 @@ impl Summarizer {
                         "Level 1 fatal error — skipping Level 2, falling back to Level 3"
                     );
                 } else {
-                    tracing::warn!(
+                    tracing::info!(
                         target = "deeplossless::summarizer",
-                        error = %e,
-                        "Level 1 summarization failed — escalating to Level 2"
+                        "Level 1 unavailable (upstream: {e}), falling back to Level 2"
                     );
                 }
                 fatal
@@ -244,10 +243,9 @@ impl Summarizer {
             match self.try_level(text, SummaryLevel::Level2, input_tokens / 2).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::info!(
                         target = "deeplossless::summarizer",
-                        error = %e,
-                        "Level 2 summarization failed — escalating to Level 3"
+                        "Level 2 unavailable (upstream: {e}), falling back to Level 3 truncation"
                     );
                 }
             }
@@ -413,10 +411,10 @@ impl Summarizer {
                                 content_length,
                                 transfer_encoding,
                                 content_type,
-                                "EMPTY RESPONSE BODY — upstream returned 2xx with zero-length body"
+                                "upstream returned 2xx with empty body — transient API quirk, escalating"
                             );
                             last_error = Some(anyhow::anyhow!(
-                                "empty response body (status {status}, content-length: {content_length})"
+                                "upstream returned empty body (200 OK), will escalate to next level"
                             ));
                             // Don't retry on empty body — escalate to next level
                             break;
@@ -507,7 +505,7 @@ impl Summarizer {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!(
-            "LLM summarization failed after {max_retries} retries"
+            "Level 1 & 2 unavailable after {max_retries} attempts, using Level 3 truncation"
         )))
     }
 

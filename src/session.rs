@@ -94,6 +94,75 @@ pub fn is_tool_result(msg: &NormalizedMessage) -> bool {
         || (msg.role == "user" && msg.content.contains("tool_result"))
 }
 
+/// Strip variable text (dates, timestamps) from system prompts so
+/// fingerprint remains stable across days.  Only used for fingerprinting;
+/// does NOT modify the actual messages sent to the upstream API.
+fn strip_dynamic_text(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_line_start = i == 0 || bytes[i - 1] == b'\n';
+
+        // Volatile whole-line anchors: skip the entire line
+        if at_line_start {
+            let is_volatile = bytes[i..].starts_with(b"Today ")
+                || bytes[i..].starts_with(b"Current date:")
+                || bytes[i..].starts_with(b"Current time:")
+                || bytes[i..].starts_with(b"System time:")
+                || bytes[i..].starts_with(b"Generated at:")
+                || bytes[i..].starts_with(b"Today's date:");
+            if is_volatile {
+                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+                if i < bytes.len() && bytes[i] == b'\n' { i += 1; }
+                continue;
+            }
+        }
+
+        // ISO date: YYYY-MM-DD
+        if i + 10 <= bytes.len()
+            && bytes[i].is_ascii_digit()
+            && bytes[i+4] == b'-' && bytes[i+7] == b'-'
+        {
+            out.push_str("[DATE]");
+            i += 10;
+            continue;
+        }
+
+        // Day-of-week date: "Thu May 28 2026"
+        let is_dow = (i == 0 || bytes[i-1] == b'\n' || bytes[i-1] == b' ')
+            && i + 4 <= bytes.len()
+            && ((bytes[i] == b'M' && bytes[i+1] == b'o' && bytes[i+2] == b'n' && bytes[i+3] == b' ')
+             || (bytes[i] == b'T' && bytes[i+1] == b'u' && bytes[i+2] == b'e' && bytes[i+3] == b' ')
+             || (bytes[i] == b'W' && bytes[i+1] == b'e' && bytes[i+2] == b'd' && bytes[i+3] == b' ')
+             || (bytes[i] == b'T' && bytes[i+1] == b'h' && bytes[i+2] == b'u' && bytes[i+3] == b' ')
+             || (bytes[i] == b'F' && bytes[i+1] == b'r' && bytes[i+2] == b'i' && bytes[i+3] == b' ')
+             || (bytes[i] == b'S' && bytes[i+1] == b'a' && bytes[i+2] == b't' && bytes[i+3] == b' ')
+             || (bytes[i] == b'S' && bytes[i+1] == b'u' && bytes[i+2] == b'n' && bytes[i+3] == b' '));
+        if is_dow {
+            out.push_str("[DATE]");
+            i += 4;
+            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b' ' { i += 1; }
+            if i < bytes.len() && bytes[i] == b' ' { i += 1; } // skip month-day separator
+            continue;
+        }
+
+        // Time "HH:MM"
+        if i + 5 <= bytes.len()
+            && bytes[i].is_ascii_digit()
+            && bytes[i+2] == b':'
+            && bytes[i+3].is_ascii_digit()
+        {
+            out.push_str("[TIME]");
+            i += 5;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Generate a stable session fingerprint from a messages array.
 ///
 /// Uses the first `prefix_count` messages (typically system prompt + first
@@ -107,11 +176,12 @@ pub fn fingerprint(messages: &[serde_json::Value], prefix_count: usize) -> Strin
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for msg in messages.iter().take(prefix_count) {
-        if let Some(role) = msg["role"].as_str() {
-            hasher.update(role.as_bytes());
-        }
+        let role = msg["role"].as_str().unwrap_or("");
+        hasher.update(role.as_bytes());
         if let Some(content) = msg["content"].as_str() {
-            hasher.update(content.as_bytes());
+            // Normalize system prompt: strip dates so fingerprint is stable across days
+            let cleaned = if role == "system" { strip_dynamic_text(content) } else { content.to_string() };
+            hasher.update(cleaned.as_bytes());
         } else if let Some(arr) = msg["content"].as_array() {
             for block in arr {
                 if let Some(text) = block["text"].as_str() {

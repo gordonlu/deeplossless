@@ -22,8 +22,14 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "<lcm_context>");
 
-    let summaries: Vec<&DagNode> = nodes.iter().filter(|n| n.level > 0).collect();
-    let mut leaves: Vec<&DagNode> = nodes.iter().filter(|n| n.is_leaf).collect();
+    let summaries: Vec<&DagNode> = nodes.iter()
+        .filter(|n| n.level > 0 && n.token_count > 0)
+        .filter(|n| !n.summary.is_empty() && n.summary != "(no output)" && n.summary != "no output")
+        .collect();
+    let mut leaves: Vec<&DagNode> = nodes.iter()
+        .filter(|n| n.is_leaf)
+        .filter(|n| !n.summary.is_empty() && n.summary != "(no output)" && n.summary != "no output")
+        .collect();
     leaves.sort_by_key(|n| n.id);
     let all_snippets: Vec<&crate::snippet::Snippet> = nodes.iter()
         .flat_map(|n| n.snippets.iter())

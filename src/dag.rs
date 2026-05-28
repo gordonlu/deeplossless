@@ -778,7 +778,7 @@ impl DagEngine {
         if let Some(tip) = self.get_active_tip(conv_id)? {
             let summaries = self.collect_summary_chain_cached(&graph, &tip, remaining)?;
             for node in summaries {
-                if !injected_ids.insert(node.id) {
+                if !injected_ids.insert(node.id) || node.token_count <= 0 {
                     continue;
                 }
                 remaining -= node.token_count;
@@ -791,7 +791,7 @@ impl DagEngine {
 
         // 2. Append most recent raw leaves NOT already covered by summaries
         let mut leaves: Vec<_> = graph.nodes.values()
-            .filter(|n| n.is_leaf)
+            .filter(|n| n.is_leaf && n.token_count > 0 && !n.summary.is_empty())
             .cloned()
             .collect();
         leaves.sort_by_key(|n| n.id);

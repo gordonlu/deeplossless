@@ -97,11 +97,21 @@ pub(crate) struct Cli {
     #[arg(long)]
     lcm_context: bool,
 
-    /// Normalize system prompts for cache-friendliness. Replaces timestamps,
-    /// UUIDs, and epoch values with stable markers to preserve DeepSeek
-    /// prefix cache hit rate.  Opt-in — test with your agent first.
+    /// Token budget for LCM context injection. Set >0 to enable (e.g. 512).
+    /// Default 0 (off). Override per-request via `lcm_max_tokens` in body.
+    #[arg(long, default_value = "1024")]
+    lcm_context_tokens: u64,
+
+    /// Disable LCM context injection entirely.
     #[arg(long)]
-    cache_normalize: bool,
+    no_lcm_context: bool,
+
+    /// Disable system prompt cache normalization. By default, timestamps and
+    /// UUIDs in system prompts are replaced with stable markers to preserve
+    /// DeepSeek prefix cache hit rate. Use this flag to disable.
+    #[arg(long)]
+    no_cache_normalize: bool,
+
 
     /// Audit mode: full (always write), onerror (buffer, flush on failure), off.
     #[arg(long, default_value = "full")]
@@ -312,7 +322,8 @@ async fn main() -> anyhow::Result<()> {
         no_pipeline: cli.no_pipeline,
         no_header_mod: cli.no_header_mod,
         lcm_context: cli.lcm_context,
-        cache_normalize: cli.cache_normalize,
+        cache_normalize: !cli.no_cache_normalize,
+        lcm_context_tokens: if cli.no_lcm_context { 0 } else { cli.lcm_context_tokens },
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

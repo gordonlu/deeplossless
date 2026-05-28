@@ -265,7 +265,6 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/lcm/chat/completions", post(lcm_chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{response_id}", get(responses_retrieve))
         .route("/v1/lcm/grep/{conv_id}", get(lcm_grep_by_id))
@@ -275,7 +274,6 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
         .route("/v1/lcm/sessions/{id}/patches", get(lcm_session_patches))
         .route("/v1/lcm/sessions/{id}/system-prompt", get(lcm_session_system_prompt))
-        .route("/v1/lcm/inject", post(lcm_context_inject))
         .route("/v1/lcm/latency", get(lcm_latency_records))
         .route("/v1/lcm/latency/summary", get(lcm_latency_summary))
         .route("/v1/lcm/cache/stability", get(lcm_cache_stability))
@@ -887,10 +885,46 @@ async fn chat_completions(
     // System prompt normalization: strip timestamps/UUIDs to preserve
     // DeepSeek prefix cache hit rate.  Timestamps in system prompts break
     // cache because every request has a different prefix.
+    let mut cache_normalized = false;
     let body_for_upstream = if state.cache_normalize {
-        normalize_system_prompt(req_body.clone())
+        let normalized = normalize_system_prompt(req_body.clone());
+        cache_normalized = normalized != req_body;
+        normalized
     } else {
         req_body.clone()
+    };
+
+    // LCM context injection (--lcm-context-tokens, default 500)
+    let lcm_budget = req_body.get("lcm_max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(state.lcm_context_tokens)
+        .clamp(0, 8000) as usize;
+    let body_for_upstream = if lcm_budget > 0 {
+        let mut injected = body_for_upstream.clone();
+        let msgs = req_body["messages"].as_array().cloned().unwrap_or_default();
+        let fp = crate::session::fingerprint(msgs.as_slice(), 3);
+        if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+            let query = msgs.iter().rev().find(|m| m["role"] == "user")
+                .and_then(|m| m["content"].as_str());
+            if let Ok(nodes) = state.storage.dag.assemble_context(cid, lcm_budget, query) {
+                if !nodes.is_empty() {
+                    let ctx_text = crate::pipeline::render_dag_context(&nodes);
+                    if let Some(arr) = injected["messages"].as_array_mut() {
+                        if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
+                            let original = last_user["content"].as_str().unwrap_or("").to_string();
+                            last_user["content"] = json!(if original.is_empty() {
+                                ctx_text
+                            } else {
+                                format!("{ctx_text}\n\n{original}")
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        injected
+    } else {
+        body_for_upstream
     };
 
     // Pipeline: always run for storage. Only modify request body when
@@ -1051,6 +1085,9 @@ async fn chat_completions(
         if let Some(cid) = conv_id {
             response.headers_mut().insert("x-deeplossless-conv", cid.to_string().parse().expect("static header"));
         }
+        if cache_normalized {
+            let _ = response.headers_mut().insert("x-lcm-normalized", "1".parse().expect("static"));
+        }
         if !state.no_header_mod {
             response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
             response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
@@ -1078,6 +1115,7 @@ async fn chat_completions(
 
 /// POST /v1/lcm/chat/completions — chat completions with automatic context injection.
 /// Same interface as /v1/chat/completions, but assembles DAG context and merges it
+#[allow(dead_code)]
 /// into the last user message before forwarding to upstream. Reports context token
 /// usage in the response via custom header `x-lcm-context-tokens`.
 async fn lcm_chat_completions(
@@ -1857,6 +1895,7 @@ async fn lcm_session_system_prompt(
     }
 }
 
+#[allow(dead_code)]
 /// POST /v1/lcm/inject — inject DAG context into the last user message.
 /// Takes a messages array, assembles DAG context for the given conversation,
 /// and appends it to the last `role: "user"` message. Returns the modified
@@ -1872,6 +1911,7 @@ struct LcmInjectRequest {
     /// Token budget for context. Default 500, max 8000. Set 0 to skip assembly.
     max_tokens: Option<usize>,
 }
+#[allow(dead_code)]
 async fn lcm_context_inject(
     State(state): State<AppState>,
     headers: HeaderMap,

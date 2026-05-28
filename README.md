@@ -84,8 +84,9 @@ cargo test --test simulated_session -- --nocapture
 | `--record` | disabled | Record raw request/response for protocol debugging |
 | `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |
 | `--tls-key` | auto-generated | Custom TLS private key (PEM) |
-| `--lcm-context` | disabled | Enable DAG context injection (for LCM-aware agents) |
-| `--cache-normalize` | off | Strip timestamps/UUIDs from system prompts (↑cache hit rate) |
+| `--lcm-context-tokens` | `0` (off) | LCM context injection budget (e.g. 1024). Merges into last user message |
+| `--no-lcm-context` | off | Disable LCM context injection |
+| `--no-cache-normalize` | off | Disable system prompt date stripping (on by default) |
 | `--dag-threshold` | `0.80` | Compaction trigger (fraction of context window) |
 | `--summarizer-budget` | `1000` | Max LLM summarizer calls per session (0=unlimited) |
 | `--http-port` | `8081` | Plain HTTP port for sandboxed agents |
@@ -115,7 +116,7 @@ codex
 ```
 
 Protocol translation and tool cache interception work transparently.
-DAG context injection is disabled by default — `--lcm-context` enables
+DAG context injection is disabled by default — `--lcm-context-tokens 1024` enables
 retrieval hints with the conversation ID for LCM endpoint queries.
 Manual agent hooks require Codex-side integration.
 

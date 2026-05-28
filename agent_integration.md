@@ -58,9 +58,7 @@ cargo build --release
 | `--rate-limit` | `100` | Max requests/second |
 | `--log-dir` | (none) | JSONL request logging |
 | `--dry-run` | (off) | Mock mode, no upstream calls |
-| `--lcm-context` | disabled | DAG context as retrieval hints (lcm_memory tool role) |
-| `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |
-| `--tls-key` | auto-generated | Custom TLS private key (PEM) |
+| `--lcm-context-tokens` | `0` (off) | LCM context injection budget (e.g. 1024). Merges DAG context into last user message without adding new messages |\n| `--no-lcm-context` | (off) | Disable LCM context injection entirely |\n| `--no-cache-normalize` | (off) | Disable system prompt date stripping (on by default for cache stability) |\n| `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |\n| `--tls-key` | auto-generated | Custom TLS private key (PEM) |
 
 TLS (HTTPS) is always enabled. A self-signed certificate is auto-generated.
 Run `deeplossless trust` once to configure it, or pass custom certs with the flags above.
@@ -294,6 +292,17 @@ POST /v1/lcm/rollback                 → rollback to a previous DAG checkpoint
 GET /v1/lcm/global/search?q=...     → search ALL conversations (cross-session)
 GET /v1/lcm/execution/search?q=...  → search execution units (tool calls, results)
 GET /v1/lcm/similar/{hash}          → find semantically similar DAG nodes
+GET /v1/lcm/sessions                → list all conversations with event counts
+GET /v1/lcm/sessions/{id}/events    → execution events for a session
+GET /v1/lcm/sessions/{id}/system-prompt  → deduplicated system prompt history
+```
+
+### Latency & Cache
+
+```
+GET /v1/lcm/latency          → recent upstream request latency records
+GET /v1/lcm/latency/summary  → aggregated P50/P95/P99 latency stats
+GET /v1/lcm/cache/stability  → system prompt cache stability metrics
 ```
 
 ---

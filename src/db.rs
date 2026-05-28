@@ -1260,7 +1260,7 @@ impl Database {
             "SELECT id, event_kind, event_payload, seq_no, created_at
              FROM execution_events
              WHERE conv_id = ?1
-             ORDER BY epoch_ms ASC, id ASC
+             ORDER BY epoch_ms DESC, id DESC
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
@@ -1990,7 +1990,7 @@ impl Database {
                     span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms
              FROM execution_events
              WHERE conv_id = ?1
-             ORDER BY epoch_ms ASC, id ASC
+             ORDER BY epoch_ms DESC, id DESC
              LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {

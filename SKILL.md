@@ -124,6 +124,34 @@ curl -sk  https://localhost:8080/v1/lcm/runtime/stats
 If any endpoint returns connection refused or timeout: deeplossless is not running.
 If `/health` returns `unhealthy`: check the deeplossless terminal for errors.
 
+## LCM context injection (auto-memory)
+
+When deeplossless is started with `--lcm-context-tokens 1024`, relevant DAG
+context is automatically merged into the last user message — no agent changes needed.
+
+## System prompt cache stability
+
+```bash
+curl -sk "https://localhost:8080/v1/lcm/sessions/{id}/system-prompt"
+```
+Returns deduplicated system prompts to debug cache-breaking volatility.
+
+## Latency dashboard
+
+```bash
+curl -sk "https://localhost:8080/v1/lcm/latency/summary"
+curl -sk "https://localhost:8080/v1/lcm/latency?limit=50"
+```
+P50/P95/P99 latency stats and recent request records.
+
+## WebUI
+
+```bash
+git clone https://github.com/gordonlu/deeplossless-ui.git
+cd deeplossless-ui && npm install && npm run dev
+```
+Opens at `http://localhost:3000` — execution forensics viewer.
+
 ## Notes
 
 - Use `-k` flag — TLS cert is self-signed (or run `deeplossless trust` once)
@@ -131,3 +159,4 @@ If `/health` returns `unhealthy`: check the deeplossless terminal for errors.
 - Models: `deepseek-v4-pro` / `deepseek-v4-flash` (both 1M context)
 - Cache store `files` param expects JSON string: `"[\"src/main.rs\"]"`
 - No API key or Authorization header needed — localhost access is always allowed
+- System prompt dates are automatically stripped for cache stability (`--no-cache-normalize` to disable)
