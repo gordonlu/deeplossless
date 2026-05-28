@@ -1496,7 +1496,10 @@ async fn anthropic_messages(
     // Compute fingerprint from workspace path (CLI or git root).
     // Workspace identity belongs to the runtime layer, not the prompt.
     let fp = crate::session::fingerprint_anthropic(state.workspace.as_deref());
-    if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+    // Synchronously create/find conversation so near-simultaneous requests
+    // (e.g. Claude Code's stream+non-stream pair) share the same ID.
+    let conv_id = state.storage.db.find_or_create_conversation(&fp, "claude").ok();
+    if let Some(cid) = conv_id {
         track_cache_stability(&state, cid, &body);
     }
 
@@ -1525,7 +1528,7 @@ async fn anthropic_messages(
     };
     let mut body = body;
     if lcm_budget > 0 {
-        if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+        if let Some(cid) = conv_id {
             if let Ok(nodes) = state.storage.dag.assemble_context(cid, lcm_budget, None) {
                 if !nodes.is_empty() {
                     let ctx_text = crate::pipeline::render_dag_context(&nodes);
@@ -1565,6 +1568,12 @@ async fn anthropic_messages(
     let body_kb = serde_json::to_string(&deepseek_body).unwrap_or_default().len() as f64 / 1024.0;
     let orig_kb = serde_json::to_string(&body).unwrap_or_default().len() as f64 / 1024.0;
     tracing::debug!(target: "deeplossless::anthropic", orig_kb, translated_kb = body_kb, overhead_ms, "request sizes");
+    // Record original Anthropic request body for protocol debugging
+    if let Some(ref dir) = state.record {
+        let _ = std::fs::create_dir_all(dir);
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+        let _ = std::fs::write(format!("{dir}/req_{ts}.json"), serde_json::to_string_pretty(&body).unwrap_or_default());
+    }
     let upstream_start = std::time::Instant::now();
     let resp = match state.runtime.client
         .post(&upstream_url)
@@ -1655,6 +1664,11 @@ async fn anthropic_messages(
     } else {
         match resp.bytes().await {
             Ok(bytes) => {
+                // Record raw DeepSeek response for protocol debugging
+                if let Some(ref dir) = state.record {
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let _ = std::fs::write(format!("{dir}/rsp_{ts}.json"), serde_json::to_string_pretty(&serde_json::from_slice::<Value>(&bytes).unwrap_or_default()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string()));
+                }
                 let deepseek_resp: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
                     Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid JSON: {e}")),
@@ -1672,7 +1686,7 @@ async fn anthropic_messages(
                 }
                 let anthropic_resp = crate::protocol::anthropic::response_to_anthropic(&deepseek_resp);
                 // Accumulate token usage for non-streaming path
-                if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
+                if let Some(cid) = conv_id {
                     let it = deepseek_resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
                     let ot = deepseek_resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
                     if it > 0 || ot > 0 {

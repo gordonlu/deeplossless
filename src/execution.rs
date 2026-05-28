@@ -561,6 +561,11 @@ pub const MIGRATION: &str = "
         ON execution_units(span_id);
     CREATE INDEX IF NOT EXISTS idx_execution_parallel
         ON execution_units(parallel_group);
+    -- Dedup existing rows before creating UNIQUE index
+    DELETE FROM execution_units WHERE id NOT IN (
+        SELECT MIN(id) FROM execution_units WHERE tool_call_id != ''
+        GROUP BY conversation_id, tool_call_id
+    ) AND tool_call_id != '';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_dedup
         ON execution_units(conversation_id, tool_call_id)
         WHERE tool_call_id != '';";

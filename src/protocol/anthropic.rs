@@ -121,6 +121,55 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
         }
     }
 
+    // Repair: DeepSeek requires tool messages to immediately follow tool_calls.
+    // In Anthropic format, user messages may combine tool_result blocks
+    // with text, creating gaps between tool_calls and their tool responses.
+    // Fix: move all tool messages after each tool_calls group to directly
+    // follow the tool_calls message, preserving text order otherwise.
+    {
+        let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+        let mut i = 0;
+        while i < messages.len() {
+            let tc_count = messages[i].get("tool_calls")
+                .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            if tc_count == 0 {
+                repaired.push(messages[i].clone());
+                i += 1;
+                continue;
+            }
+            repaired.push(messages[i].clone());
+            let mut tools: Vec<Value> = Vec::new();
+            let mut others: Vec<Value> = Vec::new();
+            let mut j = i + 1;
+            while j < messages.len() && messages[j].get("tool_calls").is_none() {
+                if messages[j]["role"] == "tool" {
+                    tools.push(messages[j].clone());
+                } else {
+                    others.push(messages[j].clone());
+                }
+                j += 1;
+            }
+            repaired.append(&mut tools);
+            repaired.append(&mut others);
+            i = j;
+        }
+        messages = repaired;
+    }
+
+    // Strip tool_calls from the final assistant if no tool results follow
+    // (the model's pending tool use that hasn't been executed yet).
+    for i in (0..messages.len()).rev() {
+        if messages[i].get("tool_calls").is_none() { continue; }
+        let next_is_tool = messages.get(i+1).map(|m| m["role"] == "tool").unwrap_or(false);
+        if !next_is_tool {
+            messages[i].as_object_mut().map(|o| o.remove("tool_calls"));
+            if messages[i].get("content").is_none() {
+                messages.remove(i);
+            }
+        }
+        break;
+    }
+
     // Translate Anthropic tools → OpenAI function format
     let tools: Value = body.get("tools").map(|arr| {
         Value::Array(arr.as_array().unwrap_or(&vec![]).iter().map(|tool| {
@@ -175,57 +224,6 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
     // last_reasoning_content for multi-turn continuity.
     if body.get("thinking").is_some() {
         req["reasoning_effort"] = json!("medium");
-    }
-
-    // DeepSeek requires tool messages to immediately follow tool_calls.
-    // In Anthropic format, user messages may combine tool_result blocks
-    // with text, creating gaps between tool_calls and their tool responses.
-    // Fix: move all tool messages after each tool_calls group to directly
-    // follow the tool_calls message, preserving text order otherwise.
-    {
-        let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
-        let mut i = 0;
-        while i < messages.len() {
-            let tc_count = messages[i].get("tool_calls")
-                .and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-            if tc_count == 0 {
-                repaired.push(messages[i].clone());
-                i += 1;
-                continue;
-            }
-            // Found tool_calls — push it, then collect all following tool msgs
-            repaired.push(messages[i].clone());
-            let mut tools: Vec<Value> = Vec::new();
-            let mut others: Vec<Value> = Vec::new();
-            let mut j = i + 1;
-            while j < messages.len() && messages[j].get("tool_calls").is_none() {
-                if messages[j]["role"] == "tool" {
-                    tools.push(messages[j].clone());
-                } else {
-                    others.push(messages[j].clone());
-                }
-                j += 1;
-            }
-            // Place tool messages directly after tool_calls, then other messages
-            repaired.append(&mut tools);
-            repaired.append(&mut others);
-            i = j;
-        }
-        messages = repaired;
-    }
-
-    // Strip tool_calls from the final assistant if no tool results follow
-    // (the model's pending tool use that hasn't been executed yet).
-    for i in (0..messages.len()).rev() {
-        if messages[i].get("tool_calls").is_none() { continue; }
-        let next_is_tool = messages.get(i+1).map(|m| m["role"] == "tool").unwrap_or(false);
-        if !next_is_tool {
-            messages[i].as_object_mut().map(|o| o.remove("tool_calls"));
-            if messages[i].get("content").is_none() {
-                messages.remove(i);
-            }
-        }
-        break;
     }
 
     // Debug: audit tool_calls → tool message pairing
@@ -583,5 +581,188 @@ mod tests {
         let results = AnthropicSseState::new().convert(data);
         assert_eq!(results.len(), 1); // input_json_delta only, no block_start
         assert!(results[0].contains("input_json_delta"));
+    }
+
+    // ── Round-trip: real Claude Code fixtures → DeepSeek format ──────
+
+    /// Realistic fixture: user message with content blocks (Claude Code format).
+    #[test]
+    fn user_message_preserves_role() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello world"}]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let last_user = msgs.iter().rev().find(|m| m["role"] == "user").unwrap();
+        assert_eq!(last_user["content"], "hello world",
+            "user message must keep role=user, not become assistant");
+    }
+
+    /// Tool result in user message keeps role=tool in DeepSeek format.
+    #[test]
+    fn tool_result_becomes_tool_message() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "grep for main"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01", "name": "Grep", "input": {"pattern": "main"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": [{"type": "text", "text": "src/main.rs:5: fn main()"}]}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+
+        // Should have: user, assistant(tool_calls), tool_result
+        let tool_msgs: Vec<_> = msgs.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(tool_msgs.len(), 1, "should have exactly 1 tool message");
+        assert_eq!(tool_msgs[0]["tool_call_id"], "toolu_01",
+            "tool_call_id must match tool_use id");
+        // Content should be extracted from array
+        let content = tool_msgs[0]["content"].as_str().unwrap();
+        assert_eq!(content, "src/main.rs:5: fn main()",
+            "tool_result content must be extracted from content blocks");
+    }
+
+    /// Tool call with no results (model's pending tool use) gets stripped.
+    #[test]
+    fn pending_tool_calls_are_stripped() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "grep for main"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01", "name": "Grep", "input": {"pattern": "main"}}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        // The assistant with pending tool_calls should have its tool_calls stripped
+        // (and the message removed if it has no content).
+        let assistants_with_tc: Vec<_> = msgs.iter()
+            .filter(|m| m.get("tool_calls").is_some())
+            .collect();
+        assert!(assistants_with_tc.is_empty(),
+            "no assistant should have pending tool_calls without results. msgs={msgs:?}");
+    }
+
+    /// Reasoning content from cache is injected into assistant messages.
+    #[test]
+    fn reasoning_content_injection() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Hi there!"},
+                {"role": "user", "content": "what's new?"}
+            ]
+        });
+        let ds = request_to_deepseek(&body, Some("Let me think about this..."));
+        let msgs = ds["messages"].as_array().unwrap();
+        // The assistant message should have reasoning_content
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["reasoning_content"], "Let me think about this...",
+            "assistant messages must include reasoning_content from cache");
+    }
+
+    /// Combined text + tool_use without tool result → tool_calls stripped, text kept.
+    #[test]
+    fn combined_text_and_tool_use() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "find main"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Let me search for that"},
+                    {"type": "tool_use", "id": "toolu_01", "name": "Grep", "input": {"pattern": "main"}}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert!(assistant["content"].as_str().unwrap_or("").contains("Let me search"),
+            "text must be preserved");
+        // Pending tool_use without result → stripped
+        assert!(assistant.get("tool_calls").is_none(),
+            "pending tool_calls without result must be stripped");
+    }
+
+    /// Multiple tool calls with interleaved text results → tool msgs kept consecutive.
+    #[test]
+    fn multi_tool_with_text_results() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "find and edit"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01", "name": "Grep", "input": {"pattern": "old"}},
+                    {"type": "tool_use", "id": "toolu_02", "name": "Edit", "input": {"path": "file.txt"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "found: line 42"},
+                    {"type": "text", "text": "here is the grep result"}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_02", "content": "edited successfully"},
+                    {"type": "text", "text": "done editing"}
+                ]}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+
+        // Find the assistant with tool_calls
+        let tc_pos = msgs.iter().position(|m| m["tool_calls"].is_array()).unwrap();
+        let tc_count = msgs[tc_pos]["tool_calls"].as_array().unwrap().len();
+        // Count consecutive tool messages after tool_calls
+        let tool_count = msgs[tc_pos+1..].iter()
+            .take_while(|m| m["role"] == "tool")
+            .count();
+        assert!(tool_count >= tc_count,
+            "must have at least {tc_count} consecutive tool messages after tool_calls, got {tool_count}. msgs={msgs:?}");
+        // All expected tool_call_ids must be in the tool messages
+        let tool_ids: Vec<&str> = msgs[tc_pos+1..tc_pos+1+tool_count].iter()
+            .filter_map(|m| m["tool_call_id"].as_str())
+            .collect();
+        assert!(tool_ids.contains(&"toolu_01"), "toolu_01 must be in {tool_ids:?}");
+        assert!(tool_ids.contains(&"toolu_02"), "toolu_02 must be in {tool_ids:?}");
+    }
+
+    /// System prompt as array of text blocks (Anthropic format) → single system message.
+    #[test]
+    fn system_as_content_blocks() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "system": [
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "You help with software."}
+            ],
+            "messages": [
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        let system = msgs.iter().find(|m| m["role"] == "system").unwrap();
+        let content = system["content"].as_str().unwrap();
+        assert!(content.contains("You are Claude Code"),
+            "system content blocks must be joined");
+        assert!(content.contains("You help with software"),
+            "all system text blocks must be included");
     }
 }
