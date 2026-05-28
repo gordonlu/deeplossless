@@ -1696,7 +1696,8 @@ impl Database {
         }
 
         // Group messages by stored_at (rounds)
-        let mut rounds: Vec<(String, Vec<&(String, String, i64, String)>)> = Vec::new();
+        type MsgRow = (String, String, i64, String);
+        let mut rounds: Vec<(String, Vec<&MsgRow>)> = Vec::new();
         for row in &rows {
             match rounds.last_mut() {
                 Some((ts, msgs)) if ts == &row.3 => msgs.push(row),
@@ -1724,10 +1725,8 @@ impl Database {
                 total_content_bytes += m.1.len();
                 // Normalize content for dedup (strip whitespace)
                 let normalized = m.1.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-                if !normalized.is_empty() {
-                    if !seen_content.insert(normalized) {
-                        redundant_bytes += m.1.len();
-                    }
+                if !normalized.is_empty() && !seen_content.insert(normalized) {
+                    redundant_bytes += m.1.len();
                 }
             }
             let redundancy_pct = if total_content_bytes > 0 {
