@@ -172,9 +172,32 @@ fn strip_dynamic_text(text: &str) -> String {
 ///
 /// The fingerprint is the first 16 hex chars of SHA-256, computed over
 /// the concatenation of `(role, content)` pairs for the prefix messages.
+/// Extract a stable project identifier from system prompt env block.
+/// Looks for "Working directory:" or "Workspace root folder:" lines.
+fn extract_project_key(text: &str) -> String {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Working directory:") || trimmed.starts_with("Workspace root folder:") {
+            return trimmed.to_string();
+        }
+    }
+    String::new()
+}
+
 pub fn fingerprint(messages: &[serde_json::Value], prefix_count: usize) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    // Include project path for stable identity across restarts
+    if let Some(system) = messages.first() {
+        if system.get("role").and_then(|v| v.as_str()) == Some("system") {
+            if let Some(content) = system.get("content").and_then(|v| v.as_str()) {
+                let project = extract_project_key(content);
+                if !project.is_empty() {
+                    hasher.update(project.as_bytes());
+                }
+            }
+        }
+    }
     for msg in messages.iter().take(prefix_count) {
         let role = msg["role"].as_str().unwrap_or("");
         hasher.update(role.as_bytes());
