@@ -363,6 +363,9 @@ async fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
     tracing::info!("upstream: {upstream}");
+    if coordinator.state.record.is_some() {
+        tracing::info!(target: "deeplossless::record", "record flag enabled at startup");
+    }
 
     // SSE connections are long-lived — graceful shutdown would hang forever.
     // Handle signal ourselves: brief drain, then exit.

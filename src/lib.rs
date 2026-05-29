@@ -88,6 +88,7 @@ pub mod protocol;
 pub mod proxy;
 pub mod replay;
 pub mod response_store;
+pub mod session_store;
 pub mod runtime_coordinator;
 pub mod session;
 pub mod snapshot;
@@ -116,6 +117,7 @@ pub struct StorageServices {
     pub db: Arc<db::Database>,
     pub dag: Arc<dag::DagEngine>,
     pub response_store: response_store::ResponseStore,
+    pub session_store: session_store::SessionStore,
 }
 
 /// Shared application state — split along service boundaries.

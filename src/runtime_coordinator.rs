@@ -109,6 +109,7 @@ impl RuntimeCoordinator {
                 db,
                 dag,
                 response_store: crate::response_store::ResponseStore::default(),
+                session_store: crate::session_store::SessionStore::default(),
             },
             compactor,
             runtime: crate::RuntimeServices {

@@ -355,7 +355,7 @@ impl ChatPipeline {
                                 if let Err(e) = db.insert_edge(
                                     hb.from_id, hb.to_id, "happens_before",
                                 ) {
-                                    tracing::warn!(target: "deeplossless::pipeline",
+                                    tracing::debug!(target: "deeplossless::pipeline",
                                         "failed to insert HappensBefore edge: {e}");
                                 }
                             }
@@ -423,11 +423,13 @@ impl ChatPipeline {
                 Self::inject_context(&mut injected, &ctx_text, conv_id);
             }
 
-        // Reasoning injection disabled — modifying request body changes model
-    // reasoning trajectory. OpenCode and other agents handle reasoning_content
-    // correctly in their own message construction. Our injection, even with
-    // real content, can cause tool-call lifecycle disruption.
-    let invalid = crate::assistant_validation::validate_request_messages(&injected);
+        // Inject reasoning_content from previous response into tool-call-only
+        // assistant messages. DeepSeek thinking mode requires reasoning_content
+        // to be echoed back on every assistant message in a tool-call sequence.
+        // Codex does not handle this automatically via the Responses API.
+        self.inject_reasoning_content(&mut injected);
+
+        let invalid = crate::assistant_validation::validate_request_messages(&injected);
     if invalid > 0 {
         tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
     }
@@ -439,15 +441,14 @@ impl ChatPipeline {
     /// `reasoning_content`, inject captured reasoning_content from the
     /// previous response. Only injects when actual content is available.
     /// Empty strings cause DeepSeek to enter confused thinking mode.
-    #[allow(dead_code)]
     fn inject_reasoning_content(&self, body: &mut serde_json::Value) {
         let model = body["model"].as_str().unwrap_or("").to_string();
-        let Some(messages) = body["messages"].as_array_mut() else { return };
-        let last_user = messages.iter().rev().find(|m| m["role"] == "user")
-            .and_then(|m| m["content"].as_str()).unwrap_or("");
-        let truncated: String = last_user.chars().take(80).collect();
-        let key = format!("reasoning:{model}:{truncated}");
+        // Use prompt_cache_key as stable session identifier (embedded by proxy)
+        let session_key = body["prompt_cache_key"].as_str().unwrap_or("");
+        if session_key.is_empty() { return; }
+        let key = format!("reasoning:{}:{}", model, session_key);
         let stored = self.db.get_reasoning(&key).ok().flatten();
+        let Some(messages) = body["messages"].as_array_mut() else { return };
         for msg in messages.iter_mut() {
             if msg["role"] != "assistant" { continue; }
             if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }

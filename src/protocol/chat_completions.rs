@@ -113,14 +113,22 @@ pub fn request_to_chat(req: &CanonicalRequest) -> serde_json::Value {
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         };
-        let text: Vec<&str> = msg.parts.iter().filter_map(|p| if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None }).collect();
-        let content = if text.len() == 1 { text[0].to_string() } else { text.join("\n") };
+        let text: Vec<String> = msg.parts.iter().filter_map(|p| match p {
+            ContentPart::Text { text } => Some(text.clone()),
+            ContentPart::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        }).collect();
+        let content = text.join("\n");
         let tool_calls: Vec<serde_json::Value> = msg.parts.iter().filter_map(|p| {
             if let ContentPart::ToolCall { id, name, arguments } = p {
                 Some(json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments.to_string()}}))
             } else { None }
         }).collect();
-        let mut m = json!({"role": role, "content": content});
+        let mut m = json!({"role": role});
+        // Omit content when empty for assistant with tool_calls (matches API spec)
+        if !content.is_empty() || tool_calls.is_empty() {
+            m["content"] = json!(content);
+        }
         if !tool_calls.is_empty() { m["tool_calls"] = json!(tool_calls); }
         if role == "tool"
             && let Some(ref meta) = msg.meta

@@ -131,6 +131,7 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
             db,
             dag,
             response_store: deeplossless::response_store::ResponseStore::default(),
+            session_store: deeplossless::session_store::SessionStore::default(),
         },
         compactor,
         runtime: deeplossless::RuntimeServices {

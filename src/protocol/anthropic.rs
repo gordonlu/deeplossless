@@ -13,7 +13,9 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
 
     let mut messages = Vec::new();
 
-    // Anthropic system prompt → Chat Completions system message
+    // Anthropic system prompt → Chat Completions system message.
+    // Newer Claude clients may send system as a message with role="system"
+    // instead of top-level "system" field. Handle both.
     if let Some(system) = body.get("system") {
         if let Some(text) = system.as_str() {
             messages.push(json!({"role": "system", "content": text}));
@@ -32,6 +34,22 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
     if let Some(msgs) = body["messages"].as_array() {
         for msg in msgs {
             let role = msg["role"].as_str().unwrap_or("user");
+            // Handle system messages within the messages array
+            if role == "system" {
+                if let Some(text) = msg["content"].as_str() {
+                    messages.push(json!({"role": "system", "content": text}));
+                } else if let Some(blocks) = msg["content"].as_array() {
+                    let text: String = blocks.iter()
+                        .filter_map(|b| b["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        messages.push(json!({"role": "system", "content": text}));
+                    }
+                }
+                continue;
+            }
+
             let content = &msg["content"];
 
             if let Some(text) = content.as_str() {
@@ -65,16 +83,25 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
                             }
                         }
                         "tool_use" => {
+                            let tool_id = block["id"].as_str().or_else(|| block["tool_call_id"].as_str()).unwrap_or("");
+                            let tool_name = block["name"].as_str().unwrap_or("");
+                            let tool_args = block.get("input")
+                                .or_else(|| block.get("arguments"))
+                                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                                .unwrap_or_default();
                             tool_calls.push(json!({
-                                "id": block["id"],
+                                "id": tool_id,
                                 "type": "function",
                                 "function": {
-                                    "name": block["name"],
-                                    "arguments": serde_json::to_string(&block["input"]).unwrap_or_default(),
+                                    "name": tool_name,
+                                    "arguments": tool_args,
                                 }
                             }));
                         }
                         "tool_result" => {
+                            let tool_use_id = block["tool_use_id"].as_str()
+                                .or_else(|| block["tool_call_id"].as_str())
+                                .unwrap_or("");
                             let tc_content = block["content"].as_str()
                                 .map(|s| json!(s))
                                 .unwrap_or_else(|| {
@@ -91,7 +118,7 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
                                 });
                             tool_results.push(json!({
                                 "role": "tool",
-                                "tool_call_id": block["tool_use_id"],
+                                "tool_call_id": tool_use_id,
                                 "content": tc_content,
                             }));
                         }
@@ -350,15 +377,13 @@ impl AnthropicSseState {
 
                 // New tool call starting → content_block_start
                 if !id.is_empty() {
-                    if idx >= self.next_block_index {
-                        self.next_block_index = idx + 1;
-                    }
-                    if !self.tool_use_block_indices.contains(&idx) {
-                        self.tool_use_block_indices.push(idx);
+                    let block_index = idx;
+                    if !self.tool_use_block_indices.contains(&block_index) {
+                        self.tool_use_block_indices.push(block_index);
                     }
                     events.push(format!("event: content_block_start\ndata: {}\n\n", json!({
                         "type": "content_block_start",
-                        "index": idx,
+                        "index": block_index,
                         "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
                     })));
                 }

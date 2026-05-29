@@ -314,7 +314,7 @@ pub enum StreamEvent {
     ToolCallStart { index: usize, id: String, name: String },
 
     #[serde(rename = "tool_call_args_delta")]
-    ToolCallArgsDelta { index: usize, arguments_delta: String },
+    ToolCallArgsDelta { index: usize, arguments_delta: String, call_id: String },
 
     #[serde(rename = "tool_call_end")]
     ToolCallEnd { index: usize },
@@ -331,11 +331,11 @@ pub enum StreamEvent {
 
     /// An output item is complete.
     #[serde(rename = "output_item_done")]
-    OutputItemDone { index: usize },
+    OutputItemDone { index: usize, item_id: String, item_type: String, name: String, arguments: String },
 
     /// Function call arguments are complete.
     #[serde(rename = "function_call_arguments_done")]
-    FunctionCallArgumentsDone { call_id: String, name: String, arguments: String },
+    FunctionCallArgumentsDone { call_id: String, name: String, arguments: String, output_index: usize },
 
     #[serde(rename = "done")]
     Done { usage: Usage, finish_reason: String, incomplete: bool, error_reason: Option<String> },

@@ -17,6 +17,33 @@ use crate::metrics;
 use crate::protocol::canonical::StreamEvent;
 use crate::AppState;
 
+/// Drop guard that ensures `data: [DONE]\n\n` is sent if the spawned task
+/// exits without sending it (e.g., panic, early return).  Uses a cloned tx
+/// so it's independent of the original sender's lifetime.
+struct DoneGuard {
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>>,
+    armed: bool,
+}
+
+impl DoneGuard {
+    fn new(tx: tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>) -> Self {
+        Self { tx: Some(tx), armed: true }
+    }
+    fn disarm(&mut self) { self.armed = false; }
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from("data: [DONE]\n\n"),
+                ));
+            }
+        }
+    }
+}
+
 /// Uniform JSON error envelope: `{"error": {"code": "...", "message": "..."}}`
 fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
@@ -87,7 +114,7 @@ fn check_tool_cache(
         // Only intercept tools whose results are compact (grep/search/diagnostics).
         // Large results (read_file, list_files) would flood the conversation.
         if !crate::tool_cache::is_interceptable(name) { return (None, 0); }
-        if let StreamEvent::ToolCallArgsDelta { index: ai, arguments_delta } = &events[offset + 1] {
+        if let StreamEvent::ToolCallArgsDelta { index: ai, arguments_delta, .. } = &events[offset + 1] {
             if si == ai {
                 let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments_delta);
                 match db.tool_cache_get(&cname, &args_hash) {
@@ -100,7 +127,15 @@ fn check_tool_cache(
                         tracing::info!(target: "deeplossless",
                             tool=name, %args_hash, raw_len=result.len(), transformed_len=transformed.len(),
                             "cache hit — intercepting tool call");
-                        return (Some(transformed), 2);
+                        // Skip FunctionCallArgumentsDone + OutputItemDone if present (from flush())
+                        let mut consumed = 2;
+                        if offset + 3 < events.len()
+                            && matches!(&events[offset + 2], StreamEvent::FunctionCallArgumentsDone { .. })
+                            && matches!(&events[offset + 3], StreamEvent::OutputItemDone { .. })
+                        {
+                            consumed = 4;
+                        }
+                        return (Some(transformed), consumed);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -336,6 +371,7 @@ async fn responses(
     let tools_count = req_body["tools"].as_array().map(|a| a.len()).unwrap_or(0);
     let store = req_body["store"].as_bool().unwrap_or(true);
     let prompt_cache_key = req_body["prompt_cache_key"].as_str().unwrap_or("(none)");
+    let session_key = prompt_cache_key.to_string();
     let input_count = req_body["input"].as_array().map(|a| a.len()).unwrap_or(0);
     tracing::info!(target: "deeplossless",
         previous_response_id=%prev_resp,
@@ -369,11 +405,104 @@ async fn responses(
     }
 
     // 2. Canonical IR → Chat Completions (for DeepSeek)
+    // Before converting, load session history for conversation continuity.
+    // Session store has the full conversation in Chat Completions format;
+    // prepend it so DeepSeek sees the assistant's previous responses.
+    if let Some(session_msgs) = state.storage.session_store.get(&session_key) {
+        if !session_msgs.is_empty() {
+            let wrapped = serde_json::json!({"messages": session_msgs});
+            let session_canonical = crate::protocol::chat_completions::request_from_chat(&wrapped);
+            // Replace with session history
+            canonical.messages = session_canonical.messages;
+            // Append tool results and new user message from Codex's raw input
+            // (these are NOT duplicates — they're the execution results from the
+            // previous turn's tool calls, followed by the user's next question).
+            if let Some(input_arr) = req_body["input"].as_array() {
+                let mut append_msgs: Vec<crate::protocol::canonical::Message> = Vec::new();
+                for item in input_arr {
+                    let item_type = item["type"].as_str().unwrap_or("");
+                    if item_type == "function_call_output" {
+                        // Deduplicate: skip if this call_id already exists in session
+                        let call_id = item["call_id"].as_str()
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or("").to_string();
+                        if call_id.is_empty() { continue; }
+                        let already_in_session = canonical.messages.iter().any(|m|
+                            m.role == crate::protocol::canonical::Role::Tool
+                            && m.meta.as_ref().and_then(|meta| meta.tool_call_id.as_ref())
+                                .map(|id| *id == call_id).unwrap_or(false)
+                        );
+                        if already_in_session {
+                            tracing::debug!(target: "deeplossless", %call_id, "skipping duplicate tool message");
+                            continue;
+                        }
+                        let output = item["output"].as_str().unwrap_or("").to_string();
+                        append_msgs.push(crate::protocol::canonical::Message {
+                            role: crate::protocol::canonical::Role::Tool,
+                            parts: vec![crate::protocol::canonical::ContentPart::ToolResult {
+                                call_id, content: output,
+                            }],
+                            meta: Some(crate::protocol::canonical::MessageMeta {
+                                tool_call_id: item["call_id"].as_str().map(|s| s.to_string()),
+                                tool_calls: vec![],
+                            }),
+                            reasoning: None,
+                        });
+                    }
+                }
+                // Also append the last user message
+                if let Some(last_user) = input_arr.iter().rev()
+                    .find(|item| item["role"].as_str() == Some("user"))
+                    .and_then(|item| item["content"].as_array())
+                    .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
+                {
+                    append_msgs.push(crate::protocol::canonical::Message {
+                        role: crate::protocol::canonical::Role::User,
+                        parts: vec![crate::protocol::canonical::ContentPart::Text {
+                            text: last_user.to_string(),
+                        }],
+                        meta: None,
+                        reasoning: None,
+                    });
+                }
+                canonical.messages.extend(append_msgs);
+            }
+
+            // If the session ends with an incomplete assistant(tc) — no tool results
+            // available yet — remove it to avoid orphaned tool_calls errors from DeepSeek.
+            if let Some(msg) = canonical.messages.last() {
+                if msg.role == crate::protocol::canonical::Role::Assistant {
+                    let has_tc = msg.meta.as_ref()
+                        .map(|m| !m.tool_calls.is_empty()).unwrap_or(false);
+                    if has_tc {
+                        let last_tc_idx = canonical.messages.len() - 1;
+                        // Count tool messages after this assistant
+                        let tool_count = canonical.messages[last_tc_idx + 1..].iter()
+                            .filter(|m| m.role == crate::protocol::canonical::Role::Tool)
+                            .count();
+                        let tc_count = msg.meta.as_ref().map(|m| m.tool_calls.len()).unwrap_or(0);
+                        if tool_count < tc_count {
+                            canonical.messages.pop();
+                            tracing::debug!(target: "deeplossless",
+                                tc_count, tool_count,
+                                "removed incomplete assistant(tc) from session");
+                        }
+                    }
+                }
+            }
+            tracing::debug!(target: "deeplossless",
+                session_len=session_msgs.len(),
+                "loaded session history for continuity");
+        }
+    }
+
     let chat_body = crate::protocol::chat_completions::request_to_chat(&canonical);
 
     // 3. Run the chat pipeline (DAG context injection, message persistence)
     let pipeline = crate::pipeline::ChatPipeline::new(&state);
-    let chat_body_val: serde_json::Value = chat_body.clone();
+    let mut chat_body_val: serde_json::Value = chat_body.clone();
+    // Embed prompt_cache_key for pipeline reasoning injection (stable session key)
+    chat_body_val["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
     let injected = match pipeline.process(&canonical.model, &chat_body_val).await {
         Ok(out) => out.injected_body,
         Err(e) => {
@@ -451,6 +580,24 @@ async fn responses(
         req_stream, msg_count=req_msgs, upstream_url,
         has_api_key=!api_key.is_empty() && api_key != "unset",
         "sending upstream request");
+    if let Some(msgs) = injected["messages"].as_array() {
+        tracing::debug!(target: "deeplossless", "upstream messages:");
+        for (i, m) in msgs.iter().enumerate() {
+            let role = m["role"].as_str().unwrap_or("?");
+            let has_tc = m.get("tool_calls").is_some();
+            let tci = m["tool_call_id"].as_str().unwrap_or("-");
+            let rc = m["reasoning_content"].as_str().unwrap_or("-").chars().take(30).collect::<String>();
+            let content = m["content"].as_str().unwrap_or("").chars().take(60).collect::<String>();
+            tracing::debug!(target: "deeplossless", "  msg[{i}] role={role} rc={rc} tc={has_tc} tci={tci} content={content}");
+        }
+    }
+    // Save input messages to session store for conversation continuity.
+    // The assistant response will be appended after streaming completes.
+    let session_input_msgs = injected["messages"].as_array().cloned().unwrap_or_default();
+    if !session_input_msgs.is_empty() {
+        state.storage.session_store.replace(&session_key, session_input_msgs.clone());
+        tracing::debug!(target: "deeplossless", session_key, msg_count=session_input_msgs.len(), "saved session messages");
+    }
     let upstream_start = std::time::Instant::now();
     let resp = match state.runtime
         .client
@@ -491,10 +638,11 @@ async fn responses(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
         let response_store = state.storage.response_store.clone();
+        let session_store = state.storage.session_store.clone();
         let db = state.storage.db.clone();
         let cycle = state.runtime.cycle.clone();
-        let store_response = store;
-        let _request_body = body.clone();
+        // Always store the response for previous_response_id continuity,
+        // regardless of the store flag (which only controls GET retrieval).
         let log_dir = state.log_dir.clone();
         let upstream_status = resp.status().as_u16();
         let start = std::time::Instant::now();
@@ -505,9 +653,34 @@ async fn responses(
         let log_instructions_len = instructions_len;
         let log_msg_count = req_msgs;
         let log_request_body_kb = body.len() as f64 / 1024.0;
+        // Compute reasoning storage key: session (prompt_cache_key) + model.
+        // Stable across all turns of the same session.
+        let reasoning_key = format!("reasoning:{}:{}", canonical.model, session_key);
         let shutdown = state.runtime.shutdown_notify.clone();
+        let record_dir = state.record.clone();
+        let record_body = if record_dir.is_some() { Some(body.clone()) } else { None };
+        if let Some(ref d) = record_dir {
+            tracing::info!(target: "deeplossless::record", dir=%d, "response recording enabled");
+        }
         tokio::spawn(async move {
-            if shutdown.notified().now_or_never().is_some() { return; }
+            let mut _guard = DoneGuard::new(tx.clone());
+            if shutdown.notified().now_or_never().is_some() {
+                _guard.disarm();
+                return;
+            }
+            // Protocol recorder: write raw request body
+            let _rec = record_dir.as_ref().map(|dir| {
+                let _ = std::fs::create_dir_all(dir);
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                if let Some(body) = &record_body {
+                    let req_path = format!("{dir}/req_{ts}.json");
+                    match std::fs::write(&req_path, serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(body).unwrap_or_default()).unwrap_or_default()) {
+                        Ok(()) => tracing::debug!(target: "deeplossless::record", path=%req_path, "recorded request"),
+                        Err(e) => tracing::warn!(target: "deeplossless::record", path=%req_path, error=%e, "failed to record request"),
+                    }
+                }
+                (dir.clone(), ts)
+            });
             // Generate IDs matching OpenAI format
             let resp_id = format!("resp_{}", crate::protocol::responses::monotonic_id());
             let msg_id = format!("msg_{}", crate::protocol::responses::monotonic_id());
@@ -544,14 +717,17 @@ async fn responses(
             let mut buf = String::new();
             let mut usage_buf: Option<serde_json::Value> = None;
             let mut first_chunk = true;
+            let mut all_bytes: Vec<u8> = Vec::new();
             let mut assembler = crate::protocol::streaming::StreamAssembler::new();
+            let mut flushed_tool_calls: Vec<(String, String, String)> = Vec::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
+                        all_bytes.extend_from_slice(&c);
                         let s = String::from_utf8_lossy(&c);
                         if first_chunk {
                             first_chunk = false;
-                            tracing::info!(target: "deeplossless",
+                            tracing::debug!(target: "deeplossless",
                                 len=c.len(), preview=&s[..s.len().min(200)],
                                 "first upstream chunk");
                         }
@@ -567,7 +743,31 @@ async fn responses(
                                 for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                                     // Done = transport-level EOF, drain remaining buffers
                                     if matches!(event, StreamEvent::Done { .. }) {
-                                        let events = assembler.flush();
+                                        let mut events = assembler.flush();
+                                        // Remap tool call output_index from 0 (DeepSeek index)
+                                        // to 1+ (beyond the text message at output_index: 0)
+                                        {
+                                            let mut tc_idx = 1usize;
+                                            for ev in &mut events {
+                                                match ev {
+                                                    StreamEvent::ToolCallStart { index, .. }
+                                                    | StreamEvent::ToolCallArgsDelta { index, .. }
+                                                    | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
+                                                    | StreamEvent::OutputItemDone { index, .. } => {
+                                                        *index = tc_idx;
+                                                    }
+                                                    _ => {}
+                                                }
+                                                if matches!(ev, StreamEvent::OutputItemDone { .. }) {
+                                                    tc_idx += 1;
+                                                }
+                                            }
+                                        }
+                                        for ev in &events {
+                                            if let StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments, .. } = ev {
+                                                flushed_tool_calls.push((call_id.clone(), name.clone(), arguments.clone()));
+                                            }
+                                        }
                                         if !process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true) { break; }
                                         continue;
                                     }
@@ -599,7 +799,27 @@ async fn responses(
                 }
             }
             // Upstream [DONE] → finish assembly, get accumulated content
-            let content = assembler.finish();
+            let (content, mut final_events) = assembler.finish();
+            // Send any remaining flush events (e.g., if the stream ended
+            // without triggering the Done handler) with proper index remapping.
+            if !final_events.is_empty() {
+                let mut tc_idx = 1usize;
+                for ev in &mut final_events {
+                    match ev {
+                        StreamEvent::ToolCallStart { index, .. }
+                        | StreamEvent::ToolCallArgsDelta { index, .. }
+                        | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
+                        | StreamEvent::OutputItemDone { index, .. } => {
+                            *index = tc_idx;
+                        }
+                        _ => {}
+                    }
+                    if matches!(ev, StreamEvent::OutputItemDone { .. }) {
+                        tc_idx += 1;
+                    }
+                }
+                process_events(final_events, db.clone(), &cycle, &tx, Some(&mut assembler), true);
+            }
             let input_tokens = usage_buf.as_ref()
                 .and_then(|v| v["usage"]["prompt_tokens"].as_u64())
                 .unwrap_or(0);
@@ -607,7 +827,7 @@ async fn responses(
                 .and_then(|v| v["usage"]["completion_tokens"].as_u64())
                 .unwrap_or(0);
             let output_text_len = content.text.len();
-            tracing::info!(target: "deeplossless",
+            tracing::debug!(target: "deeplossless",
                 input_tokens, output_tokens, output_text_len,
                 "turn complete");
 
@@ -634,6 +854,32 @@ async fn responses(
                 });
             }
 
+            // Store reasoning for multi-turn continuity (DeepSeek thinking mode
+            // requires reasoning_content to be echoed back on tool-call assistants).
+            if !content.reasoning.is_empty() {
+                if let Err(e) = db.store_reasoning(&reasoning_key, &content.reasoning) {
+                    tracing::debug!(target: "deeplossless", "store reasoning failed: {e}");
+                }
+            }
+
+            // Append assistant response to session for conversation continuity.
+            // Build in Chat Completions format matching injected["messages"].
+            let mut assistant_msg = serde_json::json!({"role": "assistant", "content": content.text});
+            if !content.reasoning.is_empty() {
+                assistant_msg["reasoning_content"] = serde_json::json!(content.reasoning);
+            }
+            if !flushed_tool_calls.is_empty() {
+                let tcs: Vec<serde_json::Value> = flushed_tool_calls.iter().map(|(id, name, args)| {
+                    serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}})
+                }).collect();
+                assistant_msg["tool_calls"] = serde_json::json!(tcs);
+            }
+            // Load current session, append assistant response, save back
+            let mut session = session_store.get(&session_key).unwrap_or_default();
+            session.push(assistant_msg);
+            session_store.replace(&session_key, session);
+            tracing::debug!(target: "deeplossless", session_key, "appended assistant response to session");
+
             // Build lifecycle events using serde_json for proper escaping
             let mut content_parts: Vec<serde_json::Value> = Vec::new();
             // Include reasoning content when present (required for tool-call multi-turn continuity)
@@ -654,9 +900,10 @@ async fn responses(
             let output_item_done = serde_json::json!({
                 "type": "response.output_item.done", "output_index": 0, "item": item_json
             });
+            // content_index 0 matches content_part.added (always announces text at index 0)
             let content_part_done = serde_json::json!({
                 "type": "response.content_part.done", "item_id": msg_id,
-                "output_index": 0, "content_index": content_parts.len().saturating_sub(1),
+                "output_index": 0, "content_index": 0,
                 "part": text_part
             });
             let resp_status = if usage_buf.is_some() { "completed" } else { "incomplete" };
@@ -665,19 +912,32 @@ async fn responses(
                 "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
                 "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
             })).unwrap_or(serde_json::json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}));
+            // Build response.completed output. Only include the text message item;
+            // function_call items were already emitted via SSE during flush().
+            // Including them again in response.completed causes Codex to see
+            // duplicates when it processes both SSE events and the final payload.
+            let output_items: Vec<serde_json::Value> = vec![item_json.clone()];
             let completed = serde_json::json!({
                 "type": "response.completed",
                 "response": {
                     "id": resp_id, "object": "response", "created_at": now,
                     "status": resp_status, "model": model,
-                    "output": [item_json],
+                    "output": output_items,
+                    "parallel_tool_calls": true,
                     "usage": usage_json
                 }
             });
 
             // Emit lifecycle events in correct order
+            let output_text_done = serde_json::json!({
+                "type": "response.output_text.done",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": content.text
+            });
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\"}\n\n")
+                axum::body::Bytes::from(format!("event: response.output_text.done\ndata: {output_text_done}\n\n"))
             ));
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from(format!("event: response.content_part.done\ndata: {content_part_done}\n\n"))
@@ -690,33 +950,45 @@ async fn responses(
             ));
             // Persist the response so GET /v1/responses/{id} returns real data,
             // and Codex's previous_response_id continuity can work incrementally.
-            // Persist reasoning for multi-turn continuity
-            if !content.reasoning.is_empty() {
-                let reason_key = format!("reasoning:{model}:{msg_id}");
-                let reason_db = db.clone();
-                let reason_text = content.reasoning.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = reason_db.store_reasoning(&reason_key, &reason_text);
-                });
-            }
+            // Reasoning is stored by the reasoning_key block above.
 
-            if store_response {
-                let resp_obj = serde_json::json!({
-                    "id": resp_id, "object": "response", "created_at": now,
-                    "status": resp_status, "model": model,
-                    "output": [{
-                        "id": msg_id, "type": "message", "status": "completed",
-                        "role": "assistant",
-                        "content": content_parts
-                    }],
-                    "usage": usage_json
-                });
-                response_store.insert(resp_id.clone(), resp_obj);
-                tracing::info!(target: "deeplossless",
-                    resp_id, text_len=content.text.len(),
-                    "response stored");
+            // Always store for previous_response_id continuity.
+            // Compute tool calls for storage, filtering out cache-intercepted ones
+            let effective_tool_calls: Vec<_> = flushed_tool_calls.iter().filter(|(_, name, arguments)| {
+                let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments);
+                db.tool_cache_get(&cname, &args_hash).ok().flatten().is_none()
+            }).cloned().collect();
+            let mut stored_output: Vec<serde_json::Value> = Vec::new();
+            for (call_id, name, arguments) in &effective_tool_calls {
+                stored_output.push(serde_json::json!({
+                    "type": "function_call", "call_id": call_id, "name": name, "arguments": arguments, "status": "completed"
+                }));
+            }
+            stored_output.push(serde_json::json!({
+                "id": msg_id, "type": "message", "status": "completed",
+                "role": "assistant",
+                "content": content_parts
+            }));
+            let resp_obj = serde_json::json!({
+                "id": resp_id, "object": "response", "created_at": now,
+                "status": resp_status, "model": model,
+                "output": stored_output, "usage": usage_json,
+                "prompt_cache_key": &session_key
+            });
+            response_store.insert(resp_id.clone(), resp_obj);
+            tracing::debug!(target: "deeplossless",
+                resp_id, text_len=content.text.len(),
+                "response stored");
+            // Write recorded upstream bytes
+            if let Some((ref dir, ts)) = _rec {
+                let rsp_path = format!("{dir}/rsp_{ts}.txt");
+                match std::fs::write(&rsp_path, &all_bytes) {
+                    Ok(()) => tracing::debug!(target: "deeplossless::record", path=%rsp_path, len=all_bytes.len(), "recorded response"),
+                    Err(e) => tracing::warn!(target: "deeplossless::record", path=%rsp_path, error=%e, "failed to record response"),
+                }
             }
             // Transport-level EOF marker
+            _guard.disarm();
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("data: [DONE]\n\n")
             ));
@@ -732,6 +1004,21 @@ async fn responses(
         // Non-streaming: translate Chat Completions response → Responses format
         match resp.bytes().await {
             Ok(bytes) => {
+                // Record raw upstream response
+                if let Some(ref dir) = state.record {
+                    let _ = std::fs::create_dir_all(dir);
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let req_path = format!("{dir}/req_{ts}.json");
+                    match std::fs::write(&req_path, serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default()).unwrap_or_default()) {
+                        Ok(()) => tracing::info!(target: "deeplossless::record", path=%req_path, "recorded non-streaming request"),
+                        Err(e) => tracing::warn!(target: "deeplossless::record", path=%req_path, error=%e, "failed to record non-streaming request"),
+                    }
+                    let rsp_path = format!("{dir}/rsp_{ts}.txt");
+                    match std::fs::write(&rsp_path, &bytes) {
+                        Ok(()) => tracing::debug!(target: "deeplossless::record", path=%rsp_path, len=bytes.len(), "recorded non-streaming response"),
+                        Err(e) => tracing::warn!(target: "deeplossless::record", path=%rsp_path, error=%e, "failed to record non-streaming response"),
+                    }
+                }
                 let chat_resp: serde_json::Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
                     Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid upstream JSON: {e}")),

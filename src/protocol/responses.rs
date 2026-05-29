@@ -23,6 +23,7 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
         .unwrap_or_default();
 
     let mut messages: Vec<Message> = Vec::new();
+    let mut pending_reasoning: Option<String> = None;
     if let Some(arr) = body["input"].as_array() {
         for item in arr {
             let item_type = item["type"].as_str().unwrap_or("");
@@ -42,6 +43,8 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                 continue;
             }
             // Reasoning items attach to the previous assistant message.
+            // If no assistant message exists yet (e.g. reasoning before function_call),
+            // store pending so it's attached when the assistant message is created.
             // Format: {"type": "reasoning", "text": "..."} or
             //         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "..."}]}
             if item_type == "reasoning" {
@@ -59,6 +62,8 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                             summarized: false,
                             tokens: None,
                         });
+                    } else {
+                        pending_reasoning = Some(reasoning_text.to_string());
                     }
                 }
                 continue;
@@ -70,12 +75,18 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
             };
             let mut parts = Vec::new();
             let mut meta = None;
+            let mut reasoning: Option<String> = None;
             if let Some(content) = item["content"].as_array() {
                 for block in content {
                     match block["type"].as_str().unwrap_or("") {
                         "input_text" | "output_text" => {
                             if let Some(t) = block["text"].as_str() {
                                 parts.push(ContentPart::Text { text: t.to_string() });
+                            }
+                        }
+                        "reasoning" => {
+                            if let Some(t) = block["text"].as_str() {
+                                reasoning = Some(t.to_string());
                             }
                         }
                         "input_image" => {
@@ -89,19 +100,69 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
             } else if let Some(s) = item["content"].as_str() {
                 parts.push(ContentPart::Text { text: s.to_string() });
             }
-            // function_call items
+            // function_call items — merge into previous assistant message, or
+            // create one if none exists (Codex may send function_call standalone).
+            // In Responses API, function_call is a separate output item, but
+            // Chat Completions requires tool_calls inside the assistant message.
+            // IMPORTANT: only merge if no non-tool messages intervene (user messages
+            // between turns break DeepSeek's adjacency requirement).
             if item_type == "function_call" {
-                let id = item["call_id"].as_str().unwrap_or("").to_string();
+                let id = item["call_id"].as_str()
+                    .or_else(|| item["id"].as_str())
+                    .unwrap_or("").to_string();
                 let name = item["name"].as_str().unwrap_or("").to_string();
                 let args_str = item["arguments"].as_str().unwrap_or(&item["arguments"].to_string()).to_string();
                 let args: serde_json::Value = serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
-                parts.push(ContentPart::ToolCall { id: id.clone(), name: name.clone(), arguments: args.clone() });
-                meta = Some(MessageMeta { tool_call_id: None, tool_calls: vec![ToolInvocation { id, name, arguments: args }] });
+                let tc = ToolInvocation { id: id.clone(), name: name.clone(), arguments: args.clone() };
+                // Check if there's a non-tool message between the last assistant and here
+                let last_assistant_pos = messages.iter().rposition(|m| m.role == Role::Assistant);
+                let intervening_non_tool = messages.iter().rev()
+                    .take_while(|m| m.role != Role::Assistant)
+                    .any(|m| m.role != Role::Tool);
+                // Capture fallback reasoning before any mutable borrow of messages.
+                // DeepSeek thinking mode requires reasoning_content on every assistant
+                // message — inherit from previous assistants if no pending reasoning.
+                let fallback_reasoning = pending_reasoning.take()
+                    .or_else(|| messages.iter().rev().find_map(|m| m.reasoning.as_ref().map(|r| r.text.clone())));
+                match last_assistant_pos {
+                    Some(idx) if !intervening_non_tool => {
+                        // Merge into existing assistant (no intervening non-tool messages)
+                        let last = &mut messages[idx];
+                        last.parts.push(ContentPart::ToolCall { id, name, arguments: args });
+                        let meta = last.meta.get_or_insert_with(|| MessageMeta { tool_call_id: None, tool_calls: vec![] });
+                        meta.tool_calls.push(tc);
+                        if last.reasoning.is_none() {
+                            if let Some(r) = fallback_reasoning.clone() {
+                                last.reasoning = Some(ReasoningTrace { text: r, summarized: false, tokens: None });
+                            }
+                        }
+                    }
+                    _ => {
+                        // Non-tool message between (user boundary) or no assistant at all
+                        // Create a new assistant message with the tool call.
+                        let reasoning = fallback_reasoning.clone()
+                            .map(|text| ReasoningTrace { text, summarized: false, tokens: None });
+                        messages.push(Message {
+                            role: Role::Assistant,
+                            parts: vec![ContentPart::ToolCall { id, name, arguments: args }],
+                            meta: Some(MessageMeta { tool_call_id: None, tool_calls: vec![tc] }),
+                            reasoning,
+                        });
+                    }
+                }
+                continue;
             }
             // function_call_output items
             if item_type == "function_call_output" {
-                let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                let content = item["output"].as_str().unwrap_or("").to_string();
+                let call_id = item["call_id"].as_str()
+                    .or_else(|| item["id"].as_str())
+                    .unwrap_or("").to_string();
+                let content = item["output"].as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| item["output"].as_array().map(|arr| {
+                        arr.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n")
+                    }))
+                    .unwrap_or_default();
                 parts.push(ContentPart::ToolResult { call_id: call_id.clone(), content });
                 meta = Some(MessageMeta { tool_call_id: Some(call_id), tool_calls: vec![] });
             }
@@ -123,7 +184,8 @@ pub fn request_from_responses(body: &serde_json::Value) -> CanonicalRequest {
                     }
                 }
             }
-            let reasoning = item["reasoning_content"].as_str().map(|s| ReasoningTrace { text: s.to_string(), summarized: false, tokens: None });
+            let reasoning = reasoning.or_else(|| item["reasoning_content"].as_str().map(|s| s.to_string()));
+            let reasoning = reasoning.map(|text| ReasoningTrace { text, summarized: false, tokens: None });
             messages.push(Message { role, parts, meta, reasoning });
         }
     } else if let Some(s) = body["input"].as_str() {
@@ -174,58 +236,86 @@ pub fn stream_event_from_chat(data: &str) -> Vec<StreamEvent> {
     let Some(choices) = v["choices"].as_array() else { return vec![] };
     let Some(choice) = choices.first() else { return vec![] };
     let delta = &choice["delta"];
+
+    // Accumulate events — a single SSE chunk may contain multiple event types
+    // (e.g. content + reasoning, content + finish_reason, tool_calls + finish_reason).
+    let mut events: Vec<StreamEvent> = Vec::new();
+
+    // 1. Text content (must be non-empty; empty content may accompany finish_reason)
     if let Some(content) = delta["content"].as_str() {
-        return vec![StreamEvent::TextDelta { text: content.to_string() }];
-    }
-    if let Some(reasoning) = delta["reasoning_content"].as_str() {
-        return vec![StreamEvent::ReasoningDelta { text: reasoning.to_string() }];
-    }
-    if let Some(tool_calls) = delta["tool_calls"].as_array()
-        && let Some(tc) = tool_calls.first() {
-        let index = tc["index"].as_u64().unwrap_or(0) as usize;
-        if let Some(name) = tc["function"]["name"].as_str() {
-            let id = tc["id"].as_str().unwrap_or("").to_string();
-            let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
-            let mut events = vec![StreamEvent::ToolCallStart { index, id, name: name.to_string() }];
-            if !args.is_empty() {
-                events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: args });
-            }
-            return events;
-        }
-        let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
-        if !args.is_empty() {
-            return vec![StreamEvent::ToolCallArgsDelta { index, arguments_delta: args }];
+        if !content.is_empty() {
+            events.push(StreamEvent::TextDelta { text: content.to_string() });
         }
     }
+
+    // 2. Finish reason — always emit Done. The proxy handler catches Done
+    //    and never forwards it to Codex — it's just a trigger for flush().
+    //    This ensures the assembler's flush() is called for tool_calls too,
+    //    emitting FunctionCallArgumentsDone/OutputItemDone downstream.
     if let Some(reason) = choice["finish_reason"].as_str() {
-        return vec![StreamEvent::Done {
+        events.push(StreamEvent::Done {
             usage: Usage {
                 prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
                 completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
                 total_tokens: v["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32,
             },
             finish_reason: reason.to_string(),
-            incomplete: false,
+            incomplete: reason == "length",
             error_reason: None,
-        }];
+        });
     }
+
+    // 3. Reasoning content
+    if let Some(reasoning) = delta["reasoning_content"].as_str() {
+        events.push(StreamEvent::ReasoningDelta { text: reasoning.to_string() });
+    }
+
+    // 4. Tool calls — accumulate multiple tool calls from the same chunk
+    if let Some(tool_calls) = delta["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let index = tc["index"].as_u64().unwrap_or(0) as usize;
+            if let Some(name) = tc["function"]["name"].as_str() {
+                let id = tc["id"].as_str().unwrap_or("").to_string();
+                let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
+                events.push(StreamEvent::ToolCallStart { index, id: id.clone(), name: name.to_string() });
+                if !args.is_empty() {
+                    events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: args, call_id: id });
+                }
+            } else {
+                let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
+                if !args.is_empty() {
+                    events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: args, call_id: String::new() });
+                }
+            }
+        }
+    }
+
+    // 5. Error
     if let Some(err) = v["error"].as_object() {
-        return vec![StreamEvent::Error { message: err["message"].as_str().unwrap_or("").to_string(), code: err["code"].as_str().map(|s| s.to_string()) }];
+        events.push(StreamEvent::Error { message: err["message"].as_str().unwrap_or("").to_string(), code: err["code"].as_str().map(|s| s.to_string()) });
     }
-    vec![]
+
+    events
 }
 
 pub fn stream_event_to_responses(event: &StreamEvent) -> String {
     use serde_json::json;
     match event {
         StreamEvent::TextDelta { text } => json!({"type": "response.output_text.delta", "delta": text}).to_string(),
-        StreamEvent::ToolCallStart { index, id, name } => json!({"type": "response.output_item.added", "item": {"id": id, "type": "function_call", "name": name}, "output_index": index}).to_string(),
-        StreamEvent::ToolCallArgsDelta { index, arguments_delta, .. } => json!({"type": "response.function_call_arguments.delta", "output_index": index, "delta": arguments_delta}).to_string(),
+        StreamEvent::ToolCallStart { index, id, name } => json!({"type": "response.output_item.added", "item": {"call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"}, "output_index": index}).to_string(),
+        StreamEvent::ToolCallArgsDelta { index, arguments_delta, call_id } => json!({"type": "response.function_call_arguments.delta", "output_index": index, "delta": arguments_delta, "item_id": call_id}).to_string(),
         StreamEvent::ToolCallEnd { index } => json!({"type": "response.output_item.done", "output_index": index}).to_string(),
-        StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments } => json!({"type": "response.function_call_arguments.done", "item_id": call_id, "name": name, "arguments": arguments}).to_string(),
+        StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments, output_index } => json!({"type": "response.function_call_arguments.done", "item_id": call_id, "name": name, "arguments": arguments, "output_index": output_index}).to_string(),
         StreamEvent::OutputItemAdded { index, item_type } => json!({"type": "response.output_item.added", "output_index": index, "item": {"type": item_type}}).to_string(),
-        StreamEvent::OutputItemDone { index } => json!({"type": "response.output_item.done", "output_index": index}).to_string(),
-        StreamEvent::ReasoningDelta { text } => json!({"type": "response.reasoning.delta", "delta": text}).to_string(),
+        StreamEvent::OutputItemDone { index, item_id, item_type, name, arguments } => {
+            let mut item = serde_json::json!({"call_id": item_id, "type": item_type});
+            if item_type == "function_call" {
+                item["name"] = serde_json::json!(name);
+                item["arguments"] = serde_json::json!(arguments);
+            }
+            serde_json::json!({"type": "response.output_item.done", "output_index": index, "item": item}).to_string()
+        }
+        StreamEvent::ReasoningDelta { text } => json!({"type": "response.reasoning_text.delta", "delta": text}).to_string(),
         StreamEvent::Done { usage, .. } => json!({"type": "response.completed", "response": {"usage": {"input_tokens": usage.prompt_tokens, "output_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens}}}).to_string(),
         StreamEvent::Error { message, code } => json!({"type": "error", "error": {"type": "server_error", "code": code.as_deref().unwrap_or("unknown"), "message": message}}).to_string(),
         _ => String::new(),

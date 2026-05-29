@@ -59,7 +59,7 @@ pub fn to_chat_completions_sse(event: &StreamEvent) -> String {
             "choices": [{"delta": {"tool_calls": [{"index": index, "id": id, "function": {"name": name, "arguments": ""}, "type": "function"}]}, "index": 0}],
             "object": "chat.completion.chunk",
         }),
-        StreamEvent::ToolCallArgsDelta { index, arguments_delta } => json!({
+        StreamEvent::ToolCallArgsDelta { index, arguments_delta, .. } => json!({
             "choices": [{"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments_delta}}]}, "index": 0}],
             "object": "chat.completion.chunk",
         }),
@@ -134,25 +134,31 @@ impl StreamAssembler {
                 vec![event]
             }
             StreamEvent::ToolCallStart { index, id, name } => {
-                self.partial_tools.insert(index, PartialToolCall { id, name, arguments: String::new() });
+                // Tolerant assembly: name/id may arrive in later chunk.
+                // Merge with existing entry rather than overwriting.
+                let entry = self.partial_tools.entry(index).or_insert(PartialToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+                if !id.is_empty() { entry.id = id; }
+                if !name.is_empty() { entry.name = name; }
                 vec![]
             }
-            StreamEvent::ToolCallArgsDelta { index, arguments_delta } => {
-                if let Some(ptc) = self.partial_tools.get_mut(&index) {
-                    ptc.arguments.push_str(&arguments_delta);
-                }
+            StreamEvent::ToolCallArgsDelta { index, arguments_delta, .. } => {
+                // Tolerant assembly: args delta may arrive before ToolCallStart.
+                // Create partial entry on first args delta even without start.
+                let ptc = self.partial_tools.entry(index).or_insert(PartialToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+                ptc.arguments.push_str(&arguments_delta);
                 vec![]
             }
             StreamEvent::ToolCallEnd { index } => {
                 let mut events = Vec::new();
                 if let Some(ptc) = self.partial_tools.remove(&index) {
                     events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
-                    events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments });
+                    events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments.clone(), call_id: ptc.id.clone() });
                 }
+                events.push(StreamEvent::ToolCallEnd { index });
                 events
             }
             StreamEvent::Done { .. } | StreamEvent::MessageEnd => {
-                self.partial_tools.clear();
+                // Don't clear partial_tools — finish()/flush() recovers them
                 vec![]
             }
             StreamEvent::Error { .. } => {
@@ -167,23 +173,36 @@ impl StreamAssembler {
     }
 
     /// Called when upstream [DONE] arrives. Returns accumulated text content
-    /// for the final lifecycle events. Also clears any partial tool state.
-    pub fn finish(&mut self) -> AssembledContent {
-        self.partial_tools.clear();
-        AssembledContent {
+    /// for the final lifecycle events and any remaining partial tool calls.
+    /// Unlike flush(), this consumes state (takes text/reasoning).
+    pub fn finish(&mut self) -> (AssembledContent, Vec<StreamEvent>) {
+        let events = self.flush();
+        (AssembledContent {
             text: std::mem::take(&mut self.full_text),
             reasoning: std::mem::take(&mut self.full_reasoning),
-        }
+        }, events)
     }
 
     /// Graceful flush — completes any partially assembled tool calls and
-    /// emits them as [ToolCallStart, ToolCallArgsDelta] pairs. Called when
-    /// the upstream stream ends normally (Done/MessagenEnd received).
+    /// emits the full lifecycle: [ToolCallStart, ToolCallArgsDelta,
+    /// FunctionCallArgumentsDone, OutputItemDone].
+    /// Called when the upstream stream ends normally (Done/MessageEnd received).
     pub fn flush(&mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        for (index, ptc) in self.partial_tools.drain() {
-            events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
-            events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments });
+        let mut indices: Vec<usize> = self.partial_tools.keys().copied().collect();
+        indices.sort();
+        for &index in &indices {
+            if let Some(ptc) = self.partial_tools.remove(&index) {
+                events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
+                events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments.clone(), call_id: ptc.id.clone() });
+                events.push(StreamEvent::FunctionCallArgumentsDone {
+                    call_id: ptc.id.clone(),
+                    name: ptc.name.clone(),
+                    arguments: ptc.arguments.clone(),
+                    output_index: index,
+                });
+                events.push(StreamEvent::OutputItemDone { index, item_id: ptc.id.clone(), item_type: "function_call".into(), name: ptc.name.clone(), arguments: ptc.arguments.clone() });
+            }
         }
         events
     }
@@ -214,12 +233,13 @@ mod assembler_tests {
     fn assembles_tool_call_from_deltas() {
         let mut asm = StreamAssembler::new();
         assert!(asm.feed(StreamEvent::ToolCallStart { index: 0, id: "tc1".into(), name: "grep".into() }).is_empty());
-        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into() }).is_empty());
-        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"ttern":"foo"}"#.into() }).is_empty());
+        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into(), call_id: "tc1".into() }).is_empty());
+        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"ttern":"foo"}"#.into(), call_id: "tc1".into() }).is_empty());
         let events = asm.feed(StreamEvent::ToolCallEnd { index: 0 });
-        assert_eq!(events.len(), 2, "should emit ToolCallStart + complete ToolCallArgsDelta");
+        assert_eq!(events.len(), 3, "should emit ToolCallStart + complete ToolCallArgsDelta + ToolCallEnd");
         assert!(matches!(events[0], StreamEvent::ToolCallStart { .. }));
         assert!(matches!(events[1], StreamEvent::ToolCallArgsDelta { .. }));
+        assert!(matches!(events[2], StreamEvent::ToolCallEnd { index: 0 }));
     }
 
     #[test]
@@ -232,12 +252,20 @@ mod assembler_tests {
     }
 
     #[test]
-    fn incomplete_tool_dropped_on_done() {
+    fn incomplete_tool_recovered_on_finish() {
         let mut asm = StreamAssembler::new();
         assert!(asm.feed(StreamEvent::ToolCallStart { index: 0, id: "tc1".into(), name: "grep".into() }).is_empty());
-        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: "{".into() }).is_empty());
-        let events = asm.feed(StreamEvent::Done { usage: Usage::default(), finish_reason: "stop".into(), incomplete: false, error_reason: None });
-        assert!(events.is_empty(), "incomplete tool dropped on Done");
+        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into(), call_id: "tc1".into() }).is_empty());
+        // Done arrives before ToolCallEnd — partial tool should survive in assembler
+        let done_events = asm.feed(StreamEvent::Done { usage: Usage::default(), finish_reason: "stop".into(), incomplete: false, error_reason: None });
+        assert!(done_events.is_empty(), "Done passes through without clearing");
+        // finish()/flush() should recover the partial tool
+        let (_content, events) = asm.finish();
+        assert_eq!(events.len(), 4, "flush emits ToolCallStart + ToolCallArgsDelta + FunctionCallArgumentsDone + OutputItemDone");
+        assert!(matches!(events[0], StreamEvent::ToolCallStart { index: 0, .. }));
+        assert!(matches!(events[1], StreamEvent::ToolCallArgsDelta { index: 0, .. }));
+        assert!(matches!(events[2], StreamEvent::FunctionCallArgumentsDone { .. }));
+        assert!(matches!(events[3], StreamEvent::OutputItemDone { .. }));
     }
 
     #[test]

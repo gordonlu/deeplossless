@@ -54,7 +54,9 @@ pub fn validate_assistant_message(msg: &Value) -> ValidationResult {
     let has_content = msg.get("content").is_some();
 
     let mut missing = Vec::new();
-    if !has_content {
+    // Content is required only when there are no tool_calls — a tool-call-only
+    // assistant message is valid per the Chat Completions spec.
+    if !has_content && !has_tool_calls {
         missing.push(CriticalField::Content);
     }
     // reasoning_content is optional — advisory only, never invalidates
@@ -139,7 +141,7 @@ mod tests {
 
     #[test]
     fn validate_request_finds_invalid_messages() {
-        // Missing content is critical; missing reasoning is advisory only
+        // Missing content is critical only when there are no tool_calls
         let body = json!({
             "messages": [
                 {"role": "user", "content": "hi"},
@@ -147,7 +149,16 @@ mod tests {
                 {"role": "tool", "tool_call_id": "c1", "content": "result"}
             ]
         });
-        assert_eq!(validate_request_messages(&body), 1);
+        // tool_calls + no content is valid
+        assert_eq!(validate_request_messages(&body), 0);
+        // No tool_calls + no content is invalid
+        let body2 = json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "reasoning_content": ""},
+            ]
+        });
+        assert_eq!(validate_request_messages(&body2), 1);
     }
 
     #[test]
