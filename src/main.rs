@@ -263,16 +263,22 @@ fn run_trust() -> anyhow::Result<()> {
     if !std::path::Path::new(&cert_path).exists() {
         anyhow::bail!("No cert at {cert_path}. Run deeplossless first to generate one.");
     }
+    println!("Certificate: {cert_path}");
+    println!();
+    println!("Set the SSL_CERT_FILE environment variable so OpenSSL-based tools");
+    println!("(including Codex/OpenCode) trust this certificate:");
+    println!();
     #[cfg(target_os = "windows")]
     {
-        println!("Run this in an admin terminal:");
-        println!("  setx NODE_EXTRA_CA_CERTS {}\\\\.deeplossless\\\\cert.pem", std::env::var("USERPROFILE").unwrap_or_default());
+        println!("  setx SSL_CERT_FILE {}\\\\.deeplossless\\\\cert.pem", std::env::var("USERPROFILE").unwrap_or_default());
+        println!();
+        println!("Then restart your terminal or close+reopen VS Code.");
     }
     #[cfg(not(target_os = "windows"))]
     {
-        println!("Add this line to your shell config (~/.bashrc, ~/.zshrc, etc.):");
-        println!("  export NODE_EXTRA_CA_CERTS={cert_path}");
+        println!("  export SSL_CERT_FILE={cert_path}");
         println!();
+        println!("Add the line above to ~/.bashrc, ~/.zshrc, or equivalent.");
         println!("Then restart your terminal or run: source ~/.bashrc");
     }
     Ok(())
@@ -391,8 +397,8 @@ async fn main() -> anyhow::Result<()> {
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
     tracing::info!("TLS enabled — HTTPS on {addr_str}");
     if cli.tls_cert.is_none()
-        && std::env::var("NODE_EXTRA_CA_CERTS").is_err() {
-        tracing::info!("Run `deeplossless trust` once to configure HTTPS certificate trust.");
+        && std::env::var("SSL_CERT_FILE").is_err() {
+        tracing::info!("Run `deeplossless trust` once to configure HTTPS certificate trust (sets SSL_CERT_FILE).");
     }
 
     // Plain HTTP for sandboxed agents that can't trust self-signed certs (OpenClaw, etc.)
