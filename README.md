@@ -82,52 +82,91 @@ cargo test --test simulated_session -- --nocapture
 | `--dry-run` | disabled | Save request bodies, skip upstream |
 | `--log-dir` | disabled | Per-request JSON logging |
 | `--record` | disabled | Record raw request/response for protocol debugging |
+| `--passthrough` | disabled | Pure byte-level passthrough (no pipeline, no context injection) |
 | `--tls-cert` | auto-generated | Custom TLS certificate (PEM) |
 | `--tls-key` | auto-generated | Custom TLS private key (PEM) |
-| `--lcm-context-tokens` | `0` (off) | LCM context injection budget (e.g. 1024). Merges into last user message |
-| `--no-lcm-context` | off | Disable LCM context injection |
+| `--lcm-context` | off | Enable DAG context injection into system messages |
+| `--lcm-context-tokens` | `1024` | Token budget for LCM context injection. Set via body `lcm_max_tokens` per-request |
+| `--no-lcm-context` | off | Disable LCM context injection entirely |
 | `--no-cache-normalize` | off | Disable system prompt date stripping (on by default) |
+| `--no-pipeline` | off | Skip context injection but still capture reasoning |
+| `--no-header-mod` | off | Use upstream headers as-is |
 | `--dag-threshold` | `0.80` | Compaction trigger (fraction of context window) |
 | `--summarizer-budget` | `1000` | Max LLM summarizer calls per session (0=unlimited) |
 | `--http-port` | `8081` | Plain HTTP port for sandboxed agents |
+| `--workspace` | auto-detected | Project path for stable conversation identity across restarts |
+| `--audit-mode` | `full` | Audit logging: `full`, `onerror` (buffer, flush on failure), `off` |
+| `--snapshot-mode` | `manual` | DAG snapshots: `auto`, `manual` (via API), `off` |
+| `--onerror-ring-size` | `50` | OnError audit ring buffer size |
 
 TLS is always on. A self-signed certificate is auto-generated at `~/.deeplossless/`.
-Run `deeplossless trust` once to configure it.
+Run `deeplossless trust` once to configure `SSL_CERT_FILE` so OpenSSL-based tools
+(Codex, curl, etc.) trust the certificate.
 
 Set via `RUNTIME_PROFILE=minimal|efficient|exploratory|autonomous|custom`.
 
 ## Codex + DeepSeek
 
 ```bash
-# 1. Start the proxy
+# 1. Trust the certificate (one-time setup)
+deeplossless trust
+setx SSL_CERT_FILE "%USERPROFILE%\.deeplossless\cert.pem"
+# Restart your terminal after this
+
+# 2. Start the proxy
 deeplossless
 
-# 2. Codex config (~/.codex/config.toml)
+# 3. Codex config (~/.codex/config.toml)
 [model_providers.localproxy]
 name = "deeplossless"
 base_url = "https://localhost:8080/v1"
-wire_api = "responses"
-
-# 3. Trust the certificate (once)
-deeplossless trust
+wire_api = "responses"    # for Codex Responses API
 
 # 4. Run
 codex
 ```
 
 Protocol translation and tool cache interception work transparently.
-DAG context injection is disabled by default — `--lcm-context-tokens 1024` enables
-retrieval hints with the conversation ID for LCM endpoint queries.
-Manual agent hooks require Codex-side integration.
+The proxy translates Codex's Responses API requests to DeepSeek Chat Completions,
+and converts streaming responses back to Responses SSE format.
 
-### Discovering LCM endpoints
+### Claude Code (Anthropic Messages API)
 
-AI agents can discover the current conversation ID via:
 ```bash
-curl -sk https://localhost:8080/v1/lcm/current
-# → {"conversation_id": 8}
+deeplossless
+# Claude Code detects the proxy automatically via SSL_CERT_FILE
+
+# ~/.claude/claude_desktop_config.json or .codex/config.toml
+[model_providers.localproxy]
+name = "deeplossless"
+base_url = "https://localhost:8080/v1"
+wire_api = "anthropic"    # Anthropic Messages API format
 ```
-Then query past context: `GET /v1/lcm/grep/{id}?query=<terms>&limit=20`
+
+The proxy translates Anthropic Messages API → DeepSeek Chat Completions, including
+tool use, content blocks (text/thinking/tool_use/tool_result), and streaming SSE
+with proper content block lifecycle events. Reasoning content from DeepSeek is
+exposed as thinking blocks for Claude clients.
+
+### LCM API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/lcm/current` | GET | Current conversation ID |
+| `/v1/lcm/grep/{id}` | GET | Search past context by query |
+| `/v1/lcm/inject` | POST | Inject DAG context into last user message |
+| `/v1/lcm/chat/completions` | POST | Chat completions with automatic context injection |
+| `/v1/lcm/sessions/{id}/system-prompt` | GET | Deduplicated system prompt history |
+| `/v1/lcm/sessions/{id}/events` | GET | Execution events for a session |
+| `/v1/lcm/sessions/{id}/patches` | GET | File observation patches |
+| `/v1/lcm/latency` | GET | Recent upstream request latency records |
+| `/v1/lcm/latency/summary` | GET | Aggregated latency statistics (p50/p95/p99) |
+| `/v1/lcm/cache/stability` | GET | Cache stability diagnostics |
+| `/v1/lcm/status/{conv_id}` | GET | DAG health and execution status |
+| `/v1/lcm/runtime/report` | GET | Session performance report |
+
+Context injection merges into the last user message (not pushed as a new message),
+preserving message sequence and avoiding agent state machine disruption.
 
 ## Session Report
 
