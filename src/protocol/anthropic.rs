@@ -58,6 +58,9 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
                     if let Some(rc) = last_reasoning_content {
                         m["reasoning_content"] = json!(rc);
                     }
+                    if let Some(tc) = msg.get("tool_calls") {
+                        m["tool_calls"] = tc.clone();
+                    }
                 }
                 if role == "tool" {
                     if let Some(tc_id) = msg["tool_call_id"].as_str() {
@@ -65,6 +68,17 @@ pub fn request_to_deepseek(body: &Value, last_reasoning_content: Option<&str>) -
                     }
                 }
                 messages.push(m);
+            } else if content.is_null() && role == "assistant" {
+                let mut m = json!({"role": "assistant", "content": ""});
+                if let Some(rc) = last_reasoning_content {
+                    m["reasoning_content"] = json!(rc);
+                }
+                if let Some(tc) = msg.get("tool_calls") {
+                    m["tool_calls"] = tc.clone();
+                }
+                if m.get("tool_calls").is_some() {
+                    messages.push(m);
+                }
             } else if let Some(blocks) = content.as_array() {
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
@@ -347,6 +361,8 @@ pub struct AnthropicSseState {
     pub reasoning_content: String,
     /// Next available content block index, monotonically increasing.
     next_block_index: usize,
+    /// Whether finish_reason has been processed (prevents fallback override).
+    finish_seen: bool,
 }
 
 impl AnthropicSseState {
@@ -397,7 +413,7 @@ impl AnthropicSseState {
                     })));
                 }
             }
-            return events;
+            // Fall through to finish_reason handling
         }
 
         // Reasoning content — accumulate for next turn, emit as thinking delta.
@@ -484,6 +500,7 @@ impl AnthropicSseState {
             events.push(format!("event: message_stop\ndata: {}\n\n", json!({
                 "type": "message_stop"
             })));
+            self.finish_seen = true;
             return events;
         }
 
@@ -500,15 +517,15 @@ impl AnthropicSseState {
 
     /// All content block indices that were started (for emitting content_block_stop).
     pub fn started_block_indices(&self) -> Vec<usize> {
-        let mut indices = self.tool_use_block_indices.clone();
-        if let Some(idx) = self.thinking_block_index {
-            indices.push(idx);
-        }
-        if let Some(idx) = self.text_block_index {
-            indices.push(idx);
-        }
-        indices.sort();
-        indices
+        let mut v: Vec<usize> = self.tool_use_block_indices.clone();
+        if let Some(ti) = self.thinking_block_index { v.push(ti); }
+        if let Some(ti) = self.text_block_index { v.push(ti); }
+        v.sort();
+        v
+    }
+
+    pub fn finish_seen(&self) -> bool {
+        self.finish_seen
     }
 }
 
@@ -1177,6 +1194,33 @@ mod tests {
         let msgs = ds["messages"].as_array().unwrap();
         let tc_count = msgs.iter().filter(|m| m.get("tool_calls").is_some()).count();
         assert_eq!(tc_count, 2, "both assistant tool_calls should be preserved");
+    }
+
+    /// Claude Code sends assistant messages with content=null and tool_calls as
+    /// a top-level field. The translator must preserve tool_calls (not just
+    /// content blocks) so the upstream provider can match tool results.
+    #[test]
+    fn request_preserves_tool_calls_with_null_content() {
+        let body = json!({
+            "model": "deepseek-v4-pro",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "fix the bug"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "tc1", "type": "function", "function": {"name": "Read", "arguments": "{\"file_path\":\"/tmp/x\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "tc1", "content": "file contents"}
+            ]
+        });
+        let ds = request_to_deepseek(&body, None);
+        let msgs = ds["messages"].as_array().unwrap();
+        // Should be: user, assistant(with tool_calls), tool
+        assert_eq!(msgs.len(), 3, "all messages should be forwarded, got {msgs:?}");
+        let asst = &msgs[1];
+        assert_eq!(asst["role"], "assistant");
+        assert!(asst.get("tool_calls").is_some(), "tool_calls must be preserved on assistant with null content");
+        assert_eq!(asst["tool_calls"][0]["function"]["name"], "Read");
+        assert_eq!(asst["tool_calls"][0]["id"], "tc1");
     }
 
     /// Pending tool_calls with content text in the same assistant message

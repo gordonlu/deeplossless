@@ -2296,3 +2296,56 @@ async fn execution_unit_dedup_different_tool_call_id() {
     assert!(id2 > 0);
     assert_ne!(id1, id2, "different tool_call_ids must create separate units");
 }
+
+// ── Bypass (passthrough) tests ────────────────────────────────────
+
+#[tokio::test]
+async fn chat_completions_bypass_forwards_raw_bytes() {
+    // Passthrough: proxy should forward raw request without augmentation.
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let mut state = build_proxy_state(upstream_addr, "bypass_cc").await;
+    state.passthrough = true;
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role":"user","content":"hello"}],
+            "stream": false,
+        }))
+        .send().await.unwrap();
+
+    assert!(resp.status().is_success(), "bypass should succeed: {}", resp.status());
+    let body = resp.text().await.unwrap();
+    // In bypass mode, the response should contain the mock upstream data directly
+    assert!(body.contains("Mock response"), "bypass should forward upstream response: {body}");
+}
+
+#[tokio::test]
+async fn responses_endpoint_bypass_skips_pipeline() {
+    // Passthrough: responses handler should skip pipeline but still convert protocol.
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let mut state = build_proxy_state(upstream_addr, "bypass_resp").await;
+    state.passthrough = true;
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("authorization", "Bearer test-key")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "input": "hello",
+            "stream": false,
+        }))
+        .send().await.unwrap();
+
+    assert!(resp.status().is_success(), "bypass responses should succeed: {}", resp.status());
+    let body = resp.text().await.unwrap();
+    // Should produce a valid response (protocol conversion still happens)
+    assert!(body.contains("resp_") || body.contains("output"),
+        "bypass responses should produce output: {body}");
+}
