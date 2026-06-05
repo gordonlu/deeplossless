@@ -1,0 +1,76 @@
+name: reuse_existing
+description: "Agent must implement normalize_path. Codebase already has it under a different name."
+start: setup
+vfs:
+  files: {}
+
+states:
+  setup:
+    assistant: "Let me set up the project first."
+    tool_calls:
+      - bash
+    args:
+      bash:
+        command: |
+          mkdir -p src &&
+          echo '# existing utility' > src/utils.sh &&
+          echo 'standardize_path() {' >> src/utils.sh &&
+          echo '  echo "$1" | sed "s|//|/|g; s|/\./|/|g; s|/[^/]*/\.\./|/|g"' >> src/utils.sh &&
+          echo '}' >> src/utils.sh
+        description: create project with existing utility
+    transitions:
+      - type: on_task
+        next: investigate
+      - type: on_test
+        result: ""
+        next: investigate
+
+  investigate:
+    assistant: "Task: implement a `normalize_path` function that normalizes file paths.\n\nCheck if anything similar already exists in the codebase before writing new code."
+    tool_calls:
+      - grep
+    args:
+      grep:
+        pattern: "path"
+        path: "src/"
+    transitions:
+      - type: on_tool
+        tool: "path"
+        next: found_existing
+      - type: on_edit
+        pattern: ""
+        next: no_search
+
+  found_existing:
+    assistant: "Good, you found `standardize_path` in src/utils.sh which does exactly what you need. You can reuse it or add an alias."
+    finish: true
+
+  no_search:
+    assistant: "You started editing without searching. Check if there's existing code first."
+    tool_calls:
+      - grep
+    args:
+      grep:
+        pattern: "path"
+        path: "src/"
+    transitions:
+      - type: on_tool
+        tool: "path"
+        next: found_existing
+      - type: on_edit
+        pattern: ""
+        next: no_search
+
+  found_existing:
+    assistant: "Good, you found `standardize_path` in src/utils.rs which does exactly what normalize_path should do. You can reuse it or add an alias."
+    finish: true
+
+  no_search:
+    assistant: "You started editing without searching. Check if there's existing code first."
+    transitions:
+      - type: on_tool
+        tool: "path"
+        next: found_existing
+      - type: on_edit
+        pattern: ""
+        next: no_search

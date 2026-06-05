@@ -1,0 +1,165 @@
+# ACES scenario: security_fix (Codex variant)
+#
+# Mirror of 07_security_fix.yaml for the OpenAI Codex CLI.
+# Reads and test runs use `shell`. Edits use `apply_patch` with
+# `update_file` and a unified-diff body.
+#
+# Drive with:
+#   deeplossless --torture-aces 07_security_fix --agent-format codex
+#
+# Sibling files:
+#   07_security_fix.yaml             — Chat Completions / OpenAI default
+#   07_security_fix.claude_code.yaml — Claude Code
+name: security_fix
+description: "Agent must remove a hardcoded API key from src/api.sh and replace it with a config-file lookup (Codex variant)"
+start: read_source
+vfs:
+  files:
+    src/api.sh: |
+      #!/bin/bash
+      # API client for example.com
+      # The API key is stored in config/api.conf — please don't hardcode it.
+      call_api() {
+        local endpoint="$1"
+        local key="sk-abc123def456ghi789"
+        curl -s -H "Authorization: Bearer $key" "https://api.example.com/$endpoint"
+      }
+    config/api.conf: |
+      # API credentials (intended source of truth)
+      API_KEY=sk-abc123def456ghi789
+    tests/api_test.sh: |
+      #!/bin/bash
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got '$actual', expected '$expected')"
+          failures=$((failures + 1))
+        fi
+      }
+
+      # 1. The hardcoded secret literal must no longer appear in src/api.sh
+      check "no hardcoded key" \
+        "$(! grep -q 'sk-abc123def456ghi789' src/api.sh && echo clean || echo leaked)" \
+        "clean"
+
+      # 2. The source must read the key from config/api.conf (or env var)
+      check "reads from config" \
+        "$(grep -q 'config/api.conf' src/api.sh && echo yes || echo no)" \
+        "yes"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # API Client
+      A bash function that calls example.com's API.
+
+      Files:
+      - `src/api.sh` — implementation
+      - `config/api.conf` — API key lives here (intended source of truth)
+      - `tests/api_test.sh` — security audit checks
+
+      Security policy: never hardcode credentials in source. Always
+      read from `config/api.conf` (or environment variable).
+
+      Run the security audit: `bash tests/api_test.sh`
+
+states:
+  read_source:
+    assistant: "There's a security issue in src/api.sh — the API key is hardcoded in the source. Read src/api.sh first to see exactly what needs to change."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/src/api.sh"
+    transitions:
+      - type: on_read
+        pattern: "api.sh"
+        next: read_test
+      - type: on_tool
+        tool: ""
+        next: read_test
+
+  read_test:
+    assistant: "Read tests/api_test.sh to see what the security audit actually checks for."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/tests/api_test.sh"
+    transitions:
+      - type: on_read
+        pattern: "api_test"
+        next: find_fix
+      - type: on_tool
+        tool: ""
+        next: find_fix
+
+  find_fix:
+    assistant: "The fix: replace the hardcoded `local key=\"sk-...\"` line in src/api.sh with a read from `config/api.conf` (e.g. `key=$(grep API_KEY config/api.conf | cut -d= -f2)`). Keep the rest of the function the same."
+    tool_calls:
+      - apply_patch
+    args_per_agent:
+      codex:
+        apply_patch:
+          operation:
+            type: "update_file"
+            path: "${VFS}/src/api.sh"
+            diff: |
+              @@ -5 +5,2 @@
+              -        local key="sk-abc123def456ghi789"
+              +        local key
+              +        key=$(grep API_KEY config/api.conf | cut -d= -f2)
+    pre_apply:
+      - file_path: "${VFS}/src/api.sh"
+        from: '        local key="sk-abc123def456ghi789"'
+        to: '        local key\n        key=$(grep API_KEY config/api.conf | cut -d= -f2)'
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/api.sh"
+        contains: "config/api.conf"
+        next: run_test
+      - type: on_edit_result
+        pattern: "api.sh"
+        result_contains: "config"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: run_test
+
+  run_test:
+    assistant: "Fix applied. Run the security audit: `bash tests/api_test.sh`."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "bash ${VFS}/tests/api_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 2 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  verify:
+    assistant: "Security audit passes. The hardcoded API key is gone; the source now reads from `config/api.conf` as intended. Task complete."
+    finish: true

@@ -1,0 +1,169 @@
+# ACES scenario: debug_from_logs (Claude Code variant)
+#
+# Mirror of 06_debug_from_logs.yaml with snake_case tool args.
+#
+# Drive with:
+#   deeplossless --torture-aces 06_debug_from_logs --agent-format claude_code
+#
+# Sibling files:
+#   06_debug_from_logs.yaml       — Chat Completions / OpenAI default
+#   06_debug_from_logs.codex.yaml — OpenAI Codex CLI
+name: debug_from_logs
+description: "Agent must read the server log to spot the error pattern, then fix a case-sensitive regex in process() (Claude Code variant)"
+start: read_log
+vfs:
+  files:
+    src/server.sh: |
+      #!/bin/bash
+      # Simple text processing server
+
+      process() {
+        local input="$1"
+        if [[ ! "$input" =~ ^[a-z]+$ ]]; then
+          echo "ERROR: invalid input '$input'" >&2
+          return 1
+        fi
+        echo "${input^^}"
+      }
+    logs/server.log: |
+      [2025-01-15 10:23:45] INFO  request processed input='hello'
+      [2025-01-15 10:24:12] ERROR invalid input 'Hello'
+      [2025-01-15 11:05:33] ERROR invalid input 'WORLD'
+      [2025-01-15 11:06:01] INFO  request processed input='foo'
+      [2025-01-15 11:06:15] ERROR invalid input 'Mixed'
+      [2025-01-15 11:07:02] INFO  request processed input='bar'
+    tests/server_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/server.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got '$actual', expected '$expected')"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "process('hello')"  "$(process 'hello')"  "HELLO"
+      check "process('Hello')"  "$(process 'Hello')"  "HELLO"
+      check "process('WORLD')"  "$(process 'WORLD')"  "WORLD"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # Text Server
+      A simple bash function `process(input)` that uppercases its input.
+
+      Files:
+      - `src/server.sh` — implementation
+      - `logs/server.log` — past request log
+      - `tests/server_test.sh` — test cases
+
+      Run tests: `bash tests/server_test.sh`
+
+states:
+  read_log:
+    assistant: "Some requests are failing in this server. Read `logs/server.log` first to see the error pattern."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        file_path: "${VFS}/logs/server.log"
+    transitions:
+      - type: on_read
+        pattern: "server.log"
+        next: read_test
+      - type: on_tool
+        tool: ""
+        next: read_test
+
+  read_test:
+    assistant: "Now read tests/server_test.sh to see exactly what `process()` should return for each input."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        file_path: "${VFS}/tests/server_test.sh"
+    transitions:
+      - type: on_read
+        pattern: "server_test"
+        next: read_server
+      - type: on_tool
+        tool: ""
+        next: read_server
+
+  read_server:
+    assistant: "Read src/server.sh to find the validation that rejects mixed/upper case input."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        file_path: "${VFS}/src/server.sh"
+    transitions:
+      - type: on_read
+        pattern: "server.sh"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: find_bug
+
+  find_bug:
+    assistant: "Found it: the regex `^[a-z]+$` is lowercase-only, so `Hello` and `WORLD` fail validation. Change it to `^[a-zA-Z]+$` to accept any case."
+    tool_calls:
+      - Edit
+    args:
+      Edit:
+        file_path: "${VFS}/src/server.sh"
+        old_string: '        if [[ ! "$input" =~ ^[a-z]+$ ]]; then'
+        new_string: '        if [[ ! "$input" =~ ^[a-zA-Z]+$ ]]; then'
+    pre_apply:
+      - file_path: "${VFS}/src/server.sh"
+        from: '        if [[ ! "$input" =~ ^[a-z]+$ ]]; then'
+        to: '        if [[ ! "$input" =~ ^[a-zA-Z]+$ ]]; then'
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/server.sh"
+        contains: "^[a-zA-Z]+$"
+        next: run_test
+      - type: on_edit_result
+        pattern: "server.sh"
+        result_contains: "a-zA-Z"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: run_test
+
+  run_test:
+    assistant: "Regex fixed. Run the test: `bash tests/server_test.sh`."
+    tool_calls:
+      - Bash
+    args:
+      Bash:
+        command: "bash ${VFS}/tests/server_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 3 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  verify:
+    assistant: "All 3 tests pass. The log hinted that uppercase/mixed-case inputs were failing — the regex was the culprit. Task complete."
+    finish: true

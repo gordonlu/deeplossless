@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Parser)]
 #[command(name = "deeplossless", version, about = "Inference-aware execution runtime for AI coding agents")]
@@ -140,6 +141,33 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Run built-in torture benchmark with deeplossless augmentation.
+    #[arg(long)]
+    torture: bool,
+
+    /// Run ACES (Agent Capability Evaluation Suite) scenario.
+    /// Starts a mock API that drives agent behavior via a state machine.
+    /// Usage: --torture-aces hidden_bug
+    /// Empty value (`--torture-aces=""`) or "all" runs the full suite:
+    /// every base scenario in scenarios/ in sorted order, sequenced by
+    /// idle-after-terminal detection.
+    #[arg(long, default_value = "")]
+    torture_aces: String,
+
+    /// Agent format used by ACES to select per-agent tool arg templates
+    /// from `args_per_agent[format]` in the scenario YAML. Default is
+    /// `openai` (camelCase field names: filePath, oldString, newString)
+    /// which matches the Chat Completions protocol the mock speaks.
+    /// Use `claude_code` (snake_case: file_path, old_string, new_string)
+    /// when driving the mock from Claude Code, which translates the
+    /// Anthropic protocol to Chat Completions.
+    /// Use `codex` for the OpenAI Codex CLI / Responses API clients
+    /// (note: Codex uses `apply_patch` for file edits, not `Edit`, so
+    /// scenario YAMLs will need a separate `args_per_agent.codex`
+    /// block with the apply_patch schema).
+    #[arg(long, default_value = "openai")]
+    agent_format: String,
 }
 
 #[derive(Parser)]
@@ -294,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     if matches!(cli.command, Some(Commands::Demo)) {
         return run_demo().await;
@@ -304,6 +332,141 @@ async fn main() -> anyhow::Result<()> {
     }
     if matches!(cli.command, Some(Commands::Trust)) {
         return run_trust();
+    }
+    let mut cli = cli;
+
+    if !cli.torture_aces.is_empty() {
+        // Suite mode runs every base scenario; single mode runs the
+        // one named scenario. The mock handles per-agent variant
+        // selection internally via Scenario::load_with_format.
+        let scenarios: Vec<String> = if cli.torture_aces == "all" || cli.torture_aces.is_empty() {
+            match deeplossless::torture::scenario::Scenario::list_base() {
+                Ok(names) if !names.is_empty() => names,
+                Ok(_) => {
+                    eprintln!("[aces] no base scenarios found in scenarios/");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("[aces] failed to list scenarios: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            vec![cli.torture_aces.clone()]
+        };
+
+        eprintln!("[aces] starting ACES mock upstream...");
+        eprintln!("[aces] suite: {} scenario(s)", scenarios.len());
+        for (i, s) in scenarios.iter().enumerate() {
+            eprintln!("[aces]   [{}/{}] {}", i + 1, scenarios.len(), s);
+        }
+        eprintln!("[aces] agent format: {}", cli.agent_format);
+
+        let mock_state = deeplossless::torture::aces::start_mock(&scenarios, &cli.agent_format).await;
+        cli.upstream = "http://127.0.0.1:9000".into();
+        eprintln!("[aces] proxy upstream set to mock on port 9000");
+
+        // For multi-scenario suites, wait for the entire suite to
+        // complete (idleness-driven), then print a summary and exit.
+        // For single-scenario runs, leave the mock running and let
+        // the existing axum serve() loop handle requests.
+        if scenarios.len() > 1 {
+            // Print prompts for the operator: which prompt to feed
+            // to the agent for each scenario. The agent stays
+            // connected to the same proxy/mock; the mock cycles
+            // through scenarios internally.
+            eprintln!();
+            eprintln!("[aces] ── Run order ────────────────────────────────────");
+            for (i, s) in scenarios.iter().enumerate() {
+                eprintln!("[aces]   [{}/{}] {} — run agent with this scenario's prompt",
+                    i + 1, scenarios.len(), s);
+            }
+            eprintln!();
+            eprintln!("[aces] waiting for suite to complete (5s idle per scenario)...");
+
+            // Poll the suite_complete flag. The mock's background
+            // idle-watcher sets it after the last scenario's idle
+            // threshold fires. The user's main loop just waits.
+            let poll_state = mock_state.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if poll_state.lock().unwrap().suite_complete {
+                        let s = poll_state.lock().unwrap();
+                        eprintln!();
+                        eprintln!("═══════════════════════════════════════════");
+                        eprintln!("  ACES Suite Complete");
+                        eprintln!("═══════════════════════════════════════════");
+                        let total: f64 = s.scores.iter().sum::<f64>() / s.scores.len() as f64;
+                        for (i, ((name, _), score)) in s.scenarios.iter().zip(s.scores.iter()).enumerate() {
+                            let status = s.statuses.get(i).map(String::as_str).unwrap_or("?");
+                            eprintln!("  [{}/{}] {:<32} {:>5.1}/100  {}", i + 1, s.scenarios.len(), name, score, status);
+                        }
+                        eprintln!("  ────────────────────────────────────────");
+                        eprintln!("  Suite Average:  {:>5.1}/100", total);
+                        eprintln!("═══════════════════════════════════════════");
+                        std::process::exit(0);
+                    }
+                }
+            });
+        }
+    }
+
+    let torture_workspace: Option<std::path::PathBuf> = if cli.torture {
+        eprintln!("[torture] starting mock upstream...");
+        if let Err(e) = torture_start_mock().await {
+            eprintln!("[torture] mock server failed: {e}");
+        }
+        let ws = std::env::current_dir().ok();
+        cli.upstream = "http://127.0.0.1:9000".into();
+        eprintln!("[torture] proxy upstream set to mock on port 9000");
+        eprintln!("[torture] connect your agent via HTTP to http://127.0.0.1:8081/v1/chat/completions");
+        eprintln!("[torture] or via HTTPS to https://127.0.0.1:8080/v1/chat/completions");
+        ws
+    } else {
+        None
+    };
+
+    let is_aces = !cli.torture_aces.is_empty();
+    let is_torture = cli.torture;
+    let mode_str = "full (runtime enabled)".to_string();
+
+    if is_aces || is_torture {
+        eprintln!();
+        if is_aces {
+        eprintln!("┌────────────────────────────────────────────────┐");
+        eprintln!("│ ACES — Agent Capability Evaluation Suite       │");
+        eprintln!("├────────────────────────────────────────────────┤");
+        eprintln!("│ Scenario: {:<37}", if cli.torture_aces.is_empty() { "(suite)".to_string() } else { cli.torture_aces.clone() });
+        eprintln!("│ Mode:     {mode_str}");
+        eprintln!("│                                                │");
+        eprintln!("│ Point your agent to:                           │");
+        eprintln!("│ http://127.0.0.1:8081/v1/chat/completions      │");
+        eprintln!("│ or HTTPS at 127.0.0.1:8080                     │");
+        eprintln!("│                                                │");
+        eprintln!("│ Scenario guides the interaction. Scores +      │");
+        eprintln!("│ runtime metrics saved on exit.                 │");
+        eprintln!("└────────────────────────────────────────────────┘");
+    } else {
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        eprintln!("  Torture Benchmark Started");
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        eprintln!("  mock upstream:  http://127.0.0.1:9000/v1/chat/completions");
+        eprintln!("  proxy HTTP:     http://127.0.0.1:8081/v1/chat/completions");
+        eprintln!("  proxy HTTPS:    https://127.0.0.1:8080/v1/chat/completions");
+        eprintln!("  mode:           {mode_str}");
+        eprintln!();
+        if let Some(ref ws) = torture_workspace {
+            eprintln!("  workspace:   {}", ws.display());
+        }
+        eprintln!("  HOW TO TEST");
+        eprintln!("  1. Open an empty directory in your agent");
+        eprintln!("  2. Point your agent to proxy:");
+        eprintln!("     http://127.0.0.1:8081 (HTTP) or https://127.0.0.1:8080 (HTTPS)");
+        eprintln!("  3. Work naturally — traces will generate files and exercise tools");
+        eprintln!("  4. After all turns complete, benchmark finishes and report is saved");
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        }
     }
 
     let audit_mode = match cli.audit_mode.as_str() {
@@ -345,7 +508,12 @@ async fn main() -> anyhow::Result<()> {
         log_dir: cli.log_dir,
         record: cli.record,
         passthrough: cli.passthrough,
-        no_pipeline: cli.no_pipeline,
+        // ACES drives its own scenario state machine — the deeplossless
+        // pipeline (storage, compactor, summarizer) is pure noise here
+        // and would call the mock's /v1/chat/completions from the
+        // summarizer, producing the "expected value at line 1 column 1"
+        // parse errors. Force the pipeline off in ACES mode.
+        no_pipeline: cli.no_pipeline || !cli.torture_aces.is_empty(),
         no_header_mod: cli.no_header_mod,
         lcm_context: cli.lcm_context,
         cache_normalize: !cli.no_cache_normalize,
@@ -448,6 +616,146 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn torture_start_mock() -> anyhow::Result<()> {
+    use deeplossless::torture::adversarial;
+    use std::sync::atomic::Ordering;
+
+    let combined = deeplossless::torture::adversarial::combined_trace();
+    let total_turns = combined.turns.len();
+    let tool_calls_total: usize = combined.turns.iter().map(|t| t.tool_calls.len()).sum();
+    let mode = "full";
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let report_path = format!("logs/torture-report-{}-{}.json", mode, ts);
+
+    eprintln!("[torture] {} mode, {} turns", mode, total_turns);
+
+    let state = std::sync::Arc::new(MockTortureState {
+        turns: combined.turns,
+        cursor: AtomicUsize::new(0),
+        report_saved: AtomicUsize::new(0),
+        started_at: std::time::Instant::now(),
+    });
+    let s = state.clone();
+    let app = axum::Router::new()
+        .route("/v1/chat/completions", axum::routing::post(move |_body: axum::Json<serde_json::Value>| {
+            let s = s.clone();
+            async move {
+                let idx = s.cursor.fetch_add(1, Ordering::Relaxed);
+
+                if idx == total_turns {
+                    s.cursor.store(total_turns, Ordering::Relaxed);
+                    if s.report_saved.fetch_add(1, Ordering::Relaxed) == 0 {
+                        eprintln!();
+                        eprintln!("═══════════════════════════════════════════");
+                        eprintln!("  Torture Benchmark Complete");
+                        eprintln!("═══════════════════════════════════════════");
+                        eprintln!("  mode:        {}", mode);
+                        eprintln!("  turns:       {}/{}", total_turns, total_turns);
+                        eprintln!("  report:      {}", report_path);
+                        eprintln!();
+
+                        let elapsed = s.started_at.elapsed().as_secs_f64();
+                        let runtime_metrics = match reqwest::Client::new()
+                            .get("http://127.0.0.1:8081/v1/lcm/runtime/stats")
+                            .header("Authorization", "Bearer test-key")
+                            .send()
+                            .await
+                        {
+                            Ok(r) => r.json::<serde_json::Value>().await.unwrap_or_default(),
+                            Err(_) => serde_json::Value::Null,
+                        };
+
+                        let report = serde_json::json!({
+                            "benchmark": "deeplossless torture suite",
+                            "version": "0.6.7",
+                            "total_turns": total_turns,
+                            "turns_served": total_turns,
+                            "tool_calls_in_trace": tool_calls_total,
+                            "elapsed_secs": elapsed,
+                            "turns_per_sec": (total_turns as f64 / elapsed).round(),
+                            "mode": mode,
+                            "runtime": runtime_metrics,
+                            "timestamp": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        });
+                        let json_str = serde_json::to_string_pretty(&report).unwrap_or_default();
+                        let _ = std::fs::create_dir_all("logs");
+                        let _ = std::fs::write(&report_path, &json_str);
+                    }
+                }
+
+                let turn_idx = idx.min(total_turns - 1);
+                let turn = &s.turns[turn_idx];
+
+                if idx > 0 && idx % 10 == 0 && idx < total_turns {
+                    let pct = (idx as f64 / total_turns as f64 * 100.0).round();
+                    eprintln!("[torture] {}/{} ({:.0}%)", idx, total_turns, pct);
+                }
+
+                let remaining = if idx >= total_turns { 0 } else { total_turns - idx };
+
+                let (delta_json, finish_reason) = if idx >= total_turns {
+                    let msg = format!("[Benchmark Complete] All {} turns executed.", total_turns);
+                    (format!("\"content\":{}", serde_json::to_string(&msg).unwrap_or_default()), "\"stop\"")
+                } else if turn.tool_calls.is_empty() {
+                    (format!("\"content\":{}", serde_json::to_string(&turn.completion).unwrap_or_default()), "\"stop\"")
+                } else {
+                    let tc_parts: Vec<String> = turn.tool_calls.iter().enumerate().map(|(ti, name)| {
+                        let args_value: serde_json::Value = match name.as_str() {
+                            "grep" | "rg" | "search" => serde_json::json!({"pattern":"fn foo","path":"src/lib.rs"}),
+                            "read" | "cat" => serde_json::json!({"filePath":"src/lib.rs"}),
+                            "edit" | "replace" => serde_json::json!({"filePath":"src/lib.rs","oldString":"fn foo() {}","newString":"fn foo() -> i32 { 42 }"}),
+                            "bash" => {
+                                let cmds = [
+                                    "mkdir -p src && echo 'fn foo() {}' > src/lib.rs",
+                                    "mkdir -p config && printf 'port=8080\\nhost=localhost\\n' > config/dev.conf",
+                                    "echo 'Hello World' > README.md",
+                                    "mkdir -p tests && echo 'mod tests;' > tests/mod.rs",
+                                    "echo 'version = \"0.1.0\"' > Cargo.toml",
+                                    "mkdir -p src && echo 'pub fn bar() -> u32 { 7 }' > src/bar.rs",
+                                    "echo 'DEBUG=true' > .env",
+                                    "printf 'fn main() {\\n    println!(\"hi\");\\n}\\n' > src/main.rs",
+                                    "mkdir -p data && echo '{\"key\": 1}' > data/config.json",
+                                    "echo 'use std::collections::HashMap;' > src/lib.rs",
+                                ];
+                                let cmd_idx = (idx + ti) % cmds.len();
+                                serde_json::json!({"command": cmds[cmd_idx], "description": cmds[cmd_idx].split(' ').take(4).collect::<Vec<_>>().join(" ")})
+                            },
+                            "glob" | "find" | "ls" => serde_json::json!({"pattern":"src/**/*.rs"}),
+                            _ => serde_json::json!({"key":"value"}),
+                        };
+                        let args_str = serde_json::to_string(&args_value).unwrap_or_default();
+                        format!("{{\"index\":{ti},\"id\":\"call_{ti}\",\"function\":{{\"name\":{},\"arguments\":{}}},\"type\":\"function\"}}",
+                            serde_json::to_string(name).unwrap_or_default(),
+                            serde_json::to_string(&args_str).unwrap_or_default())
+                    }).collect();
+                    (format!("\"tool_calls\":[{}]", tc_parts.join(",")), "\"tool_calls\"")
+                };
+
+                let events = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{{}}},\"index\":0,\"finish_reason\":{}}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{},\"total_tokens\":{},\"remaining_turns\":{}}}}}\n\ndata: [DONE]\n\n",
+                    delta_json, finish_reason, turn.tokens, turn.tokens, remaining,
+                );
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], events)
+            }
+        }));
+
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind("127.0.0.1:9000").await {
+            Ok(listener) => { axum::serve(listener, app).await.ok(); }
+            Err(e) => eprintln!("[torture] failed to start mock server: {e}"),
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    Ok(())
+}
+
+struct MockTortureState {
+    turns: Vec<deeplossless::torture::trace::Turn>,
+    cursor: AtomicUsize,
+    report_saved: AtomicUsize,
+    started_at: std::time::Instant,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +775,11 @@ mod tests {
         let args = Cli::try_parse_from(["deeplossless"]).unwrap();
         assert!(args.tls_cert.is_none());
         assert!(args.tls_key.is_none());
+    }
+
+    #[test]
+    fn torture_flag_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--torture"]).unwrap();
+        assert!(args.torture);
     }
 }

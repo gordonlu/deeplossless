@@ -1,0 +1,512 @@
+{
+  "name": "torture",
+  "description": "Combined adversarial: cache, loop, state contamination",
+  "turns": [
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "project created",
+      "completion": "response to: project created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: find the foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found in src/lib.rs: fn foo()",
+      "completion": "response to: found in src/lib.rs: fn foo()",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "change foo to return 42",
+      "completion": "response to: change foo to return 42",
+      "tokens": 50,
+      "tool_calls": [
+        "edit"
+      ]
+    },
+    {
+      "prompt": "edited",
+      "completion": "response to: edited",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "show me the file",
+      "completion": "response to: show me the file",
+      "tokens": 50,
+      "tool_calls": [
+        "read"
+      ]
+    },
+    {
+      "prompt": "```rust\nfn foo() -> i32 { 42 }\n```",
+      "completion": "response to: ```rust\nfn foo() -> i32 { 42 }\n```",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "project created",
+      "completion": "response to: project created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "find the foo function",
+      "completion": "response to: find the foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found in src/lib.rs: fn foo()",
+      "completion": "response to: found in src/lib.rs: fn foo()",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "change foo to return 42",
+      "completion": "response to: change foo to return 42",
+      "tokens": 50,
+      "tool_calls": [
+        "edit"
+      ]
+    },
+    {
+      "prompt": "edited",
+      "completion": "response to: edited",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "show me the file",
+      "completion": "response to: show me the file",
+      "tokens": 50,
+      "tool_calls": [
+        "read"
+      ]
+    },
+    {
+      "prompt": "```rust\nfn foo() -> i32 { 42 }\n```",
+      "completion": "response to: ```rust\nfn foo() -> i32 { 42 }\n```",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "crεαtε α Rust prοjεct with α lib.rs thαt hαs α fοο functiοn",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "project created",
+      "completion": "response to: project created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "find the foo function",
+      "completion": "response to: find the foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found in src/lib.rs: fn foo()",
+      "completion": "response to: found in src/lib.rs: fn foo()",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "change foo to return 42",
+      "completion": "response to: change foo to return 42",
+      "tokens": 50,
+      "tool_calls": [
+        "edit"
+      ]
+    },
+    {
+      "prompt": "edited",
+      "completion": "response to: edited",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "show me the file",
+      "completion": "response to: show me the file",
+      "tokens": 50,
+      "tool_calls": [
+        "read"
+      ]
+    },
+    {
+      "prompt": "```rust\nfn foo() -> i32 { 42 }\n```",
+      "completion": "response to: ```rust\nfn foo() -> i32 { 42 }\n```",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function [attempt 1]",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function [attempt 2]",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function [attempt 3]",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function [attempt 4]",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function [attempt 5]",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "project created",
+      "completion": "response to: project created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "find the foo function",
+      "completion": "response to: find the foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found in src/lib.rs: fn foo()",
+      "completion": "response to: found in src/lib.rs: fn foo()",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "change foo to return 42",
+      "completion": "response to: change foo to return 42",
+      "tokens": 50,
+      "tool_calls": [
+        "edit"
+      ]
+    },
+    {
+      "prompt": "edited",
+      "completion": "response to: edited",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "show me the file",
+      "completion": "response to: show me the file",
+      "tokens": 50,
+      "tool_calls": [
+        "read"
+      ]
+    },
+    {
+      "prompt": "```rust\nfn foo() -> i32 { 42 }\n```",
+      "completion": "response to: ```rust\nfn foo() -> i32 { 42 }\n```",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "project created",
+      "completion": "response to: project created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "find the foo function",
+      "completion": "response to: find the foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found in src/lib.rs: fn foo()",
+      "completion": "response to: found in src/lib.rs: fn foo()",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "change foo to return 42",
+      "completion": "response to: change foo to return 42",
+      "tokens": 50,
+      "tool_calls": [
+        "edit"
+      ]
+    },
+    {
+      "prompt": "edited",
+      "completion": "response to: edited",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "show me the file",
+      "completion": "response to: show me the file",
+      "tokens": 50,
+      "tool_calls": [
+        "read"
+      ]
+    },
+    {
+      "prompt": "```rust\nfn foo() -> i32 { 42 }\n```",
+      "completion": "response to: ```rust\nfn foo() -> i32 { 42 }\n```",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: create a Rust project with a lib.rs that has a foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "project created",
+      "completion": "response to: project created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: find the foo function",
+      "tokens": 50,
+      "tool_calls": [
+        "grep"
+      ]
+    },
+    {
+      "prompt": "create a Rust project with a lib.rs that has a foo function",
+      "completion": "response to: found in src/lib.rs: fn foo()",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "change foo to return 42",
+      "completion": "response to: change foo to return 42",
+      "tokens": 50,
+      "tool_calls": [
+        "edit"
+      ]
+    },
+    {
+      "prompt": "edited",
+      "completion": "response to: edited",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "show me the file",
+      "completion": "response to: show me the file",
+      "tokens": 50,
+      "tool_calls": [
+        "read"
+      ]
+    },
+    {
+      "prompt": "```rust\nfn foo() -> i32 { 42 }\n```",
+      "completion": "response to: ```rust\nfn foo() -> i32 { 42 }\n```",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "configs created",
+      "completion": "response to: configs created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create config files for dev, staging, and prod",
+      "completion": "response to: create config files for dev, staging, and prod",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "read all config files and find the port setting",
+      "completion": "response to: read all config files and find the port setting",
+      "tokens": 50,
+      "tool_calls": [
+        "read",
+        "glob",
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found port 8080 in all configs",
+      "completion": "response to: found port 8080 in all configs",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "configs created",
+      "completion": "response to: configs created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "create config files for dev, staging, and prod",
+      "completion": "response to: create config files for dev, staging, and prod",
+      "tokens": 50,
+      "tool_calls": [
+        "bash"
+      ]
+    },
+    {
+      "prompt": "read all config files and find the port setting",
+      "completion": "response to: read all config files and find the port setting",
+      "tokens": 50,
+      "tool_calls": [
+        "read",
+        "glob",
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found port 8080 in all configs",
+      "completion": "response to: found port 8080 in all configs",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "configs created",
+      "completion": "response to: configs created",
+      "tokens": 50,
+      "tool_calls": []
+    },
+    {
+      "prompt": "read all config files and find the port setting",
+      "completion": "response to: read all config files and find the port setting",
+      "tokens": 50,
+      "tool_calls": [
+        "read",
+        "glob",
+        "grep"
+      ]
+    },
+    {
+      "prompt": "found port 8080 in all configs",
+      "completion": "response to: found port 8080 in all configs",
+      "tokens": 50,
+      "tool_calls": []
+    }
+  ]
+}

@@ -95,6 +95,7 @@ pub mod snapshot;
 pub mod snippet;
 pub mod summarizer;
 pub mod tokenizer;
+pub mod torture;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;

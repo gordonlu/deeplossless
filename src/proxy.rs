@@ -498,16 +498,27 @@ async fn responses(
 
     let chat_body = crate::protocol::chat_completions::request_to_chat(&canonical);
 
-    // 3. Run the chat pipeline (DAG context injection, message persistence)
-    let pipeline = crate::pipeline::ChatPipeline::new(&state);
+    // 3. Run the chat pipeline (DAG context injection, message persistence).
+    //    Gated by !state.no_pipeline so ACES torture mode — where the
+    //    upstream IS the ACES mock and pipeline.process would call the
+    //    summarizer (also pointed at the mock) and produce SSE parse
+    //    errors — stays clean. The same gate exists on chat_completions
+    //    and anthropic handlers; this site was missed when the responses
+    //    handler was added, which is why Codex-mode runs logged
+    //    "summarizer: response parse error" on every request.
     let mut chat_body_val: serde_json::Value = chat_body.clone();
     // Embed prompt_cache_key for pipeline reasoning injection (stable session key)
     chat_body_val["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
-    let injected = match pipeline.process(&canonical.model, &chat_body_val).await {
-        Ok(out) => out.injected_body,
-        Err(e) => {
-            warn!("pipeline error: {e}, falling back to passthrough");
-            chat_body_val
+    let injected = if state.no_pipeline {
+        chat_body_val
+    } else {
+        let pipeline = crate::pipeline::ChatPipeline::new(&state);
+        match pipeline.process(&canonical.model, &chat_body_val).await {
+            Ok(out) => out.injected_body,
+            Err(e) => {
+                warn!("pipeline error: {e}, falling back to passthrough");
+                chat_body_val
+            }
         }
     };
 
@@ -1896,7 +1907,7 @@ async fn anthropic_messages(
             let mut buf = String::new();
             // Send message_start event
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
-                axum::body::Bytes::from("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-v4-pro\",\"content\":[],\"usage\":null}}\n\n")
+                axum::body::Bytes::from("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-v4-pro\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n")
             ));
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
@@ -1920,7 +1931,7 @@ async fn anthropic_messages(
                 }
             }
             // If upstream didn't send finish_reason (abnormal disconnect), close blocks
-            if sse_state.any_block_started() {
+            if !sse_state.finish_seen() && sse_state.any_block_started() {
                 for idx in sse_state.started_block_indices() {
                     let _ = tx.send(Ok::<_, std::convert::Infallible>(
                         axum::body::Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"))

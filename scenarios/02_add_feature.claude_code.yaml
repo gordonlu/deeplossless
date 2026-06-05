@@ -1,0 +1,176 @@
+# ACES scenario: add_feature (Claude Code variant)
+#
+# Mirror of 02_add_feature.yaml with snake_case tool args.
+#
+# Drive with:
+#   deeplossless --torture-aces 02_add_feature --agent-format claude_code
+#
+# Sibling files:
+#   02_add_feature.yaml       — Chat Completions / OpenAI default
+#   02_add_feature.codex.yaml — OpenAI Codex CLI
+name: add_feature
+description: "Agent must add a divide() function to the calculator to make the test pass (Claude Code variant)"
+start: read_test
+vfs:
+  files:
+    src/calculator.sh: |
+      #!/bin/bash
+      # Simple calculator with utilities
+      add() {
+        local a=$1
+        local b=$2
+        echo $((a + b))
+      }
+      subtract() {
+        local a=$1
+        local b=$2
+        echo $((a - b))
+      }
+      multiply() {
+        local a=$1
+        local b=$2
+        echo $((a * b))
+      }
+    tests/calculator_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/calculator.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got '$actual', expected '$expected')"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "add(2, 3)"        "$(add 2 3)"        "5"
+      check "subtract(10, 3)"  "$(subtract 10 3)"  "7"
+      check "multiply(4, 5)"   "$(multiply 4 5)"   "20"
+      check "divide(20, 4)"    "$(divide 20 4)"    "5"
+      check "divide(10, 0)"    "$(divide 10 0)"    "error"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # Calculator
+      A bash calculator with `add`, `subtract`, `multiply`.
+
+      Run the tests:
+      ```
+      bash tests/calculator_test.sh
+      ```
+
+states:
+  read_test:
+    assistant: "Two tests are failing in this project — they call `divide()` but the function doesn't exist. Read tests/calculator_test.sh to see exactly what's expected."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        file_path: "${VFS}/tests/calculator_test.sh"
+    transitions:
+      - type: on_read
+        pattern: "calculator_test"
+        next: read_code
+      - type: on_tool
+        tool: ""
+        next: read_code
+
+  read_code:
+    assistant: "Now read src/calculator.sh to learn the existing function pattern (how they use `local`, `echo`, error handling)."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        file_path: "${VFS}/src/calculator.sh"
+    transitions:
+      - type: on_read
+        pattern: "calculator.sh"
+        next: add_function
+      - type: on_tool
+        tool: ""
+        next: add_function
+
+  add_function:
+    assistant: "Add a `divide()` function to src/calculator.sh that follows the same pattern. It should: take `a` and `b` as `$1` and `$2`, print `error` and return 1 if `b` is 0, otherwise print `a / b`."
+    tool_calls:
+      - Edit
+    args:
+      Edit:
+        file_path: "${VFS}/src/calculator.sh"
+        old_string: "multiply() {\n  local a=$1\n  local b=$2\n  echo $((a * b))\n}\n"
+        new_string: "multiply() {\n  local a=$1\n  local b=$2\n  echo $((a * b))\n}\ndivide() {\n  local a=$1\n  local b=$2\n  if [ \"$b\" -eq 0 ]; then\n    echo \"error\"\n    return 1\n  fi\n  echo $((a / b))\n}\n"
+    pre_apply:
+      - file_path: "${VFS}/src/calculator.sh"
+        from: "multiply() {\n  local a=$1\n  local b=$2\n  echo $((a * b))\n}\n"
+        to: "multiply() {\n  local a=$1\n  local b=$2\n  echo $((a * b))\n}\ndivide() {\n  local a=$1\n  local b=$2\n  if [ \"$b\" -eq 0 ]; then\n    echo \"error\"\n    return 1\n  fi\n  echo $((a / b))\n}\n"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "divide()"
+        next: run_test
+      - type: on_edit_result
+        pattern: "calculator.sh"
+        result_contains: "divide"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: edit_timeout
+
+  run_test:
+    assistant: "Now run the test to confirm `divide()` works: `bash tests/calculator_test.sh`."
+    tool_calls:
+      - Bash
+    args:
+      Bash:
+        command: "bash ${VFS}/tests/calculator_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 5 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  edit_timeout:
+    assistant: "The edit didn't apply. Re-read src/calculator.sh to refresh your context, then add `divide()` to the end of the file."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        file_path: "${VFS}/src/calculator.sh"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "divide()"
+        next: run_test
+      - type: on_read
+        pattern: "calculator.sh"
+        next: add_function
+      - type: on_tool
+        tool: ""
+        next: give_up
+
+  give_up:
+    assistant: "Task abandoned. The missing function was `divide()`: takes `a` and `b` as args, returns 1 and prints `error` if `b == 0`, otherwise prints `a / b`. Add it to the end of src/calculator.sh."
+    finish: true
+
+  verify:
+    assistant: "All 5 tests pass. Task complete — `divide()` was added to the calculator."
+    finish: true

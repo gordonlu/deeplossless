@@ -1,0 +1,21 @@
+{
+  "description": "Describe your test scenario here",
+  "name": "my_scenario",
+  "turns": [
+    {
+      "completion": "Expected assistant response for this turn",
+      "prompt": "User's first message to the agent",
+      "tokens": 50,
+      "tool_calls": [
+        "tool_name_1",
+        "tool_name_2"
+      ]
+    },
+    {
+      "completion": "response with no tool calls",
+      "prompt": "User's follow-up message",
+      "tokens": 20,
+      "tool_calls": []
+    }
+  ]
+}

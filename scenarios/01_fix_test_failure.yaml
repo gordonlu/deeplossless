@@ -1,0 +1,173 @@
+# ACES scenario: fix_test_failure
+#
+# CHAT COMPLETIONS / OPENAI default (camelCase tool args).
+#
+# Agent must:
+#   1. Read the failing test
+#   2. Read the buggy code
+#   3. Fix the bug
+#   4. Run the test to confirm it passes
+#
+# This scenario is specifically designed to make Verification score
+# non-zero: the agent's task explicitly involves making a test pass,
+# and the test file is small enough that running it (Bash) is the
+# natural next step after editing. Reuse stays 0 unless the LLM
+# decides to search (single-file bug, no need to search).
+#
+# Sibling files for other agent formats:
+#   01_fix_test_failure.claude_code.yaml — Claude Code (snake_case args)
+#   01_fix_test_failure.codex.yaml       — OpenAI Codex CLI
+name: fix_test_failure
+description: "Agent must find and fix an off-by-one bug in add() to make the test pass"
+start: read_test
+vfs:
+  files:
+    src/calculator.sh: |
+      #!/bin/bash
+      # Simple calculator with utilities
+      add() {
+        local a=$1
+        local b=$2
+        echo $((a + b + 1))
+      }
+      subtract() {
+        local a=$1
+        local b=$2
+        echo $((a - b))
+      }
+      multiply() {
+        local a=$1
+        local b=$2
+        echo $((a * b))
+      }
+    tests/calculator_test.sh: |
+      #!/bin/bash
+      #!/bin/bash
+      source "$(dirname "$0")/../src/calculator.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got $actual, expected $expected)"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "add(2, 3)"        "$(add 2 3)"        "5"
+      check "add(0, 0)"        "$(add 0 0)"        "0"
+      check "add(10, 20)"      "$(add 10 20)"      "30"
+      check "subtract(10, 3)"  "$(subtract 10 3)"  "7"
+      check "multiply(4, 5)"   "$(multiply 4 5)"   "20"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # Calculator
+      A bash calculator with `add`, `subtract`, `multiply`.
+
+      Run the tests:
+      ```
+      bash tests/calculator_test.sh
+      ```
+
+states:
+  read_test:
+    assistant: "There's a failing test in this project. Read tests/calculator_test.sh to see what's expected."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/tests/calculator_test.sh"
+    transitions:
+      - type: on_read
+        pattern: "calculator_test"
+        next: read_code
+      - type: on_tool
+        tool: ""
+        next: read_code
+
+  read_code:
+    assistant: "The test expects add(2,3)=5, but the test is failing. Read src/calculator.sh to find the bug."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/calculator.sh"
+    transitions:
+      - type: on_read
+        pattern: "calculator.sh"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: find_bug
+
+  find_bug:
+    assistant: "Found it: `add()` does `a + b + 1` instead of `a + b`. Fix that line in src/calculator.sh."
+    tool_calls:
+      - Edit
+    args:
+      Edit:
+        filePath: "${VFS}/src/calculator.sh"
+        oldString: "echo $((a + b + 1))"
+        newString: "echo $((a + b))"
+    # pre_apply ensures the file is fixed on disk even if the agent's
+    # edit call doesn't actually run (e.g., Claude Code harness, or
+    # Codex's apply_patch going through Chat-Completions translation).
+    # Mock-side only — the agent's *navigation* (read test, read code,
+    # identify bug, call edit) is what the test really measures.
+    pre_apply:
+      - file_path: "${VFS}/src/calculator.sh"
+        from: "echo $((a + b + 1))"
+        to: "echo $((a + b))"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "echo $((a + b))"
+        next: verify
+      - type: on_edit_result
+        pattern: "calculator.sh"
+        result_contains: "a + b"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: edit_timeout
+
+  edit_timeout:
+    assistant: "The edit didn't apply. Re-read src/calculator.sh, then change `echo $((a + b + 1))` to `echo $((a + b))`."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/calculator.sh"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "echo $((a + b))"
+        next: verify
+      - type: on_read
+        pattern: "calculator.sh"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: give_up
+
+  give_up:
+    assistant: "Task abandoned. The bug was: `add()` had `a + b + 1` instead of `a + b`. Change line 4 of src/calculator.sh to `echo $((a + b))`."
+    finish: true
+
+  verify:
+    assistant: "Fix applied. The test should now pass — run `bash tests/calculator_test.sh` to confirm."
+    finish: true

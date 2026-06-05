@@ -1,0 +1,164 @@
+# ACES scenario: hidden_bug
+#
+# CHAT COMPLETIONS / OPENAI default (camelCase tool args).
+#
+# This file is the no-flag default: when the user runs
+# `deeplossless --torture-aces hidden_bug` with no --agent-format, the
+# mock's default agent format is `openai`, and the Chat-Completions-style
+# args below are emitted to the agent.
+#
+# Sibling files for other agent formats:
+#   hidden_bug.claude_code.yaml — Claude Code (snake_case args)
+#   hidden_bug.codex.yaml       — OpenAI Codex CLI (apply_patch schema)
+name: hidden_bug
+description: "Agent must investigate and fix a timeout config bug across multiple files"
+start: reading
+vfs:
+  files:
+    src/config.sh: |
+      #!/bin/bash
+      # Network client configuration
+      TIMEOUT_DEFAULT=30
+      MAX_RETRIES=3
+      RETRY_DELAY=2
+
+      log() {
+        echo "[$(date -Iseconds)] $*"
+      }
+    src/network.sh: |
+      #!/bin/bash
+      # Network operations with timeout enforcement
+      source "$(dirname "$0")/config.sh"
+
+      send_request() {
+        local url="$1"
+        local timeout="${TIMEOUT_DEFAULT}"
+
+        if [ "$timeout" -lt 60 ]; then
+          log "ERROR: TIMEOUT_DEFAULT must be >= 60 (got $timeout)"
+          return 1
+        fi
+
+        log "Sending request to $url (timeout=${timeout}s)"
+        return 0
+      }
+    src/client.sh: |
+      #!/bin/bash
+      # High-level client that orchestrates network calls
+      source "$(dirname "$0")/config.sh"
+      source "$(dirname "$0")/network.sh"
+
+      fetch() {
+        local path="$1"
+        local url="https://api.example.com${path}"
+
+        if ! send_request "$url"; then
+          log "fetch failed"
+          exit 1
+        fi
+        log "fetched $path"
+      }
+
+      fetch "$1"
+
+states:
+  reading:
+    assistant: "Investigate the timeout configuration. Read src/config.sh to see current values."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/config.sh"
+    transitions:
+      - type: on_read
+        pattern: "config.sh"
+        next: still_reading
+      - type: on_tool
+        tool: ""
+        next: still_reading
+
+  still_reading:
+    assistant: "config.sh has TIMEOUT_DEFAULT=30. Check how it's USED in network.sh and client.sh — the constraint isn't here, it's enforced at the use site."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/network.sh"
+    transitions:
+      - type: on_read
+        pattern: "network.sh"
+        next: found_real_bug
+      - type: on_tool
+        tool: ""
+        next: found_real_bug
+
+  found_real_bug:
+    assistant: "network.sh requires TIMEOUT_DEFAULT >= 60. Read client.sh to confirm nothing else needs changing."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/client.sh"
+    transitions:
+      - type: on_read
+        pattern: "client.sh"
+        next: understand_constraints
+      - type: on_tool
+        tool: ""
+        next: understand_constraints
+
+  understand_constraints:
+    assistant: "Now you understand the constraint. Fix config.sh: change TIMEOUT_DEFAULT from 30 to 60."
+    tool_calls:
+      - Edit
+    args:
+      Edit:
+        filePath: "${VFS}/src/config.sh"
+        oldString: "TIMEOUT_DEFAULT=30"
+        newString: "TIMEOUT_DEFAULT=60"
+    transitions:
+      # Mock reads the file on disk — robust against opaque Edit result
+      # text. Advances as soon as the change is actually applied.
+      - type: on_file_contains
+        file_path: "${VFS}/src/config.sh"
+        contains: "TIMEOUT_DEFAULT=60"
+        next: verify
+      # Fallback: if the Edit result text happens to include the new value.
+      - type: on_edit_result
+        pattern: "config.sh"
+        result_contains: "TIMEOUT_DEFAULT=60"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: edit_timeout
+
+  edit_timeout:
+    assistant: "Your previous edit didn't apply correctly. Re-read config.sh to see the current state, then retry the edit (change TIMEOUT_DEFAULT from 30 to 60)."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/config.sh"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/config.sh"
+        contains: "TIMEOUT_DEFAULT=60"
+        next: verify
+      - type: on_read
+        pattern: "config.sh"
+        next: understand_constraints
+      - type: on_edit_result
+        pattern: "config.sh"
+        result_contains: "TIMEOUT_DEFAULT=60"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: give_up
+
+  give_up:
+    assistant: "Task abandoned. The correct edit was: change 'TIMEOUT_DEFAULT=30' to 'TIMEOUT_DEFAULT=60' in src/config.sh. Reply with a brief summary and stop."
+    finish: true
+
+  verify:
+    assistant: "Fix verified. TIMEOUT_DEFAULT=60 satisfies the network.sh constraint. Task complete."
+    finish: true

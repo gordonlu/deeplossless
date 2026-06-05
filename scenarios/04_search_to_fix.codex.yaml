@@ -1,0 +1,276 @@
+# ACES scenario: search_to_fix (Codex variant)
+#
+# Mirror of 04_search_to_fix.yaml for the OpenAI Codex CLI.
+# Reads and test runs use `shell`. Edits use `apply_patch` with
+# `update_file` and a unified-diff body.
+#
+# Drive with:
+#   deeplossless --torture-aces 04_search_to_fix --agent-format codex
+#
+# Sibling files:
+#   04_search_to_fix.yaml             — Chat Completions / OpenAI default
+#   04_search_to_fix.claude_code.yaml — Claude Code
+name: search_to_fix
+description: "Agent must find and fix a trim() bug in a multi-file project — the bug is in a non-obvious file that requires search to locate (Codex variant)"
+start: read_run_all
+vfs:
+  files:
+    src/string_utils.sh: |
+      #!/bin/bash
+      # String utility functions
+
+      trim() {
+        local s="$1"
+        echo "${s#"${s%%[![:space:]]*}"}"
+      }
+
+      to_upper() {
+        local s="$1"
+        echo "${s^^}"
+      }
+
+      to_lower() {
+        local s="$1"
+        echo "${s,,}"
+      }
+    src/array_utils.sh: |
+      #!/bin/bash
+      # Array utility functions
+
+      reverse() {
+        local arr=("$@")
+        local out=()
+        for ((i=${#arr[@]}-1; i>=0; i--)); do
+          out+=("${arr[i]}")
+        done
+        echo "${out[@]}"
+      }
+    src/file_utils.sh: |
+      #!/bin/bash
+      # File utility functions
+
+      file_extension() {
+        local path="$1"
+        echo "${path##*.}"
+      }
+    src/number_utils.sh: |
+      #!/bin/bash
+      # Number utility functions
+
+      is_even() {
+        local n=$1
+        [ $((n % 2)) -eq 0 ]
+      }
+    src/date_utils.sh: |
+      #!/bin/bash
+      # Date utility functions
+
+      today_iso() {
+        date +%Y-%m-%d
+      }
+    tests/run_all.sh: |
+      #!/bin/bash
+      cd "$(dirname "$0")/.."
+      failures=0
+      for test_file in tests/*_test.sh; do
+        echo "=== $test_file ==="
+        if ! bash "$test_file"; then
+          failures=$((failures + 1))
+        fi
+      done
+      if [ "$failures" -eq 0 ]; then
+        echo "All test files passed"
+        exit 0
+      else
+        echo "$failures test file(s) failed"
+        exit 1
+      fi
+    tests/string_utils_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/string_utils.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got '$actual', expected '$expected')"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "trim('  hello  ')"  "$(trim '  hello  ')"  "hello"
+      check "trim('world')"      "$(trim 'world')"      "world"
+      check "trim('  spaces  ')" "$(trim '  spaces  ')" "spaces"
+      check "trim('')"           "$(trim '')"           ""
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    tests/array_utils_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/array_utils.sh"
+      failures=0
+      total=0
+      check() {
+        total=$((total + 1))
+        if [ "$1" = "$2" ]; then echo "PASS"; else echo "FAIL: '$1' != '$2'"; failures=$((failures + 1)); fi
+      }
+      check "$(reverse a b c)" "c b a"
+      echo "$failures/$total failed"
+      [ "$failures" -eq 0 ]
+    tests/number_utils_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/number_utils.sh"
+      failures=0
+      total=0
+      check() {
+        total=$((total + 1))
+        if [ "$1" = "$2" ]; then echo "PASS"; else echo "FAIL"; failures=$((failures + 1)); fi
+      }
+      check "$(is_even 4 && echo even || echo odd)" "even"
+      check "$(is_even 7 && echo even || echo odd)" "odd"
+      echo "$failures/$total failed"
+      [ "$failures" -eq 0 ]
+    tests/date_utils_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/date_utils.sh"
+      failures=0
+      total=0
+      check() {
+        total=$((total + 1))
+        if [ -n "$1" ]; then echo "PASS"; else echo "FAIL"; failures=$((failures + 1)); fi
+      }
+      check "$(today_iso)" "non-empty"
+      echo "$failures/$total failed"
+      [ "$failures" -eq 0 ]
+    README.md: |
+      # Utils
+      A small bash utility library.
+
+      Modules:
+      - `src/string_utils.sh` — trim, to_upper, to_lower
+      - `src/array_utils.sh`  — reverse
+      - `src/file_utils.sh`   — file_extension
+      - `src/number_utils.sh` — is_even
+      - `src/date_utils.sh`   — today_iso
+
+      Run all tests: `bash tests/run_all.sh`
+
+states:
+  read_run_all:
+    assistant: "Some tests are failing in this multi-file project. First, read tests/run_all.sh to see how the tests are organized and which ones are failing."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/tests/run_all.sh"
+    transitions:
+      - type: on_read
+        pattern: "run_all"
+        next: search_for_trim
+      - type: on_tool
+        tool: ""
+        next: search_for_trim
+
+  search_for_trim:
+    assistant: "Now use a search tool (grep, rg, or similar) to find which file in src/ contains the `trim` function. There are 5 utility files — the bug is only in one of them."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "grep -rn 'trim' ${VFS}/src/"
+    transitions:
+      - type: on_tool
+        tool: "trim"
+        next: read_trim_file
+      - type: on_tool
+        tool: ""
+        next: read_trim_file
+
+  read_trim_file:
+    assistant: "Open the file that contains `trim` and look at the function. (The grep result above should tell you which file.)"
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/src/string_utils.sh"
+    transitions:
+      - type: on_read
+        pattern: "string_utils"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: find_bug
+
+  find_bug:
+    assistant: "The bug: `trim()` only removes leading whitespace (`${s#...}`), not trailing. Add a second step to also remove trailing whitespace, then `echo` the cleaned string."
+    tool_calls:
+      - apply_patch
+    args_per_agent:
+      codex:
+        apply_patch:
+          operation:
+            type: "update_file"
+            path: "${VFS}/src/string_utils.sh"
+            diff: |
+              @@ -4,4 +4,6 @@
+               trim() {
+                 local s="$1"
+              -  echo "${s#"${s%%[![:space:]]*}"}"
+              +  s="${s#"${s%%[![:space:]]*}"}"
+              +  s="${s%"${s##*[![:space:]]}"}"
+              +  echo "$s"
+               }
+    pre_apply:
+      - file_path: "${VFS}/src/string_utils.sh"
+        from: "      trim() {\n        local s=\"$1\"\n        echo \"${s#\"${s%%[![:space:]]*}\"}\"\n      }"
+        to: "      trim() {\n        local s=\"$1\"\n        s=\"${s#\"${s%%[![:space:]]*}\"}\"\n        s=\"${s%\"${s##*[![:space:]]}\"}\"\n        echo \"$s\"\n      }"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/string_utils.sh"
+        contains: 's="${s%"${s##*[![:space:]]}"}"'
+        next: run_test
+      - type: on_edit_result
+        pattern: "string_utils.sh"
+        result_contains: "trim"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: run_test
+
+  run_test:
+    assistant: "Now run the string utils test to confirm the fix: `bash tests/string_utils_test.sh`."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "bash ${VFS}/tests/string_utils_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 4 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  verify:
+    assistant: "All 4 string utils tests pass. The bug was that `trim()` only stripped leading whitespace — now it also strips trailing. Task complete."
+    finish: true

@@ -1,0 +1,189 @@
+# ACES scenario: multi_file_edit
+#
+# CHAT COMPLETIONS / OPENAI default (camelCase tool args).
+#
+# The fix lives in `src/helper.sh`, but the test fails on
+# `format_user()` (defined in `src/main.sh` and re-exported from
+# helper.sh). The agent must read all 3 files (test, main, helper) to
+# understand the call chain before fixing. This tests:
+#   - "Understand scope" — find the actual bug, not just the failing
+#     function
+#   - Multi-file reasoning — read multiple files, follow the chain
+#   - Tool Strategy — read count >= 3, edit count >= 1
+#
+# VFS layout:
+#   src/main.sh         — public API, `format_user` calls helper's `format_name`
+#   src/helper.sh       — `format_name` is the buggy implementation
+#   tests/main_test.sh  — 3 tests, all fail until helper.sh is fixed
+#   README.md           — documents the project
+#
+# Sibling files for other agent formats:
+#   05_multi_file_edit.claude_code.yaml — Claude Code (snake_case args)
+#   05_multi_file_edit.codex.yaml       — OpenAI Codex CLI (apply_patch)
+name: multi_file_edit
+description: "Agent must trace a call chain across 3 files to find a bug in helper.sh that breaks format_user() in main.sh"
+start: read_test
+vfs:
+  files:
+    src/main.sh: |
+      #!/bin/bash
+      # Public API for user formatting. Re-exports from helper.sh.
+      source "$(dirname "$0")/helper.sh"
+
+      # Format a user's full name as "Last, First".
+      # The real implementation lives in helper.sh — see format_name.
+      format_user() {
+        format_name "$1" "$2"
+      }
+    src/helper.sh: |
+      #!/bin/bash
+      # Internal helpers used by main.sh
+
+      # Format a user's full name as "Last, First"
+      format_name() {
+        local first="$1"
+        local last="$2"
+        echo "$first $last"
+      }
+    tests/main_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/main.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got '$actual', expected '$expected')"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "format_user('John', 'Doe')"   "$(format_user John Doe)"   "Doe, John"
+      check "format_user('Jane', 'Smith')" "$(format_user Jane Smith)" "Smith, Jane"
+      check "format_user('A', 'B')"        "$(format_user A B)"        "B, A"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # User Utilities
+
+      A simple bash library for formatting user data.
+
+      ## Structure
+      - `src/main.sh` — public API, re-exports from `helper.sh`
+      - `src/helper.sh` — internal implementation
+      - `tests/main_test.sh` — tests for the public API
+
+      ## Usage
+      ```bash
+      source src/main.sh
+      format_user John Doe   # outputs: Doe, John
+      ```
+
+      Run the tests: `bash tests/main_test.sh`
+
+states:
+  read_test:
+    assistant: "Three tests in tests/main_test.sh are failing — they expect `format_user` to return `Last, First` (e.g. `Doe, John`) but the output is reversed. Read the test file first to see exactly what's expected."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/tests/main_test.sh"
+    transitions:
+      - type: on_read
+        pattern: "main_test"
+        next: read_main
+      - type: on_tool
+        tool: ""
+        next: read_main
+
+  read_main:
+    assistant: "Now read src/main.sh — it sources helper.sh and delegates to `format_name`. The bug might be in helper.sh, not main.sh."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/main.sh"
+    transitions:
+      - type: on_read
+        pattern: "main.sh"
+        next: read_helper
+      - type: on_tool
+        tool: ""
+        next: read_helper
+
+  read_helper:
+    assistant: "Read src/helper.sh to find the actual bug in `format_name`."
+    tool_calls:
+      - Read
+    args:
+      Read:
+        filePath: "${VFS}/src/helper.sh"
+    transitions:
+      - type: on_read
+        pattern: "helper.sh"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: find_bug
+
+  find_bug:
+    assistant: "Found it: `format_name` does `echo \"$first $last\"` (returns `John Doe`), but the test expects `Doe, John` (last, first). Fix the order in src/helper.sh."
+    tool_calls:
+      - Edit
+    args:
+      Edit:
+        filePath: "${VFS}/src/helper.sh"
+        oldString: '        echo "$first $last"'
+        newString: '        echo "$last, $first"'
+    pre_apply:
+      - file_path: "${VFS}/src/helper.sh"
+        from: '        echo "$first $last"'
+        to: '        echo "$last, $first"'
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/helper.sh"
+        contains: 'echo "$last, $first"'
+        next: run_test
+      - type: on_edit_result
+        pattern: "helper.sh"
+        result_contains: "$last"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: run_test
+
+  run_test:
+    assistant: "Fix applied to helper.sh. Run the test to confirm: `bash tests/main_test.sh`."
+    tool_calls:
+      - Bash
+    args:
+      Bash:
+        command: "bash ${VFS}/tests/main_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 3 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  verify:
+    assistant: "All 3 tests pass. The bug was in src/helper.sh's `format_name` — the order of arguments was wrong, returning `First Last` instead of `Last, First`."
+    finish: true

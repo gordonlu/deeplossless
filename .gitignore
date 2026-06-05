@@ -10,3 +10,7 @@ CLAUDE.md
 ROADMAP.md
 review.md
 .next/
+logs/
+# ACES test artifacts: mock VFS root written to disk during scenario runs
+# (created in the agent's CWD; name pattern is `aces_vfs_<scenario_name>`).
+aces_vfs_*/

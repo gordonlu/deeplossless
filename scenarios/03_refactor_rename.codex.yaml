@@ -1,0 +1,224 @@
+# ACES scenario: refactor_rename (Codex variant)
+#
+# Mirror of 03_refactor_rename.yaml for the OpenAI Codex CLI.
+# Edits use `apply_patch` with a multi-line unified-diff body. The test
+# file diff contains 3 hunks (one per add() call) collapsed into a
+# single diff body.
+#
+# Drive with:
+#   deeplossless --torture-aces 03_refactor_rename --agent-format codex
+#
+# Sibling files:
+#   03_refactor_rename.yaml             — Chat Completions / OpenAI default
+#   03_refactor_rename.claude_code.yaml — Claude Code
+name: refactor_rename
+description: "Agent must rename `add` to `sum` across 3 files (test, source, README) and verify the test still passes (Codex variant)"
+start: rename_in_test
+vfs:
+  files:
+    src/calculator.sh: |
+      #!/bin/bash
+      # Simple calculator with utilities
+      add() {
+        local a=$1
+        local b=$2
+        echo $((a + b))
+      }
+      subtract() {
+        local a=$1
+        local b=$2
+        echo $((a - b))
+      }
+      multiply() {
+        local a=$1
+        local b=$2
+        echo $((a * b))
+      }
+      divide() {
+        local a=$1
+        local b=$2
+        if [ "$b" -eq 0 ]; then
+          echo "error"
+          return 1
+        fi
+        echo $((a / b))
+      }
+    tests/calculator_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/calculator.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got '$actual', expected '$expected')"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "add(2, 3)"        "$(add 2 3)"        "5"
+      check "add(0, 0)"        "$(add 0 0)"        "0"
+      check "add(10, 20)"      "$(add 10 20)"      "30"
+      check "subtract(10, 3)"  "$(subtract 10 3)"  "7"
+      check "multiply(4, 5)"   "$(multiply 4 5)"   "20"
+      check "divide(20, 4)"    "$(divide 20 4)"    "5"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # Calculator
+
+      A bash calculator with these functions:
+
+      - `add(a, b)` — sum of a and b
+      - `subtract(a, b)` — difference of a and b
+      - `multiply(a, b)` — product of a and b
+      - `divide(a, b)` — quotient of a and b; prints `error` and returns 1 if b is 0
+
+      Run the tests:
+      ```bash
+      bash tests/calculator_test.sh
+      ```
+
+states:
+  rename_in_test:
+    assistant: "Refactor: rename `add` to `sum` throughout the codebase. Start with tests/calculator_test.sh — there are 3 calls to `add(2, 3)`, `add(0, 0)`, `add(10, 20)` that need updating."
+    tool_calls:
+      - apply_patch
+    args_per_agent:
+      codex:
+        apply_patch:
+          operation:
+            type: "update_file"
+            path: "${VFS}/tests/calculator_test.sh"
+            diff: |
+              @@ -20,3 +20,3 @@
+              -      check "add(2, 3)"        "$(add 2 3)"        "5"
+              -      check "add(0, 0)"        "$(add 0 0)"        "0"
+              -      check "add(10, 20)"      "$(add 10 20)"      "30"
+              +      check "sum(2, 3)"        "$(sum 2 3)"        "5"
+              +      check "sum(0, 0)"        "$(sum 0 0)"        "0"
+              +      check "sum(10, 20)"      "$(sum 10 20)"      "30"
+    pre_apply:
+      - file_path: "${VFS}/tests/calculator_test.sh"
+        from: 'check "add(2, 3)"        "$(add 2 3)"        "5"'
+        to: 'check "sum(2, 3)"        "$(sum 2 3)"        "5"'
+      - file_path: "${VFS}/tests/calculator_test.sh"
+        from: 'check "add(0, 0)"        "$(add 0 0)"        "0"'
+        to: 'check "sum(0, 0)"        "$(sum 0 0)"        "0"'
+      - file_path: "${VFS}/tests/calculator_test.sh"
+        from: 'check "add(10, 20)"      "$(add 10 20)"      "30"'
+        to: 'check "sum(10, 20)"      "$(sum 10 20)"      "30"'
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/tests/calculator_test.sh"
+        contains: "sum(2, 3)"
+        next: rename_in_code
+      - type: on_edit_result
+        pattern: "calculator_test.sh"
+        result_contains: "sum(2, 3)"
+        next: rename_in_code
+      - type: on_tool
+        tool: ""
+        next: rename_in_code
+
+  rename_in_code:
+    assistant: "Test file updated. Now rename `add` to `sum` in src/calculator.sh — both the function definition and any internal calls."
+    tool_calls:
+      - apply_patch
+    args_per_agent:
+      codex:
+        apply_patch:
+          operation:
+            type: "update_file"
+            path: "${VFS}/src/calculator.sh"
+            diff: |
+              @@ -3,5 +3,5 @@
+              -      add() {
+              +      sum() {
+                     local a=$1
+                     local b=$2
+                     echo $((a + b))
+                   }
+    pre_apply:
+      - file_path: "${VFS}/src/calculator.sh"
+        from: "      add() {\n        local a=$1\n        local b=$2\n        echo $((a + b))\n      }"
+        to: "      sum() {\n        local a=$1\n        local b=$2\n        echo $((a + b))\n      }"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "sum()"
+        next: rename_in_readme
+      - type: on_edit_result
+        pattern: "calculator.sh"
+        result_contains: "sum"
+        next: rename_in_readme
+      - type: on_tool
+        tool: ""
+        next: rename_in_readme
+
+  rename_in_readme:
+    assistant: "Source updated. Now update README.md — the function list line `- `add(a, b)` — sum of a and b` should become `- `sum(a, b)` — sum of a and b`."
+    tool_calls:
+      - apply_patch
+    args_per_agent:
+      codex:
+        apply_patch:
+          operation:
+            type: "update_file"
+            path: "${VFS}/README.md"
+            diff: |
+              @@ -5 +5 @@
+              -      - `add(a, b)` — sum of a and b
+              +      - `sum(a, b)` — sum of a and b
+    pre_apply:
+      - file_path: "${VFS}/README.md"
+        from: "- `add(a, b)` — sum of a and b"
+        to: "- `sum(a, b)` — sum of a and b"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/README.md"
+        contains: "sum(a, b) — sum of a and b"
+        next: run_test
+      - type: on_edit_result
+        pattern: "README.md"
+        result_contains: "sum(a, b)"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: run_test
+
+  run_test:
+    assistant: "Rename complete. Run `bash tests/calculator_test.sh` to confirm nothing broke."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "bash ${VFS}/tests/calculator_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 6 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  verify:
+    assistant: "All tests pass with the new `sum` name. Refactor complete."
+    finish: true

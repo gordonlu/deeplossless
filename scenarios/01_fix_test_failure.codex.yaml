@@ -1,0 +1,192 @@
+# ACES scenario: fix_test_failure (Codex variant)
+#
+# Mirror of 01_fix_test_failure.yaml for the OpenAI Codex CLI.
+# Differences from the chat default:
+#   - Reads use Codex's `shell` tool with `cat <path>` (Codex has no
+#     generic Read function tool; shell + apply_patch are the only
+#     built-in file-I/O surfaces).
+#   - The "run the test" step also uses `shell` with `bash <test>` —
+#     same tool as reads, distinguished by the command pattern.
+#   - Edits use `apply_patch` with args nested under `operation`:
+#     { type: "update_file", path, diff }.
+#   - No fallback `args:` — running under wrong --agent-format produces
+#     empty args (correct refusal, no apply_patch schema leak).
+#
+# Drive with:
+#   deeplossless --torture-aces 01_fix_test_failure --agent-format codex
+#
+# Sibling files:
+#   01_fix_test_failure.yaml             — Chat Completions / OpenAI default
+#   01_fix_test_failure.claude_code.yaml — Claude Code
+name: fix_test_failure
+description: "Agent must find and fix an off-by-one bug in add() to make the test pass (Codex variant)"
+start: read_test
+vfs:
+  files:
+    src/calculator.sh: |
+      #!/bin/bash
+      # Simple calculator with utilities
+      add() {
+        local a=$1
+        local b=$2
+        echo $((a + b + 1))
+      }
+      subtract() {
+        local a=$1
+        local b=$2
+        echo $((a - b))
+      }
+      multiply() {
+        local a=$1
+        local b=$2
+        echo $((a * b))
+      }
+    tests/calculator_test.sh: |
+      #!/bin/bash
+      source "$(dirname "$0")/../src/calculator.sh"
+
+      failures=0
+      total=0
+
+      check() {
+        local name="$1"
+        local actual="$2"
+        local expected="$3"
+        total=$((total + 1))
+        if [ "$actual" = "$expected" ]; then
+          echo "PASS: $name"
+        else
+          echo "FAIL: $name (got $actual, expected $expected)"
+          failures=$((failures + 1))
+        fi
+      }
+
+      check "add(2, 3)"        "$(add 2 3)"        "5"
+      check "add(0, 0)"        "$(add 0 0)"        "0"
+      check "add(10, 20)"      "$(add 10 20)"      "30"
+      check "subtract(10, 3)"  "$(subtract 10 3)"  "7"
+      check "multiply(4, 5)"   "$(multiply 4 5)"   "20"
+
+      if [ "$failures" -eq 0 ]; then
+        echo "All $total tests passed"
+        exit 0
+      else
+        echo "$failures/$total tests failed"
+        exit 1
+      fi
+    README.md: |
+      # Calculator
+      A bash calculator with `add`, `subtract`, `multiply`.
+
+      Run the tests:
+      ```
+      bash tests/calculator_test.sh
+      ```
+
+states:
+  read_test:
+    assistant: "There's a failing test in this project. Read tests/calculator_test.sh to see what's expected."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/tests/calculator_test.sh"
+    transitions:
+      - type: on_read
+        pattern: "calculator_test"
+        next: read_code
+      - type: on_tool
+        tool: ""
+        next: read_code
+
+  read_code:
+    assistant: "The test expects add(2,3)=5, but the test is failing. Read src/calculator.sh to find the bug."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/src/calculator.sh"
+    transitions:
+      - type: on_read
+        pattern: "calculator.sh"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: find_bug
+
+  find_bug:
+    assistant: "Found it: `add()` does `a + b + 1` instead of `a + b`. Fix that line in src/calculator.sh."
+    tool_calls:
+      - apply_patch
+    args_per_agent:
+      codex:
+        apply_patch:
+          operation:
+            type: "update_file"
+            path: "${VFS}/src/calculator.sh"
+            diff: "@@ -3 +3 @@\n-    echo $((a + b + 1))\n+    echo $((a + b))\n"
+    pre_apply:
+      - file_path: "${VFS}/src/calculator.sh"
+        from: "echo $((a + b + 1))"
+        to: "echo $((a + b))"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "echo $((a + b))"
+        next: run_test
+      - type: on_edit_result
+        pattern: "calculator.sh"
+        result_contains: "a + b"
+        next: run_test
+      - type: on_tool
+        tool: ""
+        next: edit_timeout
+
+  run_test:
+    assistant: "Fix is on disk. Now run the test to confirm it passes: `bash tests/calculator_test.sh`."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "bash ${VFS}/tests/calculator_test.sh"
+    transitions:
+      - type: on_test_result
+        result_contains: "All 5 tests passed"
+        next: verify
+      - type: on_test_result
+        result_contains: "tests passed"
+        next: verify
+      - type: on_tool
+        tool: ""
+        next: verify
+
+  edit_timeout:
+    assistant: "The edit didn't apply. Re-read src/calculator.sh, then change `echo $((a + b + 1))` to `echo $((a + b))`."
+    tool_calls:
+      - shell
+    args_per_agent:
+      codex:
+        shell:
+          command: "cat ${VFS}/src/calculator.sh"
+    transitions:
+      - type: on_file_contains
+        file_path: "${VFS}/src/calculator.sh"
+        contains: "echo $((a + b))"
+        next: run_test
+      - type: on_read
+        pattern: "calculator.sh"
+        next: find_bug
+      - type: on_tool
+        tool: ""
+        next: give_up
+
+  give_up:
+    assistant: "Task abandoned. The bug was: `add()` had `a + b + 1` instead of `a + b`. Change line 4 of src/calculator.sh to `echo $((a + b))`."
+    finish: true
+
+  verify:
+    assistant: "Fix verified — the test should now report `All 5 tests passed`. Task complete."
+    finish: true
