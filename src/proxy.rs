@@ -323,6 +323,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/global/search", get(lcm_global_search))
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
         .route("/v1/lcm/search", get(lcm_search_events))
+        .route("/v1/lcm/diffs", get(lcm_diffs_list))
+        .route("/v1/lcm/diffs/reconstruct", get(lcm_diff_reconstruct))
+        .route("/v1/lcm/diffs/overlaps", get(lcm_diff_overlaps))
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
         .route("/v1/lcm/runtime/debug-dump", get(lcm_debug_dump))
@@ -2236,6 +2239,85 @@ async fn lcm_search_events(
                 "metadata": e.metadata,
             })).collect();
             Json(json!({"events": items, "count": items.len()})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/diffs — query file-level diffs.
+/// Query params: session, file_path, tool_call_id, limit.
+async fn lcm_diffs_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    use crate::diff_events::DiffQuery;
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let q = DiffQuery {
+        session_id: params.get("session").cloned(),
+        file_path: params.get("file_path").cloned(),
+        tool_call_id: params.get("tool_call_id").cloned(),
+        limit: params.get("limit").and_then(|s| s.parse().ok()).or(Some(50)),
+    };
+    match state.storage.db.query_diffs(&q) {
+        Ok(diffs) => {
+            let items: Vec<Value> = diffs.iter().map(|d| json!({
+                "id": d.id, "session_id": d.session_id, "tool_call_id": d.tool_call_id,
+                "file_path": d.file_path, "start_line": d.start_line, "end_line": d.end_line,
+                "change_type": d.change_type.as_str(),
+                "before_snippet": d.before_snippet, "after_snippet": d.after_snippet,
+                "timestamp": d.timestamp,
+            })).collect();
+            Json(json!({"diffs": items, "count": items.len()})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/diffs/reconstruct — reconstruct file content from diffs.
+/// Query: session, file_path, initial (optional base content).
+async fn lcm_diff_reconstruct(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let session = params.get("session").cloned().unwrap_or_default();
+    let file_path = params.get("file_path").cloned().unwrap_or_default();
+    let initial = params.get("initial").cloned().unwrap_or_default();
+    if session.is_empty() || file_path.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session and file_path required");
+    }
+    match state.storage.db.reconstruct_file(&session, &file_path, &initial) {
+        Ok(content) => Json(json!({"content": content, "file_path": file_path})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
+/// GET /v1/lcm/diffs/overlaps — find overlapping edits on same file region.
+async fn lcm_diff_overlaps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+    let session = params.get("session").cloned().unwrap_or_default();
+    if session.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session required");
+    }
+    match state.storage.db.find_overlapping_edits(&session) {
+        Ok(pairs) => {
+            let items: Vec<Value> = pairs.iter().map(|(a, b)| json!({
+                "first": {"tool_call_id": a.tool_call_id, "file_path": a.file_path, "lines": format!("{}-{}", a.start_line, a.end_line)},
+                "second": {"tool_call_id": b.tool_call_id, "file_path": b.file_path, "lines": format!("{}-{}", b.start_line, b.end_line)},
+            })).collect();
+            Json(json!({"overlaps": items, "count": items.len()})).into_response()
         }
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }

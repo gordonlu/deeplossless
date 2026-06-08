@@ -67,6 +67,7 @@ pub mod dag;
 pub mod db;
 pub mod dependency_kind;
 pub mod dependency_view;
+pub mod diff_events;
 pub mod embeddings;
 pub mod artifacts;
 pub mod assistant_validation;

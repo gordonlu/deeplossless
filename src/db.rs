@@ -315,6 +315,43 @@ impl Database {
         self.insert_proxy_event(&event)
     }
 
+    /// Record a file-level diff event for an agent Edit tool call.
+    /// Computes the line-level diff from before/after content and
+    /// stores both the event and hash-deduplicated snippets.
+    pub fn record_diff(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+        file_path: &str,
+        before: &str,
+        after: &str,
+    ) -> anyhow::Result<crate::diff_events::DiffEvent> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        crate::diff_events::generate_and_store(&conn, session_id, tool_call_id, file_path, before, after, ts)
+    }
+
+    /// Query file-level diff events (file-state diffs, not stream events).
+    pub fn query_diffs(&self, q: &crate::diff_events::DiffQuery) -> anyhow::Result<Vec<crate::diff_events::DiffEvent>> {
+        let conn = self.read_conn();
+        crate::diff_events::query_diffs(&conn, q)
+    }
+
+    /// Reconstruct file content by applying all recorded diffs in order.
+    pub fn reconstruct_file(&self, session_id: &str, file_path: &str, initial: &str) -> anyhow::Result<String> {
+        let conn = self.read_conn();
+        crate::diff_events::reconstruct_file(&conn, session_id, file_path, initial)
+    }
+
+    /// Find overlapping edits on the same file region (agent iterating).
+    pub fn find_overlapping_edits(&self, session_id: &str) -> anyhow::Result<Vec<(crate::diff_events::DiffEvent, crate::diff_events::DiffEvent)>> {
+        let conn = self.read_conn();
+        crate::diff_events::find_overlapping_edits(&conn, session_id)
+    }
+
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Schema version tracking — prevents silent migration drift.
@@ -669,6 +706,7 @@ impl Database {
         }
 
         crate::event_store::create_tables(&conn)?;
+        crate::diff_events::create_tables(&conn)?;
 
         Ok(())
     }
