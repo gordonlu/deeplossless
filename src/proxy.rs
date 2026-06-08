@@ -322,6 +322,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/trace/{node_id}", get(lcm_trace))
         .route("/v1/lcm/global/search", get(lcm_global_search))
         .route("/v1/lcm/execution/search", get(lcm_execution_search))
+        .route("/v1/lcm/search", get(lcm_search_events))
         .route("/v1/lcm/stream/{conv_id}", get(lcm_stream_context))
         .route("/v1/lcm/runtime/stats", get(lcm_runtime_stats))
         .route("/v1/lcm/runtime/debug-dump", get(lcm_debug_dump))
@@ -2198,6 +2199,48 @@ async fn lcm_sessions_list(
     }
 }
 
+/// GET /v1/lcm/search — structured event search.
+/// Query params: event_type, tool, session, status, path, content (FTS), limit.
+async fn lcm_search_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    use crate::event_store::{EventFilter, EventType};
+
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
+
+    let filter = EventFilter {
+        event_type: params.get("event_type").and_then(|s| EventType::from_event_str(s)),
+        tool_name: params.get("tool").cloned(),
+        session_id: params.get("session").cloned(),
+        status: params.get("status").cloned(),
+        path_pattern: params.get("path").map(|p| format!("%{p}%")),
+        content_match: params.get("content").cloned(),
+        limit: params.get("limit").and_then(|s| s.parse().ok()).or(Some(50)),
+    };
+
+    match state.storage.db.query_proxy_events(&filter) {
+        Ok(events) => {
+            let items: Vec<Value> = events.iter().map(|e| json!({
+                "id": e.id,
+                "event_type": e.event_type.as_str(),
+                "session_id": e.session_id,
+                "timestamp": e.timestamp,
+                "tool_name": e.tool_name,
+                "path": e.path,
+                "status": e.status,
+                "content": &e.content[..e.content.len().min(500)],
+                "metadata": e.metadata,
+            })).collect();
+            Json(json!({"events": items, "count": items.len()})).into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
+    }
+}
+
 /// GET /v1/lcm/sessions/{id}/events — execution events for a session.
 async fn lcm_session_events(
     State(state): State<AppState>,
@@ -2743,9 +2786,10 @@ async fn lcm_plan_get(
     Path(conv_id): Path<i64>,
 ) -> Response {
     match state.storage.db.get_active_plan(conv_id) {
-        Ok(Some((id, goal, pending, assumptions))) => Json(json!({
+        Ok(Some((id, goal, pending, completed, assumptions))) => Json(json!({
             "id": id, "goal": goal,
             "pending_steps": pending,
+            "completed_steps": completed,
             "assumptions": assumptions,
         })).into_response(),
         Ok(None) => Json(json!({"active_plan": null})).into_response(),

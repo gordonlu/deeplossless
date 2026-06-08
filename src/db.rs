@@ -114,6 +114,8 @@ pub struct Database {
 /// Run a WAL checkpoint every N writes to limit WAL file growth.
 const CHECKPOINT_INTERVAL: u64 = 100;
 
+pub type ActivePlan = (i64, String, serde_json::Value, serde_json::Value, serde_json::Value);
+
 impl Database {
     pub fn builder() -> DatabaseBuilder {
         DatabaseBuilder::new()
@@ -2161,20 +2163,22 @@ impl Database {
     }
 
     /// Get the active plan state for a conversation.
-    /// Returns (id, goal, pending_steps, assumptions) with steps/assumptions
-    /// deserialized from their JSON column values.
-    pub fn get_active_plan(&self, conv_id: i64) -> anyhow::Result<Option<(i64, String, serde_json::Value, serde_json::Value)>> {
+    /// Returns (id, goal, pending_steps, completed_steps, assumptions) with
+    /// steps/assumptions deserialized from their JSON column values.
+    pub fn get_active_plan(&self, conv_id: i64) -> anyhow::Result<Option<ActivePlan>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, goal, pending_steps, assumptions FROM plan_states
+            "SELECT id, goal, pending_steps, completed_steps, assumptions FROM plan_states
              WHERE conversation_id = ?1 AND is_active = 1 ORDER BY id DESC LIMIT 1"
         )?;
         Ok(stmt.query_row(rusqlite::params![conv_id], |row| {
             let pending_str: String = row.get(2)?;
-            let assump_str: String = row.get(3)?;
+            let completed_str: String = row.get(3)?;
+            let assump_str: String = row.get(4)?;
             let pending: serde_json::Value = serde_json::from_str(&pending_str).unwrap_or(serde_json::Value::Array(vec![]));
+            let completed: serde_json::Value = serde_json::from_str(&completed_str).unwrap_or(serde_json::Value::Array(vec![]));
             let assumptions: serde_json::Value = serde_json::from_str(&assump_str).unwrap_or(serde_json::Value::Array(vec![]));
-            Ok((row.get(0)?, row.get(1)?, pending, assumptions))
+            Ok((row.get(0)?, row.get(1)?, pending, completed, assumptions))
         }).ok())
     }
 
