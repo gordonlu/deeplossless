@@ -785,14 +785,7 @@ impl Database {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
-        // Compute stable session fingerprint from the message set and
-        // feed the event index. Done here so every handler (chat_completions,
-        // responses, anthropic_messages) gets event extraction for free.
-        let session_id = if let Some(arr) = messages.as_array() {
-            crate::session::fingerprint(arr, 3)
-        } else {
-            String::new()
-        };
+        // Compute stable session fingerprint and feed the event index.
 
         if let Some(arr) = messages.as_array() {
             for msg in arr {
@@ -829,14 +822,9 @@ impl Database {
             }
         }
 
-        // Extract proxy events from the message array (fire-and-forget,
-        // best-effort — won't fail the transaction if the event table
-        // doesn't exist yet).
-        if !session_id.is_empty() {
-            if let Some(arr) = messages.as_array() {
-                let _ = crate::event_store::extract_and_insert(&tx, &session_id, arr);
-            }
-        }
+        // ── Pure ingestion complete. No analysis logic below this
+        // line — proxy events and file diffs are extracted in a
+        // separate post-commit pass (pipeline.rs).
 
         tx.commit()?;
         let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;

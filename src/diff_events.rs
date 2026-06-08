@@ -442,61 +442,73 @@ pub fn find_overlapping_edits(conn: &Connection, session_id: &str) -> anyhow::Re
     Ok(pairs)
 }
 
-// ── Tool-result post-process hook ──────────────────────────────────
+// ── Post-commit diff extraction ────────────────────────────────────
 
-/// Extract file diffs from a Chat Completions messages array.
-/// Called by `store_messages` after message storage, during the same
-/// transaction. For every `tool` role message whose corresponding
-/// `tool_call` was an Edit/Write operation, computes and stores a
-/// diff event.
+/// Post-commit diff extraction. Called AFTER `store_messages` has
+/// committed, so the messages table is in a consistent state.
 ///
-/// This is the bridge between the proxy's message capture and the
-/// diff_events table — the "post-process hook" that fires after
-/// messages are stored but before the transaction commits.
-pub fn extract_diffs_from_messages(
+/// Queries the committed messages table to find all Edit/Write/
+/// apply_patch tool_calls for the conversation, then computes and
+/// stores a diff event for each. Idempotent — skips tool_call_ids
+/// that already have a stored diff.
+///
+/// Unlike the old `extract_diffs_from_messages` which relied on the
+/// in-memory msgs array for tool_call↔tool_result pairing, this
+/// queries the DB directly. More robust — doesn't depend on batch
+/// ordering or partial message sets.
+pub fn extract_diffs_post_commit(
     conn: &Connection,
     session_id: &str,
-    messages: &[serde_json::Value],
+    conv_id: i64,
 ) -> anyhow::Result<usize> {
-    let mut count = 0;
+    // Find all assistant messages with tool_calls for this conversation
+    let mut stmt = conn.prepare(
+        "SELECT content FROM messages WHERE conversation_id = ?1 AND role = 'assistant' AND content LIKE '%\"tool_calls\"%' ORDER BY id"
+    )?;
+    let asst_messages: Vec<String> = stmt
+        .query_map(params![conv_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
 
-    // Build a map: tool_call_id → (tool_name, tool_args_json)
-    let mut tool_call_map: std::collections::HashMap<String, (String, serde_json::Value)> = std::collections::HashMap::new();
-    for msg in messages {
-        if msg["role"].as_str() != Some("assistant") { continue; }
-        if let Some(tool_calls) = msg["tool_calls"].as_array() {
-            for tc in tool_calls {
-                let id = tc["id"].as_str().unwrap_or("");
-                let name = tc["function"]["name"].as_str().unwrap_or("");
-                let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
-                let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or_default();
-                if !id.is_empty() {
-                    tool_call_map.insert(id.to_string(), (name.to_string(), args));
-                }
-            }
-        }
+    if asst_messages.is_empty() {
+        return Ok(0);
     }
+
+    // Query already-processed tool_call_ids for idempotency
+    let mut seen_stmt = conn.prepare(
+        "SELECT tool_call_id FROM diff_events WHERE session_id = ?1"
+    )?;
+    let seen: std::collections::HashSet<String> = seen_stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
 
-    // For each tool_result, extract diff if the tool was an edit
-    for msg in messages {
-        if msg["role"].as_str() != Some("tool") { continue; }
-        let tc_id = msg["tool_call_id"].as_str().unwrap_or("");
-        if tc_id.is_empty() { continue; }
+    let mut count = 0;
 
-        let Some((tool_name, args)) = tool_call_map.get(tc_id) else { continue; };
+    for raw in &asst_messages {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
+        let Some(tool_calls) = msg["tool_calls"].as_array() else { continue };
 
-        let (before, after, file_path) = match tool_extract_diff(tool_name, args) {
-            Some(v) => v,
-            None => continue,
-        };
+        for tc in tool_calls {
+            let tc_id = tc["id"].as_str().unwrap_or("");
+            if tc_id.is_empty() || seen.contains(tc_id) { continue; }
 
-        let _ = generate_and_store(conn, session_id, tc_id, &file_path, &before, &after, ts);
-        count += 1;
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
+            let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or_default();
+
+            let Some((before, after, file_path)) = tool_extract_diff(name, &args) else {
+                continue;
+            };
+
+            let _ = generate_and_store(conn, session_id, tc_id, &file_path, &before, &after, ts);
+            count += 1;
+        }
     }
 
     Ok(count)
@@ -554,6 +566,17 @@ mod tests {
     fn temp_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
         create_tables(&conn).expect("create tables");
+        // post_commit tests query the messages table (normally created by db.rs migration)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                role            TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                token_count     INTEGER,
+                stored_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            );"
+        ).expect("create messages");
         conn
     }
 
@@ -745,19 +768,20 @@ mod tests {
         assert_eq!(overlaps[0].1.tool_call_id, "t2");
     }
 
-    // ── Hook: extract_diffs_from_messages ──────────────────────
+    // ── Hook: extract_diffs_post_commit ────────────────────────
 
     #[test]
-    fn hook_extracts_diff_from_messages() {
+    fn post_commit_extracts_diff_from_db() {
         let conn = temp_conn();
-        let messages = serde_json::json!([
-            {"role": "user", "content": "fix the bug"},
-            {"role": "assistant", "content": null, "tool_calls": [
-                {"id": "tc1", "function": {"name": "Edit", "arguments": r#"{"file_path":"src/a.rs","old_string":"fn foo() { 1 }","new_string":"fn foo() { 2 }"}"#}}
-            ]},
-            {"role": "tool", "tool_call_id": "tc1", "content": "edited successfully"},
-        ]);
-        let count = extract_diffs_from_messages(&conn, "s_hook", messages.as_array().unwrap()).unwrap();
+        let conv_id = 1i64;
+
+        // Simulate what store_messages would write: assistant + tool messages
+        conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, stored_at) VALUES (?1, 'assistant', ?2, datetime('now'))",
+            params![conv_id, r#"{"role":"assistant","content":null,"tool_calls":[{"id":"tc1","function":{"name":"Edit","arguments":"{\"file_path\":\"src/a.rs\",\"old_string\":\"fn foo() { 1 }\",\"new_string\":\"fn foo() { 2 }\"}"}}]}"#],
+        ).unwrap();
+
+        let count = extract_diffs_post_commit(&conn, "s_hook", conv_id).unwrap();
         assert_eq!(count, 1, "should extract 1 diff from Edit tool call");
 
         let diffs = query_diffs(&conn, &DiffQuery {
@@ -770,25 +794,31 @@ mod tests {
     }
 
     #[test]
-    fn hook_skips_non_edit_tools() {
+    fn post_commit_skips_non_edit_tools() {
         let conn = temp_conn();
-        let messages = serde_json::json!([
-            {"role": "user", "content": "search"},
-            {"role": "assistant", "content": null, "tool_calls": [
-                {"id": "tc1", "function": {"name": "Grep", "arguments": r#"{"pattern":"timeout"}"#}},
-                {"id": "tc2", "function": {"name": "Read", "arguments": r#"{"file_path":"src/a.rs"}"#}}
-            ]},
-            {"role": "tool", "tool_call_id": "tc1", "content": "no matches"},
-            {"role": "tool", "tool_call_id": "tc2", "content": "fn foo() {}"},
-        ]);
-        let count = extract_diffs_from_messages(&conn, "s2", messages.as_array().unwrap()).unwrap();
-        assert_eq!(count, 0, "Grep and Read are not edit tools");
+        let conv_id = 1i64;
+        conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, stored_at) VALUES (?1, 'assistant', ?2, datetime('now'))",
+            params![conv_id, r#"{"role":"assistant","content":null,"tool_calls":[{"id":"tc1","function":{"name":"Grep","arguments":"{\"pattern\":\"timeout\"}"}}]}"#],
+        ).unwrap();
 
-        let diffs = query_diffs(&conn, &DiffQuery {
-            session_id: Some("s2".into()),
-            ..Default::default()
-        }).unwrap();
-        assert_eq!(diffs.len(), 0);
+        let count = extract_diffs_post_commit(&conn, "s2", conv_id).unwrap();
+        assert_eq!(count, 0, "Grep is not an edit tool");
+    }
+
+    #[test]
+    fn post_commit_idempotent() {
+        let conn = temp_conn();
+        let conv_id = 1i64;
+        conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, stored_at) VALUES (?1, 'assistant', ?2, datetime('now'))",
+            params![conv_id, r#"{"role":"assistant","content":null,"tool_calls":[{"id":"tc1","function":{"name":"Edit","arguments":"{\"file_path\":\"f.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}"}}]}"#],
+        ).unwrap();
+
+        let c1 = extract_diffs_post_commit(&conn, "s3", conv_id).unwrap();
+        assert_eq!(c1, 1);
+        let c2 = extract_diffs_post_commit(&conn, "s3", conv_id).unwrap();
+        assert_eq!(c2, 0, "second call should skip already-processed tool_call_id");
     }
 
     // ── Smoke: roundtrip via Database ──────────────────────────
