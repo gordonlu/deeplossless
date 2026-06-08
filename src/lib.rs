@@ -71,6 +71,7 @@ pub mod embeddings;
 pub mod artifacts;
 pub mod assistant_validation;
 pub mod audit;
+pub mod event_store;
 pub mod execution;
 pub mod file_observation;
 pub mod parallel;

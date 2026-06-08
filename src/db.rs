@@ -275,6 +275,20 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a proxy event into the structured event index. Writes
+    /// to `proxy_events` + `proxy_events_fts` in the same transaction.
+    pub fn insert_proxy_event(&self, event: &crate::event_store::ProxyEvent) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        crate::event_store::insert_event(&conn, event)
+    }
+
+    /// Query proxy events with structured filters (session, tool,
+    /// status, path, FTS on content).
+    pub fn query_proxy_events(&self, filter: &crate::event_store::EventFilter) -> anyhow::Result<Vec<crate::event_store::ProxyEvent>> {
+        let conn = self.read_conn();
+        crate::event_store::query_events(&conn, filter)
+    }
+
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Schema version tracking — prevents silent migration drift.
@@ -628,6 +642,8 @@ impl Database {
             conn.execute_batch(crate::execution::EXECUTION_UNITS_ALTER_V6)?;
         }
 
+        crate::event_store::create_tables(&conn)?;
+
         Ok(())
     }
 
@@ -700,9 +716,19 @@ impl Database {
     }
 
     /// Persist a request's `messages` array into an existing conversation.
+    /// Also extracts structured events into `proxy_events` for search.
     pub fn store_messages(&self, conv_id: i64, messages: &serde_json::Value) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
+
+        // Compute stable session fingerprint from the message set and
+        // feed the event index. Done here so every handler (chat_completions,
+        // responses, anthropic_messages) gets event extraction for free.
+        let session_id = if let Some(arr) = messages.as_array() {
+            crate::session::fingerprint(arr, 3)
+        } else {
+            String::new()
+        };
 
         if let Some(arr) = messages.as_array() {
             for msg in arr {
@@ -736,6 +762,15 @@ impl Database {
                     "INSERT OR REPLACE INTO messages_fts (rowid, content, role) VALUES (?1, ?2, ?3)",
                     rusqlite::params![msg_id, plain, role],
                 );
+            }
+        }
+
+        // Extract proxy events from the message array (fire-and-forget,
+        // best-effort — won't fail the transaction if the event table
+        // doesn't exist yet).
+        if !session_id.is_empty() {
+            if let Some(arr) = messages.as_array() {
+                let _ = crate::event_store::extract_and_insert(&tx, &session_id, arr);
             }
         }
 
