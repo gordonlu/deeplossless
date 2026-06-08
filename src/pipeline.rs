@@ -177,6 +177,16 @@ impl ChatPipeline {
                 tracing::warn!(target: "deeplossless::pipeline", "failed to store messages: {e}");
                 return;
             }
+            // ── DiffEngine: post-commit analysis layer ──────────
+            // Runs AFTER store_messages committed, BEFORE the UI
+            // sees anything. Extracts file diffs from Edit/Write
+            // tool calls found in this message batch. Not part of
+            // the ingestion transaction — pure analysis.
+            if let Some(arr) = msgs.as_array() {
+                let session_id = crate::session::fingerprint(arr, 3);
+                let conn = db.writer_conn();
+                let _ = crate::diff_events::extract_diffs_from_messages(&conn, &session_id, arr);
+            }
             if let Some(arr) = msgs.as_array() {
                 for msg in arr {
                     let role = msg["role"].as_str().unwrap_or("");
