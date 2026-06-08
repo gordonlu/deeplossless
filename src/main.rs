@@ -195,6 +195,32 @@ enum Commands {
         #[arg(long, default_value = "claude_code")]
         format: String,
     },
+    /// Search proxy events with structured filters + FTS.
+    /// Query the event index (proxy_events table) built by
+    /// deeplossless during normal proxy operation.
+    Search {
+        /// Filter by event type: request_start, user_message, tool_call, etc.
+        #[arg(long)]
+        event_type: Option<String>,
+        /// Filter by tool name: Read, Edit, Grep, Bash, etc.
+        #[arg(long)]
+        tool: Option<String>,
+        /// Filter by session fingerprint or prompt_cache_key.
+        #[arg(long)]
+        session: Option<String>,
+        /// Filter by status: success, error
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by file path (SQL LIKE pattern: %config.rs)
+        #[arg(long)]
+        path: Option<String>,
+        /// Full-text search on content column (FTS5)
+        #[arg(long)]
+        content: Option<String>,
+        /// Max results, default 50
+        #[arg(long, short = 'n', default_value = "50")]
+        limit: usize,
+    },
 }
 
 async fn run_demo() -> anyhow::Result<()> {
@@ -362,6 +388,44 @@ fn run_drive(scenario: &str, format: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_search(db_path: &str, filter: deeplossless::event_store::EventFilter) -> anyhow::Result<()> {
+    let db = deeplossless::db::Database::builder()
+        .path(db_path)
+        .build()
+        .await?;
+
+    let events = db.query_proxy_events(&filter)?;
+
+    if events.is_empty() {
+        println!("no results");
+        return Ok(());
+    }
+
+    for ev in &events {
+        let type_str = ev.event_type.as_str();
+        let tool_str = ev.tool_name.as_deref().unwrap_or("-");
+        let path_str = ev.path.as_deref().unwrap_or("-");
+        let status_str = ev.status.as_deref().unwrap_or("-");
+        let session_part = if ev.session_id.len() > 16 {
+            format!("{}…", &ev.session_id[..15])
+        } else {
+            ev.session_id.clone()
+        };
+        let content_preview = if ev.content.len() > 100 {
+            format!("{}…", &ev.content[..99])
+        } else {
+            ev.content.clone()
+        };
+        println!(
+            "{:<18} {:<12} {:<24} {:<8} {:<18} {}",
+            type_str, tool_str, session_part, status_str, path_str, content_preview
+        );
+    }
+
+    println!("\n── {} event(s) ──", events.len());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -385,6 +449,19 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(Commands::Drive { scenario, format }) = cli.command {
         return run_drive(&scenario, &format);
+    }
+    if let Some(Commands::Search { event_type, tool, session, status, path, content, limit }) = cli.command {
+        use deeplossless::event_store::{EventFilter, EventType};
+        let filter = EventFilter {
+            event_type: event_type.as_deref().and_then(EventType::from_event_str),
+            tool_name: tool,
+            session_id: session,
+            status,
+            path_pattern: path.map(|p| format!("%{p}%")),
+            content_match: content,
+            limit: Some(limit),
+        };
+        return run_search(&cli.db_path, filter).await;
     }
     let mut cli = cli;
 
