@@ -1,26 +1,24 @@
-//! 0-LLM scenario driver.
+//! 0-LLM scenario driver — a diagnostic tool, not a benchmark.
 //!
-//! Drives ACES scenarios to completion without an LLM by:
-//! 1. Loading the scenario and creating its VFS on disk
-//! 2. For each state, applying the state's `pre_apply` edits to the VFS
-//! 3. Executing the state's tool calls (Read/Edit/Bash/apply_patch/...) using
-//!    real file-system and shell operations
-//! 4. Feeding the resulting `AgentEvent` back into the state machine
-//! 5. Continuing until a terminal state is reached
+//! Drives ACES scenarios to completion without an LLM by following the
+//! scenario's state machine deterministically: for each state, the driver
+//! applies `pre_apply` edits to the VFS, executes the state's tool calls
+//! against the real filesystem, and feeds the resulting `AgentEvent`s back
+//! into the state machine. It continues until a terminal state is reached
+//! or `max_steps` is exceeded.
 //!
-//! This tests the agent's *tool layer* end-to-end: can the mock's tool calls
-//! be parsed, routed to the right implementation, executed against the VFS,
-//! and produce events that advance the state machine? The LLM (which normally
-//! decides which tool to call) is replaced by a deterministic walk: the
-//! driver follows whatever tool the state machine dictates.
+//! This is useful for:
+//! - Checking that the YAML state machine has no dead-ends
+//! - Verifying `pre_apply` from→to strings match the actual VFS content
+//! - Testing `args_per_agent` parameter mapping for a given agent format
+//! - Debugging `on_file_contains` transitions without an LLM involved
 //!
-//! Scoring reflects the mock's design and the tool layer's correctness, not
-//! the LLM's choices. The driver is useful for validating that the VFS is
-//! set up correctly, the state machine is reachable from start to terminal,
-//! and tool execution produces the expected events.
+//! The driver's value is in the **diagnostic output** (`verbose = true`),
+//! not in the score. Use it to validate your scenario YAML before hooking
+//! up a real agent.
 
 use crate::torture::aces::{apply_pre_apply, check_file_transitions, create_vfs};
-use crate::torture::scenario::{score_run, AgentEvent, Scenario, ScenarioRun, StateMachine};
+use crate::torture::scenario::{AgentEvent, Scenario, StateMachine};
 use std::path::{Path, PathBuf};
 
 /// Result of driving a single scenario.
@@ -29,7 +27,7 @@ pub struct DriveOutcome {
     pub scenario: String,
     pub terminal_state: String,
     pub events: Vec<AgentEvent>,
-    pub score: f64,
+    pub steps: usize,
     pub success: bool,
 }
 
@@ -38,10 +36,14 @@ pub struct DriveOutcome {
 /// `format` selects the per-agent arg convention ("claude_code", "codex",
 /// "openai"). `vfs_parent` is the parent directory under which a per-scenario
 /// VFS subdirectory will be created.
+///
+/// When `verbose` is true, each step is printed to stderr with the state
+/// name, the tool calls executed, and the next state.
 pub fn drive_scenario(
     name: &str,
     format: &str,
     vfs_parent: &Path,
+    verbose: bool,
 ) -> Result<DriveOutcome, String> {
     let scenario = Scenario::load_with_format(name, Some(format))
         .map_err(|e| format!("load scenario '{name}': {e}"))?;
@@ -51,9 +53,7 @@ pub fn drive_scenario(
         .map_err(|e| format!("create vfs at {}: {e}", vfs_root.display()))?;
 
     let mut machine = StateMachine::new(scenario);
-    let mut last_event: Option<AgentEvent> = None;
 
-    // Bound the loop — scenarios should terminate in O(states) steps.
     let max_steps = 200;
     let mut step = 0;
 
@@ -68,15 +68,8 @@ pub fn drive_scenario(
 
         let state_name = machine.current_state_name().to_string();
 
-        // Apply pre_apply edits before responding to tool calls. This is
-        // what the mock does in handle_request — the file on disk is fixed
-        // before the agent's edit is "evaluated" via the transition check.
         apply_pre_apply(&machine, &vfs_root);
 
-        // Get the current state's tool calls + args. The driver follows
-        // them in order. If multiple tool_calls are listed, we execute all
-        // of them; only the last event's effect on transitions matters
-        // (matches what the mock's build_sse does — emits all in one chunk).
         let tool_calls = machine.current_tool_calls();
         let mut state_events: Vec<AgentEvent> = Vec::new();
 
@@ -89,8 +82,6 @@ pub fn drive_scenario(
         }
 
         if state_events.is_empty() {
-            // No tool calls in this state — shouldn't happen for non-terminal
-            // states, but guard against infinite loops.
             return Err(format!(
                 "scenario '{name}' stuck at state '{state_name}' — no tool calls and not terminal"
             ));
@@ -99,57 +90,98 @@ pub fn drive_scenario(
         for event in &state_events {
             machine.feed(event.clone());
         }
-        // After feeding events, check file-based transitions (OnFileContains
-        // in the YAML). The mock does this in handle_request; we have to do
-        // it explicitly because the state machine's feed() only matches on
-        // event patterns, not file content.
         if let Some(next) = check_file_transitions(&machine, &vfs_root) {
             machine.set_state(&next);
         }
-        last_event = state_events.last().cloned();
+
+        if verbose {
+            let tool_info: Vec<String> = state_events
+                .iter()
+                .map(|e| match e {
+                    AgentEvent::Read(p, _) => format!("Read({})", short_path(p, &vfs_root)),
+                    AgentEvent::Edit(p, r) => format!("Edit({}) [{}]", short_path(p, &vfs_root), r),
+                    AgentEvent::Search(q, _) => format!("Search({})", q),
+                    AgentEvent::Test(t, _) => format!("Test({})", t),
+                    AgentEvent::Task(t, _) => format!("Task({})", t),
+                    _ => format!("{}", e.args()),
+                })
+                .collect();
+            eprintln!(
+                "[{:>3}] {:<20} {:<50} → {}",
+                step,
+                truncate(&state_name, 20),
+                truncate(&tool_info.join(", "), 50),
+                machine.current_state_name()
+            );
+        }
     }
 
     let terminal = machine.current_state_name().to_string();
     let success = machine.is_success();
     let events = machine.events.clone();
 
-    let expected_search = machine.scenario().expected_search;
-    let expected_read = machine.scenario().expected_read;
-    let run = ScenarioRun {
-        scenario: name.to_string(),
-        events: events.clone(),
-        terminal_state: Some(terminal.clone()),
-        score: None,
-        expected_search,
-        expected_read,
-    };
-    let score = score_run(&run).total;
-
-    // Suppress unused warning — last_event is useful for debugging.
-    let _ = last_event;
+    if verbose {
+        match (success, &terminal) {
+            (true, _) => eprintln!("  ✓ {} ({step} steps, {} events)", name, events.len()),
+            (false, t) => eprintln!("  ✗ {} → stuck at {t} after {step} steps", name),
+        }
+    }
 
     Ok(DriveOutcome {
         scenario: name.to_string(),
         terminal_state: terminal,
         events,
-        score,
+        steps: step,
         success,
     })
 }
 
 /// Drive every base scenario in sequence, returning per-scenario outcomes.
-pub fn drive_suite(format: &str, vfs_parent: &Path) -> Vec<Result<DriveOutcome, String>> {
+pub fn drive_suite(format: &str, vfs_parent: &Path, verbose: bool) -> Vec<Result<DriveOutcome, String>> {
     let names = match Scenario::list_base() {
         Ok(n) if !n.is_empty() => n,
         Ok(_) => return vec![Err("no base scenarios found in scenarios/".to_string())],
         Err(e) => return vec![Err(format!("list_base: {e}"))],
     };
 
+    if verbose {
+        eprintln!("=== drive suite: {format} ===");
+        eprintln!("   {} base scenarios found", names.len());
+    }
+
     let mut out = Vec::with_capacity(names.len());
     for name in &names {
-        out.push(drive_scenario(name, format, vfs_parent));
+        if verbose {
+            eprintln!("\n── {name} ──");
+        }
+        out.push(drive_scenario(name, format, vfs_parent, verbose));
     }
+
+    if verbose {
+        let ok = out.iter().filter(|o| o.as_ref().map(|o| o.success).unwrap_or(false)).count();
+        let err = out.len() - ok;
+        eprintln!("\n=== result: {ok} ok, {err} fail ===");
+    }
+
     out
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn short_path(path: &str, vfs_root: &Path) -> String {
+    let root_str = vfs_root.to_string_lossy();
+    if path.starts_with(root_str.as_ref()) {
+        path[root_str.len()..].trim_start_matches('/').to_string()
+    } else {
+        let segments: Vec<&str> = path.split('/').collect();
+        if segments.len() <= 3 { path.to_string() }
+        else { format!("{}/{}/{}", segments[0], segments[1], segments[segments.len()-1]) }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() }
+    else { format!("{}…", &s[..max.saturating_sub(1)]) }
 }
 
 /// Execute a single tool call against the VFS and return the resulting event.
@@ -388,10 +420,9 @@ mod tests {
     #[test]
     fn drive_hidden_bug_claude_code_reaches_terminal() {
         let parent = temp_parent("hidden_bug_cc");
-        let outcome = drive_scenario("hidden_bug", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("hidden_bug", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert!(!outcome.terminal_state.is_empty());
-        assert!(outcome.score > 0.0, "score should be > 0");
         // The hidden_bug state path includes verify.
         assert!(
             outcome.terminal_state == "verify",
@@ -403,7 +434,7 @@ mod tests {
     #[test]
     fn drive_01_fix_test_failure_claude_code() {
         let parent = temp_parent("01_cc");
-        let outcome = drive_scenario("01_fix_test_failure", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("01_fix_test_failure", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -411,7 +442,7 @@ mod tests {
     #[test]
     fn drive_02_add_feature_claude_code() {
         let parent = temp_parent("02_cc");
-        let outcome = drive_scenario("02_add_feature", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("02_add_feature", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -419,7 +450,7 @@ mod tests {
     #[test]
     fn drive_03_refactor_rename_claude_code() {
         let parent = temp_parent("03_cc");
-        let outcome = drive_scenario("03_refactor_rename", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("03_refactor_rename", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -427,7 +458,7 @@ mod tests {
     #[test]
     fn drive_04_search_to_fix_claude_code() {
         let parent = temp_parent("04_cc");
-        let outcome = drive_scenario("04_search_to_fix", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("04_search_to_fix", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -435,7 +466,7 @@ mod tests {
     #[test]
     fn drive_05_multi_file_edit_claude_code() {
         let parent = temp_parent("05_cc");
-        let outcome = drive_scenario("05_multi_file_edit", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("05_multi_file_edit", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -443,7 +474,7 @@ mod tests {
     #[test]
     fn drive_06_debug_from_logs_claude_code() {
         let parent = temp_parent("06_cc");
-        let outcome = drive_scenario("06_debug_from_logs", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("06_debug_from_logs", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -451,7 +482,7 @@ mod tests {
     #[test]
     fn drive_07_security_fix_claude_code() {
         let parent = temp_parent("07_cc");
-        let outcome = drive_scenario("07_security_fix", "claude_code", &parent).expect("drive");
+        let outcome = drive_scenario("07_security_fix", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -459,7 +490,7 @@ mod tests {
     #[test]
     fn drive_codex_format_reaches_terminal() {
         let parent = temp_parent("hidden_bug_codex");
-        let outcome = drive_scenario("hidden_bug", "codex", &parent).expect("drive");
+        let outcome = drive_scenario("hidden_bug", "codex", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -467,7 +498,7 @@ mod tests {
     #[test]
     fn drive_openai_format_reaches_terminal() {
         let parent = temp_parent("hidden_bug_openai");
-        let outcome = drive_scenario("hidden_bug", "openai", &parent).expect("drive");
+        let outcome = drive_scenario("hidden_bug", "openai", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -475,7 +506,7 @@ mod tests {
     #[test]
     fn drive_suite_runs_all_base_scenarios() {
         let parent = temp_parent("suite");
-        let outcomes = drive_suite("claude_code", &parent);
+        let outcomes = drive_suite("claude_code", &parent, false);
         assert!(!outcomes.is_empty(), "suite should have at least one scenario");
         let failures: Vec<_> = outcomes
             .iter()

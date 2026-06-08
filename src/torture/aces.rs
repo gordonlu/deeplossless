@@ -1,4 +1,4 @@
-use crate::torture::scenario::{Scenario, ScenarioRun, StateMachine, AgentEvent, extract_events_from_request, score_run};
+use crate::torture::scenario::{Scenario, StateMachine, AgentEvent, extract_events_from_request};
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -39,8 +39,6 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
         scenarios,
         current_idx: 0,
         machine: initial_machine,
-        scores: Vec::with_capacity(n),
-        statuses: Vec::with_capacity(n),
         reported: false,
         plugin_warned: false,
         terminal_sent: false,
@@ -106,21 +104,8 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
                         s.scenario_complete = true;
                         eprintln!("[aces] idle {}s after terminal — scenario complete", IDLE_THRESHOLD_SECS);
 
-                        // Score the finished scenario before advancing.
-                        let expected_search = s.machine.scenario().expected_search;
-                        let expected_read = s.machine.scenario().expected_read;
-                        let run = ScenarioRun {
-                            scenario: s.scenarios[s.current_idx].0.clone(),
-                            events: s.machine.events.clone(),
-                            terminal_state: Some(s.machine.current_state_name().to_string()),
-                            score: None,
-                            expected_search,
-                            expected_read,
-                        };
-                        let scored = score_run(&run);
-                        s.scores.push(scored.total);
                         let status = if s.machine.is_success() { "ok" } else { "give_up" };
-                        s.statuses.push(status.to_string());
+                        eprintln!("[aces]   → {}", status);
 
                         let next_idx = s.current_idx + 1;
                         if next_idx >= s.scenarios.len() {
@@ -178,11 +163,6 @@ pub struct SharedState {
     /// The active state machine for the current scenario. Replaced
     /// (in place) when advancing to the next scenario.
     pub machine: StateMachine,
-    /// Final score from each completed scenario. Same length as
-    /// `scenarios` once the suite finishes.
-    pub scores: Vec<f64>,
-    /// Per-scenario status string for the suite report. "ok" / "give_up" / "incomplete".
-    pub statuses: Vec<String>,
     pub reported: bool,
     /// VFS root path, set lazily on the first request based on the agent's
     /// working directory (parsed from the request's system prompt).
@@ -392,7 +372,9 @@ async fn handle_request(
     if is_terminal {
         if !s.reported {
             s.reported = true;
-            print_report(&s.machine);
+            let n = s.machine.events.len();
+            let t = s.machine.current_state_name();
+            eprintln!("[aces] terminal: {t} ({n} events)");
         }
         // Mark the wall-clock time of first terminal hit. The idle
         // watcher will set `scenario_complete` once 5s passes with no
@@ -637,26 +619,4 @@ data: [DONE]
         let finish = "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":10,\"total_tokens\":10}}\n\n";
         format!("{}{}data: [DONE]\n\n", content_event, finish)
     }
-}
-
-fn print_report(machine: &StateMachine) {
-    let expected_search = machine.scenario().expected_search;
-    let expected_read = machine.scenario().expected_read;
-    let run = ScenarioRun {
-        scenario: machine.current_state_name().to_string(),
-        events: machine.events.clone(),
-        terminal_state: Some(machine.current_state_name().to_string()),
-        score: None,
-        expected_search,
-        expected_read,
-    };
-    let scored = ScenarioRun {
-        scenario: run.scenario.clone(),
-        events: run.events.clone(),
-        terminal_state: run.terminal_state.clone(),
-        score: Some(score_run(&run)),
-        expected_search: run.expected_search,
-        expected_read: run.expected_read,
-    };
-    crate::torture::score::print_report(&scored);
 }

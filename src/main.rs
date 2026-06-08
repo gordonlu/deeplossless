@@ -184,6 +184,17 @@ enum Commands {
     /// Install the self-signed TLS certificate as system-trusted.
     /// After running this, HTTPS clients won't show certificate errors.
     Trust,
+    /// Drive ACES scenarios without an LLM — a diagnostic tool for
+    /// verifying YAML state machines, pre_apply edits, and agent-format
+    /// parameter mapping. No API key or LLM required.
+    Drive {
+        /// Scenario name or "all" for suite
+        #[arg(default_value = "all")]
+        scenario: String,
+        /// Agent format: openai, claude_code, codex
+        #[arg(long, default_value = "claude_code")]
+        format: String,
+    },
 }
 
 async fn run_demo() -> anyhow::Result<()> {
@@ -312,6 +323,45 @@ fn run_trust() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_drive(scenario: &str, format: &str) -> anyhow::Result<()> {
+    use std::path::PathBuf;
+
+    let parent = PathBuf::from("/tmp/aces_drive");
+
+    let verbose = true;
+
+    if scenario == "all" || scenario.is_empty() {
+        let outcomes = deeplossless::torture::driver::drive_suite(format, &parent, verbose);
+        let mut ok = 0;
+        let mut fail = 0;
+        for outcome in &outcomes {
+            match outcome {
+                Ok(o) if o.success => ok += 1,
+                Ok(o) => {
+                    fail += 1;
+                    eprintln!("  FAIL: {} → terminal={}", o.scenario, o.terminal_state);
+                }
+                Err(e) => {
+                    fail += 1;
+                    eprintln!("  FAIL: {e}");
+                }
+            }
+        }
+        eprintln!("\n── suite: {ok} OK, {fail} FAIL ──");
+        if fail > 0 {
+            anyhow::bail!("{fail} scenario(s) failed");
+        }
+    } else {
+        let outcome = deeplossless::torture::driver::drive_scenario(scenario, format, &parent, verbose)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !outcome.success {
+            anyhow::bail!("scenario '{}' failed at state '{}'", scenario, outcome.terminal_state);
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -332,6 +382,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if matches!(cli.command, Some(Commands::Trust)) {
         return run_trust();
+    }
+    if let Some(Commands::Drive { scenario, format }) = cli.command {
+        return run_drive(&scenario, &format);
     }
     let mut cli = cli;
 
@@ -397,13 +450,9 @@ async fn main() -> anyhow::Result<()> {
                         eprintln!("═══════════════════════════════════════════");
                         eprintln!("  ACES Suite Complete");
                         eprintln!("═══════════════════════════════════════════");
-                        let total: f64 = s.scores.iter().sum::<f64>() / s.scores.len() as f64;
-                        for (i, ((name, _), score)) in s.scenarios.iter().zip(s.scores.iter()).enumerate() {
-                            let status = s.statuses.get(i).map(String::as_str).unwrap_or("?");
-                            eprintln!("  [{}/{}] {:<32} {:>5.1}/100  {}", i + 1, s.scenarios.len(), name, score, status);
+                        for (i, (name, _)) in s.scenarios.iter().enumerate() {
+                            eprintln!("  [{}/{}] {}", i + 1, s.scenarios.len(), name);
                         }
-                        eprintln!("  ────────────────────────────────────────");
-                        eprintln!("  Suite Average:  {:>5.1}/100", total);
                         eprintln!("═══════════════════════════════════════════");
                         std::process::exit(0);
                     }
