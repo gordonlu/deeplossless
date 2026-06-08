@@ -86,7 +86,7 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let advance_info = {
+            {
                 let mut s = watcher_state.lock().unwrap();
                 if s.suite_complete { return; }
                 if let (Some(_terminal_at), Some(last_req)) = (s.terminal_at, s.last_request_at) {
@@ -137,8 +137,7 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
                     }
                 }
                 if s.suite_complete { return; }
-            };
-            let _ = advance_info;
+            }
         }
     });
 
@@ -220,10 +219,7 @@ pub(crate) fn create_vfs(scenario: &Scenario, base: &std::path::Path) -> std::io
 pub(crate) fn extract_agent_cwd(body: &Value) -> Option<std::path::PathBuf> {
     let msgs = body["messages"].as_array()?;
     let sys = msgs.first()?;
-    let content = match sys.get("content") {
-        Some(c) => c,
-        None => return None,
-    };
+    let content = sys.get("content")?;
     let text = match content.as_str() {
         Some(s) => s,
         None => {

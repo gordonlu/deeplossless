@@ -115,10 +115,7 @@ fn main() {
             let mut port = 9000u16;
             let mut i = 3;
             while i < args.len() {
-                match args[i].as_str() {
-                    "--port" => { i += 1; port = args[i].parse().unwrap_or(9000); }
-                    _ => {}
-                }
+                if args[i] == "--port" { i += 1; port = args[i].parse().unwrap_or(9000); }
                 i += 1;
             }
 
@@ -188,7 +185,7 @@ fn main() {
                             "choices": [{
                                 "index": 0,
                                 "message": {"role": "assistant", "content": msg},
-                                "finish_reason": if is_terminal { "stop" } else { "stop" }
+                                "finish_reason": "stop"
                             }],
                             "usage": {"prompt_tokens": 0, "completion_tokens": 10, "total_tokens": 10}
                         }))

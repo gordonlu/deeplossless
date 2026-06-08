@@ -82,7 +82,7 @@ pub fn gen_cache_stress(name: &str, total: usize, hit_rate: f64) -> ScenarioTrac
 pub fn gen_chaos(name: &str, tools: &[&str], failure_rate: f64) -> ScenarioTrace {
     let mut rng = SimpleRng::new(42);
     let mut turns = Vec::new();
-    for (_, tool) in tools.iter().enumerate() {
+    for tool in tools.iter() {
         let fails = rng.next_f64() < failure_rate;
         turns.push(Turn {
             prompt: format!("run {tool}"),

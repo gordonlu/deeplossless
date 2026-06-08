@@ -103,7 +103,7 @@ pub fn drive_scenario(
                     AgentEvent::Search(q, _) => format!("Search({})", q),
                     AgentEvent::Test(t, _) => format!("Test({})", t),
                     AgentEvent::Task(t, _) => format!("Task({})", t),
-                    _ => format!("{}", e.args()),
+                    _ => e.args().to_string(),
                 })
                 .collect();
             eprintln!(

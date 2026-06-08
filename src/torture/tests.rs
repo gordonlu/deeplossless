@@ -50,9 +50,6 @@ fn builtin_traces_are_valid() {
     for t in &traces {
         assert!(!t.name.is_empty());
         assert!(!t.turns.is_empty());
-        for turn in &t.turns {
-            assert!(turn.tokens > 0 || turn.tokens == 0);
-        }
     }
 }
 
@@ -154,7 +151,7 @@ fn adversarial_all_generated_unique_names() {
     let mut names = std::collections::HashSet::new();
     for t in &traces {
         assert!(names.insert(&t.name), "duplicate name: {}", t.name);
-        assert!(t.turns.len() >= 1);
+        assert!(!t.turns.is_empty());
     }
 }
 

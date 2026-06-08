@@ -739,7 +739,7 @@ async fn torture_start_mock() -> anyhow::Result<()> {
                     eprintln!("[torture] {}/{} ({:.0}%)", idx, total_turns, pct);
                 }
 
-                let remaining = if idx >= total_turns { 0 } else { total_turns - idx };
+                let remaining = total_turns.saturating_sub(idx);
 
                 let (delta_json, finish_reason) = if idx >= total_turns {
                     let msg = format!("[Benchmark Complete] All {} turns executed.", total_turns);

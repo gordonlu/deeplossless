@@ -829,7 +829,7 @@ pub fn extract_events_from_request(body: &serde_json::Value) -> Vec<AgentEvent> 
     let last_asst = msgs.iter().rposition(|m| {
         m["role"].as_str() == Some("assistant")
             && m["tool_calls"].is_array()
-            && !m["tool_calls"].as_array().map_or(true, |a| a.is_empty())
+            && !m["tool_calls"].as_array().is_none_or(|a| a.is_empty())
     });
 
     let start_idx = match last_asst {
