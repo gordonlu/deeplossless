@@ -19,7 +19,7 @@
 
 use crate::torture::aces::{apply_pre_apply, check_file_transitions, create_vfs};
 use crate::torture::scenario::{AgentEvent, Scenario, StateMachine};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Result of driving a single scenario.
 #[derive(Debug)]
@@ -404,6 +404,7 @@ fn run_bash(cmd: &str, vfs_root: &Path) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_parent(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(

@@ -835,7 +835,6 @@ pub fn extract_events_from_request(body: &serde_json::Value) -> Vec<AgentEvent> 
     let start_idx = match last_asst {
         Some(i) => i,
         None => {
-            let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap_or("?")).collect();
             return events;
         }
     };

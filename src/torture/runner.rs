@@ -1,5 +1,5 @@
 use deeplossless::torture::adversarial;
-use deeplossless::torture::scenario::{Scenario, ScenarioRun, StateMachine, AgentEvent, extract_events_from_request, score_run};
+use deeplossless::torture::scenario::{Scenario, ScenarioRun, StateMachine, extract_events_from_request, score_run};
 use deeplossless::torture::trace::ScenarioTrace;
 use serde_json::Value;
 

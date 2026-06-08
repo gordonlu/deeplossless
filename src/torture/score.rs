@@ -1,4 +1,4 @@
-use crate::torture::scenario::{AgentEvent, ScenarioRun, ScoreResult, score_run};
+use crate::torture::scenario::{AgentEvent, ScenarioRun, score_run};
 
 pub fn print_report(run: &ScenarioRun) {
     eprintln!();

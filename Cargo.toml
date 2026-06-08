@@ -12,7 +12,6 @@ keywords = ["ai", "agent", "runtime", "inference", "llm"]
 [[bin]]
 name = "torture"
 path = "src/torture/runner.rs"
-categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # HTTP proxy

@@ -1,4 +1,4 @@
-use crate::torture::scenario::{Scenario, StateMachine, AgentEvent, extract_events_from_request};
+use crate::torture::scenario::{Scenario, StateMachine, extract_events_from_request};
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::Mutex;

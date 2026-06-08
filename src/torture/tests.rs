@@ -691,7 +691,7 @@ fn shell_cat_event_classified_as_read() {
 #[test]
 fn scenario_list_empty_dir() {
     use crate::torture::scenario::*;
-    let list = Scenario::list().unwrap_or_default();
+    let _list = Scenario::list().unwrap_or_default();
 }
 
 #[test]
@@ -873,7 +873,6 @@ fn resolve_args_substitutes_deeply_nested_strings() {
 #[test]
 fn current_tool_args_for_selects_agent_format() {
     use crate::torture::scenario::StateMachine;
-    use serde_json::json;
     // Default args use Chat API (camelCase); claude_code override uses
     // snake_case. Loading the real hidden_bug.yaml would also work but
     // this is faster and self-contained.

@@ -372,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
 
     if matches!(cli.command, Some(Commands::Demo)) {
         return run_demo().await;
@@ -666,7 +666,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn torture_start_mock() -> anyhow::Result<()> {
-    use deeplossless::torture::adversarial;
     use std::sync::atomic::Ordering;
 
     let combined = deeplossless::torture::adversarial::combined_trace();
