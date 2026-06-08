@@ -871,6 +871,12 @@ async fn responses(
                 if let Err(e) = db.store_reasoning(&reasoning_key, &content.reasoning) {
                     tracing::debug!(target: "deeplossless", "store reasoning failed: {e}");
                 }
+                let _ = db.insert_event_simple(
+                    crate::event_store::EventType::Reasoning,
+                    &session_key,
+                    &content.reasoning,
+                    serde_json::json!({"model": canonical.model}),
+                );
             }
 
             // Append assistant response to session for conversation continuity.
@@ -1362,6 +1368,12 @@ async fn chat_completions(
             }
             if !reasoning.is_empty() {
                 let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
+                let _ = reasoning_db.insert_event_simple(
+                    crate::event_store::EventType::Reasoning,
+                    &reasoning_key,
+                    &reasoning,
+                    serde_json::json!({"source": "chat_completions"}),
+                );
             }
             // Accumulate token usage from chat completions stream
             if let Some(cid) = conv_id {
@@ -1549,6 +1561,12 @@ async fn lcm_chat_completions(
             }
             if !reasoning.is_empty() {
                 let _ = reasoning_db.store_reasoning(&reasoning_key, &reasoning);
+                let _ = reasoning_db.insert_event_simple(
+                    crate::event_store::EventType::Reasoning,
+                    &reasoning_key,
+                    &reasoning,
+                    serde_json::json!({"source": "chat_completions"}),
+                );
             }
             if let Some(cid) = conv_id {
                 if prompt_tokens > 0 || completion_tokens > 0 {
@@ -1901,6 +1919,7 @@ async fn anthropic_messages(
         let stream = UnboundedReceiverStream::new(rx);
         let reasoning_fp = fp.clone();
         let reasoning_cache = state.reasoning_cache.clone();
+        let reasoning_db = state.storage.db.clone();
         tokio::spawn(async move {
             let mut sse_state = crate::protocol::anthropic::AnthropicSseState::new();
             let mut byte_stream = resp.bytes_stream();
@@ -1948,7 +1967,13 @@ async fn anthropic_messages(
             if !sse_state.reasoning_content.is_empty() {
                 let rc_len = sse_state.reasoning_content.len();
                 let mut cache = reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
-                cache.insert(reasoning_fp.clone(), sse_state.reasoning_content);
+                cache.insert(reasoning_fp.clone(), sse_state.reasoning_content.clone());
+                let _ = reasoning_db.insert_event_simple(
+                    crate::event_store::EventType::Reasoning,
+                    &reasoning_fp,
+                    &sse_state.reasoning_content,
+                    serde_json::json!({"source": "anthropic_messages"}),
+                );
                 tracing::debug!(target: "deeplossless::anthropic",
                     fp = %reasoning_fp, rc_len,
                     "reasoning cached from stream");

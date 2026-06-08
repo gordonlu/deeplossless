@@ -289,6 +289,30 @@ impl Database {
         crate::event_store::query_events(&conn, filter)
     }
 
+    /// Shorthand for inserting a single proxy event with just the
+    /// essential fields. Session_id should be the stable conversation
+    /// fingerprint or prompt_cache_key.
+    pub fn insert_event_simple(
+        &self,
+        event_type: crate::event_store::EventType,
+        session_id: &str,
+        content: &str,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        let event = crate::event_store::ProxyEvent {
+            id: None,
+            event_type,
+            session_id: session_id.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            tool_name: None,
+            path: None,
+            status: None,
+            content: content.to_string(),
+            metadata,
+        };
+        self.insert_proxy_event(&event)
+    }
+
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Schema version tracking — prevents silent migration drift.
