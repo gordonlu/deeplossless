@@ -442,6 +442,108 @@ pub fn find_overlapping_edits(conn: &Connection, session_id: &str) -> anyhow::Re
     Ok(pairs)
 }
 
+// ── Tool-result post-process hook ──────────────────────────────────
+
+/// Extract file diffs from a Chat Completions messages array.
+/// Called by `store_messages` after message storage, during the same
+/// transaction. For every `tool` role message whose corresponding
+/// `tool_call` was an Edit/Write operation, computes and stores a
+/// diff event.
+///
+/// This is the bridge between the proxy's message capture and the
+/// diff_events table — the "post-process hook" that fires after
+/// messages are stored but before the transaction commits.
+pub fn extract_diffs_from_messages(
+    conn: &Connection,
+    session_id: &str,
+    messages: &[serde_json::Value],
+) -> anyhow::Result<usize> {
+    let mut count = 0;
+
+    // Build a map: tool_call_id → (tool_name, tool_args_json)
+    let mut tool_call_map: std::collections::HashMap<String, (String, serde_json::Value)> = std::collections::HashMap::new();
+    for msg in messages {
+        if msg["role"].as_str() != Some("assistant") { continue; }
+        if let Some(tool_calls) = msg["tool_calls"].as_array() {
+            for tc in tool_calls {
+                let id = tc["id"].as_str().unwrap_or("");
+                let name = tc["function"]["name"].as_str().unwrap_or("");
+                let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
+                let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or_default();
+                if !id.is_empty() {
+                    tool_call_map.insert(id.to_string(), (name.to_string(), args));
+                }
+            }
+        }
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    // For each tool_result, extract diff if the tool was an edit
+    for msg in messages {
+        if msg["role"].as_str() != Some("tool") { continue; }
+        let tc_id = msg["tool_call_id"].as_str().unwrap_or("");
+        if tc_id.is_empty() { continue; }
+
+        let Some((tool_name, args)) = tool_call_map.get(tc_id) else { continue; };
+
+        let (before, after, file_path) = match tool_extract_diff(tool_name, args) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let _ = generate_and_store(conn, session_id, tc_id, &file_path, &before, &after, ts);
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Extract (before, after, file_path) from a tool call's arguments.
+/// Returns None if the tool is not an edit operation.
+fn tool_extract_diff(tool_name: &str, args: &serde_json::Value) -> Option<(String, String, String)> {
+    // Common field names across agent formats
+    let path = args["file_path"].as_str()
+        .or_else(|| args["filePath"].as_str())
+        .or_else(|| args["path"].as_str())
+        .or_else(|| args["operation"]["path"].as_str()) // Codex apply_patch
+        .unwrap_or("");
+
+    if path.is_empty() { return None; }
+
+    match tool_name {
+        "Edit" | "edit" | "edit_file" | "replace" => {
+            let old = args["old_string"].as_str()
+                .or_else(|| args["oldString"].as_str())
+                .or_else(|| args["operation"]["oldString"].as_str());
+            let new = args["new_string"].as_str()
+                .or_else(|| args["newString"].as_str())
+                .or_else(|| args["operation"]["newString"].as_str());
+            let old = old?;
+            let new = new?;
+            Some((old.to_string(), new.to_string(), path.to_string()))
+        }
+        "Write" | "write" | "write_to_file" | "write_file" => {
+            let content = args["content"].as_str().unwrap_or("");
+            Some((String::new(), content.to_string(), path.to_string()))
+        }
+        "apply_patch" => {
+            let operation = &args["operation"];
+            let old = operation["oldString"].as_str()
+                .or_else(|| operation["old_string"].as_str());
+            let new = operation["newString"].as_str()
+                .or_else(|| operation["new_string"].as_str());
+            let old = old?;
+            let new = new?;
+            Some((old.to_string(), new.to_string(), path.to_string()))
+        }
+        _ => None,
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -641,6 +743,52 @@ mod tests {
         assert_eq!(overlaps.len(), 1, "only the two edits on f.rs line 2 should overlap");
         assert_eq!(overlaps[0].0.tool_call_id, "t1");
         assert_eq!(overlaps[0].1.tool_call_id, "t2");
+    }
+
+    // ── Hook: extract_diffs_from_messages ──────────────────────
+
+    #[test]
+    fn hook_extracts_diff_from_messages() {
+        let conn = temp_conn();
+        let messages = serde_json::json!([
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tc1", "function": {"name": "Edit", "arguments": r#"{"file_path":"src/a.rs","old_string":"fn foo() { 1 }","new_string":"fn foo() { 2 }"}"#}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "edited successfully"},
+        ]);
+        let count = extract_diffs_from_messages(&conn, "s_hook", messages.as_array().unwrap()).unwrap();
+        assert_eq!(count, 1, "should extract 1 diff from Edit tool call");
+
+        let diffs = query_diffs(&conn, &DiffQuery {
+            session_id: Some("s_hook".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].file_path, "src/a.rs");
+        assert_eq!(diffs[0].tool_call_id, "tc1");
+    }
+
+    #[test]
+    fn hook_skips_non_edit_tools() {
+        let conn = temp_conn();
+        let messages = serde_json::json!([
+            {"role": "user", "content": "search"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tc1", "function": {"name": "Grep", "arguments": r#"{"pattern":"timeout"}"#}},
+                {"id": "tc2", "function": {"name": "Read", "arguments": r#"{"file_path":"src/a.rs"}"#}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "no matches"},
+            {"role": "tool", "tool_call_id": "tc2", "content": "fn foo() {}"},
+        ]);
+        let count = extract_diffs_from_messages(&conn, "s2", messages.as_array().unwrap()).unwrap();
+        assert_eq!(count, 0, "Grep and Read are not edit tools");
+
+        let diffs = query_diffs(&conn, &DiffQuery {
+            session_id: Some("s2".into()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(diffs.len(), 0);
     }
 
     // ── Smoke: roundtrip via Database ──────────────────────────

@@ -835,6 +835,10 @@ impl Database {
         if !session_id.is_empty() {
             if let Some(arr) = messages.as_array() {
                 let _ = crate::event_store::extract_and_insert(&tx, &session_id, arr);
+                // Post-process: extract file diffs from Edit/Write tool calls.
+                // Fires after tool_result arrives, after messages are stored,
+                // before the UI sees anything.
+                let _ = crate::diff_events::extract_diffs_from_messages(&tx, &session_id, arr);
             }
         }
 
