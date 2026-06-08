@@ -633,6 +633,12 @@ async fn responses(
             let latency = upstream_start.elapsed().as_millis() as u64;
             metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             metrics::record_latency("responses", 502, None, latency, Some(format!("{e}")));
+            let _ = state.storage.db.insert_event_simple(
+                crate::event_store::EventType::Error,
+                &session_key,
+                &format!("{e}"),
+                serde_json::json!({"source": "responses"}),
+            );
             return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
         }
     };
@@ -641,6 +647,12 @@ async fn responses(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        let _ = state.storage.db.insert_event_simple(
+            crate::event_store::EventType::Error,
+            &session_key,
+            &body,
+            serde_json::json!({"status_code": status.as_u16(), "source": "responses"}),
+        );
         return json_error(status, "UPSTREAM_ERROR", body);
     }
 
@@ -674,6 +686,7 @@ async fn responses(
             tracing::info!(target: "deeplossless::record", dir=%d, "response recording enabled");
         }
         tokio::spawn(async move {
+            let req_start = std::time::Instant::now();
             let mut _guard = DoneGuard::new(tx.clone());
             if shutdown.notified().now_or_never().is_some() {
                 _guard.disarm();
@@ -1009,6 +1022,12 @@ async fn responses(
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("data: [DONE]\n\n")
             ));
+            let _ = db.insert_event_simple(
+                crate::event_store::EventType::RequestEnd,
+                &session_key,
+                "",
+                serde_json::json!({"duration_ms": req_start.elapsed().as_millis(), "source": "responses"}),
+            );
             // tx dropped here → stream closes
         });
         let mut response = Response::new(Body::from_stream(stream));
@@ -1296,6 +1315,13 @@ async fn chat_completions(
     metrics::record_latency("chat_completions", code, Some(code), latency, None);
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let fp = crate::session::fingerprint(req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3);
+        let _ = state.storage.db.insert_event_simple(
+            crate::event_store::EventType::Error,
+            &fp,
+            &body,
+            serde_json::json!({"status_code": code, "source": "chat_completions_lcm"}),
+        );
         return json_error(status, "UPSTREAM_ERROR", body);
     }
     let content_type = resp
@@ -1312,6 +1338,10 @@ async fn chat_completions(
         let record_body = if record_dir.is_some() { Some(req_body.clone()) } else { None };
         // Capture reasoning_content for multi-turn continuity.
         let reasoning_db = state.storage.db.clone();
+        let session_fingerprint = {
+            let msgs = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            crate::session::fingerprint(msgs, 3)
+        };
         let reasoning_key = {
             let msgs = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
             let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
@@ -1320,6 +1350,7 @@ async fn chat_completions(
             format!("reasoning:{model}:{}", last_user.chars().take(80).collect::<String>())
         };
         tokio::spawn(async move {
+            let req_start = std::time::Instant::now();
             // Protocol recorder: write raw request/response for diffing
             let _rec = record_dir.as_ref().map(|dir| {
                 let _ = std::fs::create_dir_all(dir);
@@ -1388,6 +1419,12 @@ async fn chat_completions(
             if let Some((ref dir, ts)) = _rec {
                 let _ = std::fs::write(format!("{dir}/rsp_{ts}.txt"), &all_bytes);
             }
+            let _ = reasoning_db.insert_event_simple(
+                crate::event_store::EventType::RequestEnd,
+                &session_fingerprint,
+                "",
+                serde_json::json!({"duration_ms": req_start.elapsed().as_millis(), "source": "chat_completions"}),
+            );
             tracing::debug!(target: "deeplossless::stream",
                 chunk_count=reasoning.len(), "STREAM CLOSED — task dropped, channel sender dropped, body EOF");
         });
@@ -1521,6 +1558,12 @@ async fn lcm_chat_completions(
     metrics::record_latency("lcm_chat_completions", code, Some(code), latency, None);
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let _ = state.storage.db.insert_event_simple(
+            crate::event_store::EventType::Error,
+            &crate::session::fingerprint(&msgs, 3),
+            &body,
+            serde_json::json!({"status_code": code, "source": "chat_completions"}),
+        );
         return json_error(status, "UPSTREAM_ERROR", body);
     }
 
@@ -1528,10 +1571,12 @@ async fn lcm_chat_completions(
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream = UnboundedReceiverStream::new(rx);
         let reasoning_db = state.storage.db.clone();
+        let session_fp = crate::session::fingerprint(&msgs, 3);
         let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str()).unwrap_or("");
         let reasoning_key = format!("reasoning:{}:{}", &model, last_user.chars().take(80).collect::<String>());
         tokio::spawn(async move {
+            let req_start = std::time::Instant::now();
             let mut byte_stream = resp.bytes_stream();
             let mut reasoning = String::new();
             let mut prompt_tokens: u64 = 0;
@@ -1576,6 +1621,12 @@ async fn lcm_chat_completions(
                     });
                 }
             }
+            let _ = reasoning_db.insert_event_simple(
+                crate::event_store::EventType::RequestEnd,
+                &session_fp,
+                "",
+                serde_json::json!({"duration_ms": req_start.elapsed().as_millis(), "source": "chat_completions"}),
+            );
         });
         let mut resp = axum::response::Response::new(
             axum::body::Body::from_stream(stream),
@@ -1901,6 +1952,12 @@ async fn anthropic_messages(
     {
         Ok(r) => r,
         Err(e) => {
+            let _ = state.storage.db.insert_event_simple(
+                crate::event_store::EventType::Error,
+                &fp,
+                &format!("{e}"),
+                serde_json::json!({"source": "anthropic_messages"}),
+            );
             return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}"))
         }
     };
@@ -1911,6 +1968,12 @@ async fn anthropic_messages(
 
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let _ = state.storage.db.insert_event_simple(
+            crate::event_store::EventType::Error,
+            &fp,
+            &body,
+            serde_json::json!({"status_code": status.as_u16(), "source": "anthropic_messages"}),
+        );
         return json_error(status, "UPSTREAM_ERROR", body);
     }
 
@@ -1921,6 +1984,7 @@ async fn anthropic_messages(
         let reasoning_cache = state.reasoning_cache.clone();
         let reasoning_db = state.storage.db.clone();
         tokio::spawn(async move {
+            let req_start = std::time::Instant::now();
             let mut sse_state = crate::protocol::anthropic::AnthropicSseState::new();
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
@@ -1978,6 +2042,12 @@ async fn anthropic_messages(
                     fp = %reasoning_fp, rc_len,
                     "reasoning cached from stream");
             }
+            let _ = reasoning_db.insert_event_simple(
+                crate::event_store::EventType::RequestEnd,
+                &reasoning_fp,
+                "",
+                serde_json::json!({"duration_ms": req_start.elapsed().as_millis(), "source": "anthropic_messages"}),
+            );
         });
 
         let mut response = Response::new(Body::from_stream(stream));
