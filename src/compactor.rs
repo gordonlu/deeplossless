@@ -933,4 +933,194 @@ mod tests {
     fn novelty_empty_is_one() {
         assert_eq!(novelty_score(&[]), 1.0);
     }
+
+    // ── CompactionBudget threshold calculations ─────────────────────────
+
+    #[test]
+    fn budget_is_critical_when_above_hard_limit() {
+        let budget = CompactionBudget::new(100_000, 0.80, 0.95, 32);
+        assert!(budget.is_critical(95_000));
+        assert!(!budget.is_critical(94_999));
+    }
+
+    #[test]
+    fn budget_is_advisory_when_above_soft_limit() {
+        let budget = CompactionBudget::new(100_000, 0.80, 0.95, 32);
+        assert!(budget.is_advisory(80_000, 1));
+        assert!(!budget.is_advisory(79_999, 1));
+    }
+
+    #[test]
+    fn budget_is_advisory_with_many_leaves() {
+        let budget = CompactionBudget::new(100_000, 0.80, 0.95, 32);
+        assert!(budget.is_advisory(100, 256)); // 32 * 8 = 256, triggers leaf threshold
+        assert!(!budget.is_advisory(100, 255));
+    }
+
+    #[test]
+    fn budget_limits_are_calculated_correctly() {
+        let budget = CompactionBudget::new(200_000, 0.80, 0.95, 16);
+        assert_eq!(budget.soft_limit, 160_000);
+        assert_eq!(budget.hard_limit, 190_000);
+        assert_eq!(budget.group_size, 16);
+    }
+
+    // ── leaf scoring (score_leaf) ───────────────────────────────────────
+
+    fn make_node(id: i64, summary: &str, token_count: i64) -> DagNode {
+        DagNode {
+            id,
+            conversation_id: 1,
+            level: 0,
+            summary: summary.to_string(),
+            token_count,
+            parent_ids: vec![],
+            child_ids: vec![],
+            is_leaf: true,
+            is_join: false,
+            snippets: vec![],
+            deleted: false,
+            semantic_hash: String::new(),
+            access_count: 0,
+            last_accessed_at: None,
+            reasoning: String::new(),
+            graph_revision: 0,
+            compaction_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn score_leaf_older_ranks_higher() {
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let early = make_node(1, "first message", 100);
+        let late = make_node(2, "last message", 100);
+        let early_score = planner.score_leaf(&early, 0, 10, 0.5);
+        let late_score = planner.score_leaf(&late, 9, 10, 0.5);
+        assert!(early_score.0 > late_score.0,
+            "older (earlier position) should score higher: early={} vs late={}", early_score.0, late_score.0);
+    }
+
+    #[test]
+    fn score_leaf_high_tokens_ranks_higher() {
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let small = make_node(1, "short", 50);
+        let large = make_node(2, "very long message", 500);
+        let small_score = planner.score_leaf(&small, 0, 10, 0.5);
+        let large_score = planner.score_leaf(&large, 0, 10, 0.5);
+        assert!(large_score.0 > small_score.0,
+            "high token count should score higher: large={} vs small={}", large_score.0, small_score.0);
+    }
+
+    #[test]
+    fn score_leaf_low_novelty_ranks_higher() {
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let node = make_node(1, "redundant text", 100);
+        let high_novelty = planner.score_leaf(&node, 0, 10, 0.9);
+        let low_novelty = planner.score_leaf(&node, 0, 10, 0.1);
+        assert!(low_novelty.0 > high_novelty.0,
+            "low novelty should score higher (more compressible): low_n={} vs high_n={}", low_novelty.0, high_novelty.0);
+    }
+
+    #[test]
+    fn score_leaf_single_element_scores_zero() {
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let node = make_node(1, "only one", 100);
+        let score = planner.score_leaf(&node, 0, 1, 0.5);
+        assert_eq!(score.0, 0.0, "single element should not be scored for compaction");
+    }
+
+    #[test]
+    fn score_leaf_clamped_to_zero_one() {
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let node = make_node(1, "test", 10_000); // Very high tokens
+        let score = planner.score_leaf(&node, 0, 100, 0.0); // Zero novelty → max compressibility
+        assert!(score.0 >= 0.0 && score.0 <= 1.0, "score should be clamped: {}", score.0);
+    }
+
+    // ── CompactionPlan threshold decisions ──────────────────────────────
+
+    #[test]
+    fn plan_returns_empty_when_below_threshold() {
+        let dir = tempdir().unwrap();
+        let db = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                Database::builder().path(dir.path().join("plan_below.db")).build()
+            )
+        }).join().unwrap().unwrap();
+        let db = Arc::new(db);
+        let conv_id = db.find_or_create_conversation("fp-plan", "test").unwrap();
+        let dag = DagEngine::builder().max_level(3).build(db);
+        dag.insert_leaf(conv_id, "single msg", 10).unwrap();
+
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let plan = planner.plan(&dag, conv_id, 100_000).unwrap();
+        assert!(!plan.should_compact(), "single leaf below threshold should not compact");
+        assert!(plan.groups.is_empty());
+    }
+
+    #[test]
+    fn plan_returns_groups_when_above_threshold() {
+        let dir = tempdir().unwrap();
+        let db = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                Database::builder().path(dir.path().join("plan_above.db")).build()
+            )
+        }).join().unwrap().unwrap();
+        let db = Arc::new(db);
+        let conv_id = db.find_or_create_conversation("fp-compact", "test").unwrap();
+        let dag = DagEngine::builder().max_level(3).build(db.clone());
+        for i in 0..40 {
+            dag.insert_leaf(conv_id, &format!("message number {i} with enough tokens to push past the soft limit threshold"), 500).unwrap();
+        }
+        // Store messages so total_conversation_tokens is non-zero
+        let messages: Vec<serde_json::Value> = (0..40).map(|i| {
+            serde_json::json!({"role": "user", "content": format!("msg {i}")})
+        }).collect();
+        db.store_messages(conv_id, &serde_json::json!(messages)).unwrap();
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let plan = planner.plan(&dag, conv_id, 600).unwrap();
+        assert!(!plan.groups.is_empty(), "should plan groups for 40 leaves");
+    }
+
+    #[test]
+    fn plan_slide_window_returns_empty_when_few_leaves() {
+        let dir = tempdir().unwrap();
+        let db = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                Database::builder().path(dir.path().join("slide_below.db")).build()
+            )
+        }).join().unwrap().unwrap();
+        let db = Arc::new(db);
+        let conv_id = db.find_or_create_conversation("fp-slide", "test").unwrap();
+        let dag = DagEngine::builder().max_level(3).build(db);
+        dag.insert_leaf(conv_id, "msg", 10).unwrap();
+
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let plan = planner.plan_slide_window(&dag, conv_id, 5, 100_000).unwrap();
+        assert!(plan.groups.is_empty());
+    }
+
+    #[test]
+    fn plan_slide_window_compacts_oldest_leaves() {
+        let dir = tempdir().unwrap();
+        let db = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                Database::builder().path(dir.path().join("slide_compact.db")).build()
+            )
+        }).join().unwrap().unwrap();
+        let db = Arc::new(db);
+        let conv_id = db.find_or_create_conversation("fp-slide2", "test").unwrap();
+        let dag = DagEngine::builder().max_level(3).build(db.clone());
+        for i in 0..10 {
+            dag.insert_leaf(conv_id, &format!("msg {i}"), 500).unwrap();
+        }
+        let planner = CompactionPlanner::new(CompactorConfig::default());
+        let plan = planner.plan_slide_window(&dag, conv_id, 3, 100_000).unwrap();
+        assert!(!plan.groups.is_empty(), "10 leaves with window 3 should produce groups");
+        let group = &plan.groups[0];
+        let leaf_ids: std::collections::HashSet<i64> = plan.leaves.iter().map(|n| n.id).collect();
+        for id in &group.node_ids {
+            assert!(leaf_ids.contains(id), "group node {id} should be in leaves");
+        }
+    }
 }

@@ -1898,4 +1898,203 @@ mod tests {
         let sents_cjk = split_sentences("你好世界。这是Rust。\n新行");
         assert!(sents_cjk.len() >= 2, "expected at least 2 CJK sentences, got {}", sents_cjk.len());
     }
+
+    // ── insert_leaf edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn insert_leaf_returns_node_with_correct_properties() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let node = engine.insert_leaf(conv_id, "test message", 42).unwrap();
+        assert_eq!(node.level, 0);
+        assert!(node.is_leaf);
+        assert_eq!(node.summary, "test message");
+        assert_eq!(node.token_count, 42);
+        assert_eq!(node.conversation_id, conv_id);
+    }
+
+    #[test]
+    fn insert_leaf_empty_content() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let node = engine.insert_leaf(conv_id, "", 1).unwrap();
+        assert!(node.is_leaf);
+        assert_eq!(node.summary, "");
+    }
+
+    #[test]
+    fn insert_leaf_multiple_leaves() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let ids: Vec<i64> = (0..5)
+            .map(|i| engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap().id)
+            .collect();
+        let leaves = engine.get_leaves(conv_id).unwrap();
+        assert_eq!(leaves.len(), 5);
+        for id in ids {
+            assert!(leaves.iter().any(|n| n.id == id));
+        }
+    }
+
+    // ── assemble_context with deeper DAG ───────────────────────────────
+
+    #[test]
+    fn assemble_context_includes_summaries() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db);
+        for i in 0..6 {
+            engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap();
+        }
+        let leaves = engine.get_leaves(conv_id).unwrap();
+        let ids: Vec<i64> = leaves.iter().map(|n| n.id).collect();
+        engine.compress_group(conv_id, &ids[0..4], "summary of 0-3", 15, 1).unwrap();
+
+        let context = engine.assemble_context(conv_id, 500, None).unwrap();
+        let has_summary = context.iter().any(|n| n.level > 0);
+        assert!(has_summary, "context should include summary nodes");
+    }
+
+    #[test]
+    fn assemble_context_budget_zero_returns_empty() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db);
+        engine.insert_leaf(conv_id, "msg", 10).unwrap();
+        let context = engine.assemble_context(conv_id, 0, None).unwrap();
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn assemble_context_respects_recent_message_count() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder()
+            .recent_messages(3)
+            .max_level(3)
+            .build(db);
+        for i in 0..10 {
+            engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap();
+        }
+        let context = engine.assemble_context(conv_id, 1000, None).unwrap();
+        let leaf_count = context.iter().filter(|n| n.is_leaf).count();
+        assert!(leaf_count <= 3, "should keep at most 3 recent leaf messages, got {leaf_count}");
+    }
+
+    // ── GC: collect_garbage with actual nodes ──────────────────────────
+
+    #[test]
+    fn collect_garbage_removes_unreachable_nodes() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db.clone());
+        // Create two leaves and compress them into level 1 summary
+        let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
+        let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
+        let s1 = engine.compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1).unwrap();
+        // Create a level 3 summary as the tip, so level 2 nodes are NOT tips
+        engine.compress_group(conv_id, &[s1.id], "higher summary", 5, 3).unwrap();
+        // Insert an isolated level 2 node directly — not a tip, not a leaf, no edges to it
+        let orphan_id = db.insert_dag_node(conv_id, 2, "isolated", 10, &[], &[], false).unwrap().id;
+        let ghosts = engine.collect_garbage(conv_id, false).unwrap();
+        assert_eq!(ghosts, vec![orphan_id], "isolated non-leaf below max level should be collected");
+        assert!(engine.get_node(orphan_id).unwrap().is_none(), "orphan should be purged");
+    }
+
+    #[test]
+    fn collect_garbage_preserves_reachable_nodes() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db.clone());
+        let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
+        let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
+        engine.compress_group(conv_id, &[a.id, b.id], "summary", 8, 1).unwrap();
+        let ghosts = engine.collect_garbage(conv_id, false).unwrap();
+        assert!(ghosts.is_empty(), "reachable nodes should not be collected");
+        assert!(engine.get_node(a.id).unwrap().is_some());
+        assert!(engine.get_node(b.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn collect_garbage_dry_run_does_not_purge() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db.clone());
+        // Insert level 1 summary and a level 2 summary as tip, leaving level 1 unreachable
+        let leaf = engine.insert_leaf(conv_id, "leaf", 5).unwrap();
+        let s1 = engine.compress_group(conv_id, &[leaf.id], "level 1", 3, 1).unwrap();
+        engine.compress_group(conv_id, &[s1.id], "level 2 tip", 3, 2).unwrap();
+        // Insert more leaves so level 1 is not a tip
+        engine.insert_leaf(conv_id, "extra", 5).unwrap();
+        // Now level 1 summary is not a tip node (level 2 is max), and edges go
+        // from level 2 -> level 1 -> leaf, so level 1 is reachable via level 2.
+        // GC result depends on topology, so just verify dry_run doesn't purge.
+        let ghosts = engine.collect_garbage(conv_id, true).unwrap();
+        for gid in &ghosts {
+            assert!(engine.get_node(*gid).unwrap().is_some(), "dry_run should not purge node {gid}");
+        }
+    }
+
+    // ── GC: gc_by_score ────────────────────────────────────────────────
+
+    #[test]
+    fn gc_by_score_deletes_low_score_non_leaves() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db);
+        // Create some leaves and a summary (non-leaf, should have low score)
+        let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
+        engine.compress_group(conv_id, &[a.id], "low value summary", 3, 1).unwrap();
+        let deleted = engine.gc_by_score(conv_id, 10).unwrap();
+        // The summary (level 1, low token count, old) should be deleted
+        assert!(deleted >= 1, "should delete at least one low-score non-leaf");
+    }
+
+    #[test]
+    fn gc_by_score_never_deletes_leaves() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db);
+        let leaf = engine.insert_leaf(conv_id, "important leaf", 5).unwrap();
+        let _deleted = engine.gc_by_score(conv_id, 10).unwrap();
+        assert!(engine.get_node(leaf.id).unwrap().is_some(), "leaves should never be deleted by gc_by_score");
+    }
+
+    #[test]
+    fn gc_by_score_respects_max_to_delete() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().max_level(3).build(db);
+        for i in 0..3 {
+            let a = engine.insert_leaf(conv_id, &format!("a{i}"), 5).unwrap();
+            engine.compress_group(conv_id, &[a.id], &format!("summary {i}"), 3, 1).unwrap();
+        }
+        let deleted = engine.gc_by_score(conv_id, 1).unwrap();
+        assert!(deleted <= 1, "should respect max_to_delete limit");
+    }
+
+    // ── rollback_to ─────────────────────────────────────────────────────
+
+    #[test]
+    fn rollback_to_removes_nodes_after_target() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let n1 = engine.insert_leaf(conv_id, "first", 5).unwrap();
+        let n2 = engine.insert_leaf(conv_id, "second", 5).unwrap();
+        let n3 = engine.insert_leaf(conv_id, "third", 5).unwrap();
+        let deleted = engine.rollback_to(n1.id).unwrap();
+        assert_eq!(deleted, 2, "nodes after target should be deleted");
+        assert!(engine.get_node(n1.id).unwrap().is_some());
+        assert!(engine.get_node(n2.id).unwrap().map(|n| n.deleted).unwrap_or(true));
+        assert!(engine.get_node(n3.id).unwrap().map(|n| n.deleted).unwrap_or(true));
+    }
+
+    #[test]
+    fn rollback_to_target_not_found() {
+        let (db, _conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let result = engine.rollback_to(99999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rollback_to_keeps_nodes_before_target() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let n1 = engine.insert_leaf(conv_id, "keep", 5).unwrap();
+        let _n2 = engine.insert_leaf(conv_id, "remove", 5).unwrap();
+        engine.rollback_to(n1.id).unwrap();
+        assert!(engine.get_node(n1.id).unwrap().is_some(), "target node should be kept");
+    }
 }

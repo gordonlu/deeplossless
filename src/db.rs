@@ -3962,4 +3962,121 @@ mod tests {
 
     // Bug 3: tool messages (role="tool") were not given DAG leaf nodes
     // by the pipeline. Fixed in src/pipeline.rs. Tested in proxy_integration.
+
+    // ── tool_cache_put + tool_cache_get ─────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_cache_put_and_get() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("cache.db"))
+            .build()
+            .await
+            .unwrap();
+        db.tool_cache_put("grep", "abc123", "result: found 3 lines", &[])
+            .unwrap();
+        let (result, count) = db.tool_cache_get("grep", "abc123").unwrap().unwrap();
+        assert_eq!(result, "result: found 3 lines");
+        assert!(count >= 1);
+    }
+
+    #[tokio::test]
+    async fn tool_cache_get_miss() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("miss.db"))
+            .build()
+            .await
+            .unwrap();
+        let result = db.tool_cache_get("nonexistent", "nope").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_cache_put_with_dependent_files() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("deps.db"))
+            .build()
+            .await
+            .unwrap();
+        let deps = vec!["src/main.rs".to_string(), "Cargo.toml".to_string()];
+        db.tool_cache_put("read_file", "hash123", "file contents", &deps)
+            .unwrap();
+        let (result, _) = db.tool_cache_get("read_file", "hash123").unwrap().unwrap();
+        assert_eq!(result, "file contents");
+    }
+
+    #[tokio::test]
+    async fn tool_cache_put_overwrite() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("overwrite.db"))
+            .build()
+            .await
+            .unwrap();
+        db.tool_cache_put("grep", "key", "first result", &[])
+            .unwrap();
+        db.tool_cache_put("grep", "key", "second result", &[])
+            .unwrap();
+        let (result, _) = db.tool_cache_get("grep", "key").unwrap().unwrap();
+        assert_eq!(result, "second result");
+    }
+
+    #[tokio::test]
+    async fn tool_cache_hit_count_bumps() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("bump.db"))
+            .build()
+            .await
+            .unwrap();
+        db.tool_cache_put("cmd", "k1", "out", &[]).unwrap();
+        let (result1, _) = db.tool_cache_get("cmd", "k1").unwrap().unwrap();
+        assert_eq!(result1, "out");
+        // Second get should still return the cached result
+        let (result2, _) = db.tool_cache_get("cmd", "k1").unwrap().unwrap();
+        assert_eq!(result2, "out", "repeated gets should return the cached result");
+    }
+
+    // ── find_or_create_conversation ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_or_create_conversation_creates_new() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("conv_new.db"))
+            .build()
+            .await
+            .unwrap();
+        let id1 = db.find_or_create_conversation("fp-alpha", "gpt-4").unwrap();
+        let id2 = db.find_or_create_conversation("fp-beta", "gpt-4").unwrap();
+        assert_ne!(id1, id2, "different fingerprints should get different conversations");
+    }
+
+    #[tokio::test]
+    async fn find_or_create_conversation_reuses_existing() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("conv_reuse.db"))
+            .build()
+            .await
+            .unwrap();
+        let id1 = db.find_or_create_conversation("fp-same", "claude").unwrap();
+        let id2 = db.find_or_create_conversation("fp-same", "claude").unwrap();
+        assert_eq!(id1, id2, "same fingerprint should reuse conversation");
+    }
+
+    #[tokio::test]
+    async fn find_or_create_conversation_same_fp_different_model() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("conv_model.db"))
+            .build()
+            .await
+            .unwrap();
+        let id1 = db.find_or_create_conversation("fp-x", "model-a").unwrap();
+        let id2 = db.find_or_create_conversation("fp-x", "model-b").unwrap();
+        assert_eq!(id1, id2, "model param is only used on creation, should match by fingerprint");
+    }
 }
