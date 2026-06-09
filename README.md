@@ -202,7 +202,7 @@ Opens at `http://localhost:3000` — connects to a running deeplossless instance
 
 ## Tech Docs
 
-- [Technical Reference](docs/tech-reference.md) — architecture, API reference, benchmarks, runtime strategies
+- [Technical Reference](docs/tech-reference.md) — architecture, API reference, protocol tests, runtime strategies
 - [Architecture Documents](docs/architecture/) — invariants, lifecycle, replay model, dependency authority
 - [Runtime Event Schema](docs/architecture/runtime-events.md) — frozen event contract
 - [Dependency Model](docs/architecture/dependency-model.md) — dependency taxonomy and authority boundaries

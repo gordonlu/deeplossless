@@ -9,7 +9,7 @@ struct MockServerState {
 }
 
 fn usage() {
-    eprintln!("Torture Suite — Agent Capability Evaluation Suite");
+    eprintln!("Torture Suite — Protocol Compatibility Test");
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!("  gen                     Generate adversarial traces to traces/");
@@ -125,7 +125,7 @@ fn main() {
             });
 
             eprintln!("╔═══════════════════════════════════════════════╗");
-            eprintln!("║  ACES — Agent Capability Evaluation Suite    ║");
+            eprintln!("║  Torture — Protocol Compatibility Test        ║");
             eprintln!("╠═══════════════════════════════════════════════╣");
             eprintln!("║  Scenario: {}", scenario.name);
             eprintln!("║  {} ", scenario.description);

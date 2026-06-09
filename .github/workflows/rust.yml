@@ -30,3 +30,29 @@ jobs:
 
       - name: cargo doc
         run: cargo doc --no-deps
+
+  protocol-compat:
+    name: protocol compat (${{ matrix.format }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        format:
+          - openai
+          - claude_code
+          - codex
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: cargo test (${{ matrix.format }})
+        run: |
+          case "$FORMAT" in
+            openai)       FILTER="drive_openai" ;;
+            claude_code)  FILTER="drive_suite claude_code" ;;
+            codex)        FILTER="drive_codex" ;;
+          esac
+          cargo test --lib torture::driver -- $FILTER --nocapture
+        env:
+          FORMAT: ${{ matrix.format }}

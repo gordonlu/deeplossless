@@ -142,11 +142,11 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Run built-in torture benchmark with deeplossless augmentation.
+    /// Run built-in torture protocol compatibility test with deeplossless augmentation.
     #[arg(long)]
     torture: bool,
 
-    /// Run ACES (Agent Capability Evaluation Suite) scenario.
+    /// Run protocol compatibility test scenarios.
     /// Starts a mock API that drives agent behavior via a state machine.
     /// Usage: --torture-aces hidden_bug
     /// Empty value (`--torture-aces=""`) or "all" runs the full suite:
@@ -155,7 +155,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "")]
     torture_aces: String,
 
-    /// Agent format used by ACES to select per-agent tool arg templates
+    /// Agent format used to select per-agent tool arg templates
     /// from `args_per_agent[format]` in the scenario YAML. Default is
     /// `openai` (camelCase field names: filePath, oldString, newString)
     /// which matches the Chat Completions protocol the mock speaks.
@@ -184,7 +184,7 @@ enum Commands {
     /// Install the self-signed TLS certificate as system-trusted.
     /// After running this, HTTPS clients won't show certificate errors.
     Trust,
-    /// Drive ACES scenarios without an LLM — a diagnostic tool for
+    /// Drive protocol compatibility scenarios without an LLM — a diagnostic tool for
     /// verifying YAML state machines, pre_apply edits, and agent-format
     /// parameter mapping. No API key or LLM required.
     Drive {
@@ -256,7 +256,7 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("    deeplossless --api-key sk-...");
     println!("  Then check:");
     println!("    curl https://localhost:8080/v1/lcm/runtime/stats | jq .\n");
-    println!("  Benchmarks (no API key needed):");
+    println!("  Protocol compatibility tests (no API key needed):");
     println!("    cargo test --test long_session_benchmark -- --nocapture\n");
     let _ = std::fs::remove_file(&demo_db_path);
     Ok(())
@@ -561,7 +561,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!();
         if is_aces {
         eprintln!("┌────────────────────────────────────────────────┐");
-        eprintln!("│ ACES — Agent Capability Evaluation Suite       │");
+        eprintln!("│ Torture — Protocol Compatibility Test          │");
         eprintln!("├────────────────────────────────────────────────┤");
         eprintln!("│ Scenario: {:<37}", if cli.torture_aces.is_empty() { "(suite)".to_string() } else { cli.torture_aces.clone() });
         eprintln!("│ Mode:     {mode_str}");
@@ -575,7 +575,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("└────────────────────────────────────────────────┘");
     } else {
         eprintln!("═══════════════════════════════════════════════════════════════");
-        eprintln!("  Torture Benchmark Started");
+        eprintln!("  Torture Protocol Test Started");
         eprintln!("═══════════════════════════════════════════════════════════════");
         eprintln!("  mock upstream:  http://127.0.0.1:9000/v1/chat/completions");
         eprintln!("  proxy HTTP:     http://127.0.0.1:8081/v1/chat/completions");
@@ -590,7 +590,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("  2. Point your agent to proxy:");
         eprintln!("     http://127.0.0.1:8081 (HTTP) or https://127.0.0.1:8080 (HTTPS)");
         eprintln!("  3. Work naturally — traces will generate files and exercise tools");
-        eprintln!("  4. After all turns complete, benchmark finishes and report is saved");
+        eprintln!("  4. After all turns complete, test finishes and report is saved");
         eprintln!("═══════════════════════════════════════════════════════════════");
         }
     }
@@ -772,7 +772,7 @@ async fn torture_start_mock() -> anyhow::Result<()> {
                     if s.report_saved.fetch_add(1, Ordering::Relaxed) == 0 {
                         eprintln!();
                         eprintln!("═══════════════════════════════════════════");
-                        eprintln!("  Torture Benchmark Complete");
+                        eprintln!("  Torture Protocol Test Complete");
                         eprintln!("═══════════════════════════════════════════");
                         eprintln!("  mode:        {}", mode);
                         eprintln!("  turns:       {}/{}", total_turns, total_turns);
@@ -791,7 +791,7 @@ async fn torture_start_mock() -> anyhow::Result<()> {
                         };
 
                         let report = serde_json::json!({
-                            "benchmark": "deeplossless torture suite",
+                            "test": "deeplossless torture suite",
                             "version": "0.6.7",
                             "total_turns": total_turns,
                             "turns_served": total_turns,
@@ -819,7 +819,7 @@ async fn torture_start_mock() -> anyhow::Result<()> {
                 let remaining = total_turns.saturating_sub(idx);
 
                 let (delta_json, finish_reason) = if idx >= total_turns {
-                    let msg = format!("[Benchmark Complete] All {} turns executed.", total_turns);
+                    let msg = format!("[Protocol Compatibility Test Complete] All {} turns executed.", total_turns);
                     (format!("\"content\":{}", serde_json::to_string(&msg).unwrap_or_default()), "\"stop\"")
                 } else if turn.tool_calls.is_empty() {
                     (format!("\"content\":{}", serde_json::to_string(&turn.completion).unwrap_or_default()), "\"stop\"")

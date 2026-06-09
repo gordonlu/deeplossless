@@ -3129,7 +3129,7 @@ async fn lcm_versions(
     }
 }
 
-/// Runtime metrics endpoint — exposes inference-economics counters for benchmarking.
+/// Runtime metrics endpoint — exposes inference-economics counters for diagnostics.
 async fn lcm_runtime_stats(
     State(state): State<AppState>,
     headers: HeaderMap,

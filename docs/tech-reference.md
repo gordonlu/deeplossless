@@ -132,50 +132,49 @@ POST /health                                — Health check (DB, upstream, comp
 GET  /metrics                               — Prometheus metrics
 ```
 
-## Benchmarks
+## Protocol Compatibility Test
 
-### Scope and methodology
+The torture module provides deterministic protocol-level testing of the
+deeplossless API endpoints. It uses a 0-LLM state machine to drive agent
+scenarios across three protocol formats without requiring an API key.
 
-Current benchmarks use a **deterministic local agent loop** to isolate
-runtime-level reuse effects (cache reuse, reread avoidance, failure memory,
-plan persistence) from model variance. Real-world reductions with external
-LLMs are expected to be **lower but follow similar trends**.
+### Methodology
 
-### Inference redundancy benchmark (4 tasks)
+Torture uses a **deterministic local driver** to verify that
+deeplossless correctly handles all three supported protocol formats
+(OpenAI Chat Completions, Claude Code, Codex CLI) and their
+tool-call parameter conventions. Each scenario's YAML state machine
+defines expected tool calls, file edits, and verification steps.
 
-```
-                    Baseline tokens    Runtime tokens    Reduction
-Dependency mismatch      11,602             2,626           ↓77%
-Symbol rename             5,105             1,120           ↓78%
-Config drift              9,583             2,225           ↓77%
-Misleading error          7,074             1,092           ↓85%
-──────────────────────────────────────────────────────────
-TOTAL                    33,364             7,063           ↓79%
-Cache hits: 205. Rereads avoided: 96.
-```
-
-Run: `python3 bench/run.py`
-
-### Long session (3 tasks, 86 turns)
+### Scenarios (7 base, 25 total with format variants)
 
 ```
-                    Vanilla Agent    Runtime    Reduction
-Tokens / session        21,070       13,500       ↓36%
-Repeated replans           14            5         ↓64%
-Repeated failures           8            3         ↓62%
-Repo rereads               11            2         ↓82%
-Cache hit rate              —           28%           —
-Failures broken             —            5            —
+Scenario            Description
+───────────         ───────────
+fix_test_failure    Fix off-by-one bug
+add_feature         Add new functionality
+refactor_rename     Rename across files
+search_to_fix       Search then repair
+multi_file_edit     Coordinated multi-file changes
+debug_from_logs     Root-cause from log output
+security_fix        Patch a vulnerability
+hidden_bug          Subtle logic error
 ```
 
-Run: `cargo test --test long_session_benchmark -- --nocapture`
-
-### How to benchmark
+### How to run
 
 ```bash
-cargo test --test long_session_benchmark -- --nocapture   # 86-turn punchline
-cargo test --test simulated_session -- --nocapture         # 20-turn detailed log
-cargo bench                                                # micro-benchmarks
+# Run all protocol compatibility tests
+cargo test --all-targets
+
+# Drive scenarios through the mock API
+cargo run -- --torture-aces hidden_bug --agent-format claude_code
+
+# Run the full suite
+cargo run -- --torture-aces all
+
+# Long-session stress test
+cargo test --test long_session_benchmark -- --nocapture
 
 # Live runtime metrics (requires proxy running)
 curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
