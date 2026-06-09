@@ -2633,7 +2633,11 @@ impl Database {
     pub fn total_conversation_tokens(&self, conv_id: i64) -> anyhow::Result<i64> {
         let conn = self.read_conn();
         let total: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(token_count), 0) FROM messages WHERE conversation_id = ?1",
+            "SELECT COALESCE(SUM(token_count), 0) FROM (
+                SELECT token_count FROM messages WHERE conversation_id = ?1
+                UNION ALL
+                SELECT token_count FROM dag_nodes WHERE conversation_id = ?1 AND level > 0 AND deleted = 0
+            )",
             rusqlite::params![conv_id],
             |row| row.get(0),
         )?;
