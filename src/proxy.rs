@@ -1367,6 +1367,7 @@ async fn chat_completions(
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut reasoning = String::new();
+            let mut content = String::new();
             let mut all_bytes: Vec<u8> = Vec::new();
             let mut prompt_tokens: u64 = 0;
             let mut completion_tokens: u64 = 0;
@@ -1386,6 +1387,9 @@ async fn chat_completions(
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line) {
                                     if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
                                         reasoning.push_str(rc);
+                                    }
+                                    if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                                        content.push_str(c);
                                     }
                                     if let Some(u) = v["usage"].as_object() {
                                         prompt_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
@@ -1416,6 +1420,22 @@ async fn chat_completions(
                     let usage_db = state.storage.db.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ = usage_db.accumulate_usage(cid, prompt_tokens, completion_tokens);
+                    });
+                }
+            }
+            // Save assistant response message from streaming output
+            if let Some(cid) = conv_id {
+                if !content.is_empty() {
+                    let msg_db = state.storage.db.clone();
+                    let msg_content = content.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let assistant_msgs = serde_json::json!([{
+                            "role": "assistant",
+                            "content": msg_content
+                        }]);
+                        if let Err(e) = msg_db.store_messages(cid, &assistant_msgs) {
+                            tracing::warn!(target: "deeplossless::stream", "failed to store assistant message: {e}");
+                        }
                     });
                 }
             }
