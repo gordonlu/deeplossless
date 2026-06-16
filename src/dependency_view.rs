@@ -76,38 +76,28 @@ impl DependencyView {
         Ok(ids)
     }
 
-    /// What execution units happened before `exec_unit_id`?
-    /// Reads from lineage_edges and dag_edges.
+    /// What execution units happened before `target_id`?
+    /// Reads execution-ordering edges from lineage_edges.
     pub fn execution_predecessors(
         db: &crate::db::Database,
-        exec_unit_id: i64,
+        target_id: i64,
     ) -> anyhow::Result<Vec<DependencyEdge>> {
         let mut result = Vec::new();
 
-        // Lineage edges: depends_on
-        let lineage = db.get_lineage_to(exec_unit_id)?;
+        // Lineage edges are the authority for execution ordering.
+        let lineage = db.get_lineage_to(target_id)?;
         for (from_id, to_id, kind) in lineage {
-            if kind == "depends_on" {
-                result.push(DependencyEdge {
-                    kind: DependencyKind::SequentialOrdering,
-                    source_id: from_id,
-                    target_id: to_id,
-                    context: None,
-                });
-            }
-        }
-
-        // DAG edges: happens_before
-        let dag = db.get_edges_to(exec_unit_id)?;
-        for (_edge_id, from_id, kind) in dag {
-            if kind == "happens_before" {
-                result.push(DependencyEdge {
-                    kind: DependencyKind::ParallelJoin,
-                    source_id: from_id,
-                    target_id: exec_unit_id,
-                    context: None,
-                });
-            }
+            let dependency_kind = match kind.as_str() {
+                "depends_on" => DependencyKind::SequentialOrdering,
+                "happens_before" => DependencyKind::ParallelJoin,
+                _ => continue,
+            };
+            result.push(DependencyEdge {
+                kind: dependency_kind,
+                source_id: from_id,
+                target_id: to_id,
+                context: None,
+            });
         }
 
         Ok(result)
@@ -155,18 +145,28 @@ mod tests {
         assert!(edge.kind.is_topology());
     }
 
-    #[test]
-    fn execution_predecessors_detect_both_kinds() {
-        // Validate that DependencyView recognizes both depends_on and
-        // happens_before as execution predecessors. This is a smoke test
-        // that the taxonomy covers both ordering kinds.
-        let kinds = [
-            DependencyKind::SequentialOrdering,
-            DependencyKind::ParallelJoin,
-        ];
-        for k in &kinds {
-            assert!(k.is_ordering());
-        }
+    #[tokio::test]
+    async fn execution_predecessors_read_ordering_from_lineage_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::builder()
+            .path(dir.path().join("dependency_view.db"))
+            .build()
+            .await
+            .unwrap();
+
+        db.insert_lineage_edge(10, 30, "depends_on").unwrap();
+        db.insert_lineage_edge(20, 30, "happens_before").unwrap();
+
+        let mut edges = DependencyView::execution_predecessors(&db, 30).unwrap();
+        edges.sort_by_key(|edge| edge.source_id);
+
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].kind, DependencyKind::SequentialOrdering);
+        assert_eq!(edges[0].source_id, 10);
+        assert_eq!(edges[0].target_id, 30);
+        assert_eq!(edges[1].kind, DependencyKind::ParallelJoin);
+        assert_eq!(edges[1].source_id, 20);
+        assert_eq!(edges[1].target_id, 30);
     }
 
     #[test]

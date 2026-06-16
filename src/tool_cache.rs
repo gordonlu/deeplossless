@@ -1,4 +1,4 @@
-//! Deterministic tool result cache. L1 is in-memory (RwLock<HashMap>),
+//! Deterministic tool result cache. L1 is in-memory (`RwLock<HashMap>`),
 //! L2 is SQLite for persistence across restarts.
 //!
 //! Cache key: `CacheKey { tool_name, args_hash }`.

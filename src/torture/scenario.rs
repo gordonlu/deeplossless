@@ -31,6 +31,11 @@ pub struct Scenario {
     pub expected_search: bool,
     #[serde(default)]
     pub expected_read: bool,
+    /// True when the diagnostic runner or mock used `pre_apply` edits.
+    /// A run with pre_apply is useful for state-machine diagnostics, but
+    /// should not be interpreted as proof of real edit-tool execution.
+    #[serde(default)]
+    pub pre_apply_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +195,10 @@ pub struct ScenarioRun {
     pub expected_search: bool,
     #[serde(default)]
     pub expected_read: bool,
+    /// True when the diagnostic runner or mock used `pre_apply` edits.
+    /// These runs validate scenario state machines, not independent edit execution.
+    #[serde(default)]
+    pub pre_apply_used: bool,
 }
 
 // ── Load ───────────────────────────────────────────────────────────

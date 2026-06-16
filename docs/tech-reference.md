@@ -146,7 +146,14 @@ deeplossless correctly handles all three supported protocol formats
 tool-call parameter conventions. Each scenario's YAML state machine
 defines expected tool calls, file edits, and verification steps.
 
-### Scenarios (7 base, 25 total with format variants)
+### Scenarios
+
+The full suite discovers base scenarios at runtime with
+`Scenario::list_base()`. Base scenarios are YAML files in `scenarios/`
+whose file stem has no per-agent suffix such as `.claude_code` or
+`.codex`; per-agent variants are selected by `Scenario::load_with_format()`.
+The table below summarizes the current logical scenarios rather than
+serving as a fixed count contract.
 
 ```
 Scenario            Description
@@ -159,6 +166,7 @@ multi_file_edit     Coordinated multi-file changes
 debug_from_logs     Root-cause from log output
 security_fix        Patch a vulnerability
 hidden_bug          Subtle logic error
+reuse_existing      Reuse an existing utility instead of duplicating logic
 ```
 
 ### How to run
@@ -173,12 +181,26 @@ cargo run -- --torture-aces hidden_bug --agent-format claude_code
 # Run the full suite
 cargo run -- --torture-aces all
 
+# Equivalent full-suite form; useful when scripts pass an empty value explicitly
+cargo run -- --torture-aces=""
+
 # Long-session stress test
 cargo test --test long_session_benchmark -- --nocapture
 
 # Live runtime metrics (requires proxy running)
 curl http://127.0.0.1:8080/v1/lcm/runtime/stats | jq .
 ```
+
+### Windows console encoding
+
+Repository files and documentation are UTF-8. On Windows, mojibake in
+PowerShell or `cmd.exe` usually means the console code page is not UTF-8;
+it does not by itself indicate that source files are corrupted.
+
+For local development, prefer Windows Terminal with a UTF-8 capable font.
+If using classic PowerShell or `cmd.exe`, run `chcp 65001` before commands
+that print non-ASCII documentation, scenario names, or rustdoc output.
+PowerShell 7 generally handles UTF-8 better than Windows PowerShell 5.1.
 
 ### Micro-benchmarks (criterion)
 

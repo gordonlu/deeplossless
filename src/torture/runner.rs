@@ -14,14 +14,14 @@ fn usage() {
     eprintln!("COMMANDS:");
     eprintln!("  gen                     Generate adversarial traces to traces/");
     eprintln!("  list                    List available scenarios/traces");
-    eprintln!("  serve   <file> --port   Start mock Chat Completions server");
+    eprintln!("  serve   <file> --port   Start local mock Chat Completions server");
     eprintln!("  run     <scenario>      Run a scenario (start mock, wait for agent)");
     eprintln!();
     eprintln!("EXAMPLES:");
     eprintln!("  target/release/torture gen");
     eprintln!("  target/release/torture list");
     eprintln!("  target/release/torture run hidden_bug");
-    eprintln!("  target/release/torture serve traces/simple_search_cache_identical.json --port 9000");
+    eprintln!("  target/release/torture serve traces/simple_search_cache_identical.json --port 9000 --host 127.0.0.1");
 }
 
 fn list_traces() {
@@ -156,6 +156,11 @@ fn main() {
                         if is_terminal {
                             let expected_search = machine.scenario().expected_search;
                             let expected_read = machine.scenario().expected_read;
+                            let pre_apply_used = machine
+                                .scenario()
+                                .states
+                                .values()
+                                .any(|state| !state.pre_apply.is_empty());
                             let run = ScenarioRun {
                                 scenario: machine.current_state_name().to_string(),
                                 events: machine.events.clone(),
@@ -163,6 +168,7 @@ fn main() {
                                 score: None,
                                 expected_search,
                                 expected_read,
+                                pre_apply_used,
                             };
                             let scored = ScenarioRun {
                                 scenario: run.scenario.clone(),
@@ -171,6 +177,7 @@ fn main() {
                                 score: Some(score_run(&run)),
                                 expected_search: run.expected_search,
                                 expected_read: run.expected_read,
+                                pre_apply_used: run.pre_apply_used,
                             };
                             deeplossless::torture::score::print_report(&scored);
                         }
@@ -201,17 +208,19 @@ fn main() {
         "serve" => {
             let mut trace_path = String::new();
             let mut port = 9000u16;
+            let mut host = "127.0.0.1".to_string();
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
                     "--port" => { i += 1; port = args[i].parse().unwrap_or(9000); }
+                    "--host" => { i += 1; host = args.get(i).cloned().unwrap_or_else(|| "127.0.0.1".into()); }
                     _ if trace_path.is_empty() => { trace_path = args[i].clone(); }
                     _ => {}
                 }
                 i += 1;
             }
             if trace_path.is_empty() {
-                eprintln!("Usage: serve <file> [--port <n>]");
+                eprintln!("Usage: serve <file> [--port <n>] [--host 127.0.0.1]");
                 std::process::exit(1);
             }
 
@@ -219,7 +228,7 @@ fn main() {
                 eprintln!("Error loading trace: {e}"); std::process::exit(1);
             });
             let total = trace.turns.len();
-            eprintln!("Serving {} turns from {} on port {}", total, trace_path, port);
+            eprintln!("Serving {} turns from {} on http://{}:{}", total, trace_path, host, port);
 
             let state = std::sync::Arc::new(MockServerState {
                 trace,
@@ -250,9 +259,9 @@ fn main() {
                     }
                 }));
 
-            eprintln!("Listening on http://0.0.0.0:{}", port);
+            eprintln!("Listening on http://{}:{}", host, port);
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+                let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await.unwrap();
                 axum::serve(listener, app).await.unwrap();
             });
         }

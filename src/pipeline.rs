@@ -1,10 +1,11 @@
+use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::AppState;
 use crate::compactor::{CompactCommand, CompactEvent, Compactor};
 use crate::dag::{DagEngine, DagNode};
 use crate::db::Database;
-use crate::AppState;
 
 /// Context window size for threshold calculations.
 const CONTEXT_WINDOW: usize = 1_000_000;
@@ -22,18 +23,19 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "<lcm_context>");
 
-    let summaries: Vec<&DagNode> = nodes.iter()
+    let summaries: Vec<&DagNode> = nodes
+        .iter()
         .filter(|n| n.level > 0 && n.token_count > 0)
         .filter(|n| !n.summary.is_empty() && n.summary != "(no output)" && n.summary != "no output")
         .collect();
-    let mut leaves: Vec<&DagNode> = nodes.iter()
+    let mut leaves: Vec<&DagNode> = nodes
+        .iter()
         .filter(|n| n.is_leaf)
         .filter(|n| !n.summary.is_empty() && n.summary != "(no output)" && n.summary != "no output")
         .collect();
     leaves.sort_by_key(|n| n.id);
-    let all_snippets: Vec<&crate::snippet::Snippet> = nodes.iter()
-        .flat_map(|n| n.snippets.iter())
-        .collect();
+    let all_snippets: Vec<&crate::snippet::Snippet> =
+        nodes.iter().flat_map(|n| n.snippets.iter()).collect();
 
     // ── Tier 1: Summaries (highest level first) ──
     if !summaries.is_empty() {
@@ -44,10 +46,18 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
             let _ = writeln!(
                 out,
                 "  [summary {}] L{} {} ({} tok, {} sources)",
-                node.id, node.level, node.summary, node.token_count, node.child_ids.len()
+                node.id,
+                node.level,
+                node.summary,
+                node.token_count,
+                node.child_ids.len()
             );
             if !node.child_ids.is_empty() {
-                let src_ids: Vec<String> = node.child_ids.iter().map(|id| format!("msg_{id}")).collect();
+                let src_ids: Vec<String> = node
+                    .child_ids
+                    .iter()
+                    .map(|id| format!("msg_{id}"))
+                    .collect();
                 let _ = writeln!(out, "    ← sources: {}", src_ids.join(", "));
             }
         }
@@ -61,7 +71,9 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
         let _ = writeln!(out, "  ── Snippets ──");
         let mut sorted: Vec<&crate::snippet::Snippet> = all_snippets.clone();
         sorted.sort_by(|a, b| {
-            b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal)
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.frequency.cmp(&b.frequency))
                 .then(b.content.len().cmp(&a.content.len()))
         });
@@ -76,7 +88,11 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
             if s.source_node_id.is_empty() {
                 let _ = writeln!(out, "  [{label}] {}", s.content);
             } else {
-                let _ = writeln!(out, "  [{label}] {} (src: msg_{})", s.content, s.source_node_id);
+                let _ = writeln!(
+                    out,
+                    "  [{label}] {} (src: msg_{})",
+                    s.content, s.source_node_id
+                );
             }
         }
         if !leaves.is_empty() {
@@ -89,7 +105,11 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
         let _ = writeln!(out, "  ── Recent Messages ──");
         for node in &leaves {
             let truncated: String = node.summary.chars().take(80).collect();
-            let _ = writeln!(out, "  [msg {}] {} ({} tok)", node.id, truncated, node.token_count);
+            let _ = writeln!(
+                out,
+                "  [msg {}] {} ({} tok)",
+                node.id, truncated, node.token_count
+            );
         }
     }
 
@@ -129,7 +149,7 @@ impl ChatPipeline {
     /// Run the full pipeline: resolve conversation, persist messages,
     /// trigger compaction, assemble DAG context, inject into system messages.
     /// `prefix_count` controls fingerprint stability: 3 for chat_completions
-    /// (system at msg[0]), 1 for Anthropic (system injected at msg[0], stable).
+    /// (system at `msg[0]`), 1 for Anthropic (system injected at `msg[0]`, stable).
     /// If `fp_override` is set, use it instead of computing a fingerprint.
     pub async fn process_with_prefix(
         &self,
@@ -137,7 +157,8 @@ impl ChatPipeline {
         req_body: &serde_json::Value,
         prefix_count: usize,
     ) -> anyhow::Result<PipelineOutput> {
-        self.process_with_fp(model, req_body, prefix_count, None).await
+        self.process_with_fp(model, req_body, prefix_count, None)
+            .await
     }
 
     /// Like `process_with_prefix` but accepts an optional fingerprint override.
@@ -165,7 +186,7 @@ impl ChatPipeline {
         let overhead = dag.config().token_overhead;
         let correction = dag.config().token_correction_factor;
         let msgs = messages.clone();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             // Generate a unique replay session ID for this pipeline run
             let replay_session_id = {
                 let now = std::time::SystemTime::now()
@@ -173,10 +194,8 @@ impl ChatPipeline {
                     .unwrap_or_default();
                 format!("rs_{}_{:x}", conv_id, now.as_nanos())
             };
-            if let Err(e) = db.store_messages(conv_id, &msgs) {
-                tracing::warn!(target: "deeplossless::pipeline", "failed to store messages: {e}");
-                return;
-            }
+            db.store_messages(conv_id, &msgs)
+                .context("failed to store pipeline messages")?;
             // ── Post-commit analysis pass ────────────────────────
             // Runs AFTER store_messages committed the ingestion
             // transaction. Two jobs:
@@ -187,10 +206,16 @@ impl ChatPipeline {
             if let Some(arr) = msgs.as_array() {
                 let session_id = crate::session::fingerprint(arr, 3);
                 let conn = db.writer_conn();
-                let _ = crate::event_store::extract_and_insert(&conn, &session_id, arr);
-                let _ = crate::diff_events::extract_diffs_post_commit(
-                    &conn, &session_id, conv_id,
-                );
+                if let Err(e) = crate::event_store::extract_and_insert(&conn, &session_id, arr) {
+                    crate::metrics::OBSERVABILITY_WRITE_FAILED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(target: "deeplossless::pipeline", "failed to extract proxy events: {e}");
+                }
+                if let Err(e) = crate::diff_events::extract_diffs_post_commit(&conn, &session_id, conv_id) {
+                    crate::metrics::OBSERVABILITY_WRITE_FAILED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(target: "deeplossless::pipeline", "failed to extract diff events: {e}");
+                }
             }
             if let Some(arr) = msgs.as_array() {
                 for msg in arr {
@@ -199,9 +224,8 @@ impl ChatPipeline {
                         let summary = msg["content"].to_string().chars().take(200).collect::<String>();
                         let raw_tokens = crate::tokenizer::count(&summary) + overhead;
                         let tc = crate::tokenizer::correct(raw_tokens, correction) as i64;
-                        if let Err(e) = dag.insert_leaf(conv_id, &summary, tc) {
-                            tracing::warn!(target: "deeplossless::pipeline", "failed to create DAG leaf: {e}");
-                        }
+                        dag.insert_leaf(conv_id, &summary, tc)
+                            .context("failed to create DAG leaf")?;
                     }
                 }
                 // Group tool chains into execution units (Phase 1.5)
@@ -267,7 +291,7 @@ impl ChatPipeline {
                             (String::new(), String::new(), String::new(), String::new())
                         };
 
-                    let exec_id = match db.store_execution_unit_with_span(
+                    let exec_id = db.store_execution_unit_with_span(
                         conv_id,
                         &unit.reasoning_before,
                         &unit.tool_name,
@@ -282,13 +306,8 @@ impl ChatPipeline {
                         &parallel_group,
                         &unit.tool_call_id,
                         &replay_session_id,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            tracing::warn!(target: "deeplossless::pipeline", "failed to store execution unit: {e}");
-                            continue;
-                        }
-                    };
+                    )
+                    .context("failed to store execution unit")?;
 
                     // Record DependsOn lineage edge: consecutive units in a conversation
                     // form a dependency chain (unit N depends on unit N-1's output).
@@ -351,39 +370,25 @@ impl ChatPipeline {
                         tracker.group_id,
                         tracker.branch_count(),
                     );
-                    match dag.db().insert_join_atomic(
-                        conv_id,
-                        &summary,
-                        0,
-                        &[],
-                        &[],
-                    ) {
-                        Ok(join_node) => {
-                            let edges = match tracker.clone().complete(join_node.id) {
-                                Ok(e) => e,
-                                Err(e) => {
-                                    tracing::warn!(target: "deeplossless::pipeline", "complete failed: {e}");
-                                    continue;
-                                }
-                            };
-                            for hb in &edges {
-                                if let Err(e) = db.insert_edge(
-                                    hb.from_id, hb.to_id, "happens_before",
-                                ) {
-                                    tracing::debug!(target: "deeplossless::pipeline",
-                                        "failed to insert HappensBefore edge: {e}");
-                                }
-                            }
-                            pending_hb_edges.extend(edges);
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "deeplossless::pipeline",
-                                "failed to insert join DAG node: {e}");
-                        }
+                    let join_node = dag
+                        .db()
+                        .insert_join_atomic(conv_id, &summary, 0, &[], &[])
+                        .context("failed to insert join DAG node for parallel group")?;
+                    let edges = tracker
+                        .clone()
+                        .complete(join_node.id)
+                        .context("failed to complete parallel tracker")?;
+                    for hb in &edges {
+                        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before")
+                            .context("failed to insert HappensBefore lineage edge")?;
                     }
+                    pending_hb_edges.extend(edges);
                 }
             }
-        });
+            Ok(())
+        })
+        .await
+        .context("pipeline persistence task failed to join")??;
 
         // Trigger async compaction review (soft threshold)
         // Lock held only for send — recv is NOT awaited while holding the lock,
@@ -416,27 +421,30 @@ impl ChatPipeline {
 
         // Assemble DAG context and inject into system messages
         let mut injected = req_body.clone();
-        let query = req_body["messages"].as_array()
+        let query = req_body["messages"]
+            .as_array()
             .and_then(|arr| arr.iter().rev().find(|m| m["role"] == "user"))
             .and_then(|m| m["content"].as_str());
         // LCM context appended as user message (not system prompt) — safe for
-    // tool-call agents. Disabled by default; enable via --lcm-context.
-    if self.lcm_context
+        // tool-call agents. Disabled by default; enable via --lcm-context.
+        if self.lcm_context
             && let Ok(dag_ctx) = self.dag.assemble_context(conv_id, 2000, query)
-            && !dag_ctx.is_empty() {
-                let mut ctx_text = render_dag_context(&dag_ctx);
-                if let Ok(claims) = self.db.list_all_file_claims()
-                    && !claims.is_empty() {
-                        ctx_text = ctx_text.trim_end_matches("</lcm_context>\n").to_string();
-                        use std::fmt::Write;
-                        let _ = writeln!(ctx_text, "  ── Active File Claims ──");
-                        for (agent, path, op) in &claims {
-                            let _ = writeln!(ctx_text, "  [{agent}] {op}: {path}");
-                        }
-                        let _ = writeln!(ctx_text, "</lcm_context>");
-                    }
-                Self::inject_context(&mut injected, &ctx_text, conv_id);
+            && !dag_ctx.is_empty()
+        {
+            let mut ctx_text = render_dag_context(&dag_ctx);
+            if let Ok(claims) = self.db.list_all_file_claims()
+                && !claims.is_empty()
+            {
+                ctx_text = ctx_text.trim_end_matches("</lcm_context>\n").to_string();
+                use std::fmt::Write;
+                let _ = writeln!(ctx_text, "  ── Active File Claims ──");
+                for (agent, path, op) in &claims {
+                    let _ = writeln!(ctx_text, "  [{agent}] {op}: {path}");
+                }
+                let _ = writeln!(ctx_text, "</lcm_context>");
             }
+            Self::inject_context(&mut injected, &ctx_text, conv_id);
+        }
 
         // Inject reasoning_content from previous response into tool-call-only
         // assistant messages. DeepSeek thinking mode requires reasoning_content
@@ -445,11 +453,14 @@ impl ChatPipeline {
         self.inject_reasoning_content(&mut injected);
 
         let invalid = crate::assistant_validation::validate_request_messages(&injected);
-    if invalid > 0 {
-        tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
-    }
+        if invalid > 0 {
+            tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
+        }
 
-        Ok(PipelineOutput { conv_id, injected_body: injected })
+        Ok(PipelineOutput {
+            conv_id,
+            injected_body: injected,
+        })
     }
 
     /// For any assistant message that has `tool_calls` but is missing
@@ -460,14 +471,29 @@ impl ChatPipeline {
         let model = body["model"].as_str().unwrap_or("").to_string();
         // Use prompt_cache_key as stable session identifier (embedded by proxy)
         let session_key = body["prompt_cache_key"].as_str().unwrap_or("");
-        if session_key.is_empty() { return; }
+        if session_key.is_empty() {
+            return;
+        }
         let key = format!("reasoning:{}:{}", model, session_key);
         let stored = self.db.get_reasoning(&key).ok().flatten();
-        let Some(messages) = body["messages"].as_array_mut() else { return };
+        let Some(messages) = body["messages"].as_array_mut() else {
+            return;
+        };
         for msg in messages.iter_mut() {
-            if msg["role"] != "assistant" { continue; }
-            if msg.get("tool_calls").and_then(|v| v.as_array()).map(|a| a.is_empty()) == Some(true) { continue; }
-            if msg.get("tool_calls").is_none() { continue; }
+            if msg["role"] != "assistant" {
+                continue;
+            }
+            if msg
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                == Some(true)
+            {
+                continue;
+            }
+            if msg.get("tool_calls").is_none() {
+                continue;
+            }
             if msg.get("reasoning_content").is_none() {
                 // Only inject if we have actual captured reasoning. Empty string
                 // triggers DeepSeek into thinking mode with no context → slow + hang.
@@ -494,7 +520,8 @@ impl ChatPipeline {
             .trim_start_matches("<lcm_context>\n")
             .trim_end_matches("</lcm_context>\n")
             .trim();
-        let hint: String = clean.lines()
+        let hint: String = clean
+            .lines()
             .filter(|l| !l.trim().is_empty())
             .take(2)
             .collect::<Vec<_>>()

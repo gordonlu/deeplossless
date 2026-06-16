@@ -189,6 +189,7 @@ fn scenario_score_search_before_edit() {
         score: None,
         expected_search: false,
         expected_read: false,
+        pre_apply_used: false,
     };
     let score = score_run(&run);
     assert!(score.reuse > 0.0, "should have reuse for search before edit (got {})", score.reuse);
@@ -210,6 +211,7 @@ fn scenario_score_no_search_before_edit() {
         score: None,
         expected_search: false,
         expected_read: false,
+        pre_apply_used: false,
     };
     let score = score_run(&run);
     // No searches and no reads → vacuous perfect (20/20)
@@ -232,6 +234,7 @@ fn scenario_score_no_search_when_expected_is_penalty() {
         score: None,
         expected_search: true,   // agent was supposed to search
         expected_read: false,
+        pre_apply_used: false,
     };
     let score = score_run(&run);
     assert_eq!(score.search_efficiency, 0.0, "expected_search=true with 0 searches → 0/20");
@@ -253,6 +256,7 @@ fn scenario_score_verify_after_edit() {
         score: None,
         expected_search: false,
         expected_read: false,
+        pre_apply_used: false,
     };
     let score = score_run(&run);
     assert!(score.verification > 0.0, "should have verification (got {})", score.verification);

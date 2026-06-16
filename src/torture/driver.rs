@@ -19,7 +19,7 @@
 
 use crate::torture::aces::{apply_pre_apply, check_file_transitions, create_vfs};
 use crate::torture::scenario::{AgentEvent, Scenario, StateMachine};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Result of driving a single scenario.
 #[derive(Debug)]
@@ -29,6 +29,7 @@ pub struct DriveOutcome {
     pub events: Vec<AgentEvent>,
     pub steps: usize,
     pub success: bool,
+    pub pre_apply_used: bool,
 }
 
 /// Drive a single scenario to completion with 0 LLM intervention.
@@ -45,6 +46,16 @@ pub fn drive_scenario(
     vfs_parent: &Path,
     verbose: bool,
 ) -> Result<DriveOutcome, String> {
+    drive_scenario_with_options(name, format, vfs_parent, verbose, true)
+}
+
+pub fn drive_scenario_with_options(
+    name: &str,
+    format: &str,
+    vfs_parent: &Path,
+    verbose: bool,
+    allow_pre_apply: bool,
+) -> Result<DriveOutcome, String> {
     let scenario = Scenario::load_with_format(name, Some(format))
         .map_err(|e| format!("load scenario '{name}': {e}"))?;
 
@@ -56,6 +67,7 @@ pub fn drive_scenario(
 
     let max_steps = 200;
     let mut step = 0;
+    let mut pre_apply_used = false;
 
     while !machine.is_terminal() {
         if step >= max_steps {
@@ -68,7 +80,20 @@ pub fn drive_scenario(
 
         let state_name = machine.current_state_name().to_string();
 
-        apply_pre_apply(&machine, &vfs_root);
+        let has_pre_apply = machine
+            .scenario()
+            .states
+            .get(machine.current_state_name())
+            .map(|state| !state.pre_apply.is_empty())
+            .unwrap_or(false);
+        if allow_pre_apply {
+            if has_pre_apply {
+                pre_apply_used = true;
+            }
+            apply_pre_apply(&machine, &vfs_root);
+        } else if has_pre_apply && verbose {
+            eprintln!("[strict] pre_apply disabled in state '{state_name}'");
+        }
 
         let tool_calls = machine.current_tool_calls();
         let mut state_events: Vec<AgentEvent> = Vec::new();
@@ -133,6 +158,7 @@ pub fn drive_scenario(
         events,
         steps: step,
         success,
+        pre_apply_used,
     })
 }
 
@@ -189,9 +215,13 @@ fn execute_tool_call(tool: &str, args: &serde_json::Value, vfs_root: &Path) -> A
     match tool {
         "Read" | "read" | "read_file" => {
             let path = pick_str(args, &["filePath", "file_path", "path"]);
-            let resolved = resolve_path(&path, vfs_root);
-            let result = std::fs::read_to_string(&resolved).unwrap_or_default();
-            AgentEvent::Read(resolved.clone(), result)
+            match resolve_path(&path, vfs_root) {
+                Ok(resolved) => {
+                    let result = std::fs::read_to_string(&resolved).unwrap_or_default();
+                    AgentEvent::Read(resolved.display().to_string(), result)
+                }
+                Err(e) => AgentEvent::Read(path, e),
+            }
         }
 
         "Edit" | "edit" | "edit_file" | "replace" | "Write" | "write" | "write_to_file" => {
@@ -200,19 +230,23 @@ fn execute_tool_call(tool: &str, args: &serde_json::Value, vfs_root: &Path) -> A
             let content_field = pick_str(args, &["content"]);
             if !content_field.is_empty() {
                 let path = pick_str(args, &["filePath", "file_path", "path"]);
-                let resolved = resolve_path(&path, vfs_root);
-                if let Some(parent) = Path::new(&resolved).parent() {
+                let Ok(resolved) = resolve_path(&path, vfs_root) else {
+                    return AgentEvent::Edit(path, "path outside VFS".to_string());
+                };
+                if let Some(parent) = resolved.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(&resolved, &content_field);
-                AgentEvent::Edit(resolved.clone(), "wrote".to_string())
+                AgentEvent::Edit(resolved.display().to_string(), "wrote".to_string())
             } else {
                 let path = pick_str(args, &["filePath", "file_path", "path"]);
                 let old = pick_str(args, &["oldString", "old_string"]);
                 let new = pick_str(args, &["newString", "new_string"]);
-                let resolved = resolve_path(&path, vfs_root);
+                let Ok(resolved) = resolve_path(&path, vfs_root) else {
+                    return AgentEvent::Edit(path, "path outside VFS".to_string());
+                };
                 let result = apply_edit(&resolved, &old, &new);
-                AgentEvent::Edit(resolved.clone(), result)
+                AgentEvent::Edit(resolved.display().to_string(), result)
             }
         }
 
@@ -222,9 +256,11 @@ fn execute_tool_call(tool: &str, args: &serde_json::Value, vfs_root: &Path) -> A
             let op = &args["operation"];
             let path = pick_str(op, &["path"]);
             let diff = pick_str(op, &["diff"]);
-            let resolved = resolve_path(&path, vfs_root);
+            let Ok(resolved) = resolve_path(&path, vfs_root) else {
+                return AgentEvent::Edit(path, "path outside VFS".to_string());
+            };
             let result = apply_diff(&resolved, &diff);
-            AgentEvent::Edit(resolved.clone(), result)
+            AgentEvent::Edit(resolved.display().to_string(), result)
         }
 
         "Bash" | "bash" | "shell" | "execute_command" | "command" | "run" => {
@@ -286,20 +322,39 @@ fn pick_str(args: &serde_json::Value, keys: &[&str]) -> String {
     String::new()
 }
 
-fn resolve_path(p: &str, vfs_root: &Path) -> String {
-    if p.is_empty() {
-        return vfs_root.display().to_string();
+fn resolve_path(p: &str, vfs_root: &Path) -> Result<PathBuf, String> {
+    let raw = if p.is_empty() {
+        vfs_root.to_path_buf()
+    } else if let Some(rest) = p.strip_prefix("${VFS}") {
+        vfs_root.join(rest.trim_start_matches(['/', '\\']))
+    } else {
+        let candidate = PathBuf::from(p);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            vfs_root.join(candidate)
+        }
+    };
+    let root = vfs_root
+        .canonicalize()
+        .map_err(|e| format!("canonicalize VFS root failed: {e}"))?;
+    let parent = raw.parent().unwrap_or(&root);
+    let canonical_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    if !canonical_parent.starts_with(&root) {
+        return Err(format!("path outside VFS: {}", raw.display()));
     }
-    p.replace("${VFS}", &vfs_root.display().to_string())
+    Ok(raw)
 }
 
 /// Apply a simple find-and-replace edit. Returns a short status string.
-fn apply_edit(path: &str, old: &str, new: &str) -> String {
-    if path.is_empty() {
+fn apply_edit(path: &Path, old: &str, new: &str) -> String {
+    if path.as_os_str().is_empty() {
         return "missing path".to_string();
     }
     let Ok(content) = std::fs::read_to_string(path) else {
-        return format!("read failed: {path}");
+        return format!("read failed: {}", path.display());
     };
     if !content.contains(old) {
         return "old not found".to_string();
@@ -314,19 +369,19 @@ fn apply_edit(path: &str, old: &str, new: &str) -> String {
 
 /// Apply a unified-diff body to a file. Minimal implementation: parse `@@`
 /// hunks and apply each as find-and-replace on the chunk content.
-fn apply_diff(path: &str, diff: &str) -> String {
-    if path.is_empty() {
+fn apply_diff(path: &Path, diff: &str) -> String {
+    if path.as_os_str().is_empty() {
         return "missing path".to_string();
     }
     let Ok(content) = std::fs::read_to_string(path) else {
-        return format!("read failed: {path}");
+        return format!("read failed: {}", path.display());
     };
     let mut updated = content.clone();
     for hunk in parse_diff_hunks(diff) {
         // hunk.old_text is the context+removed lines (what to find).
         // hunk.new_text is the context+added lines (what to replace with).
         if !updated.contains(&hunk.old_text) {
-            return format!("hunk not found in {}", path);
+            return format!("hunk not found in {}", path.display());
         }
         updated = updated.replacen(&hunk.old_text, &hunk.new_text, 1);
     }
@@ -532,7 +587,7 @@ mod tests {
         let f = dir.join("f.txt");
         std::fs::write(&f, "line1\nline2\nline3\n").unwrap();
         let diff = "@@ -1,3 +1,3 @@\n line1\n-line2\n+LINE2\n line3\n";
-        let r = apply_diff(&f.display().to_string(), diff);
+        let r = apply_diff(&f, diff);
         assert_eq!(r, "patched");
         let after = std::fs::read_to_string(&f).unwrap();
         assert_eq!(after, "line1\nLINE2\nline3\n");

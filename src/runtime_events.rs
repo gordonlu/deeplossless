@@ -1,8 +1,11 @@
-//! Runtime event types — append-only execution lifecycle events.
+//! Runtime event types — append-only runtime lifecycle events.
 //!
 //! Phase 2 (Event Runtime): these events replace direct mutation of
 //! execution state. The existing mutable `ExecutionCycle` fields remain
-//! as projections, derived from the event log.
+//! as projections, derived from the RuntimeEvent lifecycle substream.
+//!
+//! `execution_events` also stores protocol replay/audit rows. Those rows
+//! are not RuntimeEvent values unless they explicitly use this schema.
 //!
 //! # Scope
 //! Execution lifecycle, retry lifecycle, cancellation.
@@ -39,7 +42,7 @@ pub const RUNTIME_EVENT_SCHEMA_VERSION: u32 = 1;
 /// Frozen schema version for CancellationSource enum.
 pub const CANCELLATION_SOURCE_SCHEMA_VERSION: u32 = 1;
 
-/// A runtime event — the single source of truth for execution state
+/// A runtime event — the single source of truth for runtime lifecycle
 /// transitions. Append-only. Never mutated after emission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RuntimeEvent {

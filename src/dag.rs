@@ -301,7 +301,9 @@ pub struct DagEngine {
 impl DagEngine {
     /// Current graph revision. Starts at 0, increments on each mutation.
     pub fn current_revision(&self) -> GraphRevision {
-        GraphRevision(self.revision_counter.load(Ordering::Relaxed))
+        let memory_revision = self.revision_counter.load(Ordering::Relaxed);
+        let persisted_revision = self.db.max_graph_revision().unwrap_or(memory_revision);
+        GraphRevision(memory_revision.max(persisted_revision))
     }
 
     /// Enable/disable automatic invariant check after mutations.
@@ -311,11 +313,12 @@ impl DagEngine {
 
     /// Internal: increment revision and optionally validate.
     fn post_mutation(&self, conv_id: i64) -> anyhow::Result<()> {
-        self.revision_counter.fetch_add(1, Ordering::Relaxed);
+        let revision = self.db.bump_graph_revision(conv_id)?;
+        self.revision_counter.store(revision, Ordering::Relaxed);
         if self.auto_validate {
             let issues = self.validate_dag(conv_id)?;
             if !issues.is_empty() {
-                tracing::warn!(target: "deeplossless::dag", "post-mutation DAG invariants violated: {:?}", issues);
+                anyhow::bail!("post-mutation DAG invariants violated: {:?}", issues);
             }
         }
         Ok(())
@@ -632,14 +635,11 @@ impl DagEngine {
         // Try embedding-based similarity first
         if let Some(ref embedder) = self.embedder {
             let text = format_summary_text(summary, snippets);
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let result = handle.block_on(async { embedder.embed(&text).await });
-                if let Some(vec) = result {
-                    if let Some((node_id, _sim)) = self.db.find_nearest_embedding(&vec, 0.92)? {
-                        return self.db.get_node(node_id);
-                    }
-                    return Ok(None);
+            if let Some(vec) = Self::embed_sync_if_safe(embedder, &text) {
+                if let Some((node_id, _sim)) = self.db.find_nearest_embedding(&vec, 0.92)? {
+                    return self.db.get_node(node_id);
                 }
+                return Ok(None);
             }
         }
         // Fall back to SHA-256 exact match
@@ -688,26 +688,47 @@ impl DagEngine {
         let node = self.compress_group_with_snippets(conv_id, source_ids, summary, token_count, level, snippets)?;
         if let Some(ref embedder) = self.embedder {
             let text = format_summary_text(summary, snippets);
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let result = handle.block_on(async { embedder.embed(&text).await });
-                if let Some(vec) = result {
-                    let model = &embedder.config.model;
-                    let dims = embedder.config.dimensions as i32;
-                    if let Err(e) = self.db.store_embedding(node.id, &vec, model, dims) {
-                        tracing::warn!(target: "deeplossless::dag", "store_embedding failed: {e}");
-                    }
-                    // Auto-merge: find similar nodes across sessions
-                    if let Ok(Some((similar_id, _sim))) = self.db.find_nearest_embedding(&vec, 0.85)
-                        && similar_id != node.id {
-                            let _ = self.db.insert_edge(similar_id, node.id, "reuses");
-                            tracing::debug!(target: "deeplossless::dag",
-                                node_id = node.id, similar = similar_id,
-                                "auto-merged across sessions");
-                        }
+            if let Some(vec) = Self::embed_sync_if_safe(embedder, &text) {
+                let model = &embedder.config.model;
+                let dims = embedder.config.dimensions as i32;
+                if let Err(e) = self.db.store_embedding(node.id, &vec, model, dims) {
+                    tracing::warn!(target: "deeplossless::dag", "store_embedding failed: {e}");
                 }
-            }
+                // Auto-merge: find similar nodes across sessions
+                if let Ok(Some((similar_id, _sim))) = self.db.find_nearest_embedding(&vec, 0.85)
+                    && similar_id != node.id {
+                        let _ = self.db.insert_edge(similar_id, node.id, "reuses");
+                        tracing::debug!(target: "deeplossless::dag",
+                            node_id = node.id, similar = similar_id,
+                            "auto-merged across sessions");
+                    }
+                }
         }
         Ok(node)
+    }
+
+    fn embed_sync_if_safe(
+        embedder: &crate::embeddings::EmbeddingClient,
+        text: &str,
+    ) -> Option<Vec<f32>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tracing::warn!(
+                target = "deeplossless::dag",
+                "embedding lookup requested from sync DAG API inside tokio runtime; using hash fallback"
+            );
+            return None;
+        }
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(target = "deeplossless::dag", "embedding runtime build failed: {e}");
+                return None;
+            }
+        };
+        rt.block_on(async { embedder.embed(text).await })
     }
 
     /// Compute the set of leaf IDs covered by a node, recursively.

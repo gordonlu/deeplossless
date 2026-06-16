@@ -96,6 +96,7 @@ impl RuntimeCoordinator {
 
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(120))
             .build()?;
         let limiter = Arc::new(RateLimiter::new(cfg.rate_limit));
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -169,7 +170,7 @@ impl RuntimeCoordinator {
     /// 3. send compactor shutdown        ← CompactCommand::Shutdown
     /// 4. await worker join              ← tasks.shutdown()
     /// 5. checkpoint WAL                 ← db.checkpoint_and_optimize()
-    /// 6. close DB pool                  ← Drop (Arc<Database>)
+    /// 6. close DB pool                  ← Drop (`Arc<Database>`)
     /// 7. exit
     pub async fn shutdown(self, timeout: std::time::Duration) {
         // Step 2: cancel pipeline tasks — Notify propagates to all background work

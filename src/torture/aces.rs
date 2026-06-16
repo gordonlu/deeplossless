@@ -186,7 +186,7 @@ pub struct SharedState {
     /// when advancing to the next scenario.
     pub terminal_at: Option<std::time::Instant>,
     /// Time of the most recent request from the agent. Updated inside
-    /// [`handle_request`]. Used together with `terminal_at` to detect
+    /// `handle_request`. Used together with `terminal_at` to detect
     /// "agent has finished reacting to the terminal message".
     pub last_request_at: Option<std::time::Instant>,
     /// Set to `true` by the background idle-watcher task once the

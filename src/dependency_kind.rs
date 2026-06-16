@@ -33,7 +33,7 @@ pub enum DependencyKind {
     SequentialOrdering,
 
     /// Parallel execution group — branches happen-before the join.
-    /// Stored in: dag_edges (kind = "happens_before").
+    /// Stored in: lineage_edges (kind = "happens_before").
     ParallelJoin,
 
     // ── Artifact dependencies ────────────────────────────────────────

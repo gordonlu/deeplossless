@@ -1,8 +1,15 @@
 # Runtime Event Schema (Frozen)
 
 ## Purpose
-Define the contract for `RuntimeEvent` — the append-only event stream
-that is the single source of truth for execution lifecycle state.
+Define the contract for `RuntimeEvent` — the append-only runtime
+lifecycle event stream that is the single source of truth for
+`ExecutionCycle` lifecycle state.
+
+This contract does **not** cover every row in the `execution_events`
+table. Protocol replay rows may store canonical `StreamEvent` payloads,
+and audit rows may store compact execution-unit lifecycle records. Those
+rows share storage, but they are not `RuntimeEvent` unless explicitly
+serialized with `RUNTIME_EVENT_SCHEMA_VERSION`.
 
 ## Allowed Event Categories
 
@@ -80,15 +87,16 @@ lifecycle event log.
 ## Projection Relationship
 
 Mutable `ExecutionCycle.metrics` fields (`tokens_spent`, `cache_hits`,
-`failure_streak`, etc.) are projections derived from the event log.
+`failure_streak`, etc.) are projections derived from the `RuntimeEvent`
+lifecycle substream.
 They are NOT sources of truth.
 
 During the Phase 2 transition, both events and projections coexist.
 Projections are the safety net. The transition sequence is:
 
 1. `record_*` methods append events, then update projections
-2. `RuntimeStateView` computes state from events
-3. `projection_parity_check()` validates events vs. projections
+2. `RuntimeStateView` computes state from `RuntimeEvent` values
+3. `projection_parity_check()` validates runtime events vs. projections
 4. ONLY after sustained parity (long-run soak tests pass):
    projections may be removed
 

@@ -16,6 +16,7 @@ pub static REQUESTS_4XX: AtomicU64 = AtomicU64::new(0);
 pub static REQUESTS_5XX: AtomicU64 = AtomicU64::new(0);
 pub static RATE_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
 pub static UPSTREAM_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static OBSERVABILITY_WRITE_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// Per-request latency and outcome record.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -121,6 +122,9 @@ pub async fn handle_metrics() -> Response {
          # HELP deeplossless_upstream_errors Upstream API failures\n\
          # TYPE deeplossless_upstream_errors counter\n\
          deeplossless_upstream_errors {}\n\
+         # HELP deeplossless_observability_write_failed Proxy event/diff best-effort write failures\n\
+         # TYPE deeplossless_observability_write_failed counter\n\
+         deeplossless_observability_write_failed {}\n\
          # HELP deeplossless_uptime_seconds Server uptime\n\
          # TYPE deeplossless_uptime_seconds gauge\n\
          deeplossless_uptime_seconds {uptime}\n",
@@ -131,6 +135,7 @@ pub async fn handle_metrics() -> Response {
         REQUESTS_5XX.load(Ordering::Relaxed),
         RATE_LIMIT_HITS.load(Ordering::Relaxed),
         UPSTREAM_ERRORS.load(Ordering::Relaxed),
+        OBSERVABILITY_WRITE_FAILED.load(Ordering::Relaxed),
     );
     (StatusCode::OK, body).into_response()
 }

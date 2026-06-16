@@ -104,8 +104,8 @@ struct PartialToolCall {
 ///
 /// Lifecycle:
 ///   feed(events) → emit events as they become ready
-///   upstream [DONE] → finish() → lifecycle events with full text
-///   emit [DONE], close stream
+///   upstream `[DONE]` -> `finish()` -> lifecycle events with full text
+///   emit `[DONE]`, close stream
 pub struct StreamAssembler {
     partial_tools: HashMap<usize, PartialToolCall>,
     /// Accumulated text from all TextDelta events, used in final lifecycle.
@@ -172,7 +172,7 @@ impl StreamAssembler {
         }
     }
 
-    /// Called when upstream [DONE] arrives. Returns accumulated text content
+    /// Called when upstream `[DONE]` arrives. Returns accumulated text content
     /// for the final lifecycle events and any remaining partial tool calls.
     /// Unlike flush(), this consumes state (takes text/reasoning).
     pub fn finish(&mut self) -> (AssembledContent, Vec<StreamEvent>) {

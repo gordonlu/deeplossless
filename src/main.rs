@@ -152,8 +152,8 @@ pub(crate) struct Cli {
     /// Empty value (`--torture-aces=""`) or "all" runs the full suite:
     /// every base scenario in scenarios/ in sorted order, sequenced by
     /// idle-after-terminal detection.
-    #[arg(long, default_value = "")]
-    torture_aces: String,
+    #[arg(long)]
+    torture_aces: Option<String>,
 
     /// Agent format used to select per-agent tool arg templates
     /// from `args_per_agent[format]` in the scenario YAML. Default is
@@ -465,11 +465,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut cli = cli;
 
-    if !cli.torture_aces.is_empty() {
+    if let Some(ref torture_aces) = cli.torture_aces {
         // Suite mode runs every base scenario; single mode runs the
         // one named scenario. The mock handles per-agent variant
         // selection internally via Scenario::load_with_format.
-        let scenarios: Vec<String> = if cli.torture_aces == "all" || cli.torture_aces.is_empty() {
+        let scenarios: Vec<String> = if torture_aces == "all" || torture_aces.is_empty() {
             match deeplossless::torture::scenario::Scenario::list_base() {
                 Ok(names) if !names.is_empty() => names,
                 Ok(_) => {
@@ -482,7 +482,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         } else {
-            vec![cli.torture_aces.clone()]
+            vec![torture_aces.clone()]
         };
 
         eprintln!("[aces] starting ACES mock upstream...");
@@ -553,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let is_aces = !cli.torture_aces.is_empty();
+    let is_aces = cli.torture_aces.is_some();
     let is_torture = cli.torture;
     let mode_str = "full (runtime enabled)".to_string();
 
@@ -563,7 +563,12 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("┌────────────────────────────────────────────────┐");
         eprintln!("│ Torture — Protocol Compatibility Test          │");
         eprintln!("├────────────────────────────────────────────────┤");
-        eprintln!("│ Scenario: {:<37}", if cli.torture_aces.is_empty() { "(suite)".to_string() } else { cli.torture_aces.clone() });
+        let scenario_label = match cli.torture_aces.as_deref() {
+            Some("") | Some("all") => "(suite)",
+            Some(name) => name,
+            None => "(suite)",
+        };
+        eprintln!("│ Scenario: {:<37}", scenario_label);
         eprintln!("│ Mode:     {mode_str}");
         eprintln!("│                                                │");
         eprintln!("│ Point your agent to:                           │");
@@ -639,7 +644,7 @@ async fn main() -> anyhow::Result<()> {
         // and would call the mock's /v1/chat/completions from the
         // summarizer, producing the "expected value at line 1 column 1"
         // parse errors. Force the pipeline off in ACES mode.
-        no_pipeline: cli.no_pipeline || !cli.torture_aces.is_empty(),
+        no_pipeline: cli.no_pipeline || cli.torture_aces.is_some(),
         no_header_mod: cli.no_header_mod,
         lcm_context: cli.lcm_context,
         cache_normalize: !cli.no_cache_normalize,
@@ -906,5 +911,17 @@ mod tests {
     fn torture_flag_accepted() {
         let args = Cli::try_parse_from(["deeplossless", "--torture"]).unwrap();
         assert!(args.torture);
+    }
+
+    #[test]
+    fn torture_aces_all_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--torture-aces", "all"]).unwrap();
+        assert_eq!(args.torture_aces.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn torture_aces_empty_value_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--torture-aces="]).unwrap();
+        assert_eq!(args.torture_aces.as_deref(), Some(""));
     }
 }

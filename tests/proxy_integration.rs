@@ -6,10 +6,10 @@
 //! and Responses API protocols, including tool call/result round-tripping
 //! and streaming conversion.
 
-use axum::{routing::post, Json, Router};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use serde_json::{json, Value};
+use axum::{Json, Router, routing::post};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -21,22 +21,29 @@ type CapturedRequest = Arc<Mutex<Option<Value>>>;
 /// Start a mock upstream that returns a specific HTTP status and JSON body
 /// for every POST /v1/chat/completions request, regardless of the request body.
 async fn start_mock_upstream_with_status(
-    status: u16, body: Value,
+    status: u16,
+    body: Value,
 ) -> (SocketAddr, oneshot::Sender<()>) {
-    let app = Router::new().route("/v1/chat/completions",
+    let app = Router::new().route(
+        "/v1/chat/completions",
         post(move |_: Json<Value>| {
             let body = body.clone();
             async move {
-                (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), Json(body))
+                (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                    Json(body),
+                )
             }
-        })
+        }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
             .await
             .unwrap();
     });
@@ -49,42 +56,50 @@ async fn start_mock_upstream_ex(
     capture: Option<CapturedRequest>,
 ) -> (SocketAddr, oneshot::Sender<()>) {
     let captured = capture.unwrap_or_else(|| Arc::new(Mutex::new(None)));
-    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
-        let cap = captured.clone();
-        async move {
-            *cap.lock().unwrap() = Some(body.0.clone());
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Json<Value>| {
+            let cap = captured.clone();
+            async move {
+                *cap.lock().unwrap() = Some(body.0.clone());
 
-            let is_streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-            if is_streaming {
-                // Return an error JSON so the handler doesn't try to parse SSE
-                Json(json!({"error": "streaming not supported in mock"}))
-            } else {
-                Json(json!({
-                    "id": "mock-cmpl-001",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "Mock response"
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {
-                        "prompt_tokens": 10,
-                        "completion_tokens": 5,
-                        "total_tokens": 15
-                    }
-                }))
+                let is_streaming = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_streaming {
+                    // Return an error JSON so the handler doesn't try to parse SSE
+                    Json(json!({"error": "streaming not supported in mock"}))
+                } else {
+                    Json(json!({
+                        "id": "mock-cmpl-001",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "Mock response"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15
+                        }
+                    }))
+                }
             }
-        }
-    }));
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
             .await
             .unwrap();
     });
@@ -100,14 +115,16 @@ async fn start_mock_upstream() -> (SocketAddr, oneshot::Sender<()>) {
 async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossless::AppState {
     let db = Arc::new(
         deeplossless::db::Database::builder()
-            .path(std::env::temp_dir().join(format!("proxy_test_{}_{}", std::process::id(), suffix)))
+            .path(std::env::temp_dir().join(format!(
+                "proxy_test_{}_{}",
+                std::process::id(),
+                suffix
+            )))
             .build()
             .await
             .unwrap(),
     );
-    let dag = Arc::new(
-        deeplossless::dag::DagEngine::builder().build(db.clone()),
-    );
+    let dag = Arc::new(deeplossless::dag::DagEngine::builder().build(db.clone()));
     let compactor = Arc::new(tokio::sync::Mutex::new(
         deeplossless::compactor::Compactor::new(
             db.clone(),
@@ -125,8 +142,12 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         upstream: format!("http://{}", upstream_addr),
         api_key: std::sync::Arc::new(std::sync::Mutex::new(Some("test-key".to_string()))),
         admin_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        cache_stability: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        reasoning_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cache_stability: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        reasoning_cache: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         storage: deeplossless::StorageServices {
             db,
             dag,
@@ -137,7 +158,9 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         runtime: deeplossless::RuntimeServices {
             client: reqwest::Client::new(),
             cycle: std::sync::Arc::new(std::sync::Mutex::new(
-                deeplossless::runtime::ExecutionCycle::new(deeplossless::runtime::RuntimeProfile::Minimal),
+                deeplossless::runtime::ExecutionCycle::new(
+                    deeplossless::runtime::RuntimeProfile::Minimal,
+                ),
             )),
             rate_limiter: std::sync::Arc::new(deeplossless::runtime::RateLimiter::new(0)),
             shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -215,20 +238,36 @@ async fn responses_api_text_round_trip() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "Responses API should return 200");
+    assert!(
+        resp.status().is_success(),
+        "Responses API should return 200"
+    );
 
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["object"], "response", "should return Responses API format");
+    assert_eq!(
+        body["object"], "response",
+        "should return Responses API format"
+    );
     assert_eq!(body["status"], "completed");
     assert!(body["output"].is_array(), "should have output array");
 
     // Verify the upstream received a Chat Completions request
-    let upstream_req = captured.lock().unwrap().take().expect("upstream should have received a request");
+    let upstream_req = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream should have received a request");
     assert_eq!(upstream_req["model"], "deepseek-v4-flash");
     assert!(upstream_req["messages"].is_array());
     let msgs = upstream_req["messages"].as_array().unwrap();
-    assert!(msgs.iter().any(|m| m["role"] == "system"), "should have system message");
-    assert!(msgs.iter().any(|m| m["role"] == "user"), "should have user message");
+    assert!(
+        msgs.iter().any(|m| m["role"] == "system"),
+        "should have system message"
+    );
+    assert!(
+        msgs.iter().any(|m| m["role"] == "user"),
+        "should have user message"
+    );
 }
 
 #[tokio::test]
@@ -236,39 +275,44 @@ async fn responses_api_tool_call_round_trip() {
     // Mock upstream that returns a tool call response
     let captured: CapturedRequest = Arc::new(Mutex::new(None));
     let upstream_req = captured.clone();
-    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
-        let cap = upstream_req.clone();
-        async move {
-            *cap.lock().unwrap() = Some(body.0.clone());
-            Json(json!({
-                "id": "mock-cmpl-002",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call_abc",
-                            "type": "function",
-                            "function": {
-                                "name": "grep",
-                                "arguments": r#"{"pattern":"fn main","path":"src/"}"#
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
-            }))
-        }
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Json<Value>| {
+            let cap = upstream_req.clone();
+            async move {
+                *cap.lock().unwrap() = Some(body.0.clone());
+                Json(json!({
+                    "id": "mock-cmpl-002",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_abc",
+                                "type": "function",
+                                "function": {
+                                    "name": "grep",
+                                    "arguments": r#"{"pattern":"fn main","path":"src/"}"#
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+                }))
+            }
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
             .await
             .unwrap();
     });
@@ -290,19 +334,35 @@ async fn responses_api_tool_call_round_trip() {
         .await
         .unwrap();
 
-    assert!(resp.status().is_success(), "Responses API should return 200");
+    assert!(
+        resp.status().is_success(),
+        "Responses API should return 200"
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["object"], "response");
-    assert_eq!(body["status"], "incomplete", "tool_calls finish_reason maps to incomplete");
+    assert_eq!(
+        body["status"], "incomplete",
+        "tool_calls finish_reason maps to incomplete"
+    );
 
     // Should contain function_call in output
     let output = body["output"].as_array().expect("should have output");
     let has_fn_call = output.iter().any(|o| o["type"] == "function_call");
-    assert!(has_fn_call, "response should contain function_call output item");
+    assert!(
+        has_fn_call,
+        "response should contain function_call output item"
+    );
 
     // Verify upstream received Chat Completions with tools
-    let upstream = captured.lock().unwrap().take().expect("upstream should have received body");
-    assert!(upstream["tools"].is_array(), "upstream should receive tool definitions");
+    let upstream = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream should have received body");
+    assert!(
+        upstream["tools"].is_array(),
+        "upstream should receive tool definitions"
+    );
     assert_eq!(upstream["tools"][0]["function"]["name"], "grep");
 
     // Verify usage tokens propagated
@@ -314,8 +374,7 @@ async fn responses_api_tool_call_round_trip() {
 #[tokio::test]
 async fn pipeline_tool_result_caching() {
     // Direct test: call the pipeline's process() with tool call + result,
-    // then verify the tool cache was populated.  This avoids the HTTP layer
-    // and the spawn_blocking race.
+    // then verify the tool cache was populated before process() returns.
     use deeplossless::tool_cache;
 
     let captured: CapturedRequest = Arc::new(Mutex::new(None));
@@ -339,26 +398,25 @@ async fn pipeline_tool_result_caching() {
         ],
     });
 
-    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    let output = pipeline
+        .process("deepseek-v4-flash", &req_body)
+        .await
+        .unwrap();
     assert!(output.conv_id > 0);
 
-    // Now wait for the spawn_blocking task to complete
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     // Verify tool cache was populated
-    let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"process_data","path":"src/"}"#);
+    let (cname, args_hash) =
+        tool_cache::cache_key("grep", r#"{"pattern":"process_data","path":"src/"}"#);
     eprintln!("checking cache: name={cname:?} hash={args_hash:?}");
     match db.tool_cache_get(&cname, &args_hash) {
         Ok(Some((result, _ts))) => {
-            assert!(result.contains("process_data"), "cached result should contain expected content");
+            assert!(
+                result.contains("process_data"),
+                "cached result should contain expected content"
+            );
         }
         Ok(None) => {
-            // Try a short retry — spawn_blocking may still be running
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            match db.tool_cache_get(&cname, &args_hash) {
-                Ok(Some((result, _ts))) => assert!(result.contains("process_data")),
-                _ => panic!("cache still empty after 1.5 s total wait"),
-            }
+            panic!("cache should be populated before pipeline.process() returns");
         }
         Err(e) => {
             panic!("cache lookup error: {e}");
@@ -397,14 +455,16 @@ async fn responses_api_streaming_round_trip() {
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
             .await
             .unwrap();
     });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "streaming").await;
-    let proxy_addr = start_proxy(state).await;
+    let proxy_addr = start_proxy(state.clone()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -420,20 +480,68 @@ async fn responses_api_streaming_round_trip() {
         .unwrap();
 
     assert!(resp.status().is_success(), "streaming should return 200");
+    let execution_id: i64 = resp
+        .headers()
+        .get("x-deeplossless-execution-id")
+        .expect("streaming response should expose replay execution id")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(execution_id > 0);
 
     // Read the SSE body as text
     let sse_body = resp.text().await.unwrap();
     assert!(!sse_body.is_empty(), "SSE body should not be empty");
 
     // Verify it contains Responses API SSE events
-    assert!(sse_body.contains("response.created"), "should have response.created event");
-    assert!(sse_body.contains("response.output_text.delta"), "should have text delta events");
-    assert!(sse_body.contains("response.completed"), "should have response.completed");
+    assert!(
+        sse_body.contains("response.created"),
+        "should have response.created event"
+    );
+    assert!(
+        sse_body.contains("response.output_text.delta"),
+        "should have text delta events"
+    );
+    assert!(
+        sse_body.contains("response.completed"),
+        "should have response.completed"
+    );
     assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
 
     // Verify upstream received streaming=true
-    let upstream = captured.lock().unwrap().take().expect("upstream should have received body");
-    assert_eq!(upstream["stream"], true, "upstream should receive streaming=true");
+    let upstream = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream should have received body");
+    assert_eq!(
+        upstream["stream"], true,
+        "upstream should receive streaming=true"
+    );
+
+    let replay_resp = client
+        .get(format!("http://{}/v1/lcm/replay/{execution_id}", proxy_addr))
+        .header("authorization", "Bearer test-key")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        replay_resp.status().is_success(),
+        "replay should return stored stream events"
+    );
+    let replay_json: serde_json::Value = replay_resp.json().await.unwrap();
+    let events = replay_json["events"].as_array().unwrap();
+    assert!(!events.is_empty(), "replay should contain stream events");
+    for (idx, event) in events.iter().enumerate() {
+        assert_eq!(event["seq_no"].as_i64().unwrap(), idx as i64);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"]["type"].as_str() == Some("text_delta")),
+        "replay should include text deltas: {replay_json}"
+    );
 }
 
 #[tokio::test]
@@ -469,8 +577,11 @@ async fn tool_cache_intercepts_tool_call() {
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
-            .await.unwrap();
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
     });
     let _shutdown = tx;
 
@@ -478,7 +589,16 @@ async fn tool_cache_intercepts_tool_call() {
     // Pre-populate the tool cache — same args the upstream will "generate"
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
-    state.storage.db.tool_cache_put(&cname, &args_hash, "src/main.rs:42 found foo", &["src/main.rs".to_string()]).unwrap();
+    state
+        .storage
+        .db
+        .tool_cache_put(
+            &cname,
+            &args_hash,
+            "src/main.rs:42 found foo",
+            &["src/main.rs".to_string()],
+        )
+        .unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
@@ -490,7 +610,9 @@ async fn tool_cache_intercepts_tool_call() {
             "instructions": "Be concise.",
             "model": "deepseek-v4-flash",
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     assert!(resp.status().is_success());
     let sse_body = resp.text().await.unwrap();
@@ -498,14 +620,24 @@ async fn tool_cache_intercepts_tool_call() {
     eprintln!("=== SSE BODY ===\n{sse_body}\n=== END SSE ===");
 
     // Cache interception: should contain cached result as text
-    assert!(sse_body.contains("src/main.rs:42 found foo"),
-        "SSE body should contain cached result: {sse_body}");
+    assert!(
+        sse_body.contains("src/main.rs:42 found foo"),
+        "SSE body should contain cached result: {sse_body}"
+    );
     // Should NOT contain function_call events (tool call was intercepted)
-    assert!(!sse_body.contains("function_call"),
-        "SSE should NOT contain function_call (tool call was intercepted): {sse_body}");
+    assert!(
+        !sse_body.contains("function_call"),
+        "SSE should NOT contain function_call (tool call was intercepted): {sse_body}"
+    );
     // Must still have proper lifecycle
-    assert!(sse_body.contains("response.output_text.done"), "should have output_text.done");
-    assert!(sse_body.contains("response.completed"), "should have response.completed");
+    assert!(
+        sse_body.contains("response.output_text.done"),
+        "should have output_text.done"
+    );
+    assert!(
+        sse_body.contains("response.completed"),
+        "should have response.completed"
+    );
     assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
 }
 
@@ -542,7 +674,14 @@ async fn chat_completions_tool_call_forwarded_without_cache() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "tc_fwd").await;
@@ -558,16 +697,22 @@ async fn chat_completions_tool_call_forwarded_without_cache() {
             "messages": [{"role":"user","content":"search for foo"}],
             "stream": true,
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     assert!(resp.status().is_success());
     let body = resp.text().await.unwrap();
 
     // Must contain the tool call — it should NOT be dropped
-    assert!(body.contains("\"name\":\"grep\""),
-        "body should contain grep tool call: {body}");
-    assert!(body.contains("tool_calls"),
-        "body should contain tool_calls field: {body}");
+    assert!(
+        body.contains("\"name\":\"grep\""),
+        "body should contain grep tool call: {body}"
+    );
+    assert!(
+        body.contains("tool_calls"),
+        "body should contain tool_calls field: {body}"
+    );
     assert!(body.contains("[DONE]"), "should end with [DONE]");
 }
 
@@ -595,7 +740,14 @@ async fn concurrent_requests_no_race() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "concurrent").await;
@@ -603,26 +755,39 @@ async fn concurrent_requests_no_race() {
     let client = reqwest::Client::new();
 
     // Fire 4 concurrent requests
-    let handles: Vec<_> = (0..4).map(|_| {
-        let client = client.clone();
-        let url = format!("http://{}/v1/chat/completions", proxy_addr);
-        tokio::spawn(async move {
-            client.post(&url)
-                .header("authorization", "Bearer sk-test")
-                .json(&json!({
-                    "model": "deepseek-v4-flash",
-                    "messages": [{"role":"user","content":"ping"}],
-                    "stream": true,
-                }))
-                .send().await.unwrap()
-                .text().await.unwrap()
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let client = client.clone();
+            let url = format!("http://{}/v1/chat/completions", proxy_addr);
+            tokio::spawn(async move {
+                client
+                    .post(&url)
+                    .header("authorization", "Bearer sk-test")
+                    .json(&json!({
+                        "model": "deepseek-v4-flash",
+                        "messages": [{"role":"user","content":"ping"}],
+                        "stream": true,
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap()
+            })
         })
-    }).collect();
+        .collect();
 
     for (i, h) in handles.into_iter().enumerate() {
         let body = h.await.expect("concurrent request should not panic");
-        assert!(body.contains("[DONE]"), "request {i} should end with [DONE]: {body}");
-        assert!(body.contains("pong"), "request {i} should contain pong: {body}");
+        assert!(
+            body.contains("[DONE]"),
+            "request {i} should end with [DONE]: {body}"
+        );
+        assert!(
+            body.contains("pong"),
+            "request {i} should contain pong: {body}"
+        );
     }
 }
 
@@ -651,7 +816,14 @@ async fn lcm_grep_retrieves_stored_context() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "lcm_test").await;
@@ -659,7 +831,11 @@ async fn lcm_grep_retrieves_stored_context() {
     // Store a tool result directly in cache
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"process_data"}"#);
-    state.storage.db.tool_cache_put(&cname, &args_hash, "src/lib.rs:42 found process_data", &[]).unwrap();
+    state
+        .storage
+        .db
+        .tool_cache_put(&cname, &args_hash, "src/lib.rs:42 found process_data", &[])
+        .unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
@@ -676,21 +852,34 @@ async fn lcm_grep_retrieves_stored_context() {
             ],
             "stream": true,
         }))
-        .send().await.unwrap()
-        .text().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
 
     // Wait for pipeline spawn_blocking to finish
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Test 1: cache hit via LCM endpoint
     let cache_resp = client
-        .get(format!("{base}/v1/lcm/cache?tool=grep&args={{%22pattern%22:%22process_data%22}}"))
+        .get(format!(
+            "{base}/v1/lcm/cache?tool=grep&args={{%22pattern%22:%22process_data%22}}"
+        ))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(cache_resp.status().is_success());
     let cache_json: serde_json::Value = cache_resp.json().await.unwrap();
     assert_eq!(cache_json["hit"], true, "cache should hit: {cache_json}");
-    assert!(cache_json["result"].as_str().unwrap_or("").contains("process_data"));
+    assert!(
+        cache_json["result"]
+            .as_str()
+            .unwrap_or("")
+            .contains("process_data")
+    );
 
     // Test 2: cache put then get
     let put_resp = client
@@ -702,15 +891,24 @@ async fn lcm_grep_retrieves_stored_context() {
             "result": "fn main() { println!(\"hello\"); }",
             "files": "[\"src/main.rs\"]"
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let put_status = put_resp.status();
     let put_body = put_resp.text().await.unwrap();
-    assert!(put_status.is_success(), "cache put failed: {put_status} {put_body}");
+    assert!(
+        put_status.is_success(),
+        "cache put failed: {put_status} {put_body}"
+    );
 
     let get_resp = client
-        .get(format!("{base}/v1/lcm/cache?tool=read_file&args={{%22file_path%22:%22src/main.rs%22}}"))
+        .get(format!(
+            "{base}/v1/lcm/cache?tool=read_file&args={{%22file_path%22:%22src/main.rs%22}}"
+        ))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let get_json: serde_json::Value = get_resp.json().await.unwrap();
     assert_eq!(get_json["hit"], true, "cache get should hit after put");
 
@@ -718,7 +916,9 @@ async fn lcm_grep_retrieves_stored_context() {
     let status_resp = client
         .get(format!("{base}/v1/lcm/status/1"))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(status_resp.status().is_success());
     let status_json: serde_json::Value = status_resp.json().await.unwrap();
     assert!(status_json["total_tokens"].as_i64().unwrap_or(-1) >= 0);
@@ -727,11 +927,15 @@ async fn lcm_grep_retrieves_stored_context() {
     let search_resp = client
         .get(format!("{base}/v1/lcm/grep/1?query=process_data"))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(search_resp.status().is_success());
     let search_json: serde_json::Value = search_resp.json().await.unwrap();
-    assert!(search_json["total"].as_i64().unwrap_or(-1) >= 0,
-        "search should return results: {search_json}");
+    assert!(
+        search_json["total"].as_i64().unwrap_or(-1) >= 0,
+        "search should return results: {search_json}"
+    );
 }
 
 #[tokio::test]
@@ -758,32 +962,73 @@ async fn snapshot_and_versions_endpoints() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "snap_versions").await;
     let db = state.storage.db.clone();
 
     // Create memory versions
-    let v1 = db.create_memory_version(None, "test", "initial version", None).unwrap();
-    let _v2 = db.create_memory_version(Some(v1), "test", "second version", None).unwrap();
+    let v1 = db
+        .create_memory_version(None, "test", "initial version", None)
+        .unwrap();
+    let _v2 = db
+        .create_memory_version(Some(v1), "test", "second version", None)
+        .unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
     let base = format!("http://{proxy_addr}");
+
+    let stream_resp = client
+        .post(format!("{base}/v1/responses"))
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "input": "snapshot me",
+            "instructions": "Be concise.",
+            "model": "deepseek-v4-flash",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        stream_resp.status().is_success(),
+        "streaming request should succeed before snapshot"
+    );
+    let execution_id: i64 = stream_resp
+        .headers()
+        .get("x-deeplossless-execution-id")
+        .expect("streaming response should expose execution id")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let stream_body = stream_resp.text().await.unwrap();
+    assert!(stream_body.contains("[DONE]"));
 
     // Take a snapshot via API
     let snap_resp = client
         .post(format!("{base}/v1/lcm/snapshot"))
         .header("authorization", "Bearer test-key")
         .json(&json!({
-            "execution_id": 1,
+            "execution_id": execution_id,
             "memory_version_id": v1,
             "tier": 1,
-            "data": "{\"state\":\"test snapshot\"}",
         }))
-        .send().await.unwrap();
-    assert!(snap_resp.status().is_success(), "snapshot should succeed: {snap_resp:?}");
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        snap_resp.status().is_success(),
+        "snapshot should succeed: {snap_resp:?}"
+    );
     let snap_json: serde_json::Value = snap_resp.json().await.unwrap();
     assert_eq!(snap_json["status"], "stored");
     let snap_id = snap_json["id"].as_i64().unwrap();
@@ -792,18 +1037,32 @@ async fn snapshot_and_versions_endpoints() {
     // Restore the snapshot directly via DB
     let restored = db.restore_snapshot(snap_id).unwrap();
     assert!(restored.is_some());
-    assert!(restored.unwrap().snapshot_data.contains("test snapshot"));
+    let restored = restored.unwrap();
+    assert_eq!(restored.execution_id, execution_id);
+    assert!(restored.last_event_seq_no >= 0);
+    assert!(!restored.boundary_hash.is_empty());
+    assert!(!restored.integrity_hash.is_empty());
+    let payload = restored.payload().unwrap().unwrap();
+    assert!(payload.event_count() > 0);
 
     // List versions via API
     let versions_resp = client
         .get(format!("{base}/v1/lcm/versions"))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(versions_resp.status().is_success());
     let versions_json: serde_json::Value = versions_resp.json().await.unwrap();
     let vers = versions_json["versions"].as_array().unwrap();
-    assert!(vers.len() >= 2, "should have at least 2 versions: {versions_json}");
-    assert!(vers.iter().any(|v| v["mutation_kind"] == "test"), "should have test version");
+    assert!(
+        vers.len() >= 2,
+        "should have at least 2 versions: {versions_json}"
+    );
+    assert!(
+        vers.iter().any(|v| v["mutation_kind"] == "test"),
+        "should have test version"
+    );
 }
 
 // ── LCM Audit / Score / Motif / Observe integration tests ───────────────
@@ -821,7 +1080,11 @@ async fn lcm_audit_trail_and_report_endpoints() {
     let auth = "Bearer test-key";
 
     // Store execution units via DB
-    let conv_id = state.storage.db.find_or_create_conversation("audit_int_fp", "deepseek-v4-flash").unwrap();
+    let conv_id = state
+        .storage
+        .db
+        .find_or_create_conversation("audit_int_fp", "deepseek-v4-flash")
+        .unwrap();
     for i in 0..4 {
         let outcome = match i {
             0 => "success",
@@ -829,15 +1092,33 @@ async fn lcm_audit_trail_and_report_endpoints() {
             2 => "blocked",
             _ => "cache_hit",
         };
-        state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", if i == 2 { "Error: fail" } else { "ok" }, "", outcome, &[]).unwrap();
+        state
+            .storage
+            .db
+            .store_execution_unit(
+                conv_id,
+                "",
+                "grep",
+                "{}",
+                if i == 2 { "Error: fail" } else { "ok" },
+                "",
+                outcome,
+                &[],
+            )
+            .unwrap();
     }
 
     // Test audit trail endpoint
     let trail_resp = client
         .get(format!("{base}/v1/lcm/audit/{conv_id}"))
         .header("authorization", auth)
-        .send().await.unwrap();
-    assert!(trail_resp.status().is_success(), "audit trail: {trail_resp:?}");
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        trail_resp.status().is_success(),
+        "audit trail: {trail_resp:?}"
+    );
     let trail_json: serde_json::Value = trail_resp.json().await.unwrap();
     assert_eq!(trail_json["conv_id"], conv_id);
     let records = trail_json["records"].as_array().unwrap();
@@ -847,12 +1128,27 @@ async fn lcm_audit_trail_and_report_endpoints() {
     let report_resp = client
         .get(format!("{base}/v1/lcm/audit/report/{conv_id}"))
         .header("authorization", auth)
-        .send().await.unwrap();
-    assert!(report_resp.status().is_success(), "audit report: {report_resp:?}");
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        report_resp.status().is_success(),
+        "audit report: {report_resp:?}"
+    );
     let report_json: serde_json::Value = report_resp.json().await.unwrap();
     assert_eq!(report_json["report"]["total_actions"], 4);
-    assert!(report_json["report"]["failures"]["blocked"].as_i64().unwrap_or(0) >= 1);
-    assert!(report_json["report"]["cache_perf"]["hits"].as_i64().unwrap_or(0) >= 1);
+    assert!(
+        report_json["report"]["failures"]["blocked"]
+            .as_i64()
+            .unwrap_or(0)
+            >= 1
+    );
+    assert!(
+        report_json["report"]["cache_perf"]["hits"]
+            .as_i64()
+            .unwrap_or(0)
+            >= 1
+    );
 }
 
 #[tokio::test]
@@ -863,20 +1159,59 @@ async fn lcm_score_endpoint() {
     let client = reqwest::Client::new();
     let auth = "Bearer test-key";
 
-    let conv_id = state.storage.db.find_or_create_conversation("score_int_fp", "deepseek-v4-flash").unwrap();
-    state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
-    state.storage.db.store_execution_unit(conv_id, "", "build", "{}", "Error: fail", "", "blocked", &[]).unwrap();
-    state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", "cached", "", "cache_hit", &[]).unwrap();
+    let conv_id = state
+        .storage
+        .db
+        .find_or_create_conversation("score_int_fp", "deepseek-v4-flash")
+        .unwrap();
+    state
+        .storage
+        .db
+        .store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[])
+        .unwrap();
+    state
+        .storage
+        .db
+        .store_execution_unit(
+            conv_id,
+            "",
+            "build",
+            "{}",
+            "Error: fail",
+            "",
+            "blocked",
+            &[],
+        )
+        .unwrap();
+    state
+        .storage
+        .db
+        .store_execution_unit(conv_id, "", "grep", "{}", "cached", "", "cache_hit", &[])
+        .unwrap();
 
     let score_resp = client
         .get(format!("{base}/v1/lcm/score/{conv_id}"))
         .header("authorization", auth)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(score_resp.status().is_success(), "score: {score_resp:?}");
     let score: serde_json::Value = score_resp.json().await.unwrap();
-    assert!(score.get("composite").and_then(|v| v.as_f64()).is_some(), "composite should exist");
-    assert!(score.get("success_rate").and_then(|v| v.as_f64()).is_some(), "success_rate should exist");
-    assert!(score.get("hallucination_risk").and_then(|v| v.as_f64()).is_some(), "hallucination_risk should exist");
+    assert!(
+        score.get("composite").and_then(|v| v.as_f64()).is_some(),
+        "composite should exist"
+    );
+    assert!(
+        score.get("success_rate").and_then(|v| v.as_f64()).is_some(),
+        "success_rate should exist"
+    );
+    assert!(
+        score
+            .get("hallucination_risk")
+            .and_then(|v| v.as_f64())
+            .is_some(),
+        "hallucination_risk should exist"
+    );
 }
 
 #[tokio::test]
@@ -887,22 +1222,39 @@ async fn lcm_motifs_endpoint() {
     let client = reqwest::Client::new();
     let auth = "Bearer test-key";
 
-    let conv_id = state.storage.db.find_or_create_conversation("motif_int_fp", "deepseek-v4-flash").unwrap();
+    let conv_id = state
+        .storage
+        .db
+        .find_or_create_conversation("motif_int_fp", "deepseek-v4-flash")
+        .unwrap();
     // Repeated grep→read_file pattern
     for _ in 0..2 {
-        state.storage.db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
-        state.storage.db.store_execution_unit(conv_id, "", "read_file", "{}", "data", "", "success", &[]).unwrap();
+        state
+            .storage
+            .db
+            .store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[])
+            .unwrap();
+        state
+            .storage
+            .db
+            .store_execution_unit(conv_id, "", "read_file", "{}", "data", "", "success", &[])
+            .unwrap();
     }
 
     let motifs_resp = client
         .get(format!("{base}/v1/lcm/motifs/{conv_id}"))
         .header("authorization", auth)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(motifs_resp.status().is_success(), "motifs: {motifs_resp:?}");
     let motifs_json: serde_json::Value = motifs_resp.json().await.unwrap();
     let motifs = motifs_json["motifs"].as_array().unwrap();
     assert!(!motifs.is_empty(), "should find motifs");
-    let gr: Vec<_> = motifs.iter().filter(|m| m["tool_chain"].as_array().map(|a| a.len()) == Some(2)).collect();
+    let gr: Vec<_> = motifs
+        .iter()
+        .filter(|m| m["tool_chain"].as_array().map(|a| a.len()) == Some(2))
+        .collect();
     assert!(!gr.is_empty(), "should have grep→read_file motif");
 }
 
@@ -921,8 +1273,13 @@ async fn lcm_observe_endpoint() {
             "path": "src/main.rs",
             "content": "fn hello() {\n    println!(\"world\");\n}\n"
         }))
-        .send().await.unwrap();
-    assert!(observe_resp.status().is_success(), "observe: {observe_resp:?}");
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        observe_resp.status().is_success(),
+        "observe: {observe_resp:?}"
+    );
     let obs: serde_json::Value = observe_resp.json().await.unwrap();
     assert_eq!(obs["path"], "src/main.rs");
     assert!(obs["semantic_hash"].as_str().unwrap_or("").len() >= 8);
@@ -941,7 +1298,9 @@ async fn lcm_observe_rejects_missing_path() {
         .post(format!("{base}/v1/lcm/observe"))
         .header("authorization", auth)
         .json(&json!({"content": "fn x() {}"}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400, "missing path should 400");
 }
 
@@ -955,7 +1314,6 @@ async fn parallel_group_detection_and_join() {
     let (_upstream_addr, _shutdown) = start_mock_upstream().await;
     let state = build_proxy_state(_upstream_addr, "parallel_test").await;
     let db = state.storage.db.clone();
-    let dag = state.storage.dag.clone();
 
     let pipeline = deeplossless::pipeline::ChatPipeline::new(&state);
 
@@ -979,65 +1337,95 @@ async fn parallel_group_detection_and_join() {
         ],
     });
 
-    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    let output = pipeline
+        .process("deepseek-v4-flash", &req_body)
+        .await
+        .unwrap();
     assert!(output.conv_id > 0, "should get a valid conversation ID");
     let conv_id = output.conv_id;
 
-    // Wait for spawn_blocking persistence to finish
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-
     // ── 1. Verify execution units have parallel metadata ──────────────
     let mut units = db.get_execution_units(conv_id, 10).unwrap();
-    assert_eq!(units.len(), 2, "should have 2 execution units for 2 tool calls");
+    assert_eq!(
+        units.len(),
+        2,
+        "should have 2 execution units for 2 tool calls"
+    );
     // Sort by ID ascending for deterministic assertion order
     units.sort_by_key(|u| u.id);
 
     // Both units should have the same parallel_group and span_mode=parallel
-    assert!(!units[0].parallel_group.is_empty(), "unit 0 should have parallel_group");
-    assert!(!units[1].parallel_group.is_empty(), "unit 1 should have parallel_group");
-    assert_eq!(units[0].parallel_group, units[1].parallel_group,
-        "both units should share the same parallel_group");
-    assert_eq!(units[0].span_mode, "parallel", "unit 0 span_mode should be parallel");
-    assert_eq!(units[1].span_mode, "parallel", "unit 1 span_mode should be parallel");
+    assert!(
+        !units[0].parallel_group.is_empty(),
+        "unit 0 should have parallel_group"
+    );
+    assert!(
+        !units[1].parallel_group.is_empty(),
+        "unit 1 should have parallel_group"
+    );
+    assert_eq!(
+        units[0].parallel_group, units[1].parallel_group,
+        "both units should share the same parallel_group"
+    );
+    assert_eq!(
+        units[0].span_mode, "parallel",
+        "unit 0 span_mode should be parallel"
+    );
+    assert_eq!(
+        units[1].span_mode, "parallel",
+        "unit 1 span_mode should be parallel"
+    );
 
     // Each should have a unique span_id
-    assert_ne!(units[0].span_id, units[1].span_id, "span_ids should be unique");
+    assert_ne!(
+        units[0].span_id, units[1].span_id,
+        "span_ids should be unique"
+    );
 
     // Both should share the same parent_span_id
-    assert_eq!(units[0].parent_span_id, units[1].parent_span_id,
-        "both units should share parent_span_id");
+    assert_eq!(
+        units[0].parent_span_id, units[1].parent_span_id,
+        "both units should share parent_span_id"
+    );
 
     // Verify tool_call_id was preserved
     let call_ids: Vec<&str> = units.iter().map(|u| u.tool_call_id.as_str()).collect();
     assert!(call_ids.contains(&"call_grep"), "should contain call_grep");
     assert!(call_ids.contains(&"call_read"), "should contain call_read");
 
-    // ── 2. Verify HappensBefore edges in dag_edges table ──────────────
-    let hb_edges = db.get_edges_by_kind("happens_before").unwrap();
-
-    assert!(!hb_edges.is_empty(), "should have at least one HappensBefore edge");
-
-    // Each edge should point to the join DAG node (to_id should match a join node)
-    for (from_id, to_id, kind) in &hb_edges {
-        assert_eq!(kind, "happens_before");
-        // Verify from_id is an execution unit ID
-        assert!(
-            units.iter().any(|u| u.id == *from_id),
-            "from_id {from_id} should be one of the execution unit IDs"
-        );
-        // Verify to_id is a join DAG node
-        if let Some(node) = dag.db().get_node(*to_id).unwrap() {
-            assert!(node.is_join, "target node should be a join node");
-        }
-    }
-
-    // ── 3. Verify join DAG node exists ────────────────────────────────
+    // ── 2. Verify join DAG node exists ────────────────────────────────
     let all_nodes = db.get_all_dag_nodes(conv_id).unwrap();
     let join_nodes: Vec<_> = all_nodes.iter().filter(|n| n.is_join).collect();
     assert_eq!(join_nodes.len(), 1, "should have exactly 1 join DAG node");
 
     let join_node = join_nodes[0];
-    assert!(join_node.summary.contains("Parallel group"), "join node summary should mention parallel group");
+    assert!(
+        join_node.summary.contains("Parallel group"),
+        "join node summary should mention parallel group"
+    );
+
+    // ── 3. Verify HappensBefore edges in lineage_edges table ──────────
+    let hb_edges: Vec<_> = db
+        .get_lineage_to(join_node.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, _, kind)| kind == "happens_before")
+        .collect();
+
+    assert!(
+        !hb_edges.is_empty(),
+        "should have at least one HappensBefore edge"
+    );
+
+    // Each edge should point from an execution unit to the join DAG node.
+    for (from_id, to_id, kind) in &hb_edges {
+        assert_eq!(kind, "happens_before");
+        assert!(
+            units.iter().any(|u| u.id == *from_id),
+            "from_id {from_id} should be one of the execution unit IDs"
+        );
+        assert_eq!(*to_id, join_node.id, "target should be the join DAG node");
+    }
 
     // ── 4. Verify governance worked: both branches succeeded ──────────
     assert_eq!(units[0].outcome.as_str(), "success");
@@ -1054,73 +1442,114 @@ async fn concurrent_3_tool_execution_creates_happens_before() {
     let db = state.storage.db.clone();
 
     // Create conversation
-    let conv_id = db.create_and_store("concurrent_test", &json!([
-        {"role": "system", "content": "You are a coding agent."},
-        {"role": "user", "content": "Check three files."}
-    ])).unwrap();
-    let replay_session_id = format!("rs_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let conv_id = db
+        .create_and_store(
+            "concurrent_test",
+            &json!([
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Check three files."}
+            ]),
+        )
+        .unwrap();
+    let replay_session_id = format!(
+        "rs_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     // Root span shared by all parallel branches
     let root_span = deeplossless::parallel::ExecutionSpan::root_span();
 
     // Three tool calls to execute concurrently
     let tools = vec![
-        deeplossless::parallel::ToolCallInfo { name: "grep".into(), call_id: "tc_a".into() },
-        deeplossless::parallel::ToolCallInfo { name: "read_file".into(), call_id: "tc_b".into() },
-        deeplossless::parallel::ToolCallInfo { name: "list_files".into(), call_id: "tc_c".into() },
+        deeplossless::parallel::ToolCallInfo {
+            name: "grep".into(),
+            call_id: "tc_a".into(),
+        },
+        deeplossless::parallel::ToolCallInfo {
+            name: "read_file".into(),
+            call_id: "tc_b".into(),
+        },
+        deeplossless::parallel::ToolCallInfo {
+            name: "list_files".into(),
+            call_id: "tc_c".into(),
+        },
     ];
 
     // Fork tracker — assigns span IDs, establishes group_id and parent_span
     let tracker = deeplossless::parallel::ForkJoinTracker::fork(
-        conv_id, 0, &root_span, &tools,
+        conv_id,
+        0,
+        &root_span,
+        &tools,
         deeplossless::parallel::ParallelGovernance::default(),
     );
     let group_id = tracker.group_id.clone();
     let parent_span_id_str = tracker.parent_span.span_id.0.clone();
-    assert_eq!(tracker.branch_count(), 3, "should have 3 branches for 3 tool calls");
+    assert_eq!(
+        tracker.branch_count(),
+        3,
+        "should have 3 branches for 3 tool calls"
+    );
 
     // Extract per-branch metadata before spawning
-    let branch_metas: Vec<(String, String, String)> = tracker.branches.iter()
-        .map(|b| (b.tool_call_id.clone(), b.span_id.0.clone(), b.tool_name.clone()))
+    let branch_metas: Vec<(String, String, String)> = tracker
+        .branches
+        .iter()
+        .map(|b| {
+            (
+                b.tool_call_id.clone(),
+                b.span_id.0.clone(),
+                b.tool_name.clone(),
+            )
+        })
         .collect();
 
     // ── Spawn 3 concurrent tool execution tasks with staggered delays ──
     let db_arc = db.clone();
-    let tasks: Vec<_> = branch_metas.into_iter().enumerate().map(|(i, (tool_call_id, span_id, tool_name))| {
-        let db2 = db_arc.clone();
-        let gid = group_id.clone();
-        let psid = parent_span_id_str.clone();
-        let rsid = replay_session_id.clone();
-        let tcid = tool_call_id.clone();
-        // Staggered delays so results arrive out of order (30ms, 60ms, 90ms)
-        let delay_ms = 30 * (i as u64 + 1);
+    let tasks: Vec<_> = branch_metas
+        .into_iter()
+        .enumerate()
+        .map(|(i, (tool_call_id, span_id, tool_name))| {
+            let db2 = db_arc.clone();
+            let gid = group_id.clone();
+            let psid = parent_span_id_str.clone();
+            let rsid = replay_session_id.clone();
+            let tcid = tool_call_id.clone();
+            // Staggered delays so results arrive out of order (30ms, 60ms, 90ms)
+            let delay_ms = 30 * (i as u64 + 1);
 
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
-            let exec_id = tokio::task::spawn_blocking(move || {
-                db2.store_execution_unit_with_span(
-                    conv_id,
-                    &format!("Reasoning for {tool_name}"),
-                    &tool_name,
-                    r#"{"path":"src/main.rs"}"#,
-                    &format!("Result of {tool_name}"),
-                    "All good.",
-                    "success",
-                    &[],
-                    &span_id,
-                    &psid,
-                    "parallel",
-                    &gid,
-                    &tcid,
-                    &rsid,
-                )
-            }).await.unwrap().unwrap();
+                let exec_id = tokio::task::spawn_blocking(move || {
+                    db2.store_execution_unit_with_span(
+                        conv_id,
+                        &format!("Reasoning for {tool_name}"),
+                        &tool_name,
+                        r#"{"path":"src/main.rs"}"#,
+                        &format!("Result of {tool_name}"),
+                        "All good.",
+                        "success",
+                        &[],
+                        &span_id,
+                        &psid,
+                        "parallel",
+                        &gid,
+                        &tcid,
+                        &rsid,
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap();
 
-            (exec_id, tool_call_id, "success".to_string())
+                (exec_id, tool_call_id, "success".to_string())
+            })
         })
-    }).collect();
+        .collect();
 
     // Collect results — order depends on staggered delays, not insertion order
     let mut results: Vec<(i64, String, String)> = Vec::new();
@@ -1134,24 +1563,36 @@ async fn concurrent_3_tool_execution_creates_happens_before() {
     for (exec_id, tool_call_id, outcome_str) in &results {
         let outcome = deeplossless::execution::ExecutionOutcome::from_str(outcome_str)
             .unwrap_or(deeplossless::execution::ExecutionOutcome::Success);
-        tracker.record_branch_result(tool_call_id, *exec_id, &outcome).unwrap();
+        tracker
+            .record_branch_result(tool_call_id, *exec_id, &outcome)
+            .unwrap();
     }
 
-    assert!(tracker.should_force_join(), "all 3 branches complete → should_force_join");
+    assert!(
+        tracker.should_force_join(),
+        "all 3 branches complete → should_force_join"
+    );
 
     // ── Create join DAG node ──
     let join_summary = format!("Parallel group {group_id} (3 branches)");
-    let join_node = db.insert_join_atomic(conv_id, &join_summary, 0, &[], &[]).unwrap();
+    let join_node = db
+        .insert_join_atomic(conv_id, &join_summary, 0, &[], &[])
+        .unwrap();
     assert!(join_node.is_join, "join node should be marked is_join");
 
     // ── Complete tracker → HappensBefore edges ──
     let hb_edges = tracker.complete(join_node.id).unwrap();
-    assert_eq!(hb_edges.len(), 3, "should have 3 HappensBefore edges (one per branch)");
+    assert_eq!(
+        hb_edges.len(),
+        3,
+        "should have 3 HappensBefore edges (one per branch)"
+    );
 
     // Persist edges to lineage_edges (no FK constraint to dag_nodes, correct
     // for execution-to-execution HappensBefore relationships).
     for hb in &hb_edges {
-        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before").unwrap();
+        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before")
+            .unwrap();
     }
 
     // ── Assertions ──
@@ -1161,28 +1602,55 @@ async fn concurrent_3_tool_execution_creates_happens_before() {
     assert_eq!(units.len(), 3, "should have 3 execution units");
 
     for (exec_id, tc_id, _) in &results {
-        let unit = units.iter().find(|u| u.id == *exec_id)
+        let unit = units
+            .iter()
+            .find(|u| u.id == *exec_id)
             .unwrap_or_else(|| panic!("execution unit {exec_id} should exist"));
-        assert_eq!(unit.span_mode, "parallel", "unit {tc_id} should have span_mode=parallel");
-        assert_eq!(unit.parallel_group, group_id, "unit {tc_id} should share group_id");
-        assert_eq!(unit.parent_span_id, parent_span_id_str, "unit {tc_id} should share parent_span_id");
-        assert!(!unit.span_id.is_empty(), "unit {tc_id} should have a span_id");
-        assert_eq!(unit.outcome.as_str(), "success", "unit {tc_id} should have success outcome");
+        assert_eq!(
+            unit.span_mode, "parallel",
+            "unit {tc_id} should have span_mode=parallel"
+        );
+        assert_eq!(
+            unit.parallel_group, group_id,
+            "unit {tc_id} should share group_id"
+        );
+        assert_eq!(
+            unit.parent_span_id, parent_span_id_str,
+            "unit {tc_id} should share parent_span_id"
+        );
+        assert!(
+            !unit.span_id.is_empty(),
+            "unit {tc_id} should have a span_id"
+        );
+        assert_eq!(
+            unit.outcome.as_str(),
+            "success",
+            "unit {tc_id} should have success outcome"
+        );
     }
 
     // 2. Unique span_ids
-    let span_ids: std::collections::HashSet<&str> = units.iter().map(|u| u.span_id.as_str()).collect();
+    let span_ids: std::collections::HashSet<&str> =
+        units.iter().map(|u| u.span_id.as_str()).collect();
     assert_eq!(span_ids.len(), 3, "each unit should have a unique span_id");
 
     // 3. HappensBefore edges in lineage_edges — 3 edges, each from an execution unit to the join node
     let lineage = db.get_lineage_to(join_node.id).unwrap();
-    let hb_to_join: Vec<_> = lineage.into_iter()
+    let hb_to_join: Vec<_> = lineage
+        .into_iter()
         .filter(|(_, _, kind)| kind == "happens_before")
         .collect();
-    assert_eq!(hb_to_join.len(), 3, "should have exactly 3 HappensBefore edges to join node");
+    assert_eq!(
+        hb_to_join.len(),
+        3,
+        "should have exactly 3 HappensBefore edges to join node"
+    );
 
     for (from_id, to_id, kind) in &hb_to_join {
-        assert_eq!(*kind, "happens_before", "edge kind should be happens_before");
+        assert_eq!(
+            *kind, "happens_before",
+            "edge kind should be happens_before"
+        );
         assert!(
             results.iter().any(|(eid, _, _)| eid == from_id),
             "from_id {from_id} should be an execution unit ID",
@@ -1191,10 +1659,15 @@ async fn concurrent_3_tool_execution_creates_happens_before() {
     }
 
     // 4. Join DAG node persisted correctly
-    let stored_join = db.get_node(join_node.id).unwrap()
+    let stored_join = db
+        .get_node(join_node.id)
+        .unwrap()
         .expect("join node should exist in DB");
     assert!(stored_join.is_join, "stored node should be marked is_join");
-    assert!(stored_join.summary.contains("Parallel group"), "join summary should mention parallel group");
+    assert!(
+        stored_join.summary.contains("Parallel group"),
+        "join summary should mention parallel group"
+    );
     assert_eq!(stored_join.level, 0, "join node level should be 0");
 }
 
@@ -1204,8 +1677,10 @@ async fn concurrent_3_tool_execution_creates_happens_before() {
 async fn chat_completions_upstream_500_propagates_to_client() {
     // When upstream returns HTTP 500, the proxy should propagate the status.
     let (addr, _shutdown) = start_mock_upstream_with_status(
-        500, json!({"error": {"message": "Internal server error", "type": "server_error"}}),
-    ).await;
+        500,
+        json!({"error": {"message": "Internal server error", "type": "server_error"}}),
+    )
+    .await;
     let state = build_proxy_state(addr, "upstream_500_cc").await;
     let proxy_addr = start_proxy(state.clone()).await;
 
@@ -1218,10 +1693,15 @@ async fn chat_completions_upstream_500_propagates_to_client() {
             "messages": [{"role": "user", "content": "test"}],
             "stream": false,
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
-    assert_eq!(resp.status().as_u16(), 500,
-        "upstream 500 should be propagated to client");
+    assert_eq!(
+        resp.status().as_u16(),
+        500,
+        "upstream 500 should be propagated to client"
+    );
     let body = resp.text().await.unwrap();
     assert!(!body.is_empty(), "error response should have a body");
 }
@@ -1232,8 +1712,10 @@ async fn responses_upstream_500_does_not_crash_proxy() {
     // the proxy must not crash. Documents the gap that responses() currently
     // returns 200 OK regardless of upstream status.
     let (addr, _shutdown) = start_mock_upstream_with_status(
-        500, json!({"error": {"message": "Internal server error", "type": "server_error"}}),
-    ).await;
+        500,
+        json!({"error": {"message": "Internal server error", "type": "server_error"}}),
+    )
+    .await;
     let state = build_proxy_state(addr, "upstream_500_resp").await;
     let proxy_addr = start_proxy(state.clone()).await;
 
@@ -1246,7 +1728,8 @@ async fn responses_upstream_500_does_not_crash_proxy() {
             "model": "deepseek-v4-flash",
             "input": "test",
         }))
-        .send().await;
+        .send()
+        .await;
 
     // Proxy must not crash — response may be 502 if network fails,
     // 200 with SSE body if passthrough succeeds, or 500 if internal error.
@@ -1258,7 +1741,8 @@ async fn responses_upstream_500_does_not_crash_proxy() {
             // Even if status is 200, the body should contain the error
             // from the upstream (this is the gap to fix in responses())
             assert!(
-                body.contains("error") || body.contains("Internal server error")
+                body.contains("error")
+                    || body.contains("Internal server error")
                     || status.as_u16() >= 400,
                 "upstream 500 must be reflected in status or body: status={status}, body={body}"
             );
@@ -1283,22 +1767,44 @@ async fn concurrent_3_tool_with_1_failure_and_fail_fast() {
     let state = build_proxy_state(_upstream_addr, "partial_fail").await;
     let db = state.storage.db.clone();
 
-    let conv_id = db.create_and_store("partial_fail_test", &json!([
-        {"role": "system", "content": "Agent."},
-        {"role": "user", "content": "Check files."}
-    ])).unwrap();
-    let replay_session_id = format!("pf_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let conv_id = db
+        .create_and_store(
+            "partial_fail_test",
+            &json!([
+                {"role": "system", "content": "Agent."},
+                {"role": "user", "content": "Check files."}
+            ]),
+        )
+        .unwrap();
+    let replay_session_id = format!(
+        "pf_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     let root_span = deeplossless::parallel::ExecutionSpan::root_span();
     let tools = vec![
-        deeplossless::parallel::ToolCallInfo { name: "grep".into(), call_id: "tc_x".into() },
-        deeplossless::parallel::ToolCallInfo { name: "read_file".into(), call_id: "tc_y".into() },
-        deeplossless::parallel::ToolCallInfo { name: "list_files".into(), call_id: "tc_z".into() },
+        deeplossless::parallel::ToolCallInfo {
+            name: "grep".into(),
+            call_id: "tc_x".into(),
+        },
+        deeplossless::parallel::ToolCallInfo {
+            name: "read_file".into(),
+            call_id: "tc_y".into(),
+        },
+        deeplossless::parallel::ToolCallInfo {
+            name: "list_files".into(),
+            call_id: "tc_z".into(),
+        },
     ];
 
     let tracker = deeplossless::parallel::ForkJoinTracker::fork(
-        conv_id, 0, &root_span, &tools,
+        conv_id,
+        0,
+        &root_span,
+        &tools,
         deeplossless::parallel::ParallelGovernance::default(),
     );
     let group_id = tracker.group_id.clone();
@@ -1307,47 +1813,74 @@ async fn concurrent_3_tool_with_1_failure_and_fail_fast() {
     // Which branch will fail (index 1 = tc_y = read_file)
     let fail_tool_call_id = "tc_y".to_string();
 
-    let branch_metas: Vec<(String, String, String)> = tracker.branches.iter()
-        .map(|b| (b.tool_call_id.clone(), b.span_id.0.clone(), b.tool_name.clone()))
+    let branch_metas: Vec<(String, String, String)> = tracker
+        .branches
+        .iter()
+        .map(|b| {
+            (
+                b.tool_call_id.clone(),
+                b.span_id.0.clone(),
+                b.tool_name.clone(),
+            )
+        })
         .collect();
 
     let db_arc = db.clone();
-    let tasks: Vec<_> = branch_metas.into_iter().enumerate().map(|(i, (tool_call_id, span_id, tool_name))| {
-        let db2 = db_arc.clone();
-        let gid = group_id.clone();
-        let psid = parent_span_id_str.clone();
-        let rsid = replay_session_id.clone();
-        let is_fail = tool_call_id == fail_tool_call_id;
-        let outcome = if is_fail { "blocked".to_string() } else { "success".to_string() };
-        let delay_ms = 20 * (i as u64 + 1); // 20, 40, 60ms
-        let tcid = tool_call_id.clone();
+    let tasks: Vec<_> = branch_metas
+        .into_iter()
+        .enumerate()
+        .map(|(i, (tool_call_id, span_id, tool_name))| {
+            let db2 = db_arc.clone();
+            let gid = group_id.clone();
+            let psid = parent_span_id_str.clone();
+            let rsid = replay_session_id.clone();
+            let is_fail = tool_call_id == fail_tool_call_id;
+            let outcome = if is_fail {
+                "blocked".to_string()
+            } else {
+                "success".to_string()
+            };
+            let delay_ms = 20 * (i as u64 + 1); // 20, 40, 60ms
+            let tcid = tool_call_id.clone();
 
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            let result_text = if is_fail { "Tool call blocked — file in use".to_string() } else { format!("Result {tool_name}") };
-            let reasoning_after = if is_fail { "Recovery attempted but failed.".to_string() } else { "Ok.".to_string() };
-            let outcome_c = outcome.clone();
-            let exec_id = tokio::task::spawn_blocking(move || {
-                db2.store_execution_unit_with_span(
-                    conv_id,
-                    &format!("Reasoning {tool_name}"),
-                    &tool_name,
-                    r#"{"path":"src/main.rs"}"#,
-                    &result_text,
-                    &reasoning_after,
-                    &outcome_c,
-                    &[],
-                    &span_id,
-                    &psid,
-                    "parallel",
-                    &gid,
-                    &tcid,
-                    &rsid,
-                )
-            }).await.unwrap().unwrap();
-            (exec_id, tool_call_id, outcome)
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let result_text = if is_fail {
+                    "Tool call blocked — file in use".to_string()
+                } else {
+                    format!("Result {tool_name}")
+                };
+                let reasoning_after = if is_fail {
+                    "Recovery attempted but failed.".to_string()
+                } else {
+                    "Ok.".to_string()
+                };
+                let outcome_c = outcome.clone();
+                let exec_id = tokio::task::spawn_blocking(move || {
+                    db2.store_execution_unit_with_span(
+                        conv_id,
+                        &format!("Reasoning {tool_name}"),
+                        &tool_name,
+                        r#"{"path":"src/main.rs"}"#,
+                        &result_text,
+                        &reasoning_after,
+                        &outcome_c,
+                        &[],
+                        &span_id,
+                        &psid,
+                        "parallel",
+                        &gid,
+                        &tcid,
+                        &rsid,
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                (exec_id, tool_call_id, outcome)
+            })
         })
-    }).collect();
+        .collect();
 
     let mut results: Vec<(i64, String, String)> = Vec::new();
     for task in tasks {
@@ -1359,43 +1892,62 @@ async fn concurrent_3_tool_with_1_failure_and_fail_fast() {
     for (exec_id, tool_call_id, outcome_str) in &results {
         let outcome = deeplossless::execution::ExecutionOutcome::from_str(outcome_str)
             .unwrap_or(deeplossless::execution::ExecutionOutcome::Success);
-        tracker.record_branch_result(tool_call_id, *exec_id, &outcome).unwrap();
+        tracker
+            .record_branch_result(tool_call_id, *exec_id, &outcome)
+            .unwrap();
     }
 
     // With fail_fast=true, should_force_join must return true
     // when at least one branch is Failed/Blocked.
-    assert!(tracker.should_force_join(),
-        "fail_fast=true + 1 blocked branch → should force join");
+    assert!(
+        tracker.should_force_join(),
+        "fail_fast=true + 1 blocked branch → should force join"
+    );
 
     // Create join DAG node
     let join_summary = format!("Parallel group {group_id} (3 branches, 1 blocked)");
-    let join_node = db.insert_join_atomic(conv_id, &join_summary, 0, &[], &[]).unwrap();
+    let join_node = db
+        .insert_join_atomic(conv_id, &join_summary, 0, &[], &[])
+        .unwrap();
 
     // Complete and persist HappensBefore edges
     let hb_edges = tracker.complete(join_node.id).unwrap();
     // Failed branches also create edges since execution_unit_id is set
-    assert_eq!(hb_edges.len(), 3,
-        "all 3 branches produce happens-before edges (including failed)");
+    assert_eq!(
+        hb_edges.len(),
+        3,
+        "all 3 branches produce happens-before edges (including failed)"
+    );
 
     for hb in &hb_edges {
-        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before").unwrap();
+        db.insert_lineage_edge(hb.from_id, hb.to_id, "happens_before")
+            .unwrap();
     }
 
     // ── Verify ──
     let units = db.get_execution_units(conv_id, 10).unwrap();
     assert_eq!(units.len(), 3);
 
-    let blocked_units: Vec<_> = units.iter().filter(|u| u.outcome.as_str() == "blocked").collect();
+    let blocked_units: Vec<_> = units
+        .iter()
+        .filter(|u| u.outcome.as_str() == "blocked")
+        .collect();
     assert_eq!(blocked_units.len(), 1, "exactly 1 unit should be blocked");
     assert_eq!(blocked_units[0].span_mode, "parallel");
     assert_eq!(blocked_units[0].parallel_group, group_id);
 
-    let success_units: Vec<_> = units.iter().filter(|u| u.outcome.as_str() == "success").collect();
+    let success_units: Vec<_> = units
+        .iter()
+        .filter(|u| u.outcome.as_str() == "success")
+        .collect();
     assert_eq!(success_units.len(), 2, "exactly 2 units should succeed");
 
     // HappensBefore edges
     let lineage = db.get_lineage_to(join_node.id).unwrap();
-    let hb_count = lineage.iter().filter(|(_, _, k)| k == "happens_before").count();
+    let hb_count = lineage
+        .iter()
+        .filter(|(_, _, k)| k == "happens_before")
+        .count();
     assert_eq!(hb_count, 3, "3 happens-before edges to join node");
 
     // Join node
@@ -1418,10 +1970,15 @@ async fn audit_mode_onerror_buffers_and_flushes_on_failure() {
         cfg.onerror_ring_size = 10;
     }
 
-    let conv_id = db.create_and_store("audit_onerror_test", &json!([
-        {"role": "system", "content": "Agent."},
-        {"role": "user", "content": "test"}
-    ])).unwrap();
+    let conv_id = db
+        .create_and_store(
+            "audit_onerror_test",
+            &json!([
+                {"role": "system", "content": "Agent."},
+                {"role": "user", "content": "test"}
+            ]),
+        )
+        .unwrap();
 
     // Store 3 successful execution units — should be buffered, NOT in DB
     for i in 0..3 {
@@ -1434,13 +1991,17 @@ async fn audit_mode_onerror_buffers_and_flushes_on_failure() {
             "ok",
             "success",
             &[],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Verify no audit events written for successful units
     let events = db.get_execution_events_by_conv(conv_id, 10).unwrap();
-    assert_eq!(events.len(), 0,
-        "OnError mode: successful units should NOT write execution_events");
+    assert_eq!(
+        events.len(),
+        0,
+        "OnError mode: successful units should NOT write execution_events"
+    );
 
     // Store a failed unit — should flush buffer + write this event
     db.store_execution_unit(
@@ -1452,12 +2013,15 @@ async fn audit_mode_onerror_buffers_and_flushes_on_failure() {
         "recovery failed",
         "blocked",
         &[],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Now execution_events should have content (the failed event)
     let events_after = db.get_execution_events_by_conv(conv_id, 20).unwrap();
-    assert!(!events_after.is_empty(),
-        "OnError mode: failed unit should flush buffer + write event");
+    assert!(
+        !events_after.is_empty(),
+        "OnError mode: failed unit should flush buffer + write event"
+    );
 }
 
 #[tokio::test]
@@ -1472,10 +2036,15 @@ async fn audit_mode_off_writes_no_execution_events() {
         cfg.audit_mode = deeplossless::runtime::AuditMode::Off;
     }
 
-    let conv_id = db.create_and_store("audit_off_test", &json!([
-        {"role": "system", "content": "Agent."},
-        {"role": "user", "content": "test"}
-    ])).unwrap();
+    let conv_id = db
+        .create_and_store(
+            "audit_off_test",
+            &json!([
+                {"role": "system", "content": "Agent."},
+                {"role": "user", "content": "test"}
+            ]),
+        )
+        .unwrap();
 
     // Store execution units
     for i in 0..5 {
@@ -1488,18 +2057,25 @@ async fn audit_mode_off_writes_no_execution_events() {
             "ok",
             "success",
             &[],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Verify NO execution_events written
     let events = db.get_execution_events_by_conv(conv_id, 10).unwrap();
-    assert_eq!(events.len(), 0,
-        "AuditMode::Off: no execution_events should be written");
+    assert_eq!(
+        events.len(),
+        0,
+        "AuditMode::Off: no execution_events should be written"
+    );
 
     // Verify execution_units ARE still written
     let units = db.get_execution_units(conv_id, 10).unwrap();
-    assert_eq!(units.len(), 5,
-        "execution_units should still be written in Off mode");
+    assert_eq!(
+        units.len(),
+        5,
+        "execution_units should still be written in Off mode"
+    );
 }
 
 // ── ForkJoinTracker timeout branch ────────────────────────────────────────
@@ -1510,12 +2086,21 @@ async fn fork_join_tracker_timeout_branch_transitions_correctly() {
     // and that should_force_join reacts to the timeout with fail_fast.
     let root_span = deeplossless::parallel::ExecutionSpan::root_span();
     let tools = vec![
-        deeplossless::parallel::ToolCallInfo { name: "grep".into(), call_id: "tc_t1".into() },
-        deeplossless::parallel::ToolCallInfo { name: "read_file".into(), call_id: "tc_t2".into() },
+        deeplossless::parallel::ToolCallInfo {
+            name: "grep".into(),
+            call_id: "tc_t1".into(),
+        },
+        deeplossless::parallel::ToolCallInfo {
+            name: "read_file".into(),
+            call_id: "tc_t2".into(),
+        },
     ];
 
     let mut tracker = deeplossless::parallel::ForkJoinTracker::fork(
-        1, 0, &root_span, &tools,
+        1,
+        0,
+        &root_span,
+        &tools,
         deeplossless::parallel::ParallelGovernance::default(), // fail_fast=true
     );
 
@@ -1523,23 +2108,41 @@ async fn fork_join_tracker_timeout_branch_transitions_correctly() {
     tracker.timeout_branch("tc_t1").unwrap();
 
     // With fail_fast=true, a TimedOut branch should trigger force_join
-    assert!(tracker.should_force_join(),
-        "fail_fast + 1 timed out branch → should force join");
+    assert!(
+        tracker.should_force_join(),
+        "fail_fast + 1 timed out branch → should force join"
+    );
 
-    let timed_out_branch = tracker.branches.iter()
-        .find(|b| b.tool_call_id == "tc_t1").unwrap();
-    assert!(matches!(timed_out_branch.status,
-        deeplossless::parallel::BranchStatus::TimedOut),
-        "branch should be TimedOut");
-    assert!(timed_out_branch.error.as_deref() == Some("timeout"),
-        "error message should be 'timeout'");
+    let timed_out_branch = tracker
+        .branches
+        .iter()
+        .find(|b| b.tool_call_id == "tc_t1")
+        .unwrap();
+    assert!(
+        matches!(
+            timed_out_branch.status,
+            deeplossless::parallel::BranchStatus::TimedOut
+        ),
+        "branch should be TimedOut"
+    );
+    assert!(
+        timed_out_branch.error.as_deref() == Some("timeout"),
+        "error message should be 'timeout'"
+    );
 
     // The other branch should still be Pending
-    let pending_branch = tracker.branches.iter()
-        .find(|b| b.tool_call_id == "tc_t2").unwrap();
-    assert!(matches!(pending_branch.status,
-        deeplossless::parallel::BranchStatus::Pending),
-        "other branch should remain Pending");
+    let pending_branch = tracker
+        .branches
+        .iter()
+        .find(|b| b.tool_call_id == "tc_t2")
+        .unwrap();
+    assert!(
+        matches!(
+            pending_branch.status,
+            deeplossless::parallel::BranchStatus::Pending
+        ),
+        "other branch should remain Pending"
+    );
 }
 
 // ── Upstream malformed response tests ─────────────────────────────────────
@@ -1549,14 +2152,26 @@ async fn responses_upstream_malformed_json_returns_502() {
     // When the upstream returns a non-JSON body, the responses() non-streaming
     // path must return 502 (BAD_GATEWAY) rather than panicking on parse.
     // Use a raw-string response that is NOT valid JSON.
-    let app = Router::new().route("/v1/chat/completions", post(move |_: Json<Value>| async move {
-        (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain")], "this is not json")
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |_: Json<Value>| async move {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                "this is not json",
+            )
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
-        axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
     });
 
     let state = build_proxy_state(addr, "malformed").await;
@@ -1570,10 +2185,15 @@ async fn responses_upstream_malformed_json_returns_502() {
             "model": "deepseek-v4-flash",
             "input": "test",
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
-    assert!(resp.status().as_u16() >= 400,
-        "malformed upstream body should produce error, got {}", resp.status());
+    assert!(
+        resp.status().as_u16() >= 400,
+        "malformed upstream body should produce error, got {}",
+        resp.status()
+    );
     drop(tx);
 }
 
@@ -1585,20 +2205,30 @@ async fn proxy_handles_sse_stream_disconnect_gracefully() {
     // the proxy must close the stream cleanly (no panic, stream ends with [DONE]).
     let partial_sse_body = "data: {\"id\":\"evt-001\",\"choices\":[{\"delta\":{\"content\":\"partial response\"}}]}\n\n";
     let body = partial_sse_body.to_string();
-    let app = Router::new().route("/v1/chat/completions", post(move |_: Json<Value>| {
-        let body = body.clone();
-        async move {
-            // Return the partial SSE as a complete response body (not streamed)
-            (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
-        }
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |_: Json<Value>| {
+            let body = body.clone();
+            async move {
+                // Return the partial SSE as a complete response body (not streamed)
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    body,
+                )
+            }
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
-            .await.unwrap();
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
     });
 
     let state = build_proxy_state(addr, "sse_disconnect").await;
@@ -1614,12 +2244,17 @@ async fn proxy_handles_sse_stream_disconnect_gracefully() {
             "messages": [{"role": "user", "content": "test"}],
             "stream": true,
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
     let body = resp.text().await.unwrap();
     // Stream should end cleanly — no panic propagated to client
-    assert!(body.contains("[DONE]") || body.contains("\"partial response\""),
-        "stream should end cleanly, got: {}", &body[..body.len().min(500)]);
+    assert!(
+        body.contains("[DONE]") || body.contains("\"partial response\""),
+        "stream should end cleanly, got: {}",
+        &body[..body.len().min(500)]
+    );
     drop(tx); // cleanup
 }
 
@@ -1637,13 +2272,16 @@ async fn enforce_snapshot_budget_evicts_excess_l0_snapshots() {
     for i in 0..5 {
         db.take_snapshot(
             i + 1, // execution_id
-            0, // memory_version_id
-            0, // tier: Ephemeral
+            0,     // memory_version_id
+            0,     // tier: Ephemeral
             &format!("{{\"snap\": {i}}}"),
-            100, // size_bytes
+            100,  // size_bytes
             None, // retention_ttl
-            0, "", "",
-        ).unwrap();
+            0,
+            "",
+            "",
+        )
+        .unwrap();
     }
 
     // Enforce with a restrictive budget: max 2 hot L0 snapshots
@@ -1658,11 +2296,17 @@ async fn enforce_snapshot_budget_evicts_excess_l0_snapshots() {
 
     // Verify remaining L0 count ≤ budget
     let conn = db.writer_lock().lock().unwrap();
-    let remaining: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM execution_snapshots WHERE tier = 0",
-        [], |r| r.get(0),
-    ).unwrap();
-    assert!(remaining <= 2, "L0 snapshots should be ≤ max_hot_snapshots (2), got {remaining}");
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM execution_snapshots WHERE tier = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        remaining <= 2,
+        "L0 snapshots should be ≤ max_hot_snapshots (2), got {remaining}"
+    );
 }
 
 #[tokio::test]
@@ -1675,15 +2319,26 @@ async fn models_endpoint_lists_deepseek_models() {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("http://{proxy_addr}/v1/models"))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(json["object"], "list");
     let models = json["data"].as_array().unwrap();
-    assert!(models.iter().any(|m| m["id"] == "deepseek-v4-pro"), "should list v4-pro: {json}");
-    assert!(models.iter().any(|m| m["id"] == "deepseek-v4-flash"), "should list v4-flash: {json}");
+    assert!(
+        models.iter().any(|m| m["id"] == "deepseek-v4-pro"),
+        "should list v4-pro: {json}"
+    );
+    assert!(
+        models.iter().any(|m| m["id"] == "deepseek-v4-flash"),
+        "should list v4-flash: {json}"
+    );
     // Verify capabilities
-    let pro = models.iter().find(|m| m["id"] == "deepseek-v4-pro").unwrap();
+    let pro = models
+        .iter()
+        .find(|m| m["id"] == "deepseek-v4-pro")
+        .unwrap();
     assert_eq!(pro["capabilities"]["supports_reasoning"], true);
     assert_eq!(pro["capabilities"]["supports_thinking"], true);
     assert_eq!(pro["capabilities"]["max_context_tokens"], 1_000_000);
@@ -1723,7 +2378,14 @@ async fn reasoning_content_stream_passthrough() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "reasoning_passthrough").await;
@@ -1738,13 +2400,24 @@ async fn reasoning_content_stream_passthrough() {
             "stream": true,
             "reasoning_effort": "high",
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
     let body = resp.text().await.unwrap();
     // Reasoning content should reach the client
-    assert!(body.contains("reasoning_content"), "reasoning_content should pass through: {body}");
-    assert!(body.contains("I need to think about this carefully"), "reasoning text should be present: {body}");
-    assert!(body.contains("The answer is 42"), "regular content should be present: {body}");
+    assert!(
+        body.contains("reasoning_content"),
+        "reasoning_content should pass through: {body}"
+    );
+    assert!(
+        body.contains("I need to think about this carefully"),
+        "reasoning text should be present: {body}"
+    );
+    assert!(
+        body.contains("The answer is 42"),
+        "regular content should be present: {body}"
+    );
     assert!(body.contains("[DONE]"), "should end with [DONE]");
 }
 
@@ -1752,13 +2425,21 @@ async fn reasoning_content_stream_passthrough() {
 
 #[tokio::test]
 async fn upstream_500_returns_error_not_hang() {
-    let app = Router::new().route("/v1/chat/completions", post(|| async {
-        (StatusCode::INTERNAL_SERVER_ERROR, "boom")
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
     let state = build_proxy_state(addr, "upstream_500").await;
     let proxy_addr = start_proxy(state).await;
@@ -1767,21 +2448,40 @@ async fn upstream_500_returns_error_not_hang() {
         .post(format!("http://{proxy_addr}/v1/chat/completions"))
         .header("authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
-        .send().await.unwrap();
-    assert!(!resp.status().is_success(), "should return error, got {}", resp.status());
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "should return error, got {}",
+        resp.status()
+    );
     let body = resp.text().await.unwrap();
     assert!(body.contains("error"), "body should contain error: {body}");
 }
 
 #[tokio::test]
 async fn upstream_400_passes_through() {
-    let app = Router::new().route("/v1/chat/completions", post(|| async {
-        (StatusCode::BAD_REQUEST, json!({"error":{"message":"bad input"}}).to_string())
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":{"message":"bad input"}}).to_string(),
+            )
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
     let state = build_proxy_state(addr, "upstream_400").await;
     let proxy_addr = start_proxy(state).await;
@@ -1790,19 +2490,34 @@ async fn upstream_400_passes_through() {
         .post(format!("http://{proxy_addr}/v1/chat/completions"))
         .header("authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn non_streaming_200_returns_json() {
-    let app = Router::new().route("/v1/chat/completions", post(|| async {
-        (StatusCode::OK, json!({"choices":[{"message":{"content":"ok"}}]}).to_string())
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::OK,
+                json!({"choices":[{"message":{"content":"ok"}}]}).to_string(),
+            )
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
     let state = build_proxy_state(addr, "nonstream_200").await;
     let proxy_addr = start_proxy(state).await;
@@ -1811,7 +2526,9 @@ async fn non_streaming_200_returns_json() {
         .post(format!("http://{proxy_addr}/v1/chat/completions"))
         .header("authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
     let json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(json["choices"][0]["message"]["content"], "ok");
@@ -1830,7 +2547,14 @@ async fn stream_truncated_no_done_still_closes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
     let state = build_proxy_state(addr, "truncated").await;
     let proxy_addr = start_proxy(state).await;
@@ -1843,8 +2567,13 @@ async fn stream_truncated_no_done_still_closes() {
         .send().await.unwrap();
     assert!(resp.status().is_success());
     let body = tokio::time::timeout(std::time::Duration::from_secs(2), resp.text())
-        .await.expect("response must complete within 2s").unwrap_or_default();
-    assert!(body.contains("partial"), "should receive partial data: {body}");
+        .await
+        .expect("response must complete within 2s")
+        .unwrap_or_default();
+    assert!(
+        body.contains("partial"),
+        "should receive partial data: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1863,8 +2592,13 @@ async fn upstream_unreachable_returns_502() {
         .header("authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
         .timeout(std::time::Duration::from_secs(3))
-        .send().await.unwrap();
-    assert!(!resp.status().is_success(), "should return error for unreachable upstream");
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "should return error for unreachable upstream"
+    );
 }
 
 #[tokio::test]
@@ -1879,20 +2613,40 @@ async fn client_invalid_json_returns_400() {
         .header("content-type", "application/json")
         .body("not json {{{")
         .timeout(std::time::Duration::from_secs(3))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "invalid JSON should return 400");
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "invalid JSON should return 400"
+    );
 }
 
 #[tokio::test]
 async fn upstream_html_instead_of_sse_does_not_hang() {
     // Upstream returns HTML error page instead of SSE — proxy must forward and close.
-    let app = Router::new().route("/v1/chat/completions", post(|| async {
-        (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/html")], "<html><body>gateway timeout</body></html>")
-    }));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                "<html><body>gateway timeout</body></html>",
+            )
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
     let state = build_proxy_state(addr, "html_upstream").await;
     let proxy_addr = start_proxy(state).await;
@@ -1904,7 +2658,9 @@ async fn upstream_html_instead_of_sse_does_not_hang() {
         .timeout(std::time::Duration::from_secs(3))
         .send().await.unwrap();
     let body = tokio::time::timeout(std::time::Duration::from_secs(2), resp.text())
-        .await.expect("must complete within 2s").unwrap_or_default();
+        .await
+        .expect("must complete within 2s")
+        .unwrap_or_default();
     assert!(!body.is_empty(), "should return something, not hang");
 }
 
@@ -1943,7 +2699,14 @@ async fn multi_turn_reasoning_tool_continuity() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "reasoning_continuity").await;
@@ -1973,7 +2736,11 @@ async fn multi_turn_reasoning_tool_continuity() {
         .timeout(std::time::Duration::from_secs(5))
         .send().await.unwrap();
 
-    assert!(r2.status().is_success(), "multi-turn with reasoning should succeed, got {}", r2.status());
+    assert!(
+        r2.status().is_success(),
+        "multi-turn with reasoning should succeed, got {}",
+        r2.status()
+    );
     let body = r2.text().await.unwrap();
     assert!(body.contains("[DONE]"), "stream should complete: {body}");
 }
@@ -2003,19 +2770,29 @@ async fn pipeline_creates_leaf_nodes_for_tool_messages() {
         ],
     });
 
-    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    let output = pipeline
+        .process("deepseek-v4-flash", &req_body)
+        .await
+        .unwrap();
     let conv_id = output.conv_id;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let nodes = db.get_all_dag_nodes(conv_id).unwrap();
     let leaves: Vec<_> = nodes.iter().filter(|n| n.is_leaf).collect();
     assert!(!leaves.is_empty(), "pipeline should create leaf nodes");
 
-    let tool_leaves: Vec<_> = leaves.iter().filter(|n| n.summary.contains("fn main")).collect();
-    assert!(!tool_leaves.is_empty(),
+    let tool_leaves: Vec<_> = leaves
+        .iter()
+        .filter(|n| n.summary.contains("fn main"))
+        .collect();
+    assert!(
+        !tool_leaves.is_empty(),
         "BUG: tool messages don't create leaf nodes. {} total leaves: {:?}",
         leaves.len(),
-        leaves.iter().map(|n| &n.summary[..n.summary.len().min(60)]).collect::<Vec<_>>());
+        leaves
+            .iter()
+            .map(|n| &n.summary[..n.summary.len().min(60)])
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── End-to-end LCM context capture: store → compress → grep → assemble ──
@@ -2045,20 +2822,35 @@ async fn lcm_context_capture_after_compression_with_mock_upstream() {
         ],
     });
 
-    let output = pipeline.process("deepseek-v4-flash", &req_body).await.unwrap();
+    let output = pipeline
+        .process("deepseek-v4-flash", &req_body)
+        .await
+        .unwrap();
     let conv_id = output.conv_id;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Verify leaves were created
     let nodes = db.get_all_dag_nodes(conv_id).unwrap();
     let leaves: Vec<_> = nodes.iter().filter(|n| n.is_leaf).collect();
-    assert!(leaves.len() >= 3, "should have at least 3 leaf nodes, got {}", leaves.len());
+    assert!(
+        leaves.len() >= 3,
+        "should have at least 3 leaf nodes, got {}",
+        leaves.len()
+    );
 
     // Manually compress user+assistant pair into a summary (simulates compactor)
-    let user_msgs: Vec<_> = leaves.iter()
-        .filter(|n| n.summary.contains("database") || n.summary.contains("DB connection") || n.summary.contains("API key"))
+    let user_msgs: Vec<_> = leaves
+        .iter()
+        .filter(|n| {
+            n.summary.contains("database")
+                || n.summary.contains("DB connection")
+                || n.summary.contains("API key")
+        })
         .collect();
-    assert!(user_msgs.len() >= 2, "should find messages about DB and API key");
+    assert!(
+        user_msgs.len() >= 2,
+        "should find messages about DB and API key"
+    );
     let source_ids: Vec<i64> = user_msgs.iter().map(|n| n.id).collect();
     dag.compress_group(conv_id, &source_ids,
         "The database connection is configured in db.rs using SQLite WAL mode. The API key is read from DEEPSEEK_API_KEY environment variable in main.rs.",
@@ -2068,29 +2860,51 @@ async fn lcm_context_capture_after_compression_with_mock_upstream() {
     // ── 1. grep must find the summary content ──
     let results = db.search_unified(conv_id, "SQLite WAL mode", 20).unwrap();
     let summary_hits: Vec<_> = results.iter().filter(|r| r.source == "summary").collect();
-    assert!(!summary_hits.is_empty(),
+    assert!(
+        !summary_hits.is_empty(),
         "grep must find summary content 'SQLite WAL mode'. Got {} total results: {:?}",
-        results.len(), results.iter().map(|r| format!("{}:{}", r.source, &r.excerpt[..r.excerpt.len().min(50)])).collect::<Vec<_>>());
+        results.len(),
+        results
+            .iter()
+            .map(|r| format!("{}:{}", r.source, &r.excerpt[..r.excerpt.len().min(50)]))
+            .collect::<Vec<_>>()
+    );
 
     // ── 2. assemble_context must include the summary in query boost ──
-    let ctx = dag.assemble_context(conv_id, 500, Some("SQLite WAL mode")).unwrap();
-    let has_compressed = ctx.iter().any(|n| n.level > 0 && n.summary.contains("SQLite WAL"));
-    assert!(has_compressed,
+    let ctx = dag
+        .assemble_context(conv_id, 500, Some("SQLite WAL mode"))
+        .unwrap();
+    let has_compressed = ctx
+        .iter()
+        .any(|n| n.level > 0 && n.summary.contains("SQLite WAL"));
+    assert!(
+        has_compressed,
         "assemble_context must return compressed summary for relevant query. Got {} nodes: {:?}",
-        ctx.len(), ctx.iter().map(|n| format!("L{}:{}", n.level, &n.summary[..n.summary.len().min(50)])).collect::<Vec<_>>());
+        ctx.len(),
+        ctx.iter()
+            .map(|n| format!("L{}:{}", n.level, &n.summary[..n.summary.len().min(50)]))
+            .collect::<Vec<_>>()
+    );
 
     // ── 3. context rendering is valid ──
     let rendered = deeplossless::pipeline::render_dag_context(&ctx);
-    assert!(rendered.contains("── Summaries ──"), "should render summaries tier");
-    assert!(rendered.contains("SQLite WAL"), "summary content should appear in rendered output: {}", &rendered[..rendered.len().min(300)]);
+    assert!(
+        rendered.contains("── Summaries ──"),
+        "should render summaries tier"
+    );
+    assert!(
+        rendered.contains("SQLite WAL"),
+        "summary content should appear in rendered output: {}",
+        &rendered[..rendered.len().min(300)]
+    );
 }
 
 /// Verify that reasoning_content survives the Responses API → Chat Completions
 /// translation round-trip. Regression test for Bug HIGH-7.
 #[test]
 fn responses_to_chat_translation_preserves_reasoning_content() {
-    use deeplossless::protocol::responses;
     use deeplossless::protocol::chat_completions;
+    use deeplossless::protocol::responses;
     use serde_json::json;
 
     let req_body = json!({
@@ -2110,8 +2924,14 @@ fn responses_to_chat_translation_preserves_reasoning_content() {
 
     let msgs = chat["messages"].as_array().unwrap();
     let assistant_msg = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
-    assert!(assistant_msg.get("reasoning_content").and_then(|v| v.as_str()).is_some(),
-        "reasoning_content must survive Responses→Chat translation, got {:?}", assistant_msg);
+    assert!(
+        assistant_msg
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "reasoning_content must survive Responses→Chat translation, got {:?}",
+        assistant_msg
+    );
 }
 
 // ── End-to-end reasoning round-trip ────────────────────────────────────
@@ -2152,7 +2972,14 @@ async fn reasoning_round_trip_store_retrieve_inject() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "reasoning_roundtrip").await;
@@ -2182,8 +3009,11 @@ async fn reasoning_round_trip_store_retrieve_inject() {
         .timeout(std::time::Duration::from_secs(5))
         .send().await.unwrap();
 
-    assert_eq!(r2.status(), StatusCode::OK,
-        "turn 2 must succeed — reasoning_content required on tool-call message");
+    assert_eq!(
+        r2.status(),
+        StatusCode::OK,
+        "turn 2 must succeed — reasoning_content required on tool-call message"
+    );
 }
 
 // ── Multi-turn conversation continuity ──────────────────────────────────
@@ -2212,7 +3042,14 @@ async fn multi_turn_context_retrieval_across_turns() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "multi_turn_ctx").await;
@@ -2239,20 +3076,30 @@ async fn multi_turn_context_retrieval_across_turns() {
     let conv_resp = client
         .get(format!("http://{proxy_addr}/v1/lcm/current"))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let conv_json: serde_json::Value = conv_resp.json().await.unwrap();
-    let conv_id = conv_json["conversation_id"].as_i64().expect("must have conversation");
+    let conv_id = conv_json["conversation_id"]
+        .as_i64()
+        .expect("must have conversation");
 
     // Verify: search should find "database" in the stored context
     let grep_resp = client
-        .get(format!("http://{proxy_addr}/v1/lcm/grep/{conv_id}?query=database+timeout"))
+        .get(format!(
+            "http://{proxy_addr}/v1/lcm/grep/{conv_id}?query=database+timeout"
+        ))
         .header("authorization", "Bearer test-key")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(grep_resp.status().is_success());
     let grep_json: serde_json::Value = grep_resp.json().await.unwrap();
     let total = grep_json["total"].as_i64().unwrap_or(0);
-    assert!(total > 0,
-        "multi-turn: Turn 1 content must be retrievable in Turn 2. total={total}, grep={grep_json}");
+    assert!(
+        total > 0,
+        "multi-turn: Turn 1 content must be retrievable in Turn 2. total={total}, grep={grep_json}"
+    );
 }
 
 // ── Execution unit dedup ────────────────────────────────────────────────
@@ -2260,41 +3107,125 @@ async fn multi_turn_context_retrieval_across_turns() {
 #[tokio::test]
 async fn execution_unit_dedup_same_tool_call_id() {
     let state = build_proxy_state("127.0.0.1:1".parse().unwrap(), "dedup_same").await;
-    let conv_id = state.storage.db.create_and_store("claude", &serde_json::json!([
-        {"role": "user", "content": "test"}
-    ])).unwrap();
+    let conv_id = state
+        .storage
+        .db
+        .create_and_store(
+            "claude",
+            &serde_json::json!([
+                {"role": "user", "content": "test"}
+            ]),
+        )
+        .unwrap();
 
     let tc_id = "call_00_test123";
-    let id1 = state.storage.db.store_execution_unit_with_span(
-        conv_id, "", "Grep", "{}", "found matches", "", "success", &[],
-        "span1", "", "", "", tc_id, "rs_test",
-    ).unwrap();
-    let id2 = state.storage.db.store_execution_unit_with_span(
-        conv_id, "", "Grep", "{}", "found matches", "", "success", &[],
-        "span1", "", "", "", tc_id, "rs_test",
-    ).unwrap();
+    let id1 = state
+        .storage
+        .db
+        .store_execution_unit_with_span(
+            conv_id,
+            "",
+            "Grep",
+            "{}",
+            "found matches",
+            "",
+            "success",
+            &[],
+            "span1",
+            "",
+            "",
+            "",
+            tc_id,
+            "rs_test",
+        )
+        .unwrap();
+    let id2 = state
+        .storage
+        .db
+        .store_execution_unit_with_span(
+            conv_id,
+            "",
+            "Grep",
+            "{}",
+            "found matches",
+            "",
+            "success",
+            &[],
+            "span1",
+            "",
+            "",
+            "",
+            tc_id,
+            "rs_test",
+        )
+        .unwrap();
     assert!(id1 > 0, "first insert must succeed");
-    assert_eq!(id2, 0, "second insert with same tool_call_id must return 0 (dedup'd)");
+    assert_eq!(
+        id2, 0,
+        "second insert with same tool_call_id must return 0 (dedup'd)"
+    );
 }
 
 #[tokio::test]
 async fn execution_unit_dedup_different_tool_call_id() {
     let state = build_proxy_state("127.0.0.1:1".parse().unwrap(), "dedup_diff").await;
-    let conv_id = state.storage.db.create_and_store("claude", &serde_json::json!([
-        {"role": "user", "content": "test"}
-    ])).unwrap();
+    let conv_id = state
+        .storage
+        .db
+        .create_and_store(
+            "claude",
+            &serde_json::json!([
+                {"role": "user", "content": "test"}
+            ]),
+        )
+        .unwrap();
 
-    let id1 = state.storage.db.store_execution_unit_with_span(
-        conv_id, "", "Grep", "{}", "matches", "", "success", &[],
-        "s1", "", "", "", "call_01", "rs",
-    ).unwrap();
-    let id2 = state.storage.db.store_execution_unit_with_span(
-        conv_id, "", "Read", "{}", "content", "", "success", &[],
-        "s2", "", "", "", "call_02", "rs",
-    ).unwrap();
+    let id1 = state
+        .storage
+        .db
+        .store_execution_unit_with_span(
+            conv_id,
+            "",
+            "Grep",
+            "{}",
+            "matches",
+            "",
+            "success",
+            &[],
+            "s1",
+            "",
+            "",
+            "",
+            "call_01",
+            "rs",
+        )
+        .unwrap();
+    let id2 = state
+        .storage
+        .db
+        .store_execution_unit_with_span(
+            conv_id,
+            "",
+            "Read",
+            "{}",
+            "content",
+            "",
+            "success",
+            &[],
+            "s2",
+            "",
+            "",
+            "",
+            "call_02",
+            "rs",
+        )
+        .unwrap();
     assert!(id1 > 0);
     assert!(id2 > 0);
-    assert_ne!(id1, id2, "different tool_call_ids must create separate units");
+    assert_ne!(
+        id1, id2,
+        "different tool_call_ids must create separate units"
+    );
 }
 
 // ── Bypass (passthrough) tests ────────────────────────────────────
@@ -2316,12 +3247,21 @@ async fn chat_completions_bypass_forwards_raw_bytes() {
             "messages": [{"role":"user","content":"hello"}],
             "stream": false,
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
-    assert!(resp.status().is_success(), "bypass should succeed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "bypass should succeed: {}",
+        resp.status()
+    );
     let body = resp.text().await.unwrap();
     // In bypass mode, the response should contain the mock upstream data directly
-    assert!(body.contains("Mock response"), "bypass should forward upstream response: {body}");
+    assert!(
+        body.contains("Mock response"),
+        "bypass should forward upstream response: {body}"
+    );
 }
 
 #[tokio::test]
@@ -2341,11 +3281,19 @@ async fn responses_endpoint_bypass_skips_pipeline() {
             "input": "hello",
             "stream": false,
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
 
-    assert!(resp.status().is_success(), "bypass responses should succeed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "bypass responses should succeed: {}",
+        resp.status()
+    );
     let body = resp.text().await.unwrap();
     // Should produce a valid response (protocol conversion still happens)
-    assert!(body.contains("resp_") || body.contains("output"),
-        "bypass responses should produce output: {body}");
+    assert!(
+        body.contains("resp_") || body.contains("output"),
+        "bypass responses should produce output: {body}"
+    );
 }

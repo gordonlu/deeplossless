@@ -47,8 +47,7 @@ impl EventType {
         }
     }
 
-pub fn from_event_str(s: &str) -> Option<Self> {
-
+    pub fn from_event_str(s: &str) -> Option<Self> {
         match s {
             "request_start" => Some(EventType::RequestStart),
             "request_end" => Some(EventType::RequestEnd),
@@ -128,9 +127,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS proxy_events_fts
 
 /// Run the schema migration (called once during `Database::open`).
 pub fn create_tables(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch("DROP TABLE IF EXISTS proxy_events_fts;").ok();
     conn.execute_batch(MIGRATION)?;
     conn.execute_batch(FTS_MIGRATION)?;
+    backfill_fts(conn)?;
+    Ok(())
+}
+
+/// Keep the FTS mirror recoverable across restarts and upgrades.
+///
+/// Older builds recreated `proxy_events_fts` on every open, which left
+/// historical `proxy_events` rows invisible to content search. This pass
+/// is idempotent and only fills missing mirror rows.
+fn backfill_fts(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO proxy_events_fts (rowid, content, event_type, session_id)
+         SELECT p.id, p.content, p.event_type, p.session_id
+           FROM proxy_events p
+          WHERE p.content != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM proxy_events_fts f WHERE f.rowid = p.id
+            )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -172,7 +190,9 @@ pub fn query_events(conn: &Connection, filter: &EventFilter) -> anyhow::Result<V
     // FTS subquery — must be the first clause because it uses a
     // separate virtual table and joins via rowid.
     if let Some(ref c) = filter.content_match {
-        clauses.push("id IN (SELECT rowid FROM proxy_events_fts WHERE proxy_events_fts MATCH ?)".into());
+        clauses.push(
+            "id IN (SELECT rowid FROM proxy_events_fts WHERE proxy_events_fts MATCH ?)".into(),
+        );
         bindings.push(Box::new(c.clone()));
     }
 
@@ -212,12 +232,14 @@ pub fn query_events(conn: &Connection, filter: &EventFilter) -> anyhow::Result<V
         sql.push_str(&format!(" LIMIT {limit}"));
     }
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = bindings.iter().map(|b| b.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        bindings.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_refs.as_slice(), |row| {
         Ok(ProxyEvent {
             id: Some(row.get(0)?),
-            event_type: EventType::from_event_str(&row.get::<_, String>(1)?).unwrap_or(EventType::Error),
+            event_type: EventType::from_event_str(&row.get::<_, String>(1)?)
+                .unwrap_or(EventType::Error),
             session_id: row.get(2)?,
             timestamp: row.get(3)?,
             tool_name: row.get(4)?,
@@ -251,28 +273,14 @@ pub fn extract_and_insert(
         match role {
             "user" => {
                 let content = msg["content"].as_str().unwrap_or("");
-                if content.is_empty() { continue; }
-                insert_event(conn, &ProxyEvent {
-                    id: None,
-                    event_type: EventType::UserMessage,
-                    session_id: session_id.to_string(),
-                    timestamp: now.clone(),
-                    tool_name: None,
-                    path: None,
-                    status: None,
-                    content: content.to_string(),
-                    metadata: serde_json::json!({"role": role}),
-                })?;
-                count += 1;
-            }
-
-            "assistant" => {
-                // Emit assistant text content (if any)
-                let content = msg["content"].as_str().unwrap_or("");
-                if !content.is_empty() {
-                    insert_event(conn, &ProxyEvent {
+                if content.is_empty() {
+                    continue;
+                }
+                insert_event(
+                    conn,
+                    &ProxyEvent {
                         id: None,
-                        event_type: EventType::AssistantMessage,
+                        event_type: EventType::UserMessage,
                         session_id: session_id.to_string(),
                         timestamp: now.clone(),
                         tool_name: None,
@@ -280,7 +288,29 @@ pub fn extract_and_insert(
                         status: None,
                         content: content.to_string(),
                         metadata: serde_json::json!({"role": role}),
-                    })?;
+                    },
+                )?;
+                count += 1;
+            }
+
+            "assistant" => {
+                // Emit assistant text content (if any)
+                let content = msg["content"].as_str().unwrap_or("");
+                if !content.is_empty() {
+                    insert_event(
+                        conn,
+                        &ProxyEvent {
+                            id: None,
+                            event_type: EventType::AssistantMessage,
+                            session_id: session_id.to_string(),
+                            timestamp: now.clone(),
+                            tool_name: None,
+                            path: None,
+                            status: None,
+                            content: content.to_string(),
+                            metadata: serde_json::json!({"role": role}),
+                        },
+                    )?;
                     count += 1;
                 }
 
@@ -290,17 +320,20 @@ pub fn extract_and_insert(
                         let name = tc["function"]["name"].as_str().unwrap_or("");
                         let args = tc["function"]["arguments"].as_str().unwrap_or("");
                         let tc_id = tc["id"].as_str().unwrap_or("");
-                        insert_event(conn, &ProxyEvent {
-                            id: None,
-                            event_type: EventType::ToolCall,
-                            session_id: session_id.to_string(),
-                            timestamp: now.clone(),
-                            tool_name: Some(name.to_string()),
-                            path: self::tool_arg_path(name, args),
-                            status: None,
-                            content: format!("{name}({args})"),
-                            metadata: serde_json::json!({"tool_call_id": tc_id, "tool_name": name, "args": args}),
-                        })?;
+                        insert_event(
+                            conn,
+                            &ProxyEvent {
+                                id: None,
+                                event_type: EventType::ToolCall,
+                                session_id: session_id.to_string(),
+                                timestamp: now.clone(),
+                                tool_name: Some(name.to_string()),
+                                path: self::tool_arg_path(name, args),
+                                status: None,
+                                content: format!("{name}({args})"),
+                                metadata: serde_json::json!({"tool_call_id": tc_id, "tool_name": name, "args": args}),
+                            },
+                        )?;
                         count += 1;
                     }
                 }
@@ -309,17 +342,24 @@ pub fn extract_and_insert(
             "tool" => {
                 let content = msg["content"].as_str().unwrap_or("");
                 let tc_id = msg["tool_call_id"].as_str().unwrap_or("");
-                insert_event(conn, &ProxyEvent {
-                    id: None,
-                    event_type: EventType::ToolResult,
-                    session_id: session_id.to_string(),
-                    timestamp: now.clone(),
-                    tool_name: None, // could extract from context
-                    path: None,
-                    status: if content.contains("error") || content.contains("Error") { Some("error".into()) } else { Some("success".into()) },
-                    content: content.to_string(),
-                    metadata: serde_json::json!({"tool_call_id": tc_id}),
-                })?;
+                insert_event(
+                    conn,
+                    &ProxyEvent {
+                        id: None,
+                        event_type: EventType::ToolResult,
+                        session_id: session_id.to_string(),
+                        timestamp: now.clone(),
+                        tool_name: None, // could extract from context
+                        path: None,
+                        status: if content.contains("error") || content.contains("Error") {
+                            Some("error".into())
+                        } else {
+                            Some("success".into())
+                        },
+                        content: content.to_string(),
+                        metadata: serde_json::json!({"tool_call_id": tc_id}),
+                    },
+                )?;
                 count += 1;
             }
 
@@ -328,17 +368,20 @@ pub fn extract_and_insert(
     }
 
     // Also emit a RequestStart for session tracking
-    insert_event(conn, &ProxyEvent {
-        id: None,
-        event_type: EventType::RequestStart,
-        session_id: session_id.to_string(),
-        timestamp: now,
-        tool_name: None,
-        path: None,
-        status: None,
-        content: String::new(),
-        metadata: serde_json::json!({"msg_count": messages.len()}),
-    })?;
+    insert_event(
+        conn,
+        &ProxyEvent {
+            id: None,
+            event_type: EventType::RequestStart,
+            session_id: session_id.to_string(),
+            timestamp: now,
+            tool_name: None,
+            path: None,
+            status: None,
+            content: String::new(),
+            metadata: serde_json::json!({"msg_count": messages.len()}),
+        },
+    )?;
     count += 1;
 
     Ok(count)
@@ -348,10 +391,18 @@ pub fn extract_and_insert(
 /// path column. Handles common field names across tool call types.
 fn tool_arg_path(_tool_name: &str, args_str: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(args_str).ok()?;
-    if let Some(p) = v["file_path"].as_str() { return Some(p.to_string()); }
-    if let Some(p) = v["filePath"].as_str() { return Some(p.to_string()); }
-    if let Some(p) = v["path"].as_str() { return Some(p.to_string()); }
-    if let Some(p) = v["operation"]["path"].as_str() { return Some(p.to_string()); } // Codex apply_patch
+    if let Some(p) = v["file_path"].as_str() {
+        return Some(p.to_string());
+    }
+    if let Some(p) = v["filePath"].as_str() {
+        return Some(p.to_string());
+    }
+    if let Some(p) = v["path"].as_str() {
+        return Some(p.to_string());
+    }
+    if let Some(p) = v["operation"]["path"].as_str() {
+        return Some(p.to_string());
+    } // Codex apply_patch
     None
 }
 
@@ -425,9 +476,7 @@ mod tests {
     }
 
     fn count(conn: &Connection) -> usize {
-        query_events(conn, &EventFilter::default())
-            .unwrap()
-            .len()
+        query_events(conn, &EventFilter::default()).unwrap().len()
     }
 
     // ── Schema ──────────────────────────────────────────────────
@@ -463,11 +512,26 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(names.iter().any(|n| n == "idx_pe_type"), "type index: {names:?}");
-        assert!(names.iter().any(|n| n == "idx_pe_session"), "session index: {names:?}");
-        assert!(names.iter().any(|n| n == "idx_pe_tool"), "tool index: {names:?}");
-        assert!(names.iter().any(|n| n == "idx_pe_status"), "status index: {names:?}");
-        assert!(names.iter().any(|n| n == "idx_pe_path"), "path index: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "idx_pe_type"),
+            "type index: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "idx_pe_session"),
+            "session index: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "idx_pe_tool"),
+            "tool index: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "idx_pe_status"),
+            "status index: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "idx_pe_path"),
+            "path index: {names:?}"
+        );
     }
 
     // ── EventType ───────────────────────────────────────────────
@@ -558,9 +622,17 @@ mod tests {
     #[test]
     fn filter_by_path_pattern() {
         let conn = temp_conn();
-        insert_event(&conn, &ev_path(EventType::ToolCall, "/src/config.rs", "Read")).unwrap();
+        insert_event(
+            &conn,
+            &ev_path(EventType::ToolCall, "/src/config.rs", "Read"),
+        )
+        .unwrap();
         insert_event(&conn, &ev_path(EventType::ToolCall, "/src/auth.rs", "Read")).unwrap();
-        insert_event(&conn, &ev_path(EventType::ToolCall, "/tests/main.rs", "Edit")).unwrap();
+        insert_event(
+            &conn,
+            &ev_path(EventType::ToolCall, "/tests/main.rs", "Edit"),
+        )
+        .unwrap();
 
         let f = EventFilter {
             path_pattern: Some("%config%".into()),
@@ -574,9 +646,12 @@ mod tests {
     #[test]
     fn filter_by_session() {
         let conn = temp_conn();
-        let mut e1 = ev(EventType::UserMessage, ""); e1.session_id = "aaa".into();
-        let mut e2 = ev(EventType::UserMessage, ""); e2.session_id = "bbb".into();
-        let mut e3 = ev(EventType::UserMessage, ""); e3.session_id = "aaa".into();
+        let mut e1 = ev(EventType::UserMessage, "");
+        e1.session_id = "aaa".into();
+        let mut e2 = ev(EventType::UserMessage, "");
+        e2.session_id = "bbb".into();
+        let mut e3 = ev(EventType::UserMessage, "");
+        e3.session_id = "aaa".into();
         insert_event(&conn, &e1).unwrap();
         insert_event(&conn, &e2).unwrap();
         insert_event(&conn, &e3).unwrap();
@@ -657,35 +732,53 @@ mod tests {
     fn filter_multiple_fields() {
         let conn = temp_conn();
         // Match
-        insert_event(&conn, &ProxyEvent {
-            id: None, event_type: EventType::ToolCall,
-            session_id: "ses_X".into(), timestamp: "t".into(),
-            tool_name: Some("Read".into()),
-            path: Some("/a.rs".into()),
-            status: Some("error".into()),
-            content: "find timeout".into(),
-            metadata: serde_json::json!({}),
-        }).unwrap();
+        insert_event(
+            &conn,
+            &ProxyEvent {
+                id: None,
+                event_type: EventType::ToolCall,
+                session_id: "ses_X".into(),
+                timestamp: "t".into(),
+                tool_name: Some("Read".into()),
+                path: Some("/a.rs".into()),
+                status: Some("error".into()),
+                content: "find timeout".into(),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .unwrap();
         // Mismatch (wrong tool)
-        insert_event(&conn, &ProxyEvent {
-            id: None, event_type: EventType::ToolCall,
-            session_id: "ses_X".into(), timestamp: "t".into(),
-            tool_name: Some("Edit".into()),
-            path: Some("/a.rs".into()),
-            status: Some("error".into()),
-            content: "find timeout".into(),
-            metadata: serde_json::json!({}),
-        }).unwrap();
+        insert_event(
+            &conn,
+            &ProxyEvent {
+                id: None,
+                event_type: EventType::ToolCall,
+                session_id: "ses_X".into(),
+                timestamp: "t".into(),
+                tool_name: Some("Edit".into()),
+                path: Some("/a.rs".into()),
+                status: Some("error".into()),
+                content: "find timeout".into(),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .unwrap();
         // Mismatch (wrong session)
-        insert_event(&conn, &ProxyEvent {
-            id: None, event_type: EventType::ToolCall,
-            session_id: "ses_Y".into(), timestamp: "t".into(),
-            tool_name: Some("Read".into()),
-            path: Some("/a.rs".into()),
-            status: Some("error".into()),
-            content: "find timeout".into(),
-            metadata: serde_json::json!({}),
-        }).unwrap();
+        insert_event(
+            &conn,
+            &ProxyEvent {
+                id: None,
+                event_type: EventType::ToolCall,
+                session_id: "ses_Y".into(),
+                timestamp: "t".into(),
+                tool_name: Some("Read".into()),
+                path: Some("/a.rs".into()),
+                status: Some("error".into()),
+                content: "find timeout".into(),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .unwrap();
 
         let f = EventFilter {
             tool_name: Some("Read".into()),
@@ -730,7 +823,10 @@ mod tests {
         ]);
         let arr = messages.as_array().unwrap();
         let count = extract_and_insert(&conn, "ses_test", arr).unwrap();
-        assert!(count >= 4, "should insert user, assistant, tool_call, tool_result + request_start: got {count}");
+        assert!(
+            count >= 4,
+            "should insert user, assistant, tool_call, tool_result + request_start: got {count}"
+        );
 
         // Check that each event type exists
         let types: Vec<String> = query_events(&conn, &EventFilter::default())
@@ -738,11 +834,23 @@ mod tests {
             .iter()
             .map(|e| e.event_type.as_str().to_string())
             .collect();
-        assert!(types.contains(&"request_start".to_string()), "types: {types:?}");
-        assert!(types.contains(&"user_message".to_string()), "types: {types:?}");
-        assert!(types.contains(&"assistant_message".to_string()), "types: {types:?}");
+        assert!(
+            types.contains(&"request_start".to_string()),
+            "types: {types:?}"
+        );
+        assert!(
+            types.contains(&"user_message".to_string()),
+            "types: {types:?}"
+        );
+        assert!(
+            types.contains(&"assistant_message".to_string()),
+            "types: {types:?}"
+        );
         assert!(types.contains(&"tool_call".to_string()), "types: {types:?}");
-        assert!(types.contains(&"tool_result".to_string()), "types: {types:?}");
+        assert!(
+            types.contains(&"tool_result".to_string()),
+            "types: {types:?}"
+        );
     }
 
     #[test]
@@ -783,8 +891,11 @@ mod tests {
         };
         let events = query_events(&conn, &f).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].status.as_deref(), Some("error"),
-            "tool result with 'Error' in content should have status=error");
+        assert_eq!(
+            events[0].status.as_deref(),
+            Some("error"),
+            "tool result with 'Error' in content should have status=error"
+        );
     }
 
     #[test]
@@ -848,5 +959,42 @@ mod tests {
 
         assert_eq!(fts.len(), 1);
         assert_eq!(fts[0].session_id, "ses_smoke");
+    }
+
+    #[tokio::test]
+    async fn fts_survives_database_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reopen.db");
+
+        {
+            let db = crate::db::Database::builder()
+                .path(&db_path)
+                .build()
+                .await
+                .expect("open db");
+            db.insert_event_simple(
+                EventType::UserMessage,
+                "ses_reopen",
+                "diagnose timeout after restart",
+                serde_json::json!({}),
+            )
+            .expect("insert event");
+        }
+
+        let reopened = crate::db::Database::builder()
+            .path(db_path)
+            .build()
+            .await
+            .expect("reopen db");
+
+        let results = reopened
+            .query_proxy_events(&EventFilter {
+                content_match: Some("timeout".into()),
+                ..Default::default()
+            })
+            .expect("fts query after reopen");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "ses_reopen");
     }
 }

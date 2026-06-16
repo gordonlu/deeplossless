@@ -9,6 +9,7 @@ CLAUDE.md
 /docs/superpowers/
 ROADMAP.md
 review.md
+PROJECT_REVIEW.md
 .next/
 logs/
 # ACES test artifacts: mock VFS root written to disk during scenario runs

@@ -7,6 +7,7 @@ pub fn print_report(run: &ScenarioRun) {
     eprintln!("═══════════════════════════════════════════");
     eprintln!("  Events: {}", run.events.len());
     eprintln!("  Terminal: {:?}", run.terminal_state);
+    eprintln!("  pre_apply_used: {}", run.pre_apply_used);
     eprintln!();
 
     let score = run.score.as_ref().cloned().unwrap_or_else(|| score_run(run));

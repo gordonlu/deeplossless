@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 /// Current snapshot schema version. Bump when snapshot payload format changes.
 pub const SCHEMA_VERSION: i32 = 1;
+/// Number of trailing events included in boundary continuity hashes.
+pub const BOUNDARY_EVENT_COUNT: usize = 8;
 
 /// Snapshot budget — prevents unbounded storage growth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,7 +141,7 @@ impl ExecutionSnapshot {
         if self.snapshot_data.is_empty() || self.snapshot_data == "{}" {
             return Ok(None);
         }
-        Ok(serde_json::from_str(&self.snapshot_data).ok())
+        Ok(Some(serde_json::from_str(&self.snapshot_data)?))
     }
 }
 

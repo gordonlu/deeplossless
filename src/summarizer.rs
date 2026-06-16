@@ -90,10 +90,12 @@ pub struct SummaryResult {
 pub struct SummarizerConfig {
     /// LLM model to use for levels 1 and 2.
     pub model: String,
-    /// Upstream API base URL (e.g. https://api.deepseek.com).
+    /// Upstream API base URL (e.g. <https://api.deepseek.com>).
     pub upstream: String,
     /// API key.
     pub api_key: String,
+    /// Explicit offline mode: skip LLM levels and use deterministic fallback only.
+    pub offline_fallback_only: bool,
     /// Maximum tokens for level 3 deterministic fallback. Default: 512.
     pub fallback_max_tokens: usize,
     /// Hard token reduction threshold. If summary doesn't reduce tokens
@@ -114,6 +116,7 @@ impl Default for SummarizerConfig {
             model: "deepseek-v4-flash".to_string(),
             upstream: "https://api.deepseek.com".to_string(),
             api_key: String::new(),
+            offline_fallback_only: false,
             fallback_max_tokens: 512,
             reduction_threshold: 0.90,
             base_timeout_secs: 15,
@@ -136,6 +139,10 @@ impl SummarizerBuilder {
     pub fn model(mut self, model: &str) -> Self { self.config.model = model.to_string(); self }
     pub fn upstream(mut self, url: &str) -> Self { self.config.upstream = url.to_string(); self }
     pub fn api_key(mut self, key: &str) -> Self { self.config.api_key = key.to_string(); self }
+    pub fn offline_fallback_only(mut self) -> Self {
+        self.config.offline_fallback_only = true;
+        self
+    }
     pub fn fallback_max_tokens(mut self, n: usize) -> Self { self.config.fallback_max_tokens = n; self }
     pub fn reduction_threshold(mut self, t: f64) -> Self {
         self.config.reduction_threshold = t.clamp(0.0, 1.0);
@@ -156,7 +163,7 @@ impl SummarizerBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<Summarizer> {
-        if self.config.api_key.is_empty() {
+        if self.config.api_key.is_empty() && !self.config.offline_fallback_only {
             anyhow::bail!("Summarizer: api_key is required");
         }
         Ok(Summarizer {
@@ -195,12 +202,6 @@ impl Summarizer {
     /// - Fatal errors (auth, DNS) on L1 skip L2 — escalate directly to L3.
     /// - Cancellation via `shutdown_notify` aborts escalation immediately.
     pub async fn summarize_escalate(&self, text: &str) -> anyhow::Result<SummaryResult> {
-        // Budget check: cap total LLM calls to prevent runaway token burn
-        let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count >= self.config.max_total_calls {
-            anyhow::bail!("summarizer budget exhausted ({} calls), falling to L3 deterministic", count);
-        }
-
         // Check shutdown before any work
         if let Some(ref notify) = self.shutdown_notify {
             if Self::is_shutdown(notify) {
@@ -209,6 +210,16 @@ impl Summarizer {
         }
 
         let input_tokens = crate::tokenizer::count(text);
+
+        if self.config.offline_fallback_only {
+            return Ok(self.deterministic_fallback(text, input_tokens, "configured offline fallback"));
+        }
+
+        // Budget check: cap total LLM calls to prevent runaway token burn
+        let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count >= self.config.max_total_calls {
+            anyhow::bail!("summarizer budget exhausted ({} calls), falling to L3 deterministic", count);
+        }
 
         // Level 1: LLM preserve_details, target T tokens
         let l1_fatal = match self.try_level(text, SummaryLevel::Level1, input_tokens).await {
@@ -258,6 +269,14 @@ impl Summarizer {
             }
         }
 
+        Ok(self.deterministic_fallback(text, input_tokens, "deterministic truncation fallback"))
+    }
+
+    fn is_shutdown(notify: &Notify) -> bool {
+        notify.notified().now_or_never().is_some()
+    }
+
+    fn deterministic_fallback(&self, text: &str, input_tokens: usize, reason: &'static str) -> SummaryResult {
         let truncated = self.truncate(text);
         let out_tokens = crate::tokenizer::count(&truncated);
         tracing::debug!(
@@ -265,19 +284,16 @@ impl Summarizer {
             level = "level3",
             input_tokens = input_tokens,
             output_tokens = out_tokens,
-            "deterministic truncation (fallback)"
+            reason,
+            "deterministic truncation"
         );
-        Ok(SummaryResult {
+        SummaryResult {
             text: truncated,
             level: SummaryLevel::Level3,
             dag_level: SummaryLevel::Level3.to_dag_level(),
             input_tokens,
             output_tokens: out_tokens,
-        })
-    }
-
-    fn is_shutdown(notify: &Notify) -> bool {
-        notify.notified().now_or_never().is_some()
+        }
     }
 
     /// Try a single LLM-based level. Returns `Err` if the level fails or
@@ -622,6 +638,33 @@ mod tests {
     fn builder_rejects_empty_key() {
         let result = Summarizer::builder().build();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_accepts_explicit_offline_fallback_without_key() {
+        let s = Summarizer::builder()
+            .offline_fallback_only()
+            .fallback_max_tokens(32)
+            .build()
+            .unwrap();
+        assert!(s.config.offline_fallback_only);
+        assert!(s.config.api_key.is_empty());
+        assert_eq!(s.config.fallback_max_tokens, 32);
+    }
+
+    #[test]
+    fn offline_fallback_returns_level3_without_key() {
+        let s = Summarizer::builder()
+            .offline_fallback_only()
+            .fallback_max_tokens(10)
+            .build()
+            .unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(s.summarize_escalate("hello world this is long enough to truncate"))
+            .unwrap();
+        assert_eq!(result.level, SummaryLevel::Level3);
+        assert_eq!(s.call_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

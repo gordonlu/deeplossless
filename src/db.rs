@@ -312,7 +312,12 @@ impl Database {
             content: content.to_string(),
             metadata,
         };
-        self.insert_proxy_event(&event)
+        let result = self.insert_proxy_event(&event);
+        if result.is_err() {
+            crate::metrics::OBSERVABILITY_WRITE_FAILED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Record a file-level diff event for an agent Edit tool call.
@@ -2225,12 +2230,26 @@ impl Database {
     /// `epoch_ms` is a Unix timestamp in milliseconds for stable ordering.
     /// Respects AuditMode: Full writes immediately, OnError buffers, Off skips.
     pub fn store_execution_event(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64) -> anyhow::Result<i64> {
+        self.store_execution_event_with_replay(
+            execution_id,
+            event_kind,
+            event_payload,
+            seq_no,
+            conv_id,
+            epoch_ms,
+            "",
+        )
+    }
+
+    /// Store a single execution event with replay identity metadata.
+    /// `replay_session_id` groups stream events that belong to the same request.
+    pub fn store_execution_event_with_replay(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64, replay_session_id: &str) -> anyhow::Result<i64> {
         match self.audit_mode() {
             crate::runtime::AuditMode::Full => {
                 let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
                 conn.execute(
-                    "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms],
+                    "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms, replay_session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![execution_id, event_kind, event_payload, seq_no, conv_id, epoch_ms, replay_session_id],
                 )?;
                 Ok(conn.last_insert_rowid())
             }
@@ -2285,7 +2304,8 @@ impl Database {
     }
 
     /// Insert a provenance lineage edge into the lineage_edges table.
-    /// This is the authoritative edge store for DependsOn, DerivedFrom, etc.
+    /// This is the authoritative edge store for execution ordering
+    /// (depends_on, happens_before) and derived lineage.
     /// Returns the edge ID.
     pub fn insert_lineage_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -2311,25 +2331,58 @@ impl Database {
     }
 
     /// Get file paths that a specific execution unit depends on.
-    /// Reads from tool_cache dependent_files JSON column.
-    pub fn get_dependent_files_for_unit(&self, _execution_unit_id: i64) -> anyhow::Result<Vec<String>> {
-        // Execution units don't have a direct file-dependency column.
-        // File dependencies are tracked per cache entry (tool_cache table).
-        // For now, return empty — this is a placeholder for Phase 3 integration.
-        // TODO: when cache entries include execution_unit_id, filter here.
-        Ok(Vec::new())
+    /// Projects execution_units -> tool_cache by canonical tool cache key.
+    pub fn get_dependent_files_for_unit(&self, execution_unit_id: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.read_conn();
+        let unit = conn.query_row(
+            "SELECT tool_name, tool_args, COALESCE(tool_args_json, '') FROM execution_units WHERE id = ?1",
+            rusqlite::params![execution_unit_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        );
+        let (tool_name, tool_args, tool_args_json) = match unit {
+            Ok(unit) => unit,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let args = if tool_args_json.trim().is_empty() {
+            tool_args.as_str()
+        } else {
+            tool_args_json.as_str()
+        };
+        let (cache_tool_name, args_hash) = crate::tool_cache::cache_key(&tool_name, args);
+        let dependent_files: Option<String> = conn.query_row(
+            "SELECT dependent_files FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2",
+            rusqlite::params![cache_tool_name, args_hash],
+            |row| row.get(0),
+        ).ok();
+        let Some(dependent_files) = dependent_files else {
+            return Ok(Vec::new());
+        };
+        let files: Vec<String> = serde_json::from_str(&dependent_files)?;
+        Ok(files)
     }
 
     /// Get cache entry IDs that depend on a given file path.
     pub fn get_cache_ids_for_file(&self, file_path: &str) -> anyhow::Result<Vec<i64>> {
         let conn = self.read_conn();
-        let pattern = format!("%{}%", file_path.replace('%', "%%"));
-        let mut stmt = conn.prepare(
-            "SELECT id FROM tool_cache WHERE dependent_files LIKE ?1",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![pattern], |row| row.get(0))?;
+        let mut stmt = conn.prepare("SELECT id, dependent_files FROM tool_cache")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut ids = Vec::new();
-        for row in rows { ids.push(row?); }
+        for row in rows {
+            let (id, dependent_files) = row?;
+            let files: Vec<String> = serde_json::from_str(&dependent_files).unwrap_or_default();
+            if files.iter().any(|file| file == file_path) {
+                ids.push(id);
+            }
+        }
         Ok(ids)
     }
 
@@ -2371,7 +2424,7 @@ impl Database {
 
     /// Take an append-only snapshot. Returns the snapshot id.
     /// `last_event_seq_no`, `boundary_hash`, `integrity_hash` are computed
-    /// from the snapshot data for continuity verification.
+    /// from the authoritative execution event sequence for continuity verification.
     pub fn take_snapshot(
         &self, execution_id: i64, memory_version_id: i64,
         tier: i32, data: &str, size_bytes: i64, retention_ttl: Option<i64>,
@@ -2696,6 +2749,32 @@ impl Database {
             rusqlite::params![from_id, to_id, kind],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Return the highest persisted DAG graph revision.
+    pub fn max_graph_revision(&self) -> anyhow::Result<i64> {
+        let conn = self.read_conn();
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(graph_revision), 0) FROM dag_nodes",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Allocate and persist the next DAG graph revision for one conversation.
+    pub fn bump_graph_revision(&self, conv_id: i64) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let current: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(graph_revision), 0) FROM dag_nodes",
+            [],
+            |row| row.get(0),
+        )?;
+        let next = current + 1;
+        conn.execute(
+            "UPDATE dag_nodes SET graph_revision = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![next, conv_id],
+        )?;
+        Ok(next)
     }
 
     /// Delete edges matching the given from_id, to_id, and kind.

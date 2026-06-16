@@ -17,6 +17,7 @@
 //! patch to a file buffer, and return the reconstructed file state.
 //! Distinct from `crate::replay` which reconstructs StreamEvent sequences.
 
+use anyhow::Context;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -111,10 +112,7 @@ fn hash_snippet(s: &str) -> u64 {
 /// the surrounding context (up to 20 lines above/below). We deliberately
 /// avoid full myers-diff — the goal is lightweight causal tracking, not
 /// prettified patch generation.
-pub fn compute_diff(
-    before: &str,
-    after: &str,
-) -> (u32, u32, DiffType, String, String) {
+pub fn compute_diff(before: &str, after: &str) -> (u32, u32, DiffType, String, String) {
     let before_lines: Vec<&str> = before.lines().collect();
     let after_lines: Vec<&str> = after.lines().collect();
 
@@ -159,7 +157,13 @@ pub fn compute_diff(
     let after_snippet = after_lines[ctx_start..ctx_end_after].join("\n");
     let end_line = last_before.max(1) as u32; // 1-indexed, last changed line
 
-    (start_line, end_line, change_type, before_snippet, after_snippet)
+    (
+        start_line,
+        end_line,
+        change_type,
+        before_snippet,
+        after_snippet,
+    )
 }
 
 // ── Storage ────────────────────────────────────────────────────────
@@ -215,7 +219,8 @@ pub fn generate_and_store(
     after: &str,
     timestamp: i64,
 ) -> anyhow::Result<DiffEvent> {
-    let (start_line, end_line, change_type, before_snippet, after_snippet) = compute_diff(before, after);
+    let (start_line, end_line, change_type, before_snippet, after_snippet) =
+        compute_diff(before, after);
     let before_hash = hash_snippet(&before_snippet);
     let after_hash = hash_snippet(&after_snippet);
 
@@ -284,7 +289,8 @@ pub fn query_diffs(conn: &Connection, q: &DiffQuery) -> anyhow::Result<Vec<DiffE
         sql.push_str(&format!(" LIMIT {limit}"));
     }
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = bindings.iter().map(|b| b.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        bindings.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_refs.as_slice(), |row| {
         let before_hash: i64 = row.get(7)?;
@@ -296,7 +302,8 @@ pub fn query_diffs(conn: &Connection, q: &DiffQuery) -> anyhow::Result<Vec<DiffE
             file_path: row.get(3)?,
             start_line: row.get(4)?,
             end_line: row.get(5)?,
-            change_type: DiffType::from_diff_str(&row.get::<_, String>(6)?).unwrap_or(DiffType::Replace),
+            change_type: DiffType::from_diff_str(&row.get::<_, String>(6)?)
+                .unwrap_or(DiffType::Replace),
             before_hash: before_hash as u64,
             after_hash: after_hash as u64,
             before_snippet: load_snippet_if_needed(conn, before_hash as u64),
@@ -320,7 +327,8 @@ fn load_snippet_if_needed(conn: &Connection, hash: u64) -> Option<String> {
         "SELECT snippet FROM diff_snippets WHERE hash = ?1",
         params![hash as i64],
         |row| row.get(0),
-    ).ok()
+    )
+    .ok()
 }
 
 // ── File reconstruction ────────────────────────────────────────────
@@ -349,19 +357,40 @@ pub fn reconstruct_file(
     for ev in &events {
         let before = ev.before_snippet.as_deref().unwrap_or("");
         let after = ev.after_snippet.as_deref().unwrap_or("");
-        buf = apply_patch(&buf, before, after, ev.start_line as usize);
+        buf = apply_patch(&buf, before, after, ev.start_line as usize).with_context(|| {
+            format!(
+                "failed to apply diff id={:?} tool_call_id={} file_path={}",
+                ev.id, ev.tool_call_id, ev.file_path,
+            )
+        })?;
     }
     Ok(buf)
 }
 
 /// Apply a single before→after patch to `content`. Finds the
 /// `before_snippet` in `content` and replaces it with `after_snippet`.
-fn apply_patch(content: &str, before: &str, after: &str, start_line: usize) -> String {
+fn apply_patch(
+    content: &str,
+    before: &str,
+    after: &str,
+    start_line: usize,
+) -> anyhow::Result<String> {
     if before.is_empty() && after.is_empty() {
-        return content.to_string();
+        return Ok(content.to_string());
     }
 
     let lines: Vec<&str> = content.lines().collect();
+
+    if before.is_empty() {
+        let insert_at = start_line.saturating_sub(1).min(lines.len());
+        let mut result: Vec<&str> = Vec::with_capacity(lines.len() + after.lines().count());
+        result.extend_from_slice(&lines[..insert_at]);
+        if !after.is_empty() {
+            result.extend(after.lines());
+        }
+        result.extend_from_slice(&lines[insert_at..]);
+        return Ok(result.join("\n"));
+    }
 
     // Try to find `before` anchored at `start_line` first, then anywhere.
     let pos = find_snippet(&lines, before, start_line.saturating_sub(1))
@@ -376,9 +405,9 @@ fn apply_patch(content: &str, before: &str, after: &str, start_line: usize) -> S
                 result.extend(after.lines());
             }
             result.extend_from_slice(&lines[(pos + before_len).min(lines.len())..]);
-            result.join("\n")
+            Ok(result.join("\n"))
         }
-        None => content.to_string(), // patch doesn't match — leave as-is
+        None => anyhow::bail!("diff before_snippet did not match current file content"),
     }
 }
 
@@ -402,7 +431,10 @@ fn find_snippet(lines: &[&str], snippet: &str, starting_at: usize) -> Option<usi
 
 /// Find diff events for the same file where line ranges overlap —
 /// indicative of the agent iterating on the same region.
-pub fn find_overlapping_edits(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<(DiffEvent, DiffEvent)>> {
+pub fn find_overlapping_edits(
+    conn: &Connection,
+    session_id: &str,
+) -> anyhow::Result<Vec<(DiffEvent, DiffEvent)>> {
     let sql = "SELECT a.id, a.session_id, a.tool_call_id, a.file_path, a.start_line, a.end_line,
                       a.change_type, a.before_hash, a.after_hash, a.timestamp,
                       b.id, b.session_id, b.tool_call_id, b.file_path, b.start_line, b.end_line,
@@ -419,18 +451,34 @@ pub fn find_overlapping_edits(conn: &Connection, session_id: &str) -> anyhow::Re
     let rows = stmt.query_map(params![session_id], |row| {
         Ok((
             DiffEvent {
-                id: Some(row.get(0)?), session_id: row.get(1)?, tool_call_id: row.get(2)?,
-                file_path: row.get(3)?, start_line: row.get(4)?, end_line: row.get(5)?,
-                change_type: DiffType::from_diff_str(&row.get::<_, String>(6)?).unwrap_or(DiffType::Replace),
-                before_hash: row.get::<_, i64>(7)? as u64, after_hash: row.get::<_, i64>(8)? as u64,
-                timestamp: row.get(9)?, before_snippet: None, after_snippet: None,
+                id: Some(row.get(0)?),
+                session_id: row.get(1)?,
+                tool_call_id: row.get(2)?,
+                file_path: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+                change_type: DiffType::from_diff_str(&row.get::<_, String>(6)?)
+                    .unwrap_or(DiffType::Replace),
+                before_hash: row.get::<_, i64>(7)? as u64,
+                after_hash: row.get::<_, i64>(8)? as u64,
+                timestamp: row.get(9)?,
+                before_snippet: None,
+                after_snippet: None,
             },
             DiffEvent {
-                id: Some(row.get(10)?), session_id: row.get(11)?, tool_call_id: row.get(12)?,
-                file_path: row.get(13)?, start_line: row.get(14)?, end_line: row.get(15)?,
-                change_type: DiffType::from_diff_str(&row.get::<_, String>(16)?).unwrap_or(DiffType::Replace),
-                before_hash: row.get::<_, i64>(17)? as u64, after_hash: row.get::<_, i64>(18)? as u64,
-                timestamp: row.get(19)?, before_snippet: None, after_snippet: None,
+                id: Some(row.get(10)?),
+                session_id: row.get(11)?,
+                tool_call_id: row.get(12)?,
+                file_path: row.get(13)?,
+                start_line: row.get(14)?,
+                end_line: row.get(15)?,
+                change_type: DiffType::from_diff_str(&row.get::<_, String>(16)?)
+                    .unwrap_or(DiffType::Replace),
+                before_hash: row.get::<_, i64>(17)? as u64,
+                after_hash: row.get::<_, i64>(18)? as u64,
+                timestamp: row.get(19)?,
+                before_snippet: None,
+                after_snippet: None,
             },
         ))
     })?;
@@ -475,9 +523,8 @@ pub fn extract_diffs_post_commit(
     }
 
     // Query already-processed tool_call_ids for idempotency
-    let mut seen_stmt = conn.prepare(
-        "SELECT tool_call_id FROM diff_events WHERE session_id = ?1"
-    )?;
+    let mut seen_stmt =
+        conn.prepare("SELECT tool_call_id FROM diff_events WHERE session_id = ?1")?;
     let seen: std::collections::HashSet<String> = seen_stmt
         .query_map(params![session_id], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
@@ -491,12 +538,18 @@ pub fn extract_diffs_post_commit(
     let mut count = 0;
 
     for raw in &asst_messages {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
-        let Some(tool_calls) = msg["tool_calls"].as_array() else { continue };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        let Some(tool_calls) = msg["tool_calls"].as_array() else {
+            continue;
+        };
 
         for tc in tool_calls {
             let tc_id = tc["id"].as_str().unwrap_or("");
-            if tc_id.is_empty() || seen.contains(tc_id) { continue; }
+            if tc_id.is_empty() || seen.contains(tc_id) {
+                continue;
+            }
 
             let name = tc["function"]["name"].as_str().unwrap_or("");
             let args_str = tc["function"]["arguments"].as_str().unwrap_or("");
@@ -506,7 +559,7 @@ pub fn extract_diffs_post_commit(
                 continue;
             };
 
-            let _ = generate_and_store(conn, session_id, tc_id, &file_path, &before, &after, ts);
+            generate_and_store(conn, session_id, tc_id, &file_path, &before, &after, ts)?;
             count += 1;
         }
     }
@@ -516,22 +569,30 @@ pub fn extract_diffs_post_commit(
 
 /// Extract (before, after, file_path) from a tool call's arguments.
 /// Returns None if the tool is not an edit operation.
-fn tool_extract_diff(tool_name: &str, args: &serde_json::Value) -> Option<(String, String, String)> {
+fn tool_extract_diff(
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<(String, String, String)> {
     // Common field names across agent formats
-    let path = args["file_path"].as_str()
+    let path = args["file_path"]
+        .as_str()
         .or_else(|| args["filePath"].as_str())
         .or_else(|| args["path"].as_str())
         .or_else(|| args["operation"]["path"].as_str()) // Codex apply_patch
         .unwrap_or("");
 
-    if path.is_empty() { return None; }
+    if path.is_empty() {
+        return None;
+    }
 
     match tool_name {
         "Edit" | "edit" | "edit_file" | "replace" => {
-            let old = args["old_string"].as_str()
+            let old = args["old_string"]
+                .as_str()
                 .or_else(|| args["oldString"].as_str())
                 .or_else(|| args["operation"]["oldString"].as_str());
-            let new = args["new_string"].as_str()
+            let new = args["new_string"]
+                .as_str()
                 .or_else(|| args["newString"].as_str())
                 .or_else(|| args["operation"]["newString"].as_str());
             let old = old?;
@@ -544,9 +605,11 @@ fn tool_extract_diff(tool_name: &str, args: &serde_json::Value) -> Option<(Strin
         }
         "apply_patch" => {
             let operation = &args["operation"];
-            let old = operation["oldString"].as_str()
+            let old = operation["oldString"]
+                .as_str()
                 .or_else(|| operation["old_string"].as_str());
-            let new = operation["newString"].as_str()
+            let new = operation["newString"]
+                .as_str()
                 .or_else(|| operation["new_string"].as_str());
             let old = old?;
             let new = new?;
@@ -575,8 +638,9 @@ mod tests {
                 content         TEXT NOT NULL,
                 token_count     INTEGER,
                 stored_at       TEXT NOT NULL DEFAULT (datetime('now'))
-            );"
-        ).expect("create messages");
+            );",
+        )
+        .expect("create messages");
         conn
     }
 
@@ -586,11 +650,19 @@ mod tests {
     fn tables_exist_after_create() {
         let conn = temp_conn();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='diff_events'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='diff_events'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='diff_snippets'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='diff_snippets'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
     }
@@ -600,12 +672,15 @@ mod tests {
     #[test]
     fn compute_diff_replace_middle() {
         let before = "line1\nline2\nline3\nline4\n";
-        let after  = "line1\nline2_CHANGED\nline3\nline4\n";
+        let after = "line1\nline2_CHANGED\nline3\nline4\n";
         let (start, end, change_type, before_snip, after_snip) = compute_diff(before, after);
         assert_eq!(start, 2);
         assert_eq!(end, 2);
         assert_eq!(change_type, DiffType::Replace);
-        assert!(before_snip.contains("line1"), "context should include line before change");
+        assert!(
+            before_snip.contains("line1"),
+            "context should include line before change"
+        );
         assert!(after_snip.contains("line2_CHANGED"));
     }
 
@@ -643,17 +718,27 @@ mod tests {
     #[test]
     fn insert_then_query() {
         let conn = temp_conn();
-        let event = generate_and_store(&conn, "s1", "tc1", "src/a.rs",
+        let event = generate_and_store(
+            &conn,
+            "s1",
+            "tc1",
+            "src/a.rs",
             "fn foo() {\n  return 1;\n}\n",
             "fn foo() {\n  return 2;\n}\n",
-            1000).unwrap();
+            1000,
+        )
+        .unwrap();
 
         assert!(event.id.is_some());
 
-        let diffs = query_diffs(&conn, &DiffQuery {
-            session_id: Some("s1".into()),
-            ..Default::default()
-        }).unwrap();
+        let diffs = query_diffs(
+            &conn,
+            &DiffQuery {
+                session_id: Some("s1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].file_path, "src/a.rs");
         assert_eq!(diffs[0].change_type, DiffType::Replace);
@@ -666,11 +751,19 @@ mod tests {
         generate_and_store(&conn, "s1", "t2", "src/b.rs", "x", "y", 2000).unwrap();
         generate_and_store(&conn, "s2", "t3", "src/a.rs", "x", "y", 3000).unwrap();
 
-        let diffs = query_diffs(&conn, &DiffQuery {
-            file_path: Some("src/a.rs".into()),
-            ..Default::default()
-        }).unwrap();
-        assert_eq!(diffs.len(), 2, "should find 2 diffs for src/a.rs across sessions");
+        let diffs = query_diffs(
+            &conn,
+            &DiffQuery {
+                file_path: Some("src/a.rs".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            diffs.len(),
+            2,
+            "should find 2 diffs for src/a.rs across sessions"
+        );
     }
 
     #[test]
@@ -685,12 +778,19 @@ mod tests {
         let e2 = generate_and_store(&conn, "s1", "t2", "f.rs", before, after2, 2).unwrap();
 
         // Both should reference the same before_hash since snippets are identical
-        assert_eq!(e1.before_hash, e2.before_hash, "identical snippets share hash");
-        assert_ne!(e1.after_hash, e2.after_hash, "different after snippets differ");
+        assert_eq!(
+            e1.before_hash, e2.before_hash,
+            "identical snippets share hash"
+        );
+        assert_ne!(
+            e1.after_hash, e2.after_hash,
+            "different after snippets differ"
+        );
 
         // Check only one snippet row for the deduped before
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM diff_snippets", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM diff_snippets", [], |r| r.get(0))
+            .unwrap();
         // 1 deduped before + 2 unique afters = 3 snippets
         assert_eq!(count, 3, "3 unique snippets (1 before, 2 after)");
     }
@@ -703,10 +803,16 @@ mod tests {
         let initial = "line1\nline2\nline3\nline4\nline5\n";
 
         // Edit 1: change line2
-        let _e1 = generate_and_store(&conn, "s1", "t1", "f.rs",
+        let _e1 = generate_and_store(
+            &conn,
+            "s1",
+            "t1",
+            "f.rs",
             initial,
             "line1\nline2_CHANGED\nline3\nline4\nline5\n",
-            1000).unwrap();
+            1000,
+        )
+        .unwrap();
 
         // Edit 2: change line4 (on top of edit 1 result)
         // Reconstruct file state after edit 1 — verify edit 1 was applied
@@ -715,10 +821,16 @@ mod tests {
         assert!(!after1_full.contains("line2\nline3")); // old line2 is gone
 
         // Apply edit 2
-        generate_and_store(&conn, "s1", "t2", "f.rs",
+        generate_and_store(
+            &conn,
+            "s1",
+            "t2",
+            "f.rs",
             &after1_full,
             &after1_full.replace("line4", "line4_EDITED"),
-            2000).unwrap();
+            2000,
+        )
+        .unwrap();
 
         // Full reconstruction
         let final_content = reconstruct_file(&conn, "s1", "f.rs", initial).unwrap();
@@ -737,7 +849,8 @@ mod tests {
     #[test]
     fn reconstruct_file_multiline_edit() {
         let conn = temp_conn();
-        let initial = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{x} {y}\");\n}\n";
+        let initial =
+            "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{x} {y}\");\n}\n";
 
         // Replace two lines
         let after = "fn main() {\n    let x = 10;\n    let y = 20;\n    let z = 30;\n    println!(\"{x} {y} {z}\");\n}\n";
@@ -746,6 +859,27 @@ mod tests {
         let result = reconstruct_file(&conn, "s1", "main.rs", initial).unwrap();
         assert!(result.contains("let z = 30"));
         assert!(!result.contains("let y = 2;"));
+    }
+
+    #[test]
+    fn reconstruct_file_errors_when_patch_does_not_match() {
+        let conn = temp_conn();
+        generate_and_store(&conn, "s1", "t1", "f.rs", "alpha\n", "beta\n", 1000).unwrap();
+
+        let err = reconstruct_file(&conn, "s1", "f.rs", "gamma\n").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to apply diff"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_file_insert_into_empty_file() {
+        let conn = temp_conn();
+        generate_and_store(&conn, "s1", "t1", "new.rs", "", "fn main() {}\n", 1000).unwrap();
+
+        let result = reconstruct_file(&conn, "s1", "new.rs", "").unwrap();
+        assert!(result.contains("fn main() {}"));
     }
 
     // ── Overlap detection ──────────────────────────────────────
@@ -763,7 +897,11 @@ mod tests {
         generate_and_store(&conn, "s1", "t3", "other.rs", "a", "b", 3000).unwrap();
 
         let overlaps = find_overlapping_edits(&conn, "s1").unwrap();
-        assert_eq!(overlaps.len(), 1, "only the two edits on f.rs line 2 should overlap");
+        assert_eq!(
+            overlaps.len(),
+            1,
+            "only the two edits on f.rs line 2 should overlap"
+        );
         assert_eq!(overlaps[0].0.tool_call_id, "t1");
         assert_eq!(overlaps[0].1.tool_call_id, "t2");
     }
@@ -784,10 +922,14 @@ mod tests {
         let count = extract_diffs_post_commit(&conn, "s_hook", conv_id).unwrap();
         assert_eq!(count, 1, "should extract 1 diff from Edit tool call");
 
-        let diffs = query_diffs(&conn, &DiffQuery {
-            session_id: Some("s_hook".into()),
-            ..Default::default()
-        }).unwrap();
+        let diffs = query_diffs(
+            &conn,
+            &DiffQuery {
+                session_id: Some("s_hook".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].file_path, "src/a.rs");
         assert_eq!(diffs[0].tool_call_id, "tc1");
@@ -818,7 +960,27 @@ mod tests {
         let c1 = extract_diffs_post_commit(&conn, "s3", conv_id).unwrap();
         assert_eq!(c1, 1);
         let c2 = extract_diffs_post_commit(&conn, "s3", conv_id).unwrap();
-        assert_eq!(c2, 0, "second call should skip already-processed tool_call_id");
+        assert_eq!(
+            c2, 0,
+            "second call should skip already-processed tool_call_id"
+        );
+    }
+
+    #[test]
+    fn post_commit_returns_error_when_diff_store_fails() {
+        let conn = temp_conn();
+        let conv_id = 1i64;
+        conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, stored_at) VALUES (?1, 'assistant', ?2, datetime('now'))",
+            params![conv_id, r#"{"role":"assistant","content":null,"tool_calls":[{"id":"tc1","function":{"name":"Edit","arguments":"{\"file_path\":\"f.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}"}}]}"#],
+        ).unwrap();
+        conn.execute("DROP TABLE diff_snippets", []).unwrap();
+
+        let err = extract_diffs_post_commit(&conn, "s_fail", conv_id).unwrap_err();
+        assert!(
+            err.to_string().contains("diff_snippets"),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ── Smoke: roundtrip via Database ──────────────────────────
@@ -832,20 +994,27 @@ mod tests {
             .await
             .expect("open db");
 
-        db.record_diff("ses_smoke", "tc1", "src/lib.rs",
+        db.record_diff(
+            "ses_smoke",
+            "tc1",
+            "src/lib.rs",
             "fn foo() -> i32 { 1 }\n",
             "fn foo() -> i32 { 2 }\n",
-        ).expect("record diff");
+        )
+        .expect("record diff");
 
-        let diffs = db.query_diffs(&DiffQuery {
-            session_id: Some("ses_smoke".into()),
-            ..Default::default()
-        }).expect("query diffs");
+        let diffs = db
+            .query_diffs(&DiffQuery {
+                session_id: Some("ses_smoke".into()),
+                ..Default::default()
+            })
+            .expect("query diffs");
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].tool_call_id, "tc1");
 
-        let reconstructed = db.reconstruct_file("ses_smoke", "src/lib.rs",
-            "fn foo() -> i32 { 1 }\n").expect("reconstruct");
+        let reconstructed = db
+            .reconstruct_file("ses_smoke", "src/lib.rs", "fn foo() -> i32 { 1 }\n")
+            .expect("reconstruct");
         assert!(reconstructed.contains("-> i32 { 2 }"));
     }
 }

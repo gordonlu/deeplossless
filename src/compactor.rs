@@ -357,10 +357,11 @@ impl Compactor {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(target: "deeplossless::compactor", "summarizer build failed: {e}");
-                // Build a fallback summarizer with partial config so compaction
-                // can still run (Level 3 deterministic fallback works without API key).
+                // Explicit offline fallback: compaction can still run using
+                // deterministic Level 3 without attempting upstream calls.
                 Summarizer::builder()
-                    .api_key("unset")
+                    .offline_fallback_only()
+                    .fallback_max_tokens(config.summarizer.fallback_max_tokens)
                     .build()
                     .expect("fallback summarizer build failed")
             }

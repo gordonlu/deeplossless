@@ -388,7 +388,7 @@ impl ForkJoinTracker {
     }
 }
 
-/// A HappensBefore edge between two execution nodes.
+/// A HappensBefore edge from an execution branch to its join node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HappensBeforeEdge {
     pub from_id: i64,

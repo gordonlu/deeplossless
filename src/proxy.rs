@@ -10,23 +10,27 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use futures::StreamExt;
 use futures::FutureExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::metrics;
 use crate::protocol::canonical::StreamEvent;
 use crate::AppState;
 
+const STREAM_CHANNEL_CAPACITY: usize = 32;
+const REASONING_CACHE_CAPACITY: usize = 1024;
+type SseChunk = Result<axum::body::Bytes, std::convert::Infallible>;
+
 /// Drop guard that ensures `data: [DONE]\n\n` is sent if the spawned task
 /// exits without sending it (e.g., panic, early return).  Uses a cloned tx
 /// so it's independent of the original sender's lifetime.
 struct DoneGuard {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>>,
+    tx: Option<tokio::sync::mpsc::Sender<SseChunk>>,
     armed: bool,
 }
 
 impl DoneGuard {
-    fn new(tx: tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>) -> Self {
+    fn new(tx: tokio::sync::mpsc::Sender<SseChunk>) -> Self {
         Self { tx: Some(tx), armed: true }
     }
     fn disarm(&mut self) { self.armed = false; }
@@ -36,7 +40,7 @@ impl Drop for DoneGuard {
     fn drop(&mut self) {
         if self.armed {
             if let Some(tx) = self.tx.take() {
-                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                let _ = tx.try_send(Ok::<_, std::convert::Infallible>(
                     axum::body::Bytes::from("data: [DONE]\n\n"),
                 ));
             }
@@ -159,76 +163,85 @@ fn process_events(
     events: Vec<StreamEvent>,
     db: std::sync::Arc<crate::db::Database>,
     cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<axum::body::Bytes, std::convert::Infallible>>,
+    tx: &tokio::sync::mpsc::Sender<SseChunk>,
     mut assembler: Option<&mut crate::protocol::streaming::StreamAssembler>,
     use_responses_format: bool,
-) -> bool {
-    let mut seq: i64 = 0;
+    execution_id: i64,
+    conv_id: i64,
+    replay_session_id: &str,
+    next_seq_no: &mut i64,
+) -> anyhow::Result<bool> {
     let mut i = 0;
     while i < events.len() {
         let (cached, consumed) = check_tool_cache(&events, i, &db, cycle);
         if let Some(text) = cached {
             let text_ev = StreamEvent::TextDelta { text };
-            // Fire-and-forget event store (best-effort, never blocks the stream)
-            let db2 = db.clone();
             let kind = "TextDelta";
             let payload = event_to_payload(&text_ev);
-            let sn = seq;
+            let sn = *next_seq_no;
             let epoch_ms = crate::execution::next_logical_seq();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = db2.store_execution_event(None, kind, &payload, sn, Some(0), epoch_ms) {
-                    tracing::debug!(target: "deeplossless", "execution event store failed: {e}");
-                }
-            });
-            seq += 1;
+            db.store_execution_event_with_replay(
+                Some(execution_id),
+                kind,
+                &payload,
+                sn,
+                Some(conv_id),
+                epoch_ms,
+                replay_session_id,
+            )?;
+            *next_seq_no += 1;
             if use_responses_format {
                 if let Some(asm) = assembler.as_mut() {
                     for ev in asm.feed(text_ev) {
                         let sse_line = crate::protocol::streaming::to_responses_sse(&ev);
-                        if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
-                            return false;
+                        if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+                            return Ok(false);
                         }
                     }
                 } else {
                     let sse_line = crate::protocol::streaming::to_responses_sse(&text_ev);
-                    if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
-                        return false;
+                    if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+                        return Ok(false);
                     }
                 }
             } else {
                 let sse_line = crate::protocol::streaming::to_chat_completions_sse(&text_ev);
-                if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
-                    return false;
+                if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+                    return Ok(false);
                 }
             }
             i += consumed;
             continue;
         }
-        // Store event before emission (best-effort, non-blocking)
+        // Store event before emission. Replay state must not silently diverge
+        // from bytes sent downstream.
         let ev = &events[i];
-        let db2 = db.clone();
         let kind = event_kind_name(ev);
         let payload = event_to_payload(ev);
-        let sn = seq;
+        let sn = *next_seq_no;
         let epoch_ms = crate::execution::next_logical_seq();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = db2.store_execution_event(None, &kind, &payload, sn, Some(0), epoch_ms) {
-                tracing::debug!(target: "deeplossless", "execution event store failed: {e}");
-            }
-        });
-        seq += 1;
+        db.store_execution_event_with_replay(
+            Some(execution_id),
+            &kind,
+            &payload,
+            sn,
+            Some(conv_id),
+            epoch_ms,
+            replay_session_id,
+        )?;
+        *next_seq_no += 1;
         // Normal emission
         let sse_line = if use_responses_format {
             crate::protocol::streaming::to_responses_sse(ev)
         } else {
             crate::protocol::streaming::to_chat_completions_sse(ev)
         };
-        if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
-            return false;
+        if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
+            return Ok(false);
         }
         i += 1;
     }
-    true
+    Ok(true)
 }
 
 fn event_kind_name(ev: &StreamEvent) -> String {
@@ -513,15 +526,15 @@ async fn responses(
     let mut chat_body_val: serde_json::Value = chat_body.clone();
     // Embed prompt_cache_key for pipeline reasoning injection (stable session key)
     chat_body_val["prompt_cache_key"] = serde_json::json!(prompt_cache_key);
-    let injected = if state.no_pipeline {
-        chat_body_val
+    let (injected, stream_conv_id) = if state.no_pipeline {
+        (chat_body_val, 0)
     } else {
         let pipeline = crate::pipeline::ChatPipeline::new(&state);
         match pipeline.process(&canonical.model, &chat_body_val).await {
-            Ok(out) => out.injected_body,
+            Ok(out) => (out.injected_body, out.conv_id),
             Err(e) => {
                 warn!("pipeline error: {e}, falling back to passthrough");
-                chat_body_val
+                (chat_body_val, 0)
             }
         }
     };
@@ -544,14 +557,14 @@ async fn responses(
             "dry-run: saved to ~/.deeplossless/");
 
         // Return mock streaming response
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let _ = tx.send(Ok::<_, std::convert::Infallible>(
             axum::body::Bytes::from("data: {\"type\":\"response.output_text.delta\",\"delta\":\"[dry-run] request saved to ~/.deeplossless/translated.json\"}\n\n")
-        ));
+        )).await;
         let _ = tx.send(Ok::<_, std::convert::Infallible>(
             axum::body::Bytes::from("data: [DONE]\n\n")
-        ));
-        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+        )).await;
+        let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
         *response.status_mut() = StatusCode::OK;
         response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
         response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header"));
@@ -662,8 +675,8 @@ async fn responses(
 
     // 6. Handle streaming vs non-streaming
     if streaming {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        let stream = ReceiverStream::new(rx);
         let response_store = state.storage.response_store.clone();
         let session_store = state.storage.session_store.clone();
         let db = state.storage.db.clone();
@@ -689,8 +702,12 @@ async fn responses(
         if let Some(ref d) = record_dir {
             tracing::info!(target: "deeplossless::record", dir=%d, "response recording enabled");
         }
+        let stream_execution_id = crate::execution::next_logical_seq();
+        let replay_session_id = format!("rs_{stream_execution_id}");
+        let response_replay_session_id = replay_session_id.clone();
         tokio::spawn(async move {
             let req_start = std::time::Instant::now();
+            let mut replay_seq_no: i64 = 0;
             let mut _guard = DoneGuard::new(tx.clone());
             if shutdown.notified().now_or_never().is_some() {
                 _guard.disarm();
@@ -725,20 +742,20 @@ async fn responses(
             let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
                 "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{{}}}}}\n\n",
                 response_envelope("in_progress")
-            ))));
+            )))).await;
             // response.in_progress (same full envelope)
             let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
                 "event: response.in_progress\ndata: {{\"type\":\"response.in_progress\",\"response\":{{{}}}}}\n\n",
                 response_envelope("in_progress")
-            ))));
+            )))).await;
             // output_item.added (status=in_progress)
             let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
                 "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"{msg_id}\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}}}\n\n"
-            ))));
+            )))).await;
             // content_part.added (with item_id + annotations)
             let _ = tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
                 "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"item_id\":\"{msg_id}\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}}}\n\n"
-            ))));
+            )))).await;
             tracing::debug!(target: "deeplossless::stream", resp_id, msg_id, "sent stream preamble");
 
             let mut byte_stream = resp.bytes_stream();
@@ -796,11 +813,47 @@ async fn responses(
                                                 flushed_tool_calls.push((call_id.clone(), name.clone(), arguments.clone()));
                                             }
                                         }
-                                        if !process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true) { break; }
+                                        match process_events(
+                                            events,
+                                            db.clone(),
+                                            &cycle,
+                                            &tx,
+                                            Some(&mut assembler),
+                                            true,
+                                            stream_execution_id,
+                                            stream_conv_id,
+                                            &replay_session_id,
+                                            &mut replay_seq_no,
+                                        ) {
+                                            Ok(true) => {}
+                                            Ok(false) => break,
+                                            Err(e) => {
+                                                warn!("execution event store failed: {e}");
+                                                break;
+                                            }
+                                        }
                                         continue;
                                     }
                                     let events = assembler.feed(event);
-                                    if !process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true) { break; }
+                                    match process_events(
+                                        events,
+                                        db.clone(),
+                                        &cycle,
+                                        &tx,
+                                        Some(&mut assembler),
+                                        true,
+                                        stream_execution_id,
+                                        stream_conv_id,
+                                        &replay_session_id,
+                                        &mut replay_seq_no,
+                                    ) {
+                                        Ok(true) => {}
+                                        Ok(false) => break,
+                                        Err(e) => {
+                                            warn!("execution event store failed: {e}");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -822,7 +875,20 @@ async fn responses(
                 for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                     if !matches!(event, StreamEvent::Done { .. }) {
                         let events = assembler.feed(event);
-                        process_events(events, db.clone(), &cycle, &tx, Some(&mut assembler), true);
+                        if let Err(e) = process_events(
+                            events,
+                            db.clone(),
+                            &cycle,
+                            &tx,
+                            Some(&mut assembler),
+                            true,
+                            stream_execution_id,
+                            stream_conv_id,
+                            &replay_session_id,
+                            &mut replay_seq_no,
+                        ) {
+                            warn!("execution event store failed: {e}");
+                        }
                     }
                 }
             }
@@ -846,7 +912,20 @@ async fn responses(
                         tc_idx += 1;
                     }
                 }
-                process_events(final_events, db.clone(), &cycle, &tx, Some(&mut assembler), true);
+                if let Err(e) = process_events(
+                    final_events,
+                    db.clone(),
+                    &cycle,
+                    &tx,
+                    Some(&mut assembler),
+                    true,
+                    stream_execution_id,
+                    stream_conv_id,
+                    &replay_session_id,
+                    &mut replay_seq_no,
+                ) {
+                    warn!("execution event store failed: {e}");
+                }
             }
             let input_tokens = usage_buf.as_ref()
                 .and_then(|v| v["usage"]["prompt_tokens"].as_u64())
@@ -972,16 +1051,16 @@ async fn responses(
             });
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from(format!("event: response.output_text.done\ndata: {output_text_done}\n\n"))
-            ));
+            )).await;
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from(format!("event: response.content_part.done\ndata: {content_part_done}\n\n"))
-            ));
+            )).await;
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from(format!("event: response.output_item.done\ndata: {output_item_done}\n\n"))
-            ));
+            )).await;
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from(format!("event: response.completed\ndata: {completed}\n\n"))
-            ));
+            )).await;
             // Persist the response so GET /v1/responses/{id} returns real data,
             // and Codex's previous_response_id continuity can work incrementally.
             // Reasoning is stored by the reasoning_key block above.
@@ -1025,7 +1104,7 @@ async fn responses(
             _guard.disarm();
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("data: [DONE]\n\n")
-            ));
+            )).await;
             let _ = db.insert_event_simple(
                 crate::event_store::EventType::RequestEnd,
                 &session_key,
@@ -1039,6 +1118,14 @@ async fn responses(
         response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
         response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header"));
         response.headers_mut().insert("connection", "close".parse().expect("static header"));
+        response.headers_mut().insert(
+            "x-deeplossless-execution-id",
+            stream_execution_id.to_string().parse().expect("numeric header"),
+        );
+        response.headers_mut().insert(
+            "x-deeplossless-replay-session-id",
+            response_replay_session_id.parse().expect("ascii header"),
+        );
         response
     } else {
         // Non-streaming: translate Chat Completions response → Responses format
@@ -1093,7 +1180,11 @@ async fn responses_retrieve(
     }
     tracing::warn!(target: "deeplossless",
         %response_id, "response retrieve miss");
-    json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("response '{response_id}' not found"))
+    json_error(
+        StatusCode::NOT_FOUND,
+        "NOT_FOUND",
+        format!("response '{response_id}' not found; response continuity is ephemeral and may be lost after restart or FIFO eviction"),
+    )
 }
 
 /// OpenAI-compatible model list. OpenCode and other clients query this to
@@ -1185,16 +1276,16 @@ async fn chat_completions(
                 let status = r.status();
                 let headers = r.headers().clone();
                 let byte_stream = r.bytes_stream();
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
                 tokio::spawn(async move {
                     let mut stream = byte_stream;
                     while let Some(chunk) = stream.next().await {
                         if let Ok(c) = chunk {
-                            if tx.send(Ok::<_, std::convert::Infallible>(c)).is_err() { break; }
+                            if tx.send(Ok::<_, std::convert::Infallible>(c)).await.is_err() { break; }
                         }
                     }
                 });
-                let stream = UnboundedReceiverStream::new(rx);
+                let stream = ReceiverStream::new(rx);
                 let mut response = Response::new(Body::from_stream(stream));
                 *response.status_mut() = status;
                 for (k, v) in headers.iter() {
@@ -1335,8 +1426,8 @@ async fn chat_completions(
         .unwrap_or_else(|| "application/json".parse().expect("static header parse"));
 
     if streaming {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        let stream = ReceiverStream::new(rx);
         // Protocol recorder — raw bytes, no parsing. Compare with direct DeepSeek.
         let record_dir = state.record.clone();
         let record_body = if record_dir.is_some() { Some(req_body.clone()) } else { None };
@@ -1375,7 +1466,7 @@ async fn chat_completions(
                 match chunk {
                     Ok(c) => {
                         all_bytes.extend_from_slice(&c);
-                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).is_err() {
+                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).await.is_err() {
                             break;
                         }
                         let s = String::from_utf8_lossy(&c);
@@ -1592,8 +1683,8 @@ async fn lcm_chat_completions(
     }
 
     if streaming {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        let stream = ReceiverStream::new(rx);
         let reasoning_db = state.storage.db.clone();
         let session_fp = crate::session::fingerprint(&msgs, 3);
         let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
@@ -1608,7 +1699,7 @@ async fn lcm_chat_completions(
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
-                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).is_err() { break; }
+                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).await.is_err() { break; }
                         let s = String::from_utf8_lossy(&c);
                         for line in s.lines() {
                             if let Some(data) = line.strip_prefix("data: ") {
@@ -2002,8 +2093,8 @@ async fn anthropic_messages(
     }
 
     if streaming {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        let stream = ReceiverStream::new(rx);
         let reasoning_fp = fp.clone();
         let reasoning_cache = state.reasoning_cache.clone();
         let reasoning_db = state.storage.db.clone();
@@ -2015,7 +2106,7 @@ async fn anthropic_messages(
             // Send message_start event
             let _ = tx.send(Ok::<_, std::convert::Infallible>(
                 axum::body::Bytes::from("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-v4-pro\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n")
-            ));
+            )).await;
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
@@ -2027,7 +2118,7 @@ async fn anthropic_messages(
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" { continue; }
                                 for event in sse_state.convert(data) {
-                                    if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event))).is_err() {
+                                    if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event))).await.is_err() {
                                         return;
                                     }
                                 }
@@ -2042,19 +2133,26 @@ async fn anthropic_messages(
                 for idx in sse_state.started_block_indices() {
                     let _ = tx.send(Ok::<_, std::convert::Infallible>(
                         axum::body::Bytes::from(format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"))
-                    ));
+                    )).await;
                 }
                 let _ = tx.send(Ok::<_, std::convert::Infallible>(
                     axum::body::Bytes::from("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n")
-                ));
+                )).await;
                 let _ = tx.send(Ok::<_, std::convert::Infallible>(
                     axum::body::Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-                ));
+                )).await;
             }
             // Cache reasoning_content for the next turn
             if !sse_state.reasoning_content.is_empty() {
                 let rc_len = sse_state.reasoning_content.len();
                 let mut cache = reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if !cache.contains_key(&reasoning_fp)
+                    && cache.len() >= REASONING_CACHE_CAPACITY
+                    && let Some(evicted) = cache.keys().next().cloned()
+                {
+                    cache.remove(&evicted);
+                    tracing::debug!(target: "deeplossless", key=%evicted, "reasoning cache capacity reached, evicted one entry");
+                }
                 cache.insert(reasoning_fp.clone(), sse_state.reasoning_content.clone());
                 let _ = reasoning_db.insert_event_simple(
                     crate::event_store::EventType::Reasoning,
@@ -2096,6 +2194,13 @@ async fn anthropic_messages(
                 if !rc.is_empty() {
                     let rc_len = rc.len();
                     let mut cache = state.reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if !cache.contains_key(&fp)
+                        && cache.len() >= REASONING_CACHE_CAPACITY
+                        && let Some(evicted) = cache.keys().next().cloned()
+                    {
+                        cache.remove(&evicted);
+                        tracing::debug!(target: "deeplossless::anthropic", key=%evicted, "reasoning cache capacity reached, evicted one entry");
+                    }
                     cache.insert(fp.clone(), rc);
                     tracing::debug!(target: "deeplossless::anthropic",
                         fp = %fp, rc_len,
@@ -2439,7 +2544,7 @@ async fn lcm_stream_context(
 
     let dag = state.storage.dag.clone();
     let shutdown = state.runtime.shutdown_notify.clone();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
         if shutdown.notified().now_or_never().is_some() { return; }
@@ -2458,7 +2563,7 @@ async fn lcm_stream_context(
                 "reasoning": if node.reasoning.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(node.reasoning.clone()) },
             });
             let payload = format!("data: {}\n\n", serde_json::to_string(&data).unwrap_or_default());
-            if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(payload))).is_err() {
+            if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(payload))).await.is_err() {
                 break;
             }
             // Small yield to let the client process incrementally
@@ -2467,10 +2572,10 @@ async fn lcm_stream_context(
 
         let _ = tx.send(Ok::<_, std::convert::Infallible>(
             axum::body::Bytes::from("data: [DONE]\n\n")
-        ));
+        )).await;
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    let stream = ReceiverStream::new(rx);
     match axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -3102,8 +3207,6 @@ async fn lcm_snapshot_take(
     let execution_id = body.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let memory_version_id = body.get("memory_version_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let tier_raw = body.get("tier").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let data = body.get("data").and_then(|v| v.as_str()).unwrap_or("{}");
-    let size_bytes = data.len() as i64;
     let ttl = body.get("retention_ttl").and_then(|v| v.as_i64());
 
     if execution_id <= 0 {
@@ -3111,20 +3214,94 @@ async fn lcm_snapshot_take(
     }
 
     // Validate tier — fail fast on invalid values
-    if let Err(e) = crate::snapshot::SnapshotTier::from_i32(tier_raw) {
-        return json_error(StatusCode::BAD_REQUEST, "INVALID_TIER", format!("{e}"));
-    }
+    let tier = match crate::snapshot::SnapshotTier::from_i32(tier_raw) {
+        Ok(tier) => tier,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "INVALID_TIER", format!("{e}")),
+    };
 
-    // Compute continuity metadata from the provided data
-    let last_event_seq_no = body.get("last_event_seq_no").and_then(|v| v.as_i64()).unwrap_or(0);
+    let rows = match state.storage.db.get_execution_events(execution_id) {
+        Ok(rows) => rows,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
+    };
+    let last_event_seq_no = rows
+        .iter()
+        .map(|(_id, _kind, _payload, seq_no, _ts)| *seq_no)
+        .max()
+        .unwrap_or(0);
+    let payload = match tier {
+        crate::snapshot::SnapshotTier::Ephemeral => crate::snapshot::SnapshotPayload::Ephemeral {
+            last_seq_no: last_event_seq_no,
+            event_count: rows.len() as u32,
+        },
+        crate::snapshot::SnapshotTier::Structural
+        | crate::snapshot::SnapshotTier::Full
+        | crate::snapshot::SnapshotTier::Frozen => {
+            let mut events = Vec::with_capacity(rows.len());
+            for (_id, _kind, payload, seq_no, _ts) in &rows {
+                let value = match serde_json::from_str::<serde_json::Value>(payload) {
+                    Ok(value) => value,
+                    Err(e) => return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "SNAPSHOT_ERROR",
+                        format!("execution event payload is not valid JSON at seq_no {seq_no}: {e}"),
+                    ),
+                };
+                events.push((*seq_no, value));
+            }
+            match tier {
+                crate::snapshot::SnapshotTier::Structural => {
+                    crate::snapshot::SnapshotPayload::Structural { events }
+                }
+                crate::snapshot::SnapshotTier::Full => crate::snapshot::SnapshotPayload::Full { events },
+                crate::snapshot::SnapshotTier::Frozen => {
+                    crate::snapshot::SnapshotPayload::Frozen { events }
+                }
+                crate::snapshot::SnapshotTier::Ephemeral => unreachable!(),
+            }
+        }
+    };
+    let snapshot_event_payloads: Vec<(i64, String)> = match &payload {
+        crate::snapshot::SnapshotPayload::Ephemeral { .. } => rows
+            .iter()
+            .map(|(_id, _kind, payload, seq_no, _ts)| (*seq_no, payload.clone()))
+            .collect(),
+        crate::snapshot::SnapshotPayload::Structural { events }
+        | crate::snapshot::SnapshotPayload::Full { events }
+        | crate::snapshot::SnapshotPayload::Frozen { events } => {
+            let mut serialized = Vec::with_capacity(events.len());
+            for (seq_no, value) in events {
+                let payload = match serde_json::to_string(value) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "SNAPSHOT_ERROR",
+                            format!("snapshot event serialize failed at seq_no {seq_no}: {e}"),
+                        );
+                    }
+                };
+                serialized.push((*seq_no, payload));
+            }
+            serialized
+        }
+    };
+    let event_refs: Vec<(i64, &str)> = snapshot_event_payloads
+        .iter()
+        .map(|(seq_no, payload)| (*seq_no, payload.as_str()))
+        .collect();
+    let data = match serde_json::to_string(&payload) {
+        Ok(data) => data,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
+    };
+    let size_bytes = data.len() as i64;
     let boundary_hash = crate::snapshot::compute_boundary_hash(
-        &[(0_i64, data)],
-        1,
+        &event_refs,
+        crate::snapshot::BOUNDARY_EVENT_COUNT,
     );
-    let integrity_hash = crate::snapshot::compute_chain_hash(&[(0_i64, data)]);
+    let integrity_hash = crate::snapshot::compute_chain_hash(&event_refs);
 
     match state.storage.db.take_snapshot(
-        execution_id, memory_version_id, tier_raw, data, size_bytes, ttl,
+        execution_id, memory_version_id, tier_raw, &data, size_bytes, ttl,
         last_event_seq_no, &boundary_hash, &integrity_hash,
     ) {
         Ok(id) => {
