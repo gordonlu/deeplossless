@@ -452,6 +452,16 @@ impl ChatPipeline {
         // Codex does not handle this automatically via the Responses API.
         self.inject_reasoning_content(&mut injected);
 
+        // DS4-14: ContextPack importance ordering (default-off, Preserve = no-op)
+        if false {
+            use crate::context_pack::{ContextPack, ImportanceOrdering};
+            if let Some(msgs) = injected["messages"].as_array_mut() {
+                let mut pack = ContextPack::new(msgs);
+                pack.reorder(ImportanceOrdering::Preserve);
+                *msgs = pack.into_messages();
+            }
+        }
+
         let invalid = crate::assistant_validation::validate_request_messages(&injected);
         if invalid > 0 {
             tracing::warn!(target: "deeplossless::pipeline", invalid, "assistant messages missing critical fields");
