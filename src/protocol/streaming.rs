@@ -168,6 +168,152 @@ pub fn to_chat_completions_sse(event: &StreamEvent) -> String {
 
 use std::collections::HashMap;
 
+use crate::think_tag::ThinkTagParser;
+
+/// Combined normalizer for DeepSeek-native features.
+/// Wraps ThinkTagParser and StreamingDsmlParser.
+/// Runs before StreamAssembler — no existing code is refactored.
+pub struct DeepSeekNormalizer {
+    think_tag: ThinkTagParser,
+    dsml_parser: crate::protocol::dsml::StreamingDsmlParser,
+    tool_index: usize,
+}
+
+impl DeepSeekNormalizer {
+    pub fn new() -> Self {
+        Self {
+            think_tag: ThinkTagParser::new(),
+            dsml_parser: crate::protocol::dsml::StreamingDsmlParser::new(),
+            tool_index: 0,
+        }
+    }
+
+    /// Feed text content through think-tag and DSML parsers.
+    /// Returns enriched events (TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgsDelta, ToolCallEnd).
+    pub fn feed_text(&mut self, text: &str) -> Result<Vec<StreamEvent>, crate::model_error::ModelError> {
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 1. Extract reasoning from think tags
+        let events = self.think_tag.feed_text(text);
+
+        // 2. Extract DSML tool calls from text deltas
+        let mut enriched = Vec::new();
+        for event in events {
+            match event {
+                StreamEvent::TextDelta { ref text } if !text.is_empty() => {
+                    match self.dsml_parser.feed(text) {
+                        Ok(invocations) => {
+                            for inv in invocations {
+                                enriched.push(StreamEvent::ToolCallStart {
+                                    index: self.tool_index,
+                                    id: inv.id.clone(),
+                                    name: inv.name.clone(),
+                                });
+                                let args_str = serde_json::to_string(&inv.arguments).unwrap_or_default();
+                                enriched.push(StreamEvent::ToolCallArgsDelta {
+                                    index: self.tool_index,
+                                    arguments_delta: args_str,
+                                    call_id: inv.id.clone(),
+                                });
+                                enriched.push(StreamEvent::ToolCallEnd {
+                                    index: self.tool_index,
+                                });
+                                self.tool_index += 1;
+                            }
+                        }
+                        Err(e) => {
+                            return Err(crate::model_error::ModelError::Protocol(
+                                crate::model_error::ProtocolError::InvalidContent {
+                                    detail: format!("DSML parse error: {e}"),
+                                },
+                            ));
+                        }
+                    }
+                    let clean = strip_dsml(text);
+                    if !clean.is_empty() {
+                        enriched.push(StreamEvent::TextDelta { text: clean });
+                    }
+                }
+                other => enriched.push(other),
+            }
+        }
+        Ok(enriched)
+    }
+
+    /// Flush remaining state at stream end.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, crate::model_error::ModelError> {
+        let mut events = Vec::new();
+
+        let think_result = self.think_tag.finish();
+        // Flush any pending text from think tag parser
+        if !think_result.reasoning_text.is_empty() && !think_result.complete {
+            // Unclosed think tag — emit remaining reasoning
+            events.push(StreamEvent::ReasoningDelta { text: think_result.reasoning_text });
+        }
+
+        match self.dsml_parser.finish() {
+            Ok(invocations) => {
+                for inv in invocations {
+                    events.push(StreamEvent::ToolCallStart {
+                        index: self.tool_index,
+                        id: inv.id.clone(),
+                        name: inv.name.clone(),
+                    });
+                    let args_str = serde_json::to_string(&inv.arguments).unwrap_or_default();
+                    events.push(StreamEvent::ToolCallArgsDelta {
+                        index: self.tool_index,
+                        arguments_delta: args_str,
+                        call_id: inv.id.clone(),
+                    });
+                    events.push(StreamEvent::ToolCallEnd {
+                        index: self.tool_index,
+                    });
+                    self.tool_index += 1;
+                }
+                Ok(events)
+            }
+            Err(e) => Err(crate::model_error::ModelError::Protocol(
+                crate::model_error::ProtocolError::InvalidContent {
+                    detail: format!("DSML parse error on flush: {e}"),
+                },
+            )),
+        }
+    }
+}
+
+/// Strip DSML markup from text, returning only non-DSML content.
+fn strip_dsml(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_dsml = false;
+    let mut pos = 0;
+    while pos < text.len() {
+        if text[pos..].starts_with("<|DSML|") {
+            if let Some(end) = text[pos..].find("</|DSML|tool_calls|>") {
+                let consumed = end + "</|DSML|tool_calls|>".len();
+                pos += consumed;
+                in_dsml = false;
+                continue;
+            }
+            in_dsml = true;
+            pos += 1;
+            continue;
+        }
+        if !in_dsml {
+            if let Some(ch) = text[pos..].chars().next() {
+                result.push(ch);
+                pos += ch.len_utf8();
+            } else {
+                pos += 1;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    result
+}
+
 /// Partially assembled tool call during streaming.
 #[derive(Debug, Clone)]
 struct PartialToolCall {
@@ -307,6 +453,82 @@ impl Default for StreamAssembler {
 
 #[cfg(test)]
 mod normalizer_tests {
+    use super::*;
+
+    // ── strip_dsml tests ──
+
+    #[test]
+    fn test_strip_dsml_clean_text() {
+        assert_eq!(strip_dsml("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_dsml_removes_markup() {
+        let text = "before<|DSML|tool_calls|><|DSML|invoke| name=\"t\"><|DSML|parameter| name=\"x\" string=\"true\">v</|DSML|parameter|></|DSML|invoke|></|DSML|tool_calls|>after";
+        let clean = strip_dsml(text);
+        assert_eq!(clean, "beforeafter");
+    }
+
+    #[test]
+    fn test_strip_dsml_empty() {
+        assert_eq!(strip_dsml(""), "");
+    }
+
+    #[test]
+    fn test_strip_dsml_only_markup() {
+        let text = "<|DSML|tool_calls|><|DSML|invoke| name=\"t\"></|DSML|invoke|></|DSML|tool_calls|>";
+        assert_eq!(strip_dsml(text), "");
+    }
+
+    // ── DeepSeekNormalizer tests ──
+
+    #[test]
+    fn normalizer_passthrough_plain_text() {
+        let mut norm = DeepSeekNormalizer::new();
+        let events = norm.feed_text("hello world").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::TextDelta { ref text } if text == "hello world"));
+    }
+
+    #[test]
+    fn normalizer_extracts_think_tag() {
+        let mut norm = DeepSeekNormalizer::new();
+        let events = norm.feed_text("before<think>deep thought</think> after").unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], StreamEvent::TextDelta { ref text } if text == "before"));
+        assert!(matches!(events[1], StreamEvent::ReasoningDelta { ref text } if text == "deep thought"));
+        assert!(matches!(events[2], StreamEvent::TextDelta { ref text } if text == " after"));
+    }
+
+    #[test]
+    fn normalizer_extracts_dsml_tool_call() {
+        let mut norm = DeepSeekNormalizer::new();
+        let text = "use tool <|DSML|tool_calls|><|DSML|invoke| name=\"read\"><|DSML|parameter| name=\"path\" string=\"true\">/x</|DSML|parameter|></|DSML|invoke|></|DSML|tool_calls|>";
+        let events = norm.feed_text(text).unwrap();
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { .. })));
+    }
+
+    #[test]
+    fn normalizer_empty_text() {
+        let mut norm = DeepSeekNormalizer::new();
+        let events = norm.feed_text("").unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn normalizer_multiple_chunks() {
+        let mut norm = DeepSeekNormalizer::new();
+        let e1 = norm.feed_text("hello<think>deep").unwrap();
+        assert!(e1.iter().any(|e| matches!(e, StreamEvent::ReasoningDelta { .. })));
+        let e2 = norm.feed_text(" thought</think>done").unwrap();
+        assert!(e2.iter().any(|e| matches!(e, StreamEvent::ReasoningDelta { text } if text == " thought")));
+        assert!(e2.iter().any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "done")));
+    }
+}
+
+#[cfg(test)]
+mod normalizer_partial_tests {
     use super::*;
 
     #[test]

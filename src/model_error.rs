@@ -116,6 +116,7 @@ impl UpstreamError {
 pub enum ProtocolError {
     InvalidJson, MissingChoices, MissingDelta,
     UnsupportedResponseShape, MixedProtocolShape,
+    InvalidContent { detail: String },
 }
 
 impl ProtocolError {
