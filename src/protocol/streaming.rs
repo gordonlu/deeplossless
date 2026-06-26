@@ -28,6 +28,87 @@ pub fn from_chat_completions_sse(data: &str, usage_buffer: Option<&serde_json::V
     super::responses::stream_event_from_chat(data)
 }
 
+// ── SSI Normalizer Layers ────────────────────────────────────────────
+// These are prepended normalizers — they run BEFORE the existing
+// StreamAssembler. No refactoring of existing code.
+
+/// Assembles SSE data lines from partial network chunks.
+/// Buffers incomplete lines until the next chunk completes them.
+#[derive(Debug, Default)]
+pub struct PartialLineBuffer {
+    buffer: String,
+}
+
+impl PartialLineBuffer {
+    pub fn new() -> Self { Self { buffer: String::new() } }
+
+    /// Push a network chunk. Returns complete lines (without trailing \n).
+    pub fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
+        self.buffer.push_str(chunk);
+        let mut lines = Vec::new();
+        loop {
+            if let Some(pos) = self.buffer.find('\n') {
+                let line = self.buffer[..pos].trim_end().to_string();
+                self.buffer = self.buffer[pos + 1..].to_string();
+                lines.push(line);
+            } else {
+                break;
+            }
+        }
+        lines
+    }
+
+    /// Flush remaining buffered content (for stream end).
+    pub fn flush(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            None
+        } else {
+            let remaining = self.buffer.trim().to_string();
+            self.buffer.clear();
+            if remaining.is_empty() { None } else { Some(remaining) }
+        }
+    }
+}
+
+/// A parsed SSE event (single data: line).
+#[derive(Debug, Clone)]
+pub struct SseEvent {
+    pub event_type: Option<String>,
+    pub data: String,
+    pub is_done: bool,
+}
+
+/// Parses SSE line protocol. Tolerant of unknown fields.
+#[derive(Debug, Default)]
+pub struct SseEventParser {
+    current_event_type: Option<String>,
+}
+
+impl SseEventParser {
+    pub fn new() -> Self { Self { current_event_type: None } }
+
+    /// Feed a single line (without trailing \n). Returns Some(SseEvent) when
+    /// a complete data line is received, or None for non-data lines.
+    pub fn feed_line<'a>(&'a mut self, line: &str) -> Result<Option<SseEvent>, String> {
+        if let Some(data) = line.strip_prefix("data: ") {
+            let event = SseEvent {
+                event_type: self.current_event_type.take(),
+                data: data.to_string(),
+                is_done: data.trim() == "[DONE]",
+            };
+            Ok(Some(event))
+        } else if let Some(_event_type) = line.strip_prefix("event: ") {
+            self.current_event_type = Some(_event_type.trim().to_string());
+            Ok(None)
+        } else if line.starts_with(':') || line.trim().is_empty() {
+            Ok(None)
+        } else {
+            tracing::debug!(target: "deeplossless::sse", "unknown sse line: {}", line);
+            Ok(None)
+        }
+    }
+}
+
 /// Convert a canonical `StreamEvent` into a Responses API SSE data line.
 /// Codex requires `event: <type>\ndata: {...}\n\n` format.
 /// Escapes newlines in data to prevent SSE injection.
@@ -222,6 +303,76 @@ pub struct AssembledContent {
 
 impl Default for StreamAssembler {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod normalizer_tests {
+    use super::*;
+
+    #[test]
+    fn test_partial_line_buffer_single_chunk() {
+        let mut buf = PartialLineBuffer::new();
+        let lines = buf.push_chunk("data: hello\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "data: hello");
+    }
+
+    #[test]
+    fn test_partial_line_buffer_split_chunk() {
+        let mut buf = PartialLineBuffer::new();
+        let l1 = buf.push_chunk("data: hel");
+        assert!(l1.is_empty());
+        let l2 = buf.push_chunk("lo\n");
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0], "data: hello");
+    }
+
+    #[test]
+    fn test_partial_line_buffer_multi_line() {
+        let mut buf = PartialLineBuffer::new();
+        let lines = buf.push_chunk("data: a\ndata: b\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "data: a");
+        assert_eq!(lines[1], "data: b");
+    }
+
+    #[test]
+    fn test_partial_line_buffer_flush() {
+        let mut buf = PartialLineBuffer::new();
+        buf.push_chunk("data: incomplete");
+        assert_eq!(buf.flush(), Some("data: incomplete".to_string()));
+        assert_eq!(buf.flush(), None);
+    }
+
+    #[test]
+    fn test_sse_parser_data_line() {
+        let mut parser = SseEventParser::new();
+        let event = parser.feed_line("data: {\"key\":\"val\"}").unwrap().unwrap();
+        assert!(!event.is_done);
+        assert_eq!(event.data, "{\"key\":\"val\"}");
+    }
+
+    #[test]
+    fn test_sse_parser_done() {
+        let mut parser = SseEventParser::new();
+        let event = parser.feed_line("data: [DONE]").unwrap().unwrap();
+        assert!(event.is_done);
+    }
+
+    #[test]
+    fn test_sse_parser_event_type() {
+        let mut parser = SseEventParser::new();
+        parser.feed_line("event: response.text.delta").unwrap();
+        let event = parser.feed_line("data: {\"delta\":\"hello\"}").unwrap().unwrap();
+        assert_eq!(event.event_type.as_deref(), Some("response.text.delta"));
+    }
+
+    #[test]
+    fn test_sse_parser_unknown_field() {
+        let mut parser = SseEventParser::new();
+        let result = parser.feed_line(":comment");
+        assert!(result.unwrap().is_none());
+    }
 }
 
 #[cfg(test)]
