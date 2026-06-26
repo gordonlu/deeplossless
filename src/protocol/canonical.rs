@@ -262,7 +262,7 @@ pub struct ToolInvocation {
 
 // ── Request ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CanonicalRequest {
     /// System instructions (supports multiple blocks).
     #[serde(default)]

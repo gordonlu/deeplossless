@@ -144,6 +144,7 @@ impl RuntimeCoordinator {
             dsml_parse: cfg.dsml_parse,
             dsml_emit: cfg.dsml_emit,
             quick_instruction: cfg.quick_instruction,
+            context_ordering: crate::context_pack::ImportanceOrdering::Preserve,
         };
 
         Ok(Self { state, tasks })

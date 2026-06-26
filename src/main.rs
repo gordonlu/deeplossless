@@ -950,4 +950,58 @@ mod tests {
         let args = Cli::try_parse_from(["deeplossless", "--torture-aces="]).unwrap();
         assert_eq!(args.torture_aces.as_deref(), Some(""));
     }
+
+    #[test]
+    fn ds4_reasoning_effort_default_is_auto() {
+        let args = Cli::try_parse_from(["deeplossless"]).unwrap();
+        assert_eq!(args.reasoning_effort, "auto");
+    }
+
+    #[test]
+    fn ds4_reasoning_effort_high_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--reasoning-effort", "high"]).unwrap();
+        assert_eq!(args.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn ds4_reasoning_effort_max_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--reasoning-effort", "max"]).unwrap();
+        assert_eq!(args.reasoning_effort, "max");
+    }
+
+    #[test]
+    fn ds4_reasoning_effort_none_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--reasoning-effort", "none"]).unwrap();
+        assert_eq!(args.reasoning_effort, "none");
+    }
+
+    #[test]
+    fn ds4_dsml_parse_default_true() {
+        let args = Cli::try_parse_from(["deeplossless"]).unwrap();
+        assert!(args.dsml_parse);
+    }
+
+    #[test]
+    fn ds4_dsml_emit_default_false() {
+        let args = Cli::try_parse_from(["deeplossless"]).unwrap();
+        assert!(!args.dsml_emit);
+    }
+
+    #[test]
+    fn ds4_dsml_emit_true_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--dsml-emit"]).unwrap();
+        assert!(args.dsml_emit);
+    }
+
+    #[test]
+    fn ds4_quick_instruction_default_false() {
+        let args = Cli::try_parse_from(["deeplossless"]).unwrap();
+        assert!(!args.quick_instruction);
+    }
+
+    #[test]
+    fn ds4_quick_instruction_true_accepted() {
+        let args = Cli::try_parse_from(["deeplossless", "--quick-instruction"]).unwrap();
+        assert!(args.quick_instruction);
+    }
 }

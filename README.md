@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deeplossless)](https://crates.io/crates/deeplossless)
 [![CI](https://github.com/gordonlu/deeplossless/actions/workflows/rust.yml/badge.svg)](https://github.com/gordonlu/deeplossless/actions/workflows/rust.yml)
-[![License](https://img.shields.io/crates/l/deeplossless)](https://github.com/gordonlu/deeplossless/blob/master/LICENSE)
+[![License](https://img.shields.io/github/license/gordonlu/deeplossless)](https://github.com/gordonlu/deeplossless/blob/master/LICENSE)
 [![MSRV](https://img.shields.io/badge/rust-1.85+-orange)](https://rust-lang.org)
 
 # deeplossless

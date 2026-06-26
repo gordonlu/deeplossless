@@ -201,6 +201,146 @@ pub fn response_from_chat(body: &serde_json::Value) -> CanonicalResponse {
             completion_tokens: body["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
             total_tokens: body["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32,
         },
-        provider_meta: Some(json!({"finish_reason": finish})),
+            provider_meta: Some(json!({"finish_reason": finish})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_to_chat_reasoning_effort_passthrough() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { reasoning_effort: ReasoningEffortMode::Passthrough, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert!(body.get("reasoning_effort").is_none(), "Passthrough should omit reasoning_effort");
+    }
+
+    #[test]
+    fn request_to_chat_reasoning_effort_high() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities {
+                reasoning_effort: ReasoningEffortMode::Override(ReasoningEffort::High),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn request_to_chat_reasoning_effort_max() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities {
+                reasoning_effort: ReasoningEffortMode::Override(ReasoningEffort::Max),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn request_to_chat_reasoning_effort_none() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities {
+                reasoning_effort: ReasoningEffortMode::Override(ReasoningEffort::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn request_to_chat_dsml_parse_true() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { dsml_parse: true, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["dsml_parse"], true);
+    }
+
+    #[test]
+    fn request_to_chat_dsml_parse_false() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { dsml_parse: false, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert!(body.get("dsml_parse").is_none(), "false dsml_parse should be omitted");
+    }
+
+    #[test]
+    fn request_to_chat_dsml_emit_true() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { dsml_emit: true, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["dsml_emit"], true);
+    }
+
+    #[test]
+    fn request_to_chat_dsml_emit_false() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { dsml_emit: false, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert!(body.get("dsml_emit").is_none(), "false dsml_emit should be omitted");
+    }
+
+    #[test]
+    fn request_to_chat_quick_instruction_true() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { quick_instruction: true, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["quick_instruction"], true);
+    }
+
+    #[test]
+    fn request_to_chat_quick_instruction_false() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            deepseek_native: DeepSeekNativeCapabilities { quick_instruction: false, ..Default::default() },
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert!(body.get("quick_instruction").is_none(), "false quick_instruction should be omitted");
+    }
+
+    #[test]
+    fn request_to_chat_keeps_existing_fields() {
+        let req = CanonicalRequest {
+            model: "deepseek-v4".into(),
+            stream: true,
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = request_to_chat(&req);
+        assert_eq!(body["model"], "deepseek-v4");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["temperature"], 0.7);
     }
 }

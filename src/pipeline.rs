@@ -125,6 +125,7 @@ pub struct ChatPipeline {
     dag: Arc<DagEngine>,
     compactor: Arc<Mutex<Compactor>>,
     lcm_context: bool,
+    context_ordering: crate::context_pack::ImportanceOrdering,
 }
 
 impl ChatPipeline {
@@ -134,6 +135,7 @@ impl ChatPipeline {
             dag: state.storage.dag.clone(),
             compactor: state.compactor.clone(),
             lcm_context: state.lcm_context,
+            context_ordering: state.context_ordering,
         }
     }
 
@@ -452,12 +454,12 @@ impl ChatPipeline {
         // Codex does not handle this automatically via the Responses API.
         self.inject_reasoning_content(&mut injected);
 
-        // DS4-14: ContextPack importance ordering (default-off, Preserve = no-op)
-        if false {
-            use crate::context_pack::{ContextPack, ImportanceOrdering};
+        // DS4-14: ContextPack importance ordering (default Preserve = no-op)
+        if !matches!(self.context_ordering, crate::context_pack::ImportanceOrdering::Preserve) {
+            use crate::context_pack::ContextPack;
             if let Some(msgs) = injected["messages"].as_array_mut() {
                 let mut pack = ContextPack::new(msgs);
-                pack.reorder(ImportanceOrdering::Preserve);
+                pack.reorder(self.context_ordering);
                 *msgs = pack.into_messages();
             }
         }

@@ -180,6 +180,7 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         dsml_parse: true,
         dsml_emit: false,
         quick_instruction: false,
+        context_ordering: deeplossless::context_pack::ImportanceOrdering::Preserve,
     }
 }
 
@@ -545,7 +546,141 @@ async fn responses_api_streaming_round_trip() {
             .iter()
             .any(|event| event["event"]["type"].as_str() == Some("text_delta")),
         "replay should include text deltas: {replay_json}"
+
     );
+}
+
+#[tokio::test]
+async fn ds4_think_tag_normalized_to_reasoning_delta() {
+    // Mock upstream returns Chat Completions SSE with <think> tag in content.
+    // The DS4 normalizer should extract reasoning and emit ReasoningDelta events.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello<think>deep reasoning here</think> world\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":10,\"total_tokens\":15}}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { rx.await.ok(); })
+            .await
+            .unwrap();
+    });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "think_tag").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "input": "hello",
+            "instructions": "Be concise.",
+            "model": "deepseek-v4-flash",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let sse_body = resp.text().await.unwrap();
+    assert!(!sse_body.is_empty());
+
+    // Should emit reasoning delta event (from think tag extraction)
+    assert!(
+        sse_body.contains("reasoning"),
+        "DS4 normalizer should emit reasoning SSE events, got: {}..{}",
+        &sse_body[..sse_body.len().min(500)],
+        if sse_body.len() > 500 { "..." } else { "" }
+    );
+    // Should still contain the text deltas (before and after think tag)
+    assert!(sse_body.contains("Hello"), "should preserve text before think tag");
+    assert!(sse_body.contains("world"), "should preserve text after think tag");
+    // Should end with [DONE]
+    assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
+}
+
+#[tokio::test]
+async fn ds4_dsml_tool_call_extracted() {
+    // Mock upstream returns Chat Completions SSE with DSML tool call markup.
+    // The DS4 normalizer should extract it and emit ToolCall events.
+    let captured: CapturedRequest = Arc::new(Mutex::new(None));
+    let upstream_req = captured.clone();
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let cap = upstream_req.clone();
+        async move {
+            *cap.lock().unwrap() = Some(body.0.clone());
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Using tool <|DSML|tool_calls|><|DSML|invoke| name=\\\"read\\\"><|DSML|parameter| name=\\\"path\\\" string=\\\"true\\\">/foo</|DSML|parameter|></|DSML|invoke|></|DSML|tool_calls|> now\"},\"index\":0}],\"usage\":null}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":10,\"total_tokens\":15}}\n\n"
+                )),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: [DONE]\n\n")),
+            ]);
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], axum::body::Body::from_stream(stream))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { rx.await.ok(); })
+            .await
+            .unwrap();
+    });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "dsml_tool").await;
+    let proxy_addr = start_proxy(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .header("accept", "text/event-stream")
+        .json(&json!({
+            "input": "read the file",
+            "instructions": "Be concise.",
+            "model": "deepseek-v4-flash",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let sse_body = resp.text().await.unwrap();
+    assert!(!sse_body.is_empty());
+
+    // Should emit function_call lifecycle events (DSML extracted)
+    assert!(
+        sse_body.contains("function_call"),
+        "DS4 normalizer should emit function_call events for DSML tool calls, got: {}..{}",
+        &sse_body[..sse_body.len().min(500)],
+        if sse_body.len() > 500 { "..." } else { "" }
+    );
+    // Text around DSML markup should be preserved
+    assert!(sse_body.contains("Using tool"), "should preserve text before DSML");
+    assert!(sse_body.contains("now"), "should preserve text after DSML");
+    assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
 }
 
 #[tokio::test]

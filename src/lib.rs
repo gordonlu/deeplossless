@@ -177,6 +177,8 @@ pub struct AppState {
     pub dsml_emit: bool,
     /// Quick instruction mode.
     pub quick_instruction: bool,
+    /// Context message ordering strategy.
+    pub context_ordering: crate::context_pack::ImportanceOrdering,
 }
 
 impl AppState {
