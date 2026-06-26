@@ -95,6 +95,7 @@ pub mod runtime_coordinator;
 pub mod session;
 pub mod context_pack;
 pub mod model_error;
+pub mod prefix_stability;
 pub mod think_tag;
 pub mod snapshot;
 pub mod snippet;
