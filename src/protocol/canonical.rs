@@ -92,6 +92,44 @@ impl Default for ProviderCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    High,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortMode {
+    Passthrough,
+    Override(ReasoningEffort),
+}
+
+impl Default for ReasoningEffortMode {
+    fn default() -> Self { Self::Passthrough }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DeepSeekNativeCapabilities {
+    pub reasoning_effort: ReasoningEffortMode,
+    pub dsml_parse: bool,
+    pub dsml_emit: bool,
+    pub quick_instruction: bool,
+}
+
+impl Default for DeepSeekNativeCapabilities {
+    fn default() -> Self {
+        Self {
+            reasoning_effort: ReasoningEffortMode::Passthrough,
+            dsml_parse: true,
+            dsml_emit: false,
+            quick_instruction: false,
+        }
+    }
+}
+
 /// Centralized capability adapter — produces a downgrade plan.
 /// No provider-specific branches. The runtime uses capabilities to
 /// decide which features to enable, not which provider it's talking to.
@@ -254,6 +292,14 @@ pub struct CanonicalRequest {
     /// What the provider supports.
     #[serde(default)]
     pub capabilities: ProviderCapabilities,
+
+    /// Reasoning effort override (DeepSeek-V4 native).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// DeepSeek-V4 native capabilities.
+    #[serde(default)]
+    pub deepseek_native: DeepSeekNativeCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +334,34 @@ pub enum ResponseStatus {
     Completed,
     Incomplete,
     Error,
+}
+
+/// Provider-agnostic finish reason for stream completion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    #[serde(rename = "unknown")]
+    Unknown,
+    #[serde(rename = "done_without_explicit_reason")]
+    DoneWithoutExplicitReason,
+    #[serde(rename = "stream_interrupted")]
+    StreamInterrupted,
+}
+
+impl FinishReason {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "stop" => FinishReason::Stop,
+            "length" => FinishReason::Length,
+            "tool_calls" => FinishReason::ToolCalls,
+            "content_filter" => FinishReason::ContentFilter,
+            _ => FinishReason::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

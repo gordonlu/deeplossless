@@ -93,6 +93,8 @@ pub fn request_from_chat(body: &serde_json::Value) -> CanonicalRequest {
         response_format,
         provider: ProviderKind::OpenAI,
         capabilities: ProviderCapabilities { structured_output: StructuredOutputMode::JsonSchema, ..Default::default() },
+        reasoning_effort: None,
+        deepseek_native: Default::default(),
     }
 }
 

@@ -54,6 +54,10 @@ pub use canonical::{
     ToolStreamingMode,
     ReasoningMode,
     StructuredOutputMode,
+    FinishReason,
+    ReasoningEffort,
+    ReasoningEffortMode,
+    DeepSeekNativeCapabilities,
 };
 
 /// Provider capability registry: maps upstream model names to local equivalents.
