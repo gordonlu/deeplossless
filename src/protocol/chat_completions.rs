@@ -152,6 +152,16 @@ pub fn request_to_chat(req: &CanonicalRequest) -> serde_json::Value {
     if let Some(ref rf) = req.response_format {
         body["response_format"] = json!({"type": rf.format_type, "json_schema": rf.json_schema});
     }
+    // DeepSeek-V4 native options
+    match req.deepseek_native.reasoning_effort {
+        ReasoningEffortMode::Override(ReasoningEffort::High) => { body["reasoning_effort"] = json!("high"); }
+        ReasoningEffortMode::Override(ReasoningEffort::Max) => { body["reasoning_effort"] = json!("max"); }
+        ReasoningEffortMode::Override(ReasoningEffort::None) => { body["reasoning_effort"] = json!("none"); }
+        ReasoningEffortMode::Passthrough => {}
+    }
+    if req.deepseek_native.dsml_parse { body["dsml_parse"] = json!(true); }
+    if req.deepseek_native.dsml_emit { body["dsml_emit"] = json!(true); }
+    if req.deepseek_native.quick_instruction { body["quick_instruction"] = json!(true); }
     body
 }
 

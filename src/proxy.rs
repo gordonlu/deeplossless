@@ -412,6 +412,11 @@ async fn responses(
 
     // 1. Responses API → canonical IR
     let mut canonical = crate::protocol::responses::request_from_responses(&req_body);
+    // Apply DeepSeek native options from CLI config
+    canonical.deepseek_native.reasoning_effort = state.reasoning_effort;
+    canonical.deepseek_native.dsml_parse = state.dsml_parse;
+    canonical.deepseek_native.dsml_emit = state.dsml_emit;
+    canonical.deepseek_native.quick_instruction = state.quick_instruction;
     // Map Codex model names to DeepSeek equivalents
     canonical.model = map_model(&canonical.model);
     // Codex sends Accept: text/event-stream — treat as implicit stream request

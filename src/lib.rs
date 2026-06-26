@@ -167,8 +167,16 @@ pub struct AppState {
     /// LCM context injection default budget in tokens (0 = off).
     pub lcm_context_tokens: u64,
 
-    /// Workspace root for stable conversation identity.
     pub workspace: Option<String>,
+
+    /// Default reasoning effort for DeepSeek-V4.
+    pub reasoning_effort: crate::protocol::ReasoningEffortMode,
+    /// Parse DSML tool calls from response text.
+    pub dsml_parse: bool,
+    /// Emit DSML tool calls (debug only).
+    pub dsml_emit: bool,
+    /// Quick instruction mode.
+    pub quick_instruction: bool,
 }
 
 impl AppState {

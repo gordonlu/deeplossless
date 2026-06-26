@@ -155,6 +155,23 @@ pub(crate) struct Cli {
     #[arg(long)]
     torture_aces: Option<String>,
 
+    /// Default reasoning effort for DeepSeek-V4 (auto, high, max, none).
+    /// Override per-request via reasoning_effort field.
+    #[arg(long, default_value = "auto")]
+    reasoning_effort: String,
+
+    /// Parse DSML tool calls from DeepSeek-V4 response text.
+    #[arg(long, default_value = "true")]
+    dsml_parse: bool,
+
+    /// Emit DSML tool calls to upstream (debug only, off by default).
+    #[arg(long)]
+    dsml_emit: bool,
+
+    /// Quick instruction mode — optimizes system prompt for speed.
+    #[arg(long)]
+    quick_instruction: bool,
+
     /// Agent format used to select per-agent tool arg templates
     /// from `args_per_agent[format]` in the scenario YAML. Default is
     /// `openai` (camelCase field names: filePath, oldString, newString)
@@ -650,6 +667,15 @@ async fn main() -> anyhow::Result<()> {
         cache_normalize: !cli.no_cache_normalize,
         lcm_context_tokens: if cli.no_lcm_context { 0 } else { cli.lcm_context_tokens },
         workspace,
+        reasoning_effort: match cli.reasoning_effort.as_str() {
+            "high" | "High" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::High),
+            "max" | "Max" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::Max),
+            "none" | "None" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::None),
+            _ => deeplossless::protocol::ReasoningEffortMode::Passthrough,
+        },
+        dsml_parse: cli.dsml_parse,
+        dsml_emit: cli.dsml_emit,
+        quick_instruction: cli.quick_instruction,
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

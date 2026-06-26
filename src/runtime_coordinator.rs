@@ -27,8 +27,16 @@ pub struct CoordinatorConfig {
     /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
     pub policy_config: RuntimePolicyConfig,
 
-    /// Workspace root path for stable conversation identity.
     pub workspace: Option<String>,
+
+    /// Default reasoning effort for DeepSeek-V4.
+    pub reasoning_effort: crate::protocol::ReasoningEffortMode,
+    /// Parse DSML tool calls from response text.
+    pub dsml_parse: bool,
+    /// Emit DSML tool calls (debug only).
+    pub dsml_emit: bool,
+    /// Quick instruction mode.
+    pub quick_instruction: bool,
 }
 
 /// Assembles and owns all runtime services.
@@ -132,6 +140,10 @@ impl RuntimeCoordinator {
             cache_normalize: cfg.cache_normalize,
             lcm_context_tokens: cfg.lcm_context_tokens,
             workspace: cfg.workspace.clone(),
+            reasoning_effort: cfg.reasoning_effort,
+            dsml_parse: cfg.dsml_parse,
+            dsml_emit: cfg.dsml_emit,
+            quick_instruction: cfg.quick_instruction,
         };
 
         Ok(Self { state, tasks })
