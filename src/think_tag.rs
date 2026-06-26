@@ -22,21 +22,24 @@ pub struct ThinkTagResult {
 pub struct ThinkTagParser {
     state: ThinkTagState,
     reasoning_buffer: String,
-    answer_buffer: String,
-    /// Text held back because it might be a partial `<think>` or `</think>`.
     pending: String,
     consumed: bool,
 }
 
-impl ThinkTagParser {
-    pub fn new() -> Self {
+impl Default for ThinkTagParser {
+    fn default() -> Self {
         Self {
             state: ThinkTagState::Idle,
             reasoning_buffer: String::new(),
-            answer_buffer: String::new(),
             pending: String::new(),
             consumed: false,
         }
+    }
+}
+
+impl ThinkTagParser {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Process a text chunk. Returns normalized events.
@@ -89,8 +92,8 @@ impl ThinkTagParser {
                 }
             }
             // Also check for bare `<` that could start a tag
-            if text.ends_with('<') {
-                return (text[..text.len() - 1].to_string(), "<".to_string());
+            if let Some(stripped) = text.strip_suffix('<') {
+                return (stripped.to_string(), "<".to_string());
             }
             (text.to_string(), String::new())
         }
@@ -110,13 +113,11 @@ impl ThinkTagParser {
                         let before = &remaining[..pos];
                         if !before.is_empty() {
                             events.push(StreamEvent::TextDelta { text: before.to_string() });
-                            self.answer_buffer.push_str(before);
                         }
                         remaining = &remaining[pos + 7..];
                         self.state = ThinkTagState::InThinkTag;
                     } else {
                         events.push(StreamEvent::TextDelta { text: remaining.to_string() });
-                        self.answer_buffer.push_str(remaining);
                         break;
                     }
                 }
@@ -137,7 +138,6 @@ impl ThinkTagParser {
                 }
                 ThinkTagState::InAnswer => {
                     events.push(StreamEvent::TextDelta { text: remaining.to_string() });
-                    self.answer_buffer.push_str(remaining);
                     break;
                 }
             }
@@ -154,10 +154,6 @@ impl ThinkTagParser {
             self.process_text(&pending_text);
         }
         let complete = matches!(self.state, ThinkTagState::InAnswer | ThinkTagState::Idle);
-        // Emit trailing text after unclosed think tag
-        if !pending_text.is_empty() {
-            self.answer_buffer.push_str(&pending_text);
-        }
         ThinkTagResult {
             reasoning_text: self.reasoning_buffer.clone(),
             complete,
@@ -167,7 +163,6 @@ impl ThinkTagParser {
     pub fn reset(&mut self) {
         self.state = ThinkTagState::Idle;
         self.reasoning_buffer.clear();
-        self.answer_buffer.clear();
         self.pending.clear();
         self.consumed = false;
     }

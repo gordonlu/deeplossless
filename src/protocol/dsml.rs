@@ -48,7 +48,7 @@ impl std::fmt::Display for DsmlError {
 }
 
 /// Parse a complete DSML tool_calls block from assistant content.
-pub fn parse_dsml_tool_calls(raw: &str) -> Result<Vec<ToolInvocation>, DsmlError> {
+pub fn parse_dsml_tool_calls(raw: &str, next_id: &mut u64) -> Result<Vec<ToolInvocation>, DsmlError> {
     let start_tag = "<|DSML|tool_calls|>";
     let start = raw.find(start_tag).ok_or(DsmlError::MalformedSyntax {
         position: 0, detail: "missing <|DSML|tool_calls|>".into(),
@@ -62,7 +62,7 @@ pub fn parse_dsml_tool_calls(raw: &str) -> Result<Vec<ToolInvocation>, DsmlError
     let body = &content_after_start[..end];
 
     let doc = parse_dsml_body(body)?;
-    Ok(doc.invocations_to_canonical())
+    Ok(doc.invocations_to_canonical(next_id))
 }
 
 fn parse_dsml_body(body: &str) -> Result<DsmlDocument, DsmlError> {
@@ -94,18 +94,14 @@ fn parse_invoke(raw: &str) -> Result<DsmlInvoke, DsmlError> {
     })?;
     let mut parameters = Vec::new();
     let mut remaining = raw;
-    loop {
-        if let Some(param_start) = remaining.find("<|DSML|parameter|") {
-            remaining = &remaining[param_start + "<|DSML|parameter|".len()..];
-            let param_end = remaining.find("</|DSML|parameter|>")
-                .ok_or(DsmlError::UnclosedTag { tag: "</|DSML|parameter|>".into() })?;
-            let param_raw = &remaining[..param_end + "</|DSML|parameter|>".len()];
-            let param = parse_parameter(param_raw)?;
-            parameters.push(param);
-            remaining = &remaining[param_end + "</|DSML|parameter|>".len()..];
-        } else {
-            break;
-        }
+    while let Some(param_start) = remaining.find("<|DSML|parameter|") {
+        remaining = &remaining[param_start + "<|DSML|parameter|".len()..];
+        let param_end = remaining.find("</|DSML|parameter|>")
+            .ok_or(DsmlError::UnclosedTag { tag: "</|DSML|parameter|>".into() })?;
+        let param_raw = &remaining[..param_end + "</|DSML|parameter|>".len()];
+        let param = parse_parameter(param_raw)?;
+        parameters.push(param);
+        remaining = &remaining[param_end + "</|DSML|parameter|>".len()..];
     }
     Ok(DsmlInvoke { name, parameters })
 }
@@ -161,11 +157,13 @@ fn json_to_dsml(v: serde_json::Value) -> DsmlValue {
 }
 
 impl DsmlDocument {
-    fn invocations_to_canonical(&self) -> Vec<ToolInvocation> {
-        self.invokes.iter().enumerate().map(|(i, invoke)| {
+    fn invocations_to_canonical(&self, next_id: &mut u64) -> Vec<ToolInvocation> {
+        self.invokes.iter().map(|invoke| {
+            let id = *next_id;
+            *next_id += 1;
             let args = dsml_params_to_json(&invoke.parameters);
             ToolInvocation {
-                id: format!("dsml_{}", i),
+                id: format!("dsml_{id}"),
                 name: invoke.name.clone(),
                 arguments: args,
             }
@@ -176,6 +174,7 @@ impl DsmlDocument {
 fn dsml_params_to_json(params: &[DsmlParameter]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for p in params {
+        if p.name.is_empty() { continue; }
         map.insert(p.name.clone(), dsml_value_to_json(&p.value));
     }
     serde_json::Value::Object(map)
@@ -222,10 +221,11 @@ pub fn emit_dsml_tool_calls(tool_calls: &[ToolInvocation]) -> String {
 #[derive(Debug, Default)]
 pub struct StreamingDsmlParser {
     buffer: String,
+    next_id: u64,
 }
 
 impl StreamingDsmlParser {
-    pub fn new() -> Self { Self { buffer: String::new() } }
+    pub fn new() -> Self { Self { buffer: String::new(), next_id: 0 } }
 
     /// Feed a text chunk. Returns complete ToolInvocation vectors when full
     /// <|DSML|tool_calls|>...</|DSML|tool_calls|> documents close.
@@ -240,7 +240,7 @@ impl StreamingDsmlParser {
                 let after_start = &self.buffer[start..];
                 if let Some(end) = after_start.find("</|DSML|tool_calls|>") {
                     let full_doc = &after_start[..end + "</|DSML|tool_calls|>".len()];
-                    let tool_calls = parse_dsml_tool_calls(full_doc)?;
+                    let tool_calls = parse_dsml_tool_calls(full_doc, &mut self.next_id)?;
                     results.extend(tool_calls);
                     let consumed = start + end + "</|DSML|tool_calls|>".len();
                     self.buffer = self.buffer[consumed..].to_string();
@@ -248,14 +248,25 @@ impl StreamingDsmlParser {
                     break;
                 }
             } else {
-                if self.buffer.ends_with("<|DSML") || self.buffer.ends_with("<|DSML|") || self.buffer.ends_with("<|DSML|tool_calls") {
-                } else {
+                if !self.ends_with_partial_prefix() {
                     self.buffer.clear();
                 }
                 break;
             }
         }
         Ok(results)
+    }
+
+    /// Returns true if the buffer ends with any prefix of `<|DSML|tool_calls|>`
+    /// (preserving partial opening tags across chunks).
+    fn ends_with_partial_prefix(&self) -> bool {
+        let marker = "<|DSML|tool_calls|>";
+        let check_len = self.buffer.len().min(marker.len());
+        if check_len == 0 {
+            return false;
+        }
+        let suffix = &self.buffer[self.buffer.len() - check_len..];
+        marker.starts_with(suffix)
     }
 
     /// Flush remaining buffer at stream end (may return DsmlIncomplete).
@@ -282,10 +293,15 @@ mod tests {
         )
     }
 
+    fn parse_once(raw: &str) -> Result<Vec<ToolInvocation>, DsmlError> {
+        let mut id = 0;
+        parse_dsml_tool_calls(raw, &mut id)
+    }
+
     #[test]
     fn test_parse_simple_invoke() {
         let raw = sample_dsml("read_file", "path", "/foo/bar.txt");
-        let result = parse_dsml_tool_calls(&raw).unwrap();
+        let result = parse_once(&raw).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "read_file");
         assert_eq!(result[0].arguments["path"], "/foo/bar.txt");
@@ -298,7 +314,7 @@ mod tests {
 <|DSML|parameter| name="max_results" string="false">10</|DSML|parameter|>
 </|DSML|invoke|>
 </|DSML|tool_calls|>"##;
-        let result = parse_dsml_tool_calls(raw).unwrap();
+        let result = parse_once(raw).unwrap();
         assert_eq!(result[0].arguments["max_results"], 10);
     }
 
@@ -309,7 +325,7 @@ mod tests {
 <|DSML|parameter| name="flag" string="false">true</|DSML|parameter|>
 </|DSML|invoke|>
 </|DSML|tool_calls|>"##;
-        let result = parse_dsml_tool_calls(raw).unwrap();
+        let result = parse_once(raw).unwrap();
         assert_eq!(result[0].arguments["flag"], true);
     }
 
@@ -320,7 +336,7 @@ mod tests {
 <|DSML|parameter| name="config" string="false">{"key":"val","count":3}</|DSML|parameter|>
 </|DSML|invoke|>
 </|DSML|tool_calls|>"##;
-        let result = parse_dsml_tool_calls(raw).unwrap();
+        let result = parse_once(raw).unwrap();
         assert_eq!(result[0].arguments["config"]["key"], "val");
         assert_eq!(result[0].arguments["config"]["count"], 3);
     }
@@ -335,7 +351,7 @@ mod tests {
                    <|DSML|parameter| name=\"q\" string=\"true\">hello</|DSML|parameter|>\n\
                    </|DSML|invoke|>\n\
                    </|DSML|tool_calls|>";
-        let result = parse_dsml_tool_calls(raw).unwrap();
+        let result = parse_once(raw).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, "read");
         assert_eq!(result[1].name, "search");
@@ -344,7 +360,7 @@ mod tests {
     #[test]
     fn test_malformed_missing_name() {
         let raw = "<|DSML|tool_calls|>\n<|DSML|invoke|>\n</|DSML|invoke|>\n</|DSML|tool_calls|>";
-        assert!(parse_dsml_tool_calls(raw).is_err());
+        assert!(parse_once(raw).is_err());
     }
 
     #[test]

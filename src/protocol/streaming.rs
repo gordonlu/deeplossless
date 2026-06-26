@@ -46,14 +46,10 @@ impl PartialLineBuffer {
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
         self.buffer.push_str(chunk);
         let mut lines = Vec::new();
-        loop {
-            if let Some(pos) = self.buffer.find('\n') {
-                let line = self.buffer[..pos].trim_end().to_string();
-                self.buffer = self.buffer[pos + 1..].to_string();
-                lines.push(line);
-            } else {
-                break;
-            }
+        while let Some(pos) = self.buffer.find('\n') {
+            let line = self.buffer[..pos].trim_end().to_string();
+            self.buffer = self.buffer[pos + 1..].to_string();
+            lines.push(line);
         }
         lines
     }
@@ -89,7 +85,7 @@ impl SseEventParser {
 
     /// Feed a single line (without trailing \n). Returns Some(SseEvent) when
     /// a complete data line is received, or None for non-data lines.
-    pub fn feed_line<'a>(&'a mut self, line: &str) -> Result<Option<SseEvent>, String> {
+    pub fn feed_line(&mut self, line: &str) -> Result<Option<SseEvent>, String> {
         if let Some(data) = line.strip_prefix("data: ") {
             let event = SseEvent {
                 event_type: self.current_event_type.take(),
@@ -173,19 +169,17 @@ use crate::think_tag::ThinkTagParser;
 /// Combined normalizer for DeepSeek-native features.
 /// Wraps ThinkTagParser and StreamingDsmlParser.
 /// Runs before StreamAssembler — no existing code is refactored.
+#[derive(Default)]
 pub struct DeepSeekNormalizer {
     think_tag: ThinkTagParser,
     dsml_parser: crate::protocol::dsml::StreamingDsmlParser,
     tool_index: usize,
+    in_dsml_tracking: bool,
 }
 
 impl DeepSeekNormalizer {
     pub fn new() -> Self {
-        Self {
-            think_tag: ThinkTagParser::new(),
-            dsml_parser: crate::protocol::dsml::StreamingDsmlParser::new(),
-            tool_index: 0,
-        }
+        Self::default()
     }
 
     /// Feed text content through think-tag and DSML parsers.
@@ -231,7 +225,7 @@ impl DeepSeekNormalizer {
                             ));
                         }
                     }
-                    let clean = strip_dsml(text);
+                    let clean = self.strip_dsml(text);
                     if !clean.is_empty() {
                         enriched.push(StreamEvent::TextDelta { text: clean });
                     }
@@ -253,7 +247,7 @@ impl DeepSeekNormalizer {
             events.push(StreamEvent::ReasoningDelta { text: think_result.reasoning_text });
         }
 
-        match self.dsml_parser.finish() {
+        let dsml_err = match self.dsml_parser.finish() {
             Ok(invocations) => {
                 for inv in invocations {
                     events.push(StreamEvent::ToolCallStart {
@@ -272,46 +266,49 @@ impl DeepSeekNormalizer {
                     });
                     self.tool_index += 1;
                 }
-                Ok(events)
+                None
             }
-            Err(e) => Err(crate::model_error::ModelError::Protocol(
-                crate::model_error::ProtocolError::InvalidContent {
-                    detail: format!("DSML parse error on flush: {e}"),
-                },
-            )),
-        }
-    }
-}
+            Err(e) => Some(e),
+        };
 
-/// Strip DSML markup from text, returning only non-DSML content.
-fn strip_dsml(text: &str) -> String {
-    let mut result = String::new();
-    let mut in_dsml = false;
-    let mut pos = 0;
-    while pos < text.len() {
-        if text[pos..].starts_with("<|DSML|") {
-            if let Some(end) = text[pos..].find("</|DSML|tool_calls|>") {
-                let consumed = end + "</|DSML|tool_calls|>".len();
-                pos += consumed;
-                in_dsml = false;
+        if let Some(e) = dsml_err {
+            tracing::warn!("DS4 normalizer: DSML flush error (reasoning preserved): {e}");
+            // Return events even when DSML flush fails — reasoning is not lost
+        }
+
+        Ok(events)
+    }
+
+    /// Strip DSML markup from text, returning only non-DSML content.
+    /// Tracks cross-chunk DSML open/close via `in_dsml_tracking`.
+    fn strip_dsml(&mut self, text: &str) -> String {
+        let mut result = String::new();
+        let mut pos = 0;
+        while pos < text.len() {
+            if text[pos..].starts_with("<|DSML|") {
+                if let Some(end) = text[pos..].find("</|DSML|tool_calls|>") {
+                    let consumed = end + "</|DSML|tool_calls|>".len();
+                    pos += consumed;
+                    self.in_dsml_tracking = false;
+                    continue;
+                }
+                self.in_dsml_tracking = true;
+                pos += 1;
                 continue;
             }
-            in_dsml = true;
-            pos += 1;
-            continue;
-        }
-        if !in_dsml {
-            if let Some(ch) = text[pos..].chars().next() {
-                result.push(ch);
-                pos += ch.len_utf8();
+            if !self.in_dsml_tracking {
+                if let Some(ch) = text[pos..].chars().next() {
+                    result.push(ch);
+                    pos += ch.len_utf8();
+                } else {
+                    pos += 1;
+                }
             } else {
                 pos += 1;
             }
-        } else {
-            pos += 1;
         }
+        result
     }
-    result
 }
 
 /// Partially assembled tool call during streaming.
@@ -457,27 +454,32 @@ mod normalizer_tests {
 
     // ── strip_dsml tests ──
 
+    fn strip_dsml_on(text: &str) -> String {
+        let mut norm = DeepSeekNormalizer::new();
+        norm.strip_dsml(text)
+    }
+
     #[test]
     fn test_strip_dsml_clean_text() {
-        assert_eq!(strip_dsml("hello world"), "hello world");
+        assert_eq!(strip_dsml_on("hello world"), "hello world");
     }
 
     #[test]
     fn test_strip_dsml_removes_markup() {
         let text = "before<|DSML|tool_calls|><|DSML|invoke| name=\"t\"><|DSML|parameter| name=\"x\" string=\"true\">v</|DSML|parameter|></|DSML|invoke|></|DSML|tool_calls|>after";
-        let clean = strip_dsml(text);
+        let clean = strip_dsml_on(text);
         assert_eq!(clean, "beforeafter");
     }
 
     #[test]
     fn test_strip_dsml_empty() {
-        assert_eq!(strip_dsml(""), "");
+        assert_eq!(strip_dsml_on(""), "");
     }
 
     #[test]
     fn test_strip_dsml_only_markup() {
         let text = "<|DSML|tool_calls|><|DSML|invoke| name=\"t\"></|DSML|invoke|></|DSML|tool_calls|>";
-        assert_eq!(strip_dsml(text), "");
+        assert_eq!(strip_dsml_on(text), "");
     }
 
     // ── DeepSeekNormalizer tests ──

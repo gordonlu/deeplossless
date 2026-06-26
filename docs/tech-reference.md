@@ -28,6 +28,68 @@ between your client and the DeepSeek API:
 | **Replay Engine** | Deterministic reconstruction of execution sequences from event log |
 | **Snapshot Isolation** | Copy-on-write memory versions with budget-aware retention tiers (L0–L3) |
 
+## DeepSeek-V4 Native Infrastructure
+
+DeepLossless supports DeepSeek-V4's native capabilities via a prepended normalizer layer that runs before `StreamAssembler`, requiring no refactoring of existing streaming code.
+
+### Streaming Normalizer (`src/protocol/streaming.rs`)
+
+Runs conditionally (gated on `dsml_parse` or `reasoning_effort` CLI flags). Three sub-components:
+
+| Sub-component | Role |
+|---------------|------|
+| **ThinkTagParser** | Streaming `<think>`/`</think>` detection. Buffers up to 7 bytes across chunks to detect partial tags, emits `ReasoningDelta` events. |
+| **StreamingDsmlParser** | Parses DSML tool call markup (`<\|DSML\|tool_calls\|>...</\|DSML\|tool_calls\|>`) from text deltas across chunk boundaries. Returns `ToolInvocation` objects. |
+| **DeepSeekNormalizer** | Orchestrates ThinkTagParser + StreamingDsmlParser. `feed_text()` enriches TextDelta events into ReasoningDelta/ToolCallStart/ArgsDelta/ToolCallEnd. |
+
+Key design decisions:
+- Default-off — existing behavior unchanged when flags are not set
+- Structured events (ReasoningDelta, ToolCallStart/ArgsDelta/End) produced from raw TextDelta content
+- `strip_dsml()` tracks cross-chunk DSML open state to prevent markup leakage
+
+### Context Pack (`src/context_pack.rs`)
+
+Orders conversation history for context window optimization:
+
+| Ordering | Behavior |
+|----------|----------|
+| `Preserve` (default) | No-op — pass through unchanged |
+| `ReverseChronological` | Most recent messages first |
+| `ByImportance` | Ranked by access count, recency, and role weight |
+
+Wired into `ChatPipeline` with `context_ordering` field (default `Preserve`).
+
+### Model Error (`src/model_error.rs`)
+
+Structured error taxonomy:
+
+| Variant | Use case |
+|---------|----------|
+| `ProtocolError::InvalidContent` | DSML parse failures, malformed SSE |
+| `StreamError` | Stream assembly failures |
+| `StorageError` | DB/IO errors in event persistence |
+| `ModelCrashed` | Upstream model returned crash signal |
+
+All errors implement `ErrorMeta` for structured logging and diagnostics.
+
+### Prefix Stability (`src/prefix_stability.rs`)
+
+Compares two text streams and reports their first difference position, stable
+prefix length (across multiple characters), and list of `DiffOp` operations.
+Used by the system prompt cache stability endpoint to detect when context
+changes invalidate cached prefixes.
+
+### CLI Flags
+
+| Flag | Type | Default | Effect |
+|------|------|---------|--------|
+| `--reasoning-effort` | `auto`/`high`/`max`/`none` | `auto` | Override per-request reasoning_effort field |
+| `--dsml-parse` | `bool` | `true` | Parse DSML tool calls from model output |
+| `--dsml-emit` | `bool` | `false` | Inject DSML format in upstream requests |
+| `--quick-instruction` | `bool` | `false` | Minimize instruction overhead in system prompt |
+
+Flags flow through: `CLI → CoordinatorConfig → AppState → CanonicalRequest.deepseek_native → request_to_chat()`
+
 ## Design Principles
 
 - **Reasoning is expensive.** Don't redo it.

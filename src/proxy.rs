@@ -769,7 +769,9 @@ async fn responses(
             let mut first_chunk = true;
             let mut all_bytes: Vec<u8> = Vec::new();
             let mut assembler = crate::protocol::streaming::StreamAssembler::new();
-            let mut ds4_normalizer = if canonical.deepseek_native.dsml_parse {
+            let use_normalizer = canonical.deepseek_native.dsml_parse
+                || !matches!(canonical.deepseek_native.reasoning_effort, crate::protocol::ReasoningEffortMode::Passthrough);
+            let mut ds4_normalizer = if use_normalizer {
                 Some(crate::protocol::streaming::DeepSeekNormalizer::new())
             } else {
                 None
@@ -903,20 +905,38 @@ async fn responses(
                     }
                 for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                     if !matches!(event, StreamEvent::Done { .. }) {
-                        let events = assembler.feed(event);
-                        if let Err(e) = process_events(
-                            events,
-                            db.clone(),
-                            &cycle,
-                            &tx,
-                            Some(&mut assembler),
-                            true,
-                            stream_execution_id,
-                            stream_conv_id,
-                            &replay_session_id,
-                            &mut replay_seq_no,
-                        ) {
-                            warn!("execution event store failed: {e}");
+                        let enriched: Vec<StreamEvent> = if let Some(ref mut norm) = ds4_normalizer {
+                            match &event {
+                                StreamEvent::TextDelta { text } => {
+                                    match norm.feed_text(text) {
+                                        Ok(events) => events,
+                                        Err(e) => {
+                                            warn!("DS4 normalizer error (trailing buffer): {:?}", e);
+                                            vec![event.clone()]
+                                        }
+                                    }
+                                }
+                                _ => vec![event.clone()],
+                            }
+                        } else {
+                            vec![event]
+                        };
+                        for ev in enriched {
+                            let events = assembler.feed(ev);
+                            if let Err(e) = process_events(
+                                events,
+                                db.clone(),
+                                &cycle,
+                                &tx,
+                                Some(&mut assembler),
+                                true,
+                                stream_execution_id,
+                                stream_conv_id,
+                                &replay_session_id,
+                                &mut replay_seq_no,
+                            ) {
+                                warn!("execution event store failed: {e}");
+                            }
                         }
                     }
                 }

@@ -42,6 +42,10 @@ Optional flags:
 | `--db-path` | `~/.deeplossless/lcm.db` | SQLite database |
 | `--log-dir` | (disabled) | Per-request JSON metrics |
 | `--runtime-profile` | `autonomous` | Cache/retry/context strategy |
+| `--reasoning-effort` | `auto` | Override reasoning effort (`auto`, `high`, `max`, `none`) |
+| `--dsml-parse` | `true` | Parse DSML tool calls from model output |
+| `--dsml-emit` | `false` | Inject DSML tool call format in requests |
+| `--quick-instruction` | `false` | Minimize system prompt overhead |
 
 ### 2. Connect your agent
 

@@ -237,7 +237,7 @@ impl RuntimeError {
 // ── Classify upstream errors ──
 
 pub fn classify_upstream(status: u16, body: &str) -> ModelError {
-    let err = match status {
+    match status {
         429 => ModelError::Upstream(UpstreamError::RateLimited),
         401 => ModelError::Upstream(UpstreamError::AuthenticationFailed),
         403 => ModelError::Upstream(UpstreamError::PermissionDenied),
@@ -253,8 +253,7 @@ pub fn classify_upstream(status: u16, body: &str) -> ModelError {
                 ModelError::Upstream(UpstreamError::ServerError)
             }
         }
-    };
-    err
+    }
 }
 
 #[cfg(test)]

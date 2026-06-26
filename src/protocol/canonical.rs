@@ -100,15 +100,12 @@ pub enum ReasoningEffort {
     Max,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffortMode {
+    #[default]
     Passthrough,
     Override(ReasoningEffort),
-}
-
-impl Default for ReasoningEffortMode {
-    fn default() -> Self { Self::Passthrough }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -293,10 +290,6 @@ pub struct CanonicalRequest {
     #[serde(default)]
     pub capabilities: ProviderCapabilities,
 
-    /// Reasoning effort override (DeepSeek-V4 native).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
-
     /// DeepSeek-V4 native capabilities.
     #[serde(default)]
     pub deepseek_native: DeepSeekNativeCapabilities,
@@ -350,18 +343,6 @@ pub enum FinishReason {
     DoneWithoutExplicitReason,
     #[serde(rename = "stream_interrupted")]
     StreamInterrupted,
-}
-
-impl FinishReason {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "stop" => FinishReason::Stop,
-            "length" => FinishReason::Length,
-            "tool_calls" => FinishReason::ToolCalls,
-            "content_filter" => FinishReason::ContentFilter,
-            _ => FinishReason::Unknown,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
