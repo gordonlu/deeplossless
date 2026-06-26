@@ -769,6 +769,11 @@ async fn responses(
             let mut first_chunk = true;
             let mut all_bytes: Vec<u8> = Vec::new();
             let mut assembler = crate::protocol::streaming::StreamAssembler::new();
+            let mut ds4_normalizer = if canonical.deepseek_native.dsml_parse {
+                Some(crate::protocol::streaming::DeepSeekNormalizer::new())
+            } else {
+                None
+            };
             let mut flushed_tool_calls: Vec<(String, String, String)> = Vec::new();
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
@@ -790,34 +795,74 @@ async fn responses(
                                     && v.get("usage").is_some() {
                                         usage_buf = Some(v.clone());
                                     }
-                                for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
-                                    // Done = transport-level EOF, drain remaining buffers
-                                    if matches!(event, StreamEvent::Done { .. }) {
-                                        let mut events = assembler.flush();
-                                        // Remap tool call output_index from 0 (DeepSeek index)
-                                        // to 1+ (beyond the text message at output_index: 0)
-                                        {
-                                            let mut tc_idx = 1usize;
-                                            for ev in &mut events {
-                                                match ev {
-                                                    StreamEvent::ToolCallStart { index, .. }
-                                                    | StreamEvent::ToolCallArgsDelta { index, .. }
-                                                    | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
-                                                    | StreamEvent::OutputItemDone { index, .. } => {
-                                                        *index = tc_idx;
+                                    'event_loop: for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
+                                    // Enrich TextDelta events through DS4 normalizer when enabled
+                                    let enriched: Vec<StreamEvent> = if let Some(ref mut norm) = ds4_normalizer {
+                                        match &event {
+                                            StreamEvent::TextDelta { text } => {
+                                                match norm.feed_text(text) {
+                                                    Ok(events) => events,
+                                                    Err(e) => {
+                                                        warn!("DS4 normalizer error: {:?}", e);
+                                                        vec![event.clone()]
                                                     }
-                                                    _ => {}
-                                                }
-                                                if matches!(ev, StreamEvent::OutputItemDone { .. }) {
-                                                    tc_idx += 1;
                                                 }
                                             }
+                                            _ => vec![event.clone()],
                                         }
-                                        for ev in &events {
-                                            if let StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments, .. } = ev {
-                                                flushed_tool_calls.push((call_id.clone(), name.clone(), arguments.clone()));
+                                    } else {
+                                        vec![event]
+                                    };
+                                    for ev in enriched {
+                                        // Done = transport-level EOF, drain remaining buffers
+                                        if matches!(ev, StreamEvent::Done { .. }) {
+                                            let mut events = assembler.flush();
+                                            // Remap tool call output_index from 0 (DeepSeek index)
+                                            // to 1+ (beyond the text message at output_index: 0)
+                                            {
+                                                let mut tc_idx = 1usize;
+                                                for ev in &mut events {
+                                                    match ev {
+                                                        StreamEvent::ToolCallStart { index, .. }
+                                                        | StreamEvent::ToolCallArgsDelta { index, .. }
+                                                        | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
+                                                        | StreamEvent::OutputItemDone { index, .. } => {
+                                                            *index = tc_idx;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                    if matches!(ev, StreamEvent::OutputItemDone { .. }) {
+                                                        tc_idx += 1;
+                                                    }
+                                                }
                                             }
+                                            for ev in &events {
+                                                if let StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments, .. } = ev {
+                                                    flushed_tool_calls.push((call_id.clone(), name.clone(), arguments.clone()));
+                                                }
+                                            }
+                                            match process_events(
+                                                events,
+                                                db.clone(),
+                                                &cycle,
+                                                &tx,
+                                                Some(&mut assembler),
+                                                true,
+                                                stream_execution_id,
+                                                stream_conv_id,
+                                                &replay_session_id,
+                                                &mut replay_seq_no,
+                                            ) {
+                                                Ok(true) => {}
+                                                Ok(false) => break 'event_loop,
+                                                Err(e) => {
+                                                    warn!("execution event store failed: {e}");
+                                                    break 'event_loop;
+                                                }
+                                            }
+                                            continue 'event_loop;
                                         }
+                                        let events = assembler.feed(ev);
                                         match process_events(
                                             events,
                                             db.clone(),
@@ -831,32 +876,11 @@ async fn responses(
                                             &mut replay_seq_no,
                                         ) {
                                             Ok(true) => {}
-                                            Ok(false) => break,
+                                            Ok(false) => break 'event_loop,
                                             Err(e) => {
                                                 warn!("execution event store failed: {e}");
-                                                break;
+                                                break 'event_loop;
                                             }
-                                        }
-                                        continue;
-                                    }
-                                    let events = assembler.feed(event);
-                                    match process_events(
-                                        events,
-                                        db.clone(),
-                                        &cycle,
-                                        &tx,
-                                        Some(&mut assembler),
-                                        true,
-                                        stream_execution_id,
-                                        stream_conv_id,
-                                        &replay_session_id,
-                                        &mut replay_seq_no,
-                                    ) {
-                                        Ok(true) => {}
-                                        Ok(false) => break,
-                                        Err(e) => {
-                                            warn!("execution event store failed: {e}");
-                                            break;
                                         }
                                     }
                                 }
@@ -895,6 +919,32 @@ async fn responses(
                             warn!("execution event store failed: {e}");
                         }
                     }
+                }
+            }
+            // Flush DS4 normalizer (emit any remaining think-reasoning or DSML tool calls)
+            if let Some(ref mut norm) = ds4_normalizer {
+                match norm.finish() {
+                    Ok(flush_events) => {
+                        for ev in flush_events {
+                            if !matches!(ev, StreamEvent::ReasoningDelta { .. } | StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallArgsDelta { .. } | StreamEvent::ToolCallEnd { .. }) {
+                                continue;
+                            }
+                            let events = assembler.feed(ev);
+                            let _ = process_events(
+                                events,
+                                db.clone(),
+                                &cycle,
+                                &tx,
+                                Some(&mut assembler),
+                                true,
+                                stream_execution_id,
+                                stream_conv_id,
+                                &replay_session_id,
+                                &mut replay_seq_no,
+                            );
+                        }
+                    }
+                    Err(e) => warn!("DS4 normalizer finish error: {:?}", e),
                 }
             }
             // Upstream [DONE] → finish assembly, get accumulated content

@@ -176,6 +176,10 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         cache_normalize: false,
         lcm_context_tokens: 0,
         workspace: None,
+        reasoning_effort: deeplossless::protocol::ReasoningEffortMode::Passthrough,
+        dsml_parse: true,
+        dsml_emit: false,
+        quick_instruction: false,
     }
 }
 
