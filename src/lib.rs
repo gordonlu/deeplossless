@@ -93,6 +93,7 @@ pub mod response_store;
 pub mod session_store;
 pub mod runtime_coordinator;
 pub mod session;
+pub mod model_error;
 pub mod snapshot;
 pub mod snippet;
 pub mod summarizer;
