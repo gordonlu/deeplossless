@@ -33,6 +33,7 @@
 pub mod anthropic;
 pub mod canonical;
 pub mod chat_completions;
+pub mod dsml;
 pub mod responses;
 pub mod streaming;
 
@@ -59,6 +60,8 @@ pub use canonical::{
     ReasoningEffortMode,
     DeepSeekNativeCapabilities,
 };
+
+pub use dsml::parse_dsml_tool_calls;
 
 /// Provider capability registry: maps upstream model names to local equivalents.
 /// Explicit overrides take priority over prefix rules. Falls back to identity.
