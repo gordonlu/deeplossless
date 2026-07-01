@@ -2906,28 +2906,32 @@ async fn stream_truncated_no_done_still_closes() {
 
 #[tokio::test]
 async fn upstream_unreachable_returns_502() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        if let Ok((socket, _)) = listener.accept().await {
-            drop(socket);
-        }
-    });
+    // Bind to a random port, then drop — yielding a guaranteed-closed port.
+    let closed_addr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    };
 
-    let state = build_proxy_state(addr, "unreachable").await;
+    let state = build_proxy_state(closed_addr, "unreachable").await;
     let proxy_addr = start_proxy(state).await;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
     let resp = client
         .post(format!("http://{proxy_addr}/v1/chat/completions"))
         .header("authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}))
-        .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
         .unwrap();
+    let status = resp.status();
     assert!(
-        !resp.status().is_success(),
-        "should return error for unreachable upstream"
+        status.as_u16() == 502,
+        "unreachable upstream should return 502, got {status}: {}",
+        resp.text().await.unwrap_or_default()
     );
 }
 
@@ -3626,4 +3630,256 @@ async fn responses_endpoint_bypass_skips_pipeline() {
         body.contains("resp_") || body.contains("output"),
         "bypass responses should produce output: {body}"
     );
+}
+
+// ── Route inventory test ──────────────────────────────────────────────────
+// Verifies all documented LCM routes are registered and respond (not 404).
+
+struct RouteInventoryEntry {
+    method: reqwest::Method,
+    path: String,
+    not_found_ok: bool,
+}
+
+/// Helper: check that a route responds (not an axum 404 = unregistered).
+async fn check_route(client: &reqwest::Client, base: &str, entry: &RouteInventoryEntry) {
+    let url = format!("{base}{path}", path = entry.path);
+    let req = client.request(entry.method.clone(), &url).header("authorization", "Bearer test-key");
+    let resp = req.send().await.unwrap_or_else(|e| panic!("request to {url} failed: {e}"));
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+
+    if status == StatusCode::NOT_FOUND {
+        let body = resp.text().await.unwrap_or_default();
+        // Axum returns "Not Found" or empty body for unmatched routes
+        let is_axum_404 = body.trim().is_empty() || body.trim() == "Not Found" || body.contains("NotFound");
+        if is_axum_404 {
+            panic!("route {method} {path}: not registered (axum 404)",
+                method = entry.method, path = entry.path);
+        }
+        // Handler returned 404 with JSON — route is registered
+        eprintln!("NOTE: route {method} {path} returned 404 with body — handler needs data",
+            method = entry.method, path = entry.path);
+    } else if status.is_server_error() && !entry.not_found_ok {
+        panic!("route {method} {path}: unexpected 500", method = entry.method, path = entry.path);
+    } else if status.is_server_error() {
+        eprintln!("WARN: route {method} {path} returned 500 — handler may need data set up",
+            method = entry.method, path = entry.path);
+    }
+}
+
+#[tokio::test]
+async fn route_inventory_documented_endpoints_are_registered() {
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(upstream_addr, "route_inv").await;
+    let proxy_addr = start_proxy(state).await;
+    let base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let routes = vec![
+        // Data-independent routes (must return non-404/non-500)
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/models".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/runtime/stats".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/runtime/debug-dump".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/sessions".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/latency".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/latency/summary".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/cache/stability".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/versions".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/health".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/file/conflicts".into(), not_found_ok: false },
+        // Data-dependent routes (accept 404 if data not set up)
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/grep/1?query=test".into(), not_found_ok: true },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/expand/1".into(), not_found_ok: true },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/status/1".into(), not_found_ok: true },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/snippets/1".into(), not_found_ok: true },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/trace/1".into(), not_found_ok: true },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/replay/1".into(), not_found_ok: true },
+        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/cache?tool=test&args=test".into(), not_found_ok: true },
+        // Mutation/data-push routes
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/failure".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/plan".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/file/claim".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/file/release".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/compress".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/delete".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/rollback".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/inject".into(), not_found_ok: false },
+        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/chat/completions".into(), not_found_ok: false },
+    ];
+
+    for entry in &routes {
+        check_route(&client, &base, entry).await;
+    }
+}
+
+// ── Broader negative tests (P1 #9) ──────────────────────────────────────
+
+/// Helper: start a mock upstream that returns SSE for streaming requests or
+/// a tool-call JSON for non-streaming requests. Returns (addr, shutdown_tx).
+async fn start_tool_call_mock_upstream(
+    sse_chunks: Vec<&'static str>,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::routing::post;
+    use futures::stream;
+
+    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
+        let sse_chunks = sse_chunks.clone();
+        async move {
+            let is_streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_streaming {
+                let stream = stream::iter(sse_chunks.into_iter().map(|c| {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(c))
+                }));
+                ([(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], Body::from_stream(stream))
+            } else {
+                // Non-streaming: return a tool call in standard JSON
+                let resp = json!({
+                    "id": "mock-cmpl-001",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_mock",
+                                "type": "function",
+                                "function": {
+                                    "name": "grep",
+                                    "arguments": r#"{"pattern":"foo"}"#
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                });
+                ([(header::CONTENT_TYPE, "application/json")], Body::from(serde_json::to_string(&resp).unwrap()))
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap();
+    });
+    (addr, tx)
+}
+
+#[tokio::test]
+async fn tool_call_duplicate_arg_chunks_still_assembles() {
+    // Upstream sends the same argument fragment twice — the assembler must
+    // not produce duplicate tool-call entries or corrupt argument JSON.
+    let (addr, _shutdown) = start_tool_call_mock_upstream(vec![
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pa\"}}]},\"index\":0}],\"usage\":null}\n\n",
+        // Same chunk sent TWICE
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pa\"}}}]},\"index\":0}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ttern\\\":\\\"foo\\\"}\"}}]},\"index\":0}],\"usage\":null}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+        "data: [DONE]\n\n",
+    ]).await;
+    let state = build_proxy_state(addr, "dup_chunks").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","input":"search","stream":true}))
+        .send().await.unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_success(), "duplicate arg chunks should produce valid SSE stream: {} — body: {}", status, body);
+    assert!(body.contains("grep"), "response should contain tool call name: {body}");
+    assert!(body.contains("pattern"), "response should contain tool call args: {body}");
+}
+
+#[tokio::test]
+async fn tool_call_partial_args_graceful_degradation() {
+    // Upstream sends a tool call but cuts off before all arguments arrive.
+    // The assembler should still produce a complete-enough tool call entry
+    // rather than panicking or hanging.
+    let (addr, _shutdown) = start_tool_call_mock_upstream(vec![
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"\"}}]},\"index\":0}],\"usage\":null}\n\n",
+        // Only one fragment arrives, then finish with no more data
+        "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
+        "data: [DONE]\n\n",
+    ]).await;
+    let state = build_proxy_state(addr, "partial_args").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&json!({"model":"deepseek-v4-flash","input":"search","stream":false}))
+        .send().await.unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_success(), "partial tool call args should produce valid response: {} — body: {}", status, body);
+    assert!(body.contains("grep"), "response should contain tool call name even with partial args: {body}");
+}
+
+// ── Cache invalidation via file observation ───────────────────────────────
+// P0 #5: store_file_observation must invalidate tool cache on content change.
+
+#[tokio::test]
+async fn file_observation_content_change_invalidates_tool_cache() {
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(upstream_addr, "obs_inval").await;
+
+    // 1. Store baseline observation (first time — no previous, no invalidation)
+    let obs_old = deeplossless::file_observation::observe_file("src/main.rs", "old content");
+    state.storage.db.store_file_observation(&obs_old).unwrap();
+
+    // 2. Populate tool cache with an entry dependent on "src/main.rs"
+    use deeplossless::tool_cache;
+    let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
+    state.storage.db.tool_cache_put(
+        &cname, &args_hash, "cached result",
+        &["src/main.rs".to_string()],
+    ).unwrap();
+    let before = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
+    assert!(before.is_some(), "cache entry should exist before content change");
+
+    // 3. Observe the file again with NEW content (hash differs → invalidate)
+    let obs_new = deeplossless::file_observation::observe_file("src/main.rs", "new content here");
+    state.storage.db.store_file_observation(&obs_new).unwrap();
+
+    // 4. Verify cache entry was invalidated
+    let after = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
+    assert!(after.is_none(), "cache entry should be invalidated after content change");
+}
+
+#[tokio::test]
+async fn file_observation_same_content_does_not_invalidate_cache() {
+    let (upstream_addr, _shutdown) = start_mock_upstream().await;
+    let state = build_proxy_state(upstream_addr, "obs_keep").await;
+
+    // 1. Populate tool cache
+    use deeplossless::tool_cache;
+    let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"bar"}"#);
+    state.storage.db.tool_cache_put(
+        &cname, &args_hash, "cached result",
+        &["src/lib.rs".to_string()],
+    ).unwrap();
+    let before = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
+    assert!(before.is_some());
+
+    // 2. Store initial observation
+    let obs1 = deeplossless::file_observation::observe_file("src/lib.rs", "same content");
+    state.storage.db.store_file_observation(&obs1).unwrap();
+
+    // 3. Store ANOTHER observation with IDENTICAL content
+    let obs2 = deeplossless::file_observation::observe_file("src/lib.rs", "same content");
+    state.storage.db.store_file_observation(&obs2).unwrap();
+
+    // 4. Cache entry should SURVIVE (content hash unchanged)
+    let after = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
+    assert!(after.is_some(), "cache entry should survive when content unchanged");
 }

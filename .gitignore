@@ -3,8 +3,10 @@
 *.db-wal
 *.db-shm
 .env
-AGENTS.md
 .claude/
+.codex/
+.opencode/
+AGENTS.md
 CLAUDE.md
 /docs/superpowers/
 ROADMAP.md

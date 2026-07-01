@@ -130,8 +130,12 @@ RUNTIME_BUDGET=0.1-1
 ### Proxy
 
 ```
-POST /v1/chat/completions     — OpenAI-compatible proxy, SSE streaming, DAG context injected
-POST /v1/responses            — Responses API → Chat Completions (enables Codex + DeepSeek)
+GET  /v1/models                    — List available models (auto-mapped)
+POST /v1/chat/completions          — OpenAI-compatible proxy, SSE streaming, DAG context injected
+POST /v1/responses                 — Responses API → Chat Completions (enables Codex + DeepSeek)
+GET  /v1/responses/{response_id}   — Retrieve a stored response by ID
+POST /v1/lcm/chat/completions      — Chat completions with DAG context injection
+POST /v1/lcm/inject                — Inject DAG context into messages array
 ```
 
 Model names are auto-mapped: `gpt-5*` → `deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.
@@ -139,28 +143,41 @@ Model names are auto-mapped: `gpt-5*` → `deepseek-v4-pro`, `gpt-*-mini` → `d
 ### Memory
 
 ```
-GET  /v1/lcm/grep/{conv_id}?query=     — FTS5 BM25 full-text search
-GET  /v1/lcm/expand/{node_id}          — Expand summary to children
-GET  /v1/lcm/status/{conv_id}          — DAG health (tokens, leaves, level)
-GET  /v1/lcm/snippets/{node_id}        — View extracted precision-critical values
-GET  /v1/lcm/trace/{node_id}           — Sentence-level provenance with source excerpts
-GET  /v1/lcm/stream/{conv_id}?budget=  — Streaming DAG context (SSE incremental delivery)
+GET  /v1/lcm/grep/{conv_id}?query=        — FTS5 BM25 full-text search
+GET  /v1/lcm/grep?fingerprint=            — Search by conversation fingerprint
+GET  /v1/lcm/current                      — Current conversation info
+GET  /v1/lcm/expand/{node_id}             — Expand summary to children
+GET  /v1/lcm/status/{conv_id}             — DAG health (tokens, leaves, level)
+GET  /v1/lcm/snippets/{node_id}           — View extracted precision-critical values
+GET  /v1/lcm/trace/{node_id}              — Sentence-level provenance with source excerpts
+GET  /v1/lcm/stream/{conv_id}?budget=     — Streaming DAG context (SSE incremental delivery)
+GET  /v1/lcm/similar/{hash}               — Find similar nodes by semantic hash
+GET  /v1/lcm/similar                      — Find similar (missing hash — returns 400)
+GET  /v1/lcm/sessions/{id}/patches        — Session patches
+GET  /v1/lcm/sessions/{id}/context-pressure — Context pressure metrics
 ```
 
 ### Runtime
 
 ```
-GET  /v1/lcm/global/search?q=&limit=     — Cross-session semantic search
-GET  /v1/lcm/execution/search?q=         — Execution memory: bugs, tool chains, code edits
-GET  /v1/lcm/runtime/stats               — Runtime metrics (tokens, cache rate, failures)
+GET  /v1/lcm/global/search?q=&limit=       — Cross-session semantic search
+GET  /v1/lcm/execution/search?q=           — Execution memory: bugs, tool chains, code edits
+GET  /v1/lcm/runtime/stats                 — Runtime metrics (tokens, cache rate, failures)
 GET  /v1/lcm/runtime/report?conv_id=&format= — Session report (markdown or SVG share card)
-GET  /v1/lcm/runtime/debug-dump          — Structured dump for GitHub issues (no user content)
-GET  /v1/lcm/sessions                    — List all conversations
-GET  /v1/lcm/sessions/{id}/events        — Execution events for a session
-GET  /v1/lcm/sessions/{id}/system-prompt — Deduplicated system prompt history
-GET  /v1/lcm/latency                     — Recent upstream latency records
-GET  /v1/lcm/latency/summary             — Aggregated P50/P95/P99 latency
-GET  /v1/lcm/cache/stability             — System prompt cache stability
+GET  /v1/lcm/runtime/debug-dump            — Structured dump for GitHub issues (no user content)
+GET  /v1/lcm/sessions                      — List all conversations
+GET  /v1/lcm/sessions/{id}/events          — Execution events for a session
+GET  /v1/lcm/sessions/{id}/system-prompt   — Deduplicated system prompt history
+GET  /v1/lcm/latency                       — Recent upstream latency records
+GET  /v1/lcm/latency/summary               — Aggregated P50/P95/P99 latency
+GET  /v1/lcm/cache/stability               — System prompt cache stability
+GET  /v1/lcm/search                        — Search execution events
+GET  /v1/lcm/diffs                         — List file diffs
+GET  /v1/lcm/diffs/reconstruct             — Reconstruct diff from events
+GET  /v1/lcm/diffs/overlaps                — Find diff overlaps
+GET  /v1/lcm/score/{conv_id}               — Conversation score
+GET  /v1/lcm/audit/{conv_id}               — Audit trail
+GET  /v1/lcm/audit/report/{conv_id}        — Audit report
 ```
 
 ### Replay
@@ -176,12 +193,17 @@ GET  /v1/lcm/versions                       — List memory version history
 ```
 GET  /v1/lcm/cache?tool=&args=           — Check tool cache before execution
 POST /v1/lcm/cache/put                   — Store tool result after execution
+DELETE /v1/lcm/cache                     — Delete cache entry
 POST /v1/lcm/failure                     — Record failure pattern
 POST /v1/lcm/plan                        — Store execution plan
 GET  /v1/lcm/plan/{conv_id}              — Read active plan
+DELETE /v1/lcm/plan                      — Delete plan
 POST /v1/lcm/file/claim                  — Claim file ownership (409 if conflict)
 POST /v1/lcm/file/release                — Release file ownership
 GET  /v1/lcm/file/conflicts              — List active file claims
+GET  /v1/lcm/health/{conv_id}            — DAG health for a conversation
+GET  /v1/lcm/motifs/{conv_id}            — Conversation motifs
+POST /v1/lcm/observe                     — Observe a file (register for cache invalidation)
 ```
 
 ### Operations
@@ -190,7 +212,8 @@ GET  /v1/lcm/file/conflicts              — List active file claims
 POST /v1/lcm/compress  {conv_id, from, to}  — Compress node range
 POST /v1/lcm/delete    {conv_id, id}        — Soft-delete from active context
 POST /v1/lcm/rollback  {conv_id, id}        — Rollback to checkpoint
-POST /health                                — Health check (DB, upstream, compactor)
+GET  /health                                — Health check (DB, upstream, compactor)
+GET  /v1/health                             — Same as /health
 GET  /metrics                               — Prometheus metrics
 ```
 

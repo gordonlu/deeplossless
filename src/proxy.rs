@@ -222,7 +222,7 @@ fn check_tool_cache(
 ///
 /// Cache-hit text is fed back through the assembler (when provided) so the
 /// final lifecycle events contain the cached content.
-fn process_events(
+pub(crate) fn process_events(
     events: Vec<StreamEvent>,
     db: std::sync::Arc<crate::db::Database>,
     cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
@@ -414,6 +414,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/versions", get(lcm_versions))
         .route("/v1/lcm/cache/put", post(lcm_cache_put))
         .route("/v1/lcm/cache", get(lcm_cache_get))
+        .route("/v1/lcm/chat/completions", post(lcm_chat_completions))
+        .route("/v1/lcm/inject", post(lcm_context_inject))
         .route("/v1/lcm/cache", delete(lcm_cache_delete))
         .route("/v1/lcm/failure", post(lcm_failure_put))
         .route("/v1/lcm/plan", post(lcm_plan_put))
@@ -1794,7 +1796,6 @@ async fn chat_completions(
 
 /// POST /v1/lcm/chat/completions — chat completions with automatic context injection.
 /// Same interface as /v1/chat/completions, but assembles DAG context and merges it
-#[allow(dead_code)]
 /// into the last user message before forwarding to upstream. Reports context token
 /// usage in the response via custom header `x-lcm-context-tokens`.
 async fn lcm_chat_completions(
@@ -2876,8 +2877,12 @@ async fn lcm_file_conflicts(
 /// Store a tool result in cache. Agent calls this after executing a tool.
 async fn lcm_cache_put(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let tool = body.get("tool").map(|s| s.as_str()).unwrap_or("");
     let args = body.get("args").map(|s| s.as_str()).unwrap_or("");
     let result = body.get("result").map(|s| s.as_str()).unwrap_or("");
@@ -2898,8 +2903,12 @@ async fn lcm_cache_put(
 /// Look up a cached tool result. Agent calls this before executing a tool.
 async fn lcm_cache_get(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let tool = params.get("tool").map(|s| s.as_str()).unwrap_or("");
     let args = params.get("args").map(|s| s.as_str()).unwrap_or("");
 
@@ -3041,7 +3050,6 @@ async fn lcm_context_pressure(
     }
 }
 
-#[allow(dead_code)]
 /// POST /v1/lcm/inject — inject DAG context into the last user message.
 /// Takes a messages array, assembles DAG context for the given conversation,
 /// and appends it to the last `role: "user"` message. Returns the modified
@@ -3057,7 +3065,6 @@ struct LcmInjectRequest {
     /// Token budget for context. Default 500, max 8000. Set 0 to skip assembly.
     max_tokens: Option<usize>,
 }
-#[allow(dead_code)]
 async fn lcm_context_inject(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3159,8 +3166,12 @@ async fn lcm_cache_stability(
 /// Store a failure pattern. Agent calls this after a fix fails.
 async fn lcm_failure_put(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let conv_id: i64 = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(1);
     let sig = body.get("signature").and_then(|v| v.as_str()).unwrap_or("");
     let fix = body.get("attempted_fix").and_then(|v| v.as_str()).unwrap_or("");
@@ -3186,8 +3197,12 @@ async fn lcm_failure_put(
 /// Store an execution plan. Agent calls this after creating a plan.
 async fn lcm_plan_put(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<HashMap<String, serde_json::Value>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let conv_id: i64 = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(1);
     let goal = body.get("goal").and_then(|v| v.as_str()).unwrap_or("");
     let steps: Vec<String> = body.get("steps")
@@ -3205,8 +3220,12 @@ async fn lcm_plan_put(
 /// Get the active plan for a conversation.
 async fn lcm_plan_get(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(conv_id): Path<i64>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     match state.storage.db.get_active_plan(conv_id) {
         Ok(Some((id, goal, pending, completed, assumptions))) => Json(json!({
             "id": id, "goal": goal,
@@ -3242,7 +3261,11 @@ async fn lcm_plan_delete(
 /// Debug dump for GitHub issues. Strips user content — only counters, hashes, and structure.
 async fn lcm_debug_dump(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
     let m = &cycle.metrics;
 
@@ -3286,8 +3309,12 @@ async fn lcm_debug_dump(
 /// Generate a shareable session report (markdown).
 async fn lcm_runtime_report(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !ctx_react_auth_ok(&headers, &state) {
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
+    }
     let label = params.get("label").map(|s| s.as_str()).unwrap_or("coding session");
     let conv_id: Option<i64> = params.get("conv_id").and_then(|s| s.parse().ok());
     let turns: usize = params.get("turns").and_then(|s| s.parse().ok()).unwrap_or(0);

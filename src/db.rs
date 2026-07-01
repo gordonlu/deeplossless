@@ -2004,6 +2004,15 @@ impl Database {
         &self,
         obs: &crate::file_observation::FileObservation,
     ) -> anyhow::Result<i64> {
+        // Check if content changed vs previous observation for the same path.
+        let previous_hash = self.get_previous_observation_hash(&obs.path)?;
+        if let Some(prev_hash) = previous_hash {
+            if prev_hash != obs.content_hash {
+                // Content changed — invalidate tool cache entries that depend on this file
+                let _ = self.on_files_changed(std::slice::from_ref(&obs.path));
+            }
+        }
+
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let ast_json = serde_json::to_string(&obs.ast)?;
         conn.execute(
@@ -2015,6 +2024,19 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the content_hash of the latest observation for a path, if any.
+    fn get_previous_observation_hash(&self, path: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT content_hash FROM file_observations WHERE path = ?1 ORDER BY created_at DESC LIMIT 1"
+        )?;
+        let mut rows = stmt.query(rusqlite::params![path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
     }
 
     /// Compute and return the execution score for a conversation.
