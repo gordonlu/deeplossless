@@ -114,7 +114,7 @@ impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             model: "deepseek-v4-flash".to_string(),
-            upstream: "https://api.deepseek.com".to_string(),
+            upstream: "https://api.deepseek.com/v1/chat/completions".to_string(),
             api_key: String::new(),
             offline_fallback_only: false,
             fallback_max_tokens: 512,
@@ -335,7 +335,7 @@ impl Summarizer {
 
     /// Build the chat completion URL for the configured upstream provider.
     fn chat_url(&self) -> String {
-        format!("{}/v1/chat/completions", self.config.upstream.trim_end_matches('/'))
+        self.config.upstream.clone()
     }
 
     /// Construct the summarization prompt from a template (P1-2).

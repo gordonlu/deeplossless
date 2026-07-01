@@ -19,7 +19,7 @@ pub(crate) struct Cli {
     http_port: u16,
 
     /// Upstream DeepSeek API base URL
-    #[arg(long, default_value = "https://api.deepseek.com")]
+    #[arg(long, default_value = "https://api.deepseek.com/v1/chat/completions")]
     upstream: String,
 
     /// SQLite database path (supports ~/ and $HOME expansion)
