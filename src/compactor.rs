@@ -900,7 +900,11 @@ mod tests {
         );
 
         let config = CompactorConfig {
-            summarizer: SummarizerConfig { api_key: "test".to_string(), ..Default::default() },
+            summarizer: SummarizerConfig {
+                api_key: "test".to_string(),
+                upstream_path: "/v1/chat/completions".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

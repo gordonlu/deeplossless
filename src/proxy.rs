@@ -53,6 +53,20 @@ fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>
     (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
 }
 
+/// Build the upstream Chat Completions URL with auto-detection.
+/// If `upstream` already ends with `/chat/completions` or `/v1`, use it
+/// directly or append only the missing suffix. Otherwise append `path`.
+pub fn upstream_chat_url(upstream: &str, path: &str) -> String {
+    let base = upstream.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}{}", base, path)
+    }
+}
+
 fn response_session_key_from_object(resp: &Value) -> Option<String> {
     resp["prompt_cache_key"]
         .as_str()
@@ -678,7 +692,7 @@ async fn responses(
     }
 
     // 4. Forward to upstream
-    let upstream_url = state.upstream.clone();
+    let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let api_key = get_cached_key(&state.api_key);
     let req_stream = injected.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let req_msgs = injected.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -1482,7 +1496,7 @@ async fn chat_completions(
     // Pure passthrough: zero processing. Forward upstream URL, method, body, headers.
     // For isolating protocol bugs — when this works but the full pipeline doesn't.
     if state.passthrough && streaming {
-        let upstream_url = state.upstream.clone();
+        let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
         let resp = state.runtime.client.post(&upstream_url)
             .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
             .header("Content-Type", "application/json")
@@ -1601,7 +1615,7 @@ async fn chat_completions(
     }
 
     // Forward to upstream
-    let upstream_url = state.upstream.clone();
+    let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let upstream_start = std::time::Instant::now();
     let resp = match state.runtime
         .client
@@ -1863,7 +1877,7 @@ async fn lcm_chat_completions(
     }
 
     // Forward to upstream
-    let upstream_url = state.upstream.clone();
+    let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let upstream_start = std::time::Instant::now();
     let resp = match state.runtime
         .client
@@ -2262,7 +2276,7 @@ async fn anthropic_messages(
     let overhead_ms = t0.elapsed().as_millis();
 
     // Forward to upstream
-    let upstream_url = state.upstream.clone();
+    let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let body_kb = serde_json::to_string(&deepseek_body).unwrap_or_default().len() as f64 / 1024.0;
     let orig_kb = serde_json::to_string(&body).unwrap_or_default().len() as f64 / 1024.0;
     tracing::debug!(target: "deeplossless::anthropic", orig_kb, translated_kb = body_kb, overhead_ms, "request sizes");

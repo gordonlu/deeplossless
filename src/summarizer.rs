@@ -92,6 +92,8 @@ pub struct SummarizerConfig {
     pub model: String,
     /// Upstream API base URL (e.g. <https://api.deepseek.com>).
     pub upstream: String,
+    /// Upstream API path suffix. Default: /v1/chat/completions.
+    pub upstream_path: String,
     /// API key.
     pub api_key: String,
     /// Explicit offline mode: skip LLM levels and use deterministic fallback only.
@@ -114,7 +116,8 @@ impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             model: "deepseek-v4-flash".to_string(),
-            upstream: "https://api.deepseek.com/v1/chat/completions".to_string(),
+            upstream: "https://api.deepseek.com".to_string(),
+            upstream_path: "/v1/chat/completions".to_string(),
             api_key: String::new(),
             offline_fallback_only: false,
             fallback_max_tokens: 512,
@@ -335,7 +338,14 @@ impl Summarizer {
 
     /// Build the chat completion URL for the configured upstream provider.
     fn chat_url(&self) -> String {
-        self.config.upstream.clone()
+        let base = self.config.upstream.trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}{}", base, self.config.upstream_path)
+        }
     }
 
     /// Construct the summarization prompt from a template (P1-2).

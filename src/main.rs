@@ -18,9 +18,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "8081")]
     http_port: u16,
 
-    /// Upstream DeepSeek API base URL
-    #[arg(long, default_value = "https://api.deepseek.com/v1/chat/completions")]
+    /// Upstream API base URL. If path already contains /chat/completions,
+    /// --upstream-path is not appended.
+    #[arg(long, default_value = "https://api.deepseek.com")]
     upstream: String,
+
+    /// Upstream API path suffix. Only appended when --upstream does not
+    /// already end with /chat/completions.
+    #[arg(long, default_value = "/v1/chat/completions")]
+    upstream_path: String,
 
     /// SQLite database path (supports ~/ and $HOME expansion)
     #[arg(long, default_value = "~/.deeplossless/lcm.db")]
@@ -646,6 +652,7 @@ async fn main() -> anyhow::Result<()> {
         dag_threshold: cli.dag_threshold,
         summarizer_budget: cli.summarizer_budget,
         upstream: cli.upstream,
+        upstream_path: cli.upstream_path,
         db_path: cli.db_path,
         api_key: cli.api_key,
         admin_key: cli.admin_key,

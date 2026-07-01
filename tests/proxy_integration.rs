@@ -139,7 +139,8 @@ async fn build_proxy_state(upstream_addr: SocketAddr, suffix: &str) -> deeplossl
         ),
     ));
     deeplossless::AppState {
-        upstream: format!("http://{}/v1/chat/completions", upstream_addr),
+        upstream: format!("http://{}", upstream_addr),
+        upstream_path: "/v1/chat/completions".to_string(),
         api_key: std::sync::Arc::new(std::sync::Mutex::new(Some("test-key".to_string()))),
         admin_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
         cache_stability: std::sync::Arc::new(std::sync::Mutex::new(
