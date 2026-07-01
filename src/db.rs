@@ -686,6 +686,28 @@ impl Database {
         // v0.5.0: reasoning store for multi-turn continuity
         conn.execute_batch(crate::execution::REASONING_STORE_MIGRATION)?;
 
+        // v0.7.1: persisted Responses API continuity. The in-memory
+        // ResponseStore/SessionStore remain hot caches; these tables are the
+        // restart recovery source of truth.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS response_objects (
+                response_id TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL DEFAULT '',
+                response_json TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_response_objects_session
+                ON response_objects(session_id);
+
+            CREATE TABLE IF NOT EXISTS response_sessions (
+                session_id TEXT PRIMARY KEY,
+                messages_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );"
+        )?;
+
         // v0.5.0: tool_call_id for parallel group matching
         let has_tool_call_id: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_call_id'")
@@ -2124,6 +2146,76 @@ impl Database {
             }
         }
         Ok(invalidated)
+    }
+
+    /// Persist a Responses API envelope for restart-safe
+    /// `/v1/responses/{id}` retrieval.
+    pub fn store_response_object(
+        &self,
+        response_id: &str,
+        session_id: &str,
+        response: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(response)?;
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO response_objects (response_id, session_id, response_json, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(response_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                response_json = excluded.response_json,
+                updated_at = datetime('now')",
+            rusqlite::params![response_id, session_id, payload],
+        )?;
+        Ok(())
+    }
+
+    /// Load a persisted Responses API envelope.
+    pub fn get_response_object(&self, response_id: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let conn = self.read_conn();
+        let payload = conn.query_row(
+            "SELECT response_json FROM response_objects WHERE response_id = ?1",
+            rusqlite::params![response_id],
+            |row| row.get::<_, String>(0),
+        ).ok();
+        match payload {
+            Some(payload) => Ok(Some(serde_json::from_str(&payload)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist Chat Completions-format messages for a Responses session
+    /// keyed by `prompt_cache_key`.
+    pub fn store_response_session(
+        &self,
+        session_id: &str,
+        messages: &[serde_json::Value],
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(messages)?;
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO response_sessions (session_id, messages_json, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(session_id) DO UPDATE SET
+                messages_json = excluded.messages_json,
+                updated_at = datetime('now')",
+            rusqlite::params![session_id, payload],
+        )?;
+        Ok(())
+    }
+
+    /// Load persisted Chat Completions-format messages for a Responses session.
+    pub fn get_response_session(&self, session_id: &str) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+        let conn = self.read_conn();
+        let payload = conn.query_row(
+            "SELECT messages_json FROM response_sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        ).ok();
+        match payload {
+            Some(payload) => Ok(Some(serde_json::from_str(&payload)?)),
+            None => Ok(None),
+        }
     }
 
     // ── Failure memory (v0.8) ─────────────────────────────────────────
@@ -4120,6 +4212,51 @@ mod tests {
         // Second get should still return the cached result
         let (result2, _) = db.tool_cache_get("cmd", "k1").unwrap().unwrap();
         assert_eq!(result2, "out", "repeated gets should return the cached result");
+    }
+
+    #[tokio::test]
+    async fn response_continuity_survives_database_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("responses.db");
+        {
+            let db = Database::builder()
+                .path(&path)
+                .build()
+                .await
+                .unwrap();
+            db.store_response_object(
+                "resp_persisted",
+                "session-a",
+                &serde_json::json!({
+                    "id": "resp_persisted",
+                    "object": "response",
+                    "output": []
+                }),
+            )
+            .unwrap();
+            db.store_response_session(
+                "session-a",
+                &[serde_json::json!({"role": "user", "content": "hello"})],
+            )
+            .unwrap();
+        }
+
+        let reopened = Database::builder()
+            .path(&path)
+            .build()
+            .await
+            .unwrap();
+        let response = reopened
+            .get_response_object("resp_persisted")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["id"], "resp_persisted");
+        let session = reopened
+            .get_response_session("session-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.len(), 1);
+        assert_eq!(session[0]["content"], "hello");
     }
 
     // ── find_or_create_conversation ─────────────────────────────────────

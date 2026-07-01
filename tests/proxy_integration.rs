@@ -276,6 +276,147 @@ async fn responses_api_text_round_trip() {
 }
 
 #[tokio::test]
+async fn responses_retrieve_falls_back_to_persisted_response() {
+    let state = build_proxy_state(dummy_upstream_addr(), "responses_persisted_get").await;
+    state
+        .storage
+        .db
+        .store_response_object(
+            "resp_from_db",
+            "session-db",
+            &json!({
+                "id": "resp_from_db",
+                "object": "response",
+                "status": "completed",
+                "output": []
+            }),
+        )
+        .unwrap();
+    let proxy_addr = start_proxy(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/v1/responses/resp_from_db", proxy_addr))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "resp_from_db");
+    assert_eq!(body["status"], "completed");
+}
+
+#[tokio::test]
+async fn responses_previous_response_id_restores_session_without_prompt_cache_key() {
+    let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_req = captured.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Json<Value>| {
+            let cap = upstream_req.clone();
+            async move {
+                let idx = {
+                    let mut requests = cap.lock().unwrap();
+                    let idx = requests.len() + 1;
+                    requests.push(body.0.clone());
+                    idx
+                };
+                Json(json!({
+                    "id": format!("mock-cmpl-{idx:03}"),
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": format!("Mock response {idx}")
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15
+                    }
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+    let _shutdown = tx;
+
+    let mut state = build_proxy_state(upstream_addr, "responses_prev_id_no_cache_key").await;
+    state.no_pipeline = true;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+
+    let first_resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .json(&json!({
+            "input": "first turn",
+            "instructions": "Be concise.",
+            "model": "deepseek-v4-flash"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first_resp.status().is_success());
+    let first_body: Value = first_resp.json().await.unwrap();
+    let first_id = first_body["id"].as_str().expect("first response id");
+    let session_key = first_body["prompt_cache_key"].as_str().expect("session key");
+    assert_ne!(session_key, "(none)");
+
+    let second_resp = client
+        .post(format!("http://{}/v1/responses", proxy_addr))
+        .json(&json!({
+            "previous_response_id": first_id,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "second turn"}]
+            }],
+            "instructions": "Be concise.",
+            "model": "deepseek-v4-flash"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(second_resp.status().is_success());
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["prompt_cache_key"], json!(session_key));
+    assert_eq!(requests[1]["prompt_cache_key"], json!(session_key));
+
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let contents: Vec<&str> = messages
+        .iter()
+        .filter_map(|msg| msg["content"].as_str())
+        .collect();
+    assert!(
+        contents.iter().any(|content| content.contains("first turn")),
+        "second turn should include first user message, got {contents:?}"
+    );
+    assert!(
+        contents.iter().any(|content| content.contains("Mock response 1")),
+        "second turn should include first assistant response, got {contents:?}"
+    );
+    assert!(
+        contents.iter().any(|content| content.contains("second turn")),
+        "second turn should include latest user message, got {contents:?}"
+    );
+}
+
+#[tokio::test]
 async fn responses_api_tool_call_round_trip() {
     // Mock upstream that returns a tool call response
     let captured: CapturedRequest = Arc::new(Mutex::new(None));
@@ -1896,6 +2037,54 @@ async fn responses_upstream_500_does_not_crash_proxy() {
     }
 }
 
+#[tokio::test]
+async fn responses_streaming_rejects_non_sse_upstream_body() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                "<html><body>gateway timeout</body></html>",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+    let _shutdown = tx;
+
+    let state = build_proxy_state(addr, "responses_non_sse_upstream").await;
+    let proxy_addr = start_proxy(state).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("Authorization", "Bearer sk-test")
+        .header("Accept", "text/event-stream")
+        .json(&json!({
+            "model": "deepseek-v4-flash",
+            "input": "test",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("expected upstream text/event-stream"),
+        "non-SSE upstream response should be explicit: {body}"
+    );
+}
+
 // ── Parallel execution failure paths ─────────────────────────────────────
 
 #[tokio::test]
@@ -2717,13 +2906,15 @@ async fn stream_truncated_no_done_still_closes() {
 
 #[tokio::test]
 async fn upstream_unreachable_returns_502() {
-    let dead_addr = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
-        a
-    };
-    let state = build_proxy_state(dead_addr, "unreachable").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
+
+    let state = build_proxy_state(addr, "unreachable").await;
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();
     let resp = client

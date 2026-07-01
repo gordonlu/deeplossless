@@ -53,6 +53,69 @@ fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>
     (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
 }
 
+fn response_session_key_from_object(resp: &Value) -> Option<String> {
+    resp["prompt_cache_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string)
+}
+
+fn response_session_key_from_previous(state: &AppState, response_id: &str) -> Option<String> {
+    if let Some(resp) = state.storage.response_store.get(response_id) {
+        if let Some(key) = response_session_key_from_object(&resp) {
+            return Some(key);
+        }
+    }
+
+    match state.storage.db.get_response_object(response_id) {
+        Ok(Some(resp)) => {
+            let key = response_session_key_from_object(&resp);
+            state.storage.response_store.insert(response_id.to_string(), resp);
+            key
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(target: "deeplossless", response_id, "failed to load previous response for session key: {e}");
+            None
+        }
+    }
+}
+
+fn fallback_response_session_key(req_body: &Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    let seed = json!({
+        "instructions": req_body.get("instructions").cloned().unwrap_or(Value::Null),
+        "input": req_body.get("input").cloned().unwrap_or(Value::Null),
+    });
+    let encoded = serde_json::to_vec(&seed).unwrap_or_default();
+    let digest = Sha256::digest(&encoded);
+    format!("responses:{}", hex::encode(&digest[..8]))
+}
+
+fn response_session_key(state: &AppState, req_body: &Value) -> String {
+    if let Some(key) = req_body["prompt_cache_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        return key.to_string();
+    }
+
+    if let Some(prev_id) = req_body["previous_response_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if let Some(key) = response_session_key_from_previous(state, prev_id) {
+            return key;
+        }
+    }
+
+    fallback_response_session_key(req_body)
+}
+
 /// Readiness probe: checks DB connectivity, upstream reachability,
 /// and compactor liveness. Returns 200 with status JSON, or 503 if
 /// any dependency is unhealthy.
@@ -387,13 +450,15 @@ async fn responses(
     let instructions_len = req_body["instructions"].as_str().map(|s| s.len()).unwrap_or(0);
     let tools_count = req_body["tools"].as_array().map(|a| a.len()).unwrap_or(0);
     let store = req_body["store"].as_bool().unwrap_or(true);
-    let prompt_cache_key = req_body["prompt_cache_key"].as_str().unwrap_or("(none)");
-    let session_key = prompt_cache_key.to_string();
+    let request_prompt_cache_key = req_body["prompt_cache_key"].as_str().unwrap_or("(none)");
+    let session_key = response_session_key(&state, &req_body);
+    let prompt_cache_key = session_key.as_str();
     let input_count = req_body["input"].as_array().map(|a| a.len()).unwrap_or(0);
     tracing::info!(target: "deeplossless",
         previous_response_id=%prev_resp,
         instructions_len, input_count, tools_count,
         store, prompt_cache_key=%prompt_cache_key,
+        request_prompt_cache_key=%request_prompt_cache_key,
         request_body_kb=body.len() as f64 / 1024.0,
         turnaround=input_count.saturating_sub(1).min(99),
         "request diagnostics");
@@ -430,7 +495,19 @@ async fn responses(
     // Before converting, load session history for conversation continuity.
     // Session store has the full conversation in Chat Completions format;
     // prepend it so DeepSeek sees the assistant's previous responses.
-    if let Some(session_msgs) = state.storage.session_store.get(&session_key) {
+    let persisted_session_msgs = state.storage.session_store.get(&session_key)
+        .or_else(|| match state.storage.db.get_response_session(&session_key) {
+            Ok(Some(messages)) => {
+                state.storage.session_store.replace(&session_key, messages.clone());
+                Some(messages)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(target: "deeplossless", session_key, "failed to load persisted response session: {e}");
+                None
+            }
+        });
+    if let Some(session_msgs) = persisted_session_msgs {
         if !session_msgs.is_empty() {
             let wrapped = serde_json::json!({"messages": session_msgs});
             let session_canonical = crate::protocol::chat_completions::request_from_chat(&wrapped);
@@ -629,6 +706,9 @@ async fn responses(
     let session_input_msgs = injected["messages"].as_array().cloned().unwrap_or_default();
     if !session_input_msgs.is_empty() {
         state.storage.session_store.replace(&session_key, session_input_msgs.clone());
+        if let Err(e) = state.storage.db.store_response_session(&session_key, &session_input_msgs) {
+            tracing::warn!(target: "deeplossless", session_key, "failed to persist response session input: {e}");
+        }
         tracing::debug!(target: "deeplossless", session_key, msg_count=session_input_msgs.len(), "saved session messages");
     }
     let upstream_start = std::time::Instant::now();
@@ -676,6 +756,26 @@ async fn responses(
             serde_json::json!({"status_code": status.as_u16(), "source": "responses"}),
         );
         return json_error(status, "UPSTREAM_ERROR", body);
+    }
+
+    if streaming {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !content_type.to_ascii_lowercase().contains("text/event-stream") {
+            let body = resp.text().await.unwrap_or_default();
+            let message = format!("expected upstream text/event-stream, got {content_type}: {body}");
+            let _ = state.storage.db.insert_event_simple(
+                crate::event_store::EventType::Error,
+                &session_key,
+                &message,
+                serde_json::json!({"content_type": content_type, "source": "responses"}),
+            );
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", message);
+        }
     }
 
     // 6. Handle streaming vs non-streaming
@@ -1066,6 +1166,11 @@ async fn responses(
             let mut session = session_store.get(&session_key).unwrap_or_default();
             session.push(assistant_msg);
             session_store.replace(&session_key, session);
+            if let Some(session) = session_store.get(&session_key) {
+                if let Err(e) = db.store_response_session(&session_key, &session) {
+                    tracing::warn!(target: "deeplossless", session_key, "failed to persist response session: {e}");
+                }
+            }
             tracing::debug!(target: "deeplossless", session_key, "appended assistant response to session");
 
             // Build lifecycle events using serde_json for proper escaping
@@ -1163,7 +1268,10 @@ async fn responses(
                 "output": stored_output, "usage": usage_json,
                 "prompt_cache_key": &session_key
             });
-            response_store.insert(resp_id.clone(), resp_obj);
+            response_store.insert(resp_id.clone(), resp_obj.clone());
+            if let Err(e) = db.store_response_object(&resp_id, &session_key, &resp_obj) {
+                tracing::warn!(target: "deeplossless", resp_id, "failed to persist response object: {e}");
+            }
             tracing::debug!(target: "deeplossless",
                 resp_id, text_len=content.text.len(),
                 "response stored");
@@ -1226,7 +1334,26 @@ async fn responses(
                     Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid upstream JSON: {e}")),
                 };
                 let canonical_resp = crate::protocol::chat_completions::response_from_chat(&chat_resp);
-                let responses_body = crate::protocol::responses::response_to_responses(&canonical_resp);
+                if let Some(message) = chat_resp["choices"][0]["message"].as_object() {
+                    let mut assistant_msg = Value::Object(message.clone());
+                    if assistant_msg.get("role").is_none() {
+                        assistant_msg["role"] = json!("assistant");
+                    }
+                    let mut session = state.storage.session_store.get(&session_key).unwrap_or_default();
+                    session.push(assistant_msg);
+                    state.storage.session_store.replace(&session_key, session.clone());
+                    if let Err(e) = state.storage.db.store_response_session(&session_key, &session) {
+                        tracing::warn!(target: "deeplossless", session_key, "failed to persist non-streaming response session: {e}");
+                    }
+                }
+                let mut responses_body = crate::protocol::responses::response_to_responses(&canonical_resp);
+                responses_body["prompt_cache_key"] = json!(session_key);
+                if let Some(resp_id) = responses_body["id"].as_str() {
+                    state.storage.response_store.insert(resp_id.to_string(), responses_body.clone());
+                    if let Err(e) = state.storage.db.store_response_object(resp_id, &session_key, &responses_body) {
+                        tracing::warn!(target: "deeplossless", resp_id, "failed to persist non-streaming response object: {e}");
+                    }
+                }
                 let mut response = Response::new(Body::from(serde_json::to_string(&responses_body).unwrap_or_default()));
                 *response.status_mut() = StatusCode::OK;
                 response.headers_mut().insert("content-type", "application/json".parse().expect("static header"));
@@ -1252,6 +1379,19 @@ async fn responses_retrieve(
         tracing::debug!(target: "deeplossless",
             %response_id, "response retrieve hit");
         return Json(resp).into_response();
+    }
+    match state.storage.db.get_response_object(&response_id) {
+        Ok(Some(resp)) => {
+            state.storage.response_store.insert(response_id.clone(), resp.clone());
+            tracing::debug!(target: "deeplossless",
+                %response_id, "response retrieve persisted hit");
+            return Json(resp).into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(target: "deeplossless",
+                %response_id, "response retrieve persisted lookup failed: {e}");
+        }
     }
     tracing::warn!(target: "deeplossless",
         %response_id, "response retrieve miss");
