@@ -133,6 +133,9 @@ pub struct StorageServices {
 pub struct AppState {
     // ── Upstream / Network ───────────────────────────────────────────
     pub upstream: String,
+    /// Upstream API path suffix (e.g. /v1/chat/completions for DeepSeek,
+    /// /chat/completions for Ark). Default: /v1/chat/completions.
+    pub upstream_path: String,
     /// API key extracted from the first incoming request's Authorization header.
     pub api_key: Arc<StdMutex<Option<String>>>,
     /// Separate admin key for LCM endpoint authentication.

@@ -9,6 +9,8 @@ pub struct CoordinatorConfig {
     pub dag_threshold: Option<f64>,
     pub summarizer_budget: u64,
     pub upstream: String,
+    /// Upstream API path suffix. Default: /v1/chat/completions.
+    pub upstream_path: String,
     pub db_path: String,
     pub api_key: Option<String>,
     pub admin_key: Option<String>,
@@ -72,6 +74,7 @@ impl RuntimeCoordinator {
             summarizer: crate::summarizer::SummarizerConfig {
                 api_key: initial_api_key.clone().unwrap_or_default(),
                 upstream: upstream.clone(),
+                upstream_path: cfg.upstream_path.clone(),
                 model: cfg.summarizer_model.clone(),
                 max_total_calls: if cfg.summarizer_budget == 0 { u64::MAX } else { cfg.summarizer_budget },
                 ..Default::default()
@@ -110,6 +113,7 @@ impl RuntimeCoordinator {
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let state = AppState {
             upstream: cfg.upstream,
+            upstream_path: cfg.upstream_path,
             api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
             admin_key: Arc::new(std::sync::Mutex::new(cfg.admin_key)),
             cache_stability: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
