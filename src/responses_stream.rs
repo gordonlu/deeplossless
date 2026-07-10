@@ -19,7 +19,7 @@ pub enum StreamPhase {
     Preamble,
     /// Processing upstream SSE data, emitting Responses SSE
     Active,
-    /// Upstream [DONE] received, draining assembled content
+    /// Upstream `DONE` received, draining assembled content
     Draining,
     /// Final events emitted, persisting to DB
     Persisting,

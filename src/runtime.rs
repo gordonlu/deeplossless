@@ -327,7 +327,7 @@ pub struct FailureHint {
 }
 
 impl FailureHint {
-    /// Build from a stored [`FailurePattern`].
+    /// Build from a stored [`crate::execution::FailurePattern`].
     pub fn from_failure_pattern(
         fp: &crate::execution::FailurePattern,
         retry_count: u32,
