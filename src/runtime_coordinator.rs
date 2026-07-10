@@ -4,18 +4,35 @@ use tokio::sync::Mutex;
 use crate::AppState;
 use crate::runtime::{BackgroundTasks, RateLimiter, RuntimeProfile, ExecutionCycle, RuntimePolicyConfig};
 
-/// Configuration derived from CLI args.
-pub struct CoordinatorConfig {
-    pub dag_threshold: Option<f64>,
-    pub summarizer_budget: u64,
+/// Config for the LCM proxy / upstream provider connection.
+#[derive(Clone)]
+pub struct ProviderConfig {
     pub upstream: String,
     pub upstream_path: String,
-    pub db_path: String,
     pub api_key: Option<String>,
     pub admin_key: Option<String>,
+    pub reasoning_effort: crate::protocol::ReasoningEffortMode,
+    pub dsml_parse: bool,
+    pub dsml_emit: bool,
+}
+
+/// Config for storage and persistence.
+#[derive(Clone)]
+pub struct StorageConfig {
+    pub db_path: String,
+    pub dag_threshold: Option<f64>,
     pub summarizer_model: String,
-    pub rate_limit: u64,
+    pub summarizer_budget: u64,
+    pub workspace: Option<String>,
+    pub cache_normalize: bool,
+    pub lcm_context_tokens: u64,
+}
+
+/// Config for runtime execution behavior.
+#[derive(Clone)]
+pub struct RuntimeConfig {
     pub runtime_profile: String,
+    pub rate_limit: u64,
     pub dry_run: bool,
     pub log_dir: Option<String>,
     pub record: Option<String>,
@@ -23,21 +40,16 @@ pub struct CoordinatorConfig {
     pub no_pipeline: bool,
     pub no_header_mod: bool,
     pub lcm_context: bool,
-    pub cache_normalize: bool,
-    pub lcm_context_tokens: u64,
+    pub quick_instruction: bool,
+}
+
+/// Configuration derived from CLI args — composed from layered sub-configs.
+pub struct CoordinatorConfig {
+    pub provider: ProviderConfig,
+    pub storage: StorageConfig,
+    pub runtime: RuntimeConfig,
     /// Runtime policy config (audit/snapshot modes). Default: Full audit, Manual snapshot.
     pub policy_config: RuntimePolicyConfig,
-
-    pub workspace: Option<String>,
-
-    /// Default reasoning effort for DeepSeek-V4.
-    pub reasoning_effort: crate::protocol::ReasoningEffortMode,
-    /// Parse DSML tool calls from response text.
-    pub dsml_parse: bool,
-    /// Emit DSML tool calls (debug only).
-    pub dsml_emit: bool,
-    /// Quick instruction mode.
-    pub quick_instruction: bool,
 }
 
 /// Assembles and owns all runtime services.
@@ -49,33 +61,36 @@ pub struct RuntimeCoordinator {
 
 impl RuntimeCoordinator {
     pub async fn build(cfg: CoordinatorConfig) -> anyhow::Result<Self> {
-        let upstream = cfg.upstream.clone();
+        let provider = cfg.provider;
+        let storage = cfg.storage;
+        let runtime = cfg.runtime;
         let policy_config = cfg.policy_config.clone();
+
         let db = Arc::new(
             crate::db::Database::builder()
-                .path(&cfg.db_path)
+                .path(&storage.db_path)
                 .policy_config(policy_config)
                 .build()
                 .await?,
         );
         let dag_builder = crate::dag::DagEngine::builder();
-        let dag_builder = if let Some(t) = cfg.dag_threshold {
+        let dag_builder = if let Some(t) = storage.dag_threshold {
             dag_builder.soft_threshold(t)
         } else {
             dag_builder
         };
         let dag = Arc::new(dag_builder.build(db.clone()));
 
-        let initial_api_key = cfg.api_key.clone()
+        let initial_api_key = provider.api_key.clone()
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
 
         let compactor_config = crate::compactor::CompactorConfig {
             summarizer: crate::summarizer::SummarizerConfig {
                 api_key: initial_api_key.clone().unwrap_or_default(),
-                upstream: upstream.clone(),
-                upstream_path: cfg.upstream_path.clone(),
-                model: cfg.summarizer_model.clone(),
-                max_total_calls: if cfg.summarizer_budget == 0 { u64::MAX } else { cfg.summarizer_budget },
+                upstream: provider.upstream.clone(),
+                upstream_path: provider.upstream_path.clone(),
+                model: storage.summarizer_model.clone(),
+                max_total_calls: if storage.summarizer_budget == 0 { u64::MAX } else { storage.summarizer_budget },
                 ..Default::default()
             },
             ..Default::default()
@@ -108,13 +123,13 @@ impl RuntimeCoordinator {
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(std::time::Duration::from_secs(120))
             .build()?;
-        let limiter = Arc::new(RateLimiter::new(cfg.rate_limit));
+        let limiter = Arc::new(RateLimiter::new(runtime.rate_limit));
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let state = AppState {
-            upstream: cfg.upstream,
-            upstream_path: cfg.upstream_path,
+            upstream: provider.upstream,
+            upstream_path: provider.upstream_path,
             api_key: Arc::new(std::sync::Mutex::new(initial_api_key)),
-            admin_key: Arc::new(std::sync::Mutex::new(cfg.admin_key)),
+            admin_key: Arc::new(std::sync::Mutex::new(provider.admin_key)),
             cache_stability: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reasoning_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             storage: crate::StorageServices {
@@ -127,26 +142,26 @@ impl RuntimeCoordinator {
             runtime: crate::RuntimeServices {
                 client,
                 cycle: Arc::new(std::sync::Mutex::new(
-                    ExecutionCycle::new(RuntimeProfile::from_str(&cfg.runtime_profile)),
+                    ExecutionCycle::new(RuntimeProfile::from_str(&runtime.runtime_profile)),
                 )),
                 rate_limiter: limiter.clone(),
                 shutdown_notify: shutdown_notify.clone(),
             },
-            summarizer_model: cfg.summarizer_model,
-            dry_run: cfg.dry_run,
-            log_dir: cfg.log_dir,
-            record: cfg.record,
-            passthrough: cfg.passthrough,
-            no_pipeline: cfg.no_pipeline,
-            no_header_mod: cfg.no_header_mod,
-            lcm_context: cfg.lcm_context,
-            cache_normalize: cfg.cache_normalize,
-            lcm_context_tokens: cfg.lcm_context_tokens,
-            workspace: cfg.workspace.clone(),
-            reasoning_effort: cfg.reasoning_effort,
-            dsml_parse: cfg.dsml_parse,
-            dsml_emit: cfg.dsml_emit,
-            quick_instruction: cfg.quick_instruction,
+            summarizer_model: storage.summarizer_model,
+            dry_run: runtime.dry_run,
+            log_dir: runtime.log_dir,
+            record: runtime.record,
+            passthrough: runtime.passthrough,
+            no_pipeline: runtime.no_pipeline,
+            no_header_mod: runtime.no_header_mod,
+            lcm_context: runtime.lcm_context,
+            cache_normalize: storage.cache_normalize,
+            lcm_context_tokens: storage.lcm_context_tokens,
+            workspace: storage.workspace.clone(),
+            reasoning_effort: provider.reasoning_effort,
+            dsml_parse: provider.dsml_parse,
+            dsml_emit: provider.dsml_emit,
+            quick_instruction: runtime.quick_instruction,
             context_ordering: crate::context_pack::ImportanceOrdering::Preserve,
         };
 

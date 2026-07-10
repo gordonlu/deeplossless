@@ -594,6 +594,8 @@ impl Database {
         conn.execute_batch(crate::tool_cache::MIGRATION)?;
         // v0.9: artifact versioning + dependency edges for invalidation correctness
         conn.execute_batch(crate::artifacts::MIGRATION)?;
+        // v0.9+: execution artifact store (input + dep snapshot + output)
+        conn.execute_batch(crate::artifacts::ARTIFACT_MIGRATION)?;
         // v0.9: provenance lineage edges
         conn.execute_batch(crate::execution::LINEAGE_MIGRATION)?;
         // v0.9: structured reasoning steps
@@ -662,6 +664,9 @@ impl Database {
         }
         // v0.8: plan persistence
         conn.execute_batch(crate::execution::PLAN_MIGRATION)?;
+
+        // v0.8: runtime decision records
+        conn.execute_batch(crate::execution::DECISION_RECORDS_MIGRATION)?;
 
         // v0.4.0: execution snapshots — replay acceleration with budget-aware retention
         conn.execute_batch(crate::snapshot::MIGRATION)?;
@@ -949,6 +954,33 @@ impl Database {
         )?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], Self::row_to_node)?;
         Ok(rows.next().transpose()?)
+    }
+
+    /// Batch-fetch multiple DAG nodes by ID. Only returns existing (non-deleted) nodes.
+    /// The returned Vec may be smaller than `node_ids` if some IDs don't exist or are deleted.
+    pub fn get_nodes_batch(&self, node_ids: &[i64]) -> anyhow::Result<Vec<DagNode>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.read_conn();
+        let placeholders: Vec<String> = (1..=node_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
+        let sql = format!(
+            "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
+             FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
+            placeholders.join(","),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), Self::row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
     }
 
     /// Find nodes whose child_ids list contains the given node_id.
@@ -1248,6 +1280,28 @@ impl Database {
             "UPDATE dag_nodes SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id = ?1",
             rusqlite::params![node_id],
         )?;
+        Ok(())
+    }
+
+    /// Batch-touch multiple DAG nodes in a single SQL UPDATE.
+    /// Best-effort: errors are logged but not propagated (caller should not fail on touch).
+    pub fn batch_touch_nodes(&self, node_ids: &[i64]) -> anyhow::Result<()> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let placeholders: Vec<String> = (1..=node_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
+        let sql = format!(
+            "UPDATE dag_nodes SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id IN ({})",
+            placeholders.join(","),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        stmt.execute(params.as_slice())?;
         Ok(())
     }
 
@@ -2170,6 +2224,173 @@ impl Database {
         Ok(invalidated)
     }
 
+    // ── Execution Artifact Store ─────────────────────────────────────────
+
+    /// Store a complete execution artifact (input + dep snapshot + output).
+    /// Also records dependency edges in the `dependency_edges` table.
+    pub fn store_artifact(&self, artifact: &crate::artifacts::ExecutionArtifact) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let deps_json = serde_json::to_string(&artifact.dependent_files)?;
+        let hashes_json = serde_json::to_string(&artifact.file_hashes)?;
+        conn.execute(
+            "INSERT INTO execution_artifacts (execution_key, tool_name, args, args_hash, result,
+             dependent_files, file_hashes, environment_fingerprint, created_at, hit_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                artifact.execution_key, artifact.tool_name, artifact.args,
+                artifact.args_hash, artifact.result, deps_json, hashes_json,
+                artifact.environment_fingerprint, artifact.created_at, artifact.hit_count,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        // Record dependency edges
+        for (exec_key, av, kind) in artifact.dependency_edges() {
+            let kind_str = match kind {
+                crate::artifacts::DependencyKind::Read => "read",
+                crate::artifacts::DependencyKind::Search => "search",
+                crate::artifacts::DependencyKind::Parse => "parse",
+                crate::artifacts::DependencyKind::BuildInput => "build_input",
+                crate::artifacts::DependencyKind::Produced => "produced",
+            };
+            if let Err(e) = conn.execute(
+                "INSERT INTO dependency_edges (execution_key, artifact_path, kind) VALUES (?1, ?2, ?3)",
+                rusqlite::params![exec_key, av.path, kind_str],
+            ) {
+                tracing::warn!(target: "deeplossless::db", "failed to record dependency edge: {e}");
+            }
+        }
+        Ok(id)
+    }
+
+    /// Look up an execution artifact by its canonical execution key.
+    pub fn get_artifact_by_key(&self, execution_key: &str) -> anyhow::Result<Option<crate::artifacts::ExecutionArtifact>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_key, tool_name, args, args_hash, result,
+                    dependent_files, file_hashes, environment_fingerprint, created_at, hit_count
+             FROM execution_artifacts WHERE execution_key = ?1 ORDER BY id DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(rusqlite::params![execution_key], |row| {
+            let deps_str: String = row.get(6)?;
+            let hashes_str: String = row.get(7)?;
+            Ok(crate::artifacts::ExecutionArtifact {
+                id: row.get(0)?,
+                execution_key: row.get(1)?,
+                tool_name: row.get(2)?,
+                args: row.get(3)?,
+                args_hash: row.get(4)?,
+                result: row.get(5)?,
+                dependent_files: serde_json::from_str(&deps_str).unwrap_or_default(),
+                file_hashes: serde_json::from_str(&hashes_str).unwrap_or_default(),
+                environment_fingerprint: row.get(8)?,
+                created_at: row.get(9)?,
+                hit_count: row.get(10)?,
+            })
+        });
+        match result {
+            Ok(a) => Ok(Some(a)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Look up an execution artifact by tool_name + args_hash (legacy tool cache key).
+    pub fn get_artifact_by_tool_hash(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<crate::artifacts::ExecutionArtifact>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_key, tool_name, args, args_hash, result,
+                    dependent_files, file_hashes, environment_fingerprint, created_at, hit_count
+             FROM execution_artifacts
+             WHERE tool_name = ?1 AND args_hash = ?2
+             ORDER BY id DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(rusqlite::params![tool_name, args_hash], |row| {
+            let deps_str: String = row.get(6)?;
+            let hashes_str: String = row.get(7)?;
+            Ok(crate::artifacts::ExecutionArtifact {
+                id: row.get(0)?,
+                execution_key: row.get(1)?,
+                tool_name: row.get(2)?,
+                args: row.get(3)?,
+                args_hash: row.get(4)?,
+                result: row.get(5)?,
+                dependent_files: serde_json::from_str(&deps_str).unwrap_or_default(),
+                file_hashes: serde_json::from_str(&hashes_str).unwrap_or_default(),
+                environment_fingerprint: row.get(8)?,
+                created_at: row.get(9)?,
+                hit_count: row.get(10)?,
+            })
+        });
+        match result {
+            Ok(a) => Ok(Some(a)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Increment hit count for an artifact (cache reuse).
+    pub fn bump_artifact_hit_count(&self, artifact_id: i64) -> anyhow::Result<()> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE execution_artifacts SET hit_count = hit_count + 1 WHERE id = ?1",
+            rusqlite::params![artifact_id],
+        )?;
+        Ok(())
+    }
+
+    /// Store a tool execution as a full artifact (input + output + deps).
+    /// Also updates the tool_cache for backward compatibility.
+    /// This is the primary integration point for pipeline.rs cache population.
+    pub fn store_tool_artifact(
+        &self,
+        tool_name: &str,
+        args: &str,
+        result: &str,
+        dependent_files: &[String],
+    ) -> anyhow::Result<i64> {
+        let (cname, args_hash) = crate::tool_cache::cache_key(tool_name, args);
+        let execution_key = format!("{}:{}", cname, args_hash);
+
+        // Store full artifact
+        let artifact = crate::artifacts::ExecutionArtifact::new(
+            &execution_key, tool_name, args, &args_hash,
+            result, dependent_files.to_vec(), vec![], "",
+        );
+        let id = self.store_artifact(&artifact)?;
+
+        // Also update tool_cache for backward compat (L2 + L1)
+        let _ = self.tool_cache_put(tool_name, &args_hash, result, dependent_files);
+
+        Ok(id)
+    }
+
+    /// Invalidate artifacts whose dependent files have changed.
+    /// Returns the number of invalidated artifacts.
+    pub fn invalidate_artifacts_for_files(&self, changed_files: &[String]) -> anyhow::Result<usize> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT id, dependent_files FROM execution_artifacts"
+        )?;
+        let mut to_delete: Vec<i64> = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let deps_str: String = row.get(1)?;
+            Ok((id, deps_str))
+        })?;
+        for row in rows {
+            let (id, deps_str) = row?;
+            let deps: Vec<String> = serde_json::from_str(&deps_str).unwrap_or_default();
+            if deps.iter().any(|d| changed_files.contains(d)) {
+                to_delete.push(id);
+            }
+        }
+        for id in &to_delete {
+            conn.execute("DELETE FROM execution_artifacts WHERE id = ?1", rusqlite::params![id])?;
+        }
+        Ok(to_delete.len())
+    }
+
     /// Persist a Responses API envelope for restart-safe
     /// `/v1/responses/{id}` retrieval.
     pub fn store_response_object(
@@ -2283,6 +2504,83 @@ impl Database {
         Ok(results)
     }
 
+    /// Get full failure pattern data (with all fields) by signature.
+    pub fn get_failure_pattern_by_signature(
+        &self, conv_id: i64, signature: &str,
+    ) -> anyhow::Result<Option<(String, String, Vec<String>, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT attempted_fix, why_failed, invalidated_assumptions, environment_fingerprint
+             FROM failure_patterns
+             WHERE conversation_id = ?1 AND signature = ?2
+             ORDER BY id DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(rusqlite::params![conv_id, signature], |row| {
+            let assump_str: String = row.get(2)?;
+            let assumptions: Vec<String> = serde_json::from_str(&assump_str).unwrap_or_default();
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                assumptions,
+                row.get::<_, String>(3)?,
+            ))
+        });
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get the most recent failure patterns for a conversation.
+    /// Returns full [`crate::execution::FailurePattern`] objects ordered by recency (newest first).
+    pub fn get_recent_failure_patterns(
+        &self, conv_id: i64, limit: usize,
+    ) -> anyhow::Result<Vec<crate::execution::FailurePattern>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, signature, attempted_fix, why_failed,
+                    invalidated_assumptions, related_files, execution_unit_id,
+                    execution_key, environment_fingerprint, created_at
+             FROM failure_patterns
+             WHERE conversation_id = ?1
+             ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            let assump_str: String = row.get(5)?;
+            let files_str: String = row.get(6)?;
+            Ok(crate::execution::FailurePattern {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                signature: row.get(2)?,
+                attempted_fix: row.get(3)?,
+                why_failed: row.get(4)?,
+                invalidated_assumptions: serde_json::from_str(&assump_str).unwrap_or_default(),
+                related_files: serde_json::from_str(&files_str).unwrap_or_default(),
+                execution_unit_id: row.get(7)?,
+                execution_key: row.get(8)?,
+                environment_fingerprint: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get retry count for a specific failure pattern (conversation + signature).
+    pub fn get_failure_retry_count(&self, conv_id: i64, signature: &str) -> anyhow::Result<u32> {
+        let conn = self.read_conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM failure_patterns WHERE conversation_id = ?1 AND signature = ?2",
+            rusqlite::params![conv_id, signature],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
     // ── Plan persistence (v0.8) ───────────────────────────────────────
 
     /// Store a new plan state. Deactivates previous active plans for the conversation.
@@ -2335,6 +2633,120 @@ impl Database {
             rusqlite::params![id],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Update plan steps. Each step list replaces the existing column value entirely.
+    /// Pass `None` for columns you don't want to change.
+    pub fn update_plan_steps(
+        &self, plan_id: i64,
+        completed_steps: Option<&[String]>,
+        blocked_steps: Option<&[String]>,
+        invalidated_steps: Option<&[String]>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sql = String::from("UPDATE plan_states SET updated_at = datetime('now')");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(steps) = completed_steps {
+            sql.push_str(", completed_steps = ?");
+            params.push(Box::new(serde_json::to_string(steps).unwrap_or_default()));
+        }
+        if let Some(steps) = blocked_steps {
+            sql.push_str(", blocked_steps = ?");
+            params.push(Box::new(serde_json::to_string(steps).unwrap_or_default()));
+        }
+        if let Some(steps) = invalidated_steps {
+            sql.push_str(", invalidated_steps = ?");
+            params.push(Box::new(serde_json::to_string(steps).unwrap_or_default()));
+        }
+        sql.push_str(" WHERE id = ?");
+        params.push(Box::new(plan_id));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = conn.execute(&sql, rusqlite::params_from_iter(param_refs))?;
+        Ok(rows > 0)
+    }
+
+    // ── Runtime Decision Records (v0.8) ────────────────────────────────
+
+    /// Store a new decision record. Returns ID.
+    /// `accepted` and `outcome` are initially NULL (pending).
+    pub fn store_decision_record(&self, conv_id: i64, action: &str, confidence: f64, reason: &str, estimated_token_saving: u64) -> anyhow::Result<i64> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO runtime_decision_records (conversation_id, action, confidence, reason, accepted, outcome, estimated_token_saving, actual_token_saving)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL)",
+            rusqlite::params![conv_id, action, confidence, reason, estimated_token_saving],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Mark a decision record as accepted or rejected.
+    pub fn mark_decision_accepted(&self, id: i64, accepted: bool) -> anyhow::Result<bool> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = conn.execute(
+            "UPDATE runtime_decision_records SET accepted = ?1 WHERE id = ?2",
+            rusqlite::params![accepted as i64, id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Record the execution outcome for a decision record.
+    pub fn evaluate_decision(&self, id: i64, outcome: &str, actual_token_saving: Option<u64>) -> anyhow::Result<bool> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = conn.execute(
+            "UPDATE runtime_decision_records SET outcome = ?1, actual_token_saving = ?2 WHERE id = ?3",
+            rusqlite::params![outcome, actual_token_saving, id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Query decision outcomes across all conversations, grouped by action type.
+    /// Returns (action, success_count, total_count) for the most recent N records.
+    pub fn query_decision_outcomes_by_action(&self, limit: usize) -> anyhow::Result<Vec<(String, u64, u64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT action,
+                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successes,
+                    COUNT(*) as total
+             FROM (
+                 SELECT action, outcome FROM runtime_decision_records
+                 WHERE accepted = 1 AND outcome IS NOT NULL
+                 ORDER BY id DESC
+                 LIMIT ?1
+             )
+             GROUP BY action"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Query decision records for a conversation (most recent first).
+    pub fn query_decision_records(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(i64, String, f64, Option<bool>, Option<String>, u64, Option<u64>, String)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, action, confidence, accepted, outcome, estimated_token_saving, actual_token_saving, created_at
+             FROM runtime_decision_records
+             WHERE conversation_id = ?1
+             ORDER BY id DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, Option<bool>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, Option<u64>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     // ── Execution Events (v0.4.0) ──────────────────────────────────────
@@ -2413,6 +2825,45 @@ impl Database {
                 row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
                 row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
             ))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Read all execution events for a replay session (by replay_session_id).
+    /// Returns (id, execution_id, event_kind, event_payload, seq_no, created_at, epoch_ms)
+    /// ordered by insertion order (id ascending) for deterministic replay.
+    pub fn get_execution_events_by_session(
+        &self, session_id: &str,
+    ) -> anyhow::Result<Vec<(i64, Option<i64>, String, String, i64, String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, event_kind, event_payload, seq_no, created_at, epoch_ms
+             FROM execution_events
+             WHERE replay_session_id = ?1
+             ORDER BY id ASC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?,
+            ))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// List recent replay sessions with event counts and timestamps.
+    pub fn list_replay_sessions(&self, limit: usize) -> anyhow::Result<Vec<(String, i64, String, i64)>> {
+        let conn = self.read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT replay_session_id, COUNT(*) as cnt, MIN(created_at) as first_seen, MAX(epoch_ms) as last_epoch
+             FROM execution_events
+             WHERE replay_session_id != ''
+             GROUP BY replay_session_id
+             ORDER BY MAX(epoch_ms) DESC
+             LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -2729,7 +3180,10 @@ impl Database {
         // Also invalidate SQLite cache
         let _ = self.tool_cache_invalidate(&expanded)?;
 
-        // 2. Release claims on changed files (agent finished editing)
+        // 2. Invalidate execution artifacts
+        let _ = self.invalidate_artifacts_for_files(&expanded)?;
+
+        // 3. Release claims on changed files (agent finished editing)
         if !changed_files.is_empty() {
             let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             for f in changed_files {
@@ -3798,6 +4252,112 @@ mod tests {
         assert!(db.get_node(node.id).unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn get_nodes_batch_returns_matching_nodes() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("batch_get.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
+
+        let n1 = db.insert_dag_node(conv_id, 0, "leaf a", 10, &[], &[], true).unwrap();
+        let n2 = db.insert_dag_node(conv_id, 0, "leaf b", 20, &[], &[], true).unwrap();
+        let n3 = db.insert_dag_node(conv_id, 1, "summary", 5, &[n1.id, n2.id], &[], false).unwrap();
+
+        // Fetch all three
+        let batch = db.get_nodes_batch(&[n1.id, n2.id, n3.id]).unwrap();
+        assert_eq!(batch.len(), 3);
+
+        // Fetch subset
+        let subset = db.get_nodes_batch(&[n1.id, n3.id]).unwrap();
+        assert_eq!(subset.len(), 2);
+
+        // Empty input
+        let empty = db.get_nodes_batch(&[]).unwrap();
+        assert!(empty.is_empty());
+
+        // Deleted node should not appear
+        db.delete_dag_node(n1.id).unwrap();
+        let after_delete = db.get_nodes_batch(&[n1.id, n2.id]).unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].id, n2.id);
+    }
+
+    #[tokio::test]
+    async fn batch_touch_nodes_increments_access_count() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("batch_touch.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
+
+        let n1 = db.insert_dag_node(conv_id, 0, "leaf a", 10, &[], &[], true).unwrap();
+        let n2 = db.insert_dag_node(conv_id, 0, "leaf b", 20, &[], &[], true).unwrap();
+
+        assert_eq!(n1.access_count, 0);
+        assert_eq!(n2.access_count, 0);
+
+        db.batch_touch_nodes(&[n1.id, n2.id]).unwrap();
+
+        let updated1 = db.get_node(n1.id).unwrap().unwrap();
+        let updated2 = db.get_node(n2.id).unwrap().unwrap();
+        assert_eq!(updated1.access_count, 1);
+        assert_eq!(updated2.access_count, 1);
+
+        // Batch touch again
+        db.batch_touch_nodes(&[n1.id]).unwrap();
+        let updated1b = db.get_node(n1.id).unwrap().unwrap();
+        assert_eq!(updated1b.access_count, 2);
+        assert_eq!(db.get_node(n2.id).unwrap().unwrap().access_count, 1);
+
+        // Empty input is a no-op
+        db.batch_touch_nodes(&[]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn decision_recording_cache_hit_and_failure_evaluation() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("decision_fb.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
+
+        // Simulate proxy path: cache hit → store decision record
+        let rec_id = db.store_decision_record(conv_id, "ReuseToolCache", 0.8, "cache hit for tool=grep", 100).unwrap();
+
+        // Verify record is stored
+        let records = db.query_decision_records(conv_id, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, "ReuseToolCache");
+
+        // Simulate proxy path: failure reported → evaluate pending cache decisions
+        db.evaluate_decision(rec_id, "cache_invalidated", Some(0)).unwrap();
+
+        // Verify evaluation was written
+        let records2 = db.query_decision_records(conv_id, 10).unwrap();
+        assert_eq!(records2[0].4.as_deref(), Some("cache_invalidated"));
+        assert_eq!(records2[0].6, Some(0));
+
+        // Simulate proxy path: store failure decision
+        let fail_id = db.store_decision_record(conv_id, "RetryWithFix", 0.7, "failure pattern stored: signature=E0308", 0).unwrap();
+        assert!(fail_id > 0);
+
+        // Verify both records present, ordered newest first
+        let all = db.query_decision_records(conv_id, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].1, "RetryWithFix"); // newest first
+        assert_eq!(all[1].1, "ReuseToolCache");
+    }
+
     // ── P0: search_messages ─────────────────────────────────────────────
 
     #[tokio::test]
@@ -4320,5 +4880,406 @@ mod tests {
         let id1 = db.find_or_create_conversation("fp-x", "model-a").unwrap();
         let id2 = db.find_or_create_conversation("fp-x", "model-b").unwrap();
         assert_eq!(id1, id2, "model param is only used on creation, should match by fingerprint");
+    }
+
+    // ── Runtime Decision Record tests (v0.8) ──────────────────────────
+
+    #[tokio::test]
+    async fn decision_record_store_and_query() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("decision_record.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let id = db.store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500).unwrap();
+        assert!(id > 0, "expected valid record ID");
+
+        let records = db.query_decision_records(conv_id, 10).unwrap();
+        assert_eq!(records.len(), 1, "expected 1 record");
+        assert_eq!(records[0].1, "ReuseToolCache");
+        assert!((records[0].2 - 0.95).abs() < 0.01);
+        assert_eq!(records[0].3, None, "accepted should initially be None");
+    }
+
+    #[tokio::test]
+    async fn decision_record_accept_and_evaluate() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("decision_accept.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let id = db.store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500).unwrap();
+
+        let updated = db.mark_decision_accepted(id, true).unwrap();
+        assert!(updated, "expected row to be updated");
+
+        let evaluated = db.evaluate_decision(id, "success", Some(50)).unwrap();
+        assert!(evaluated, "expected row to be evaluated");
+
+        let records = db.query_decision_records(conv_id, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].3, Some(true), "should be accepted");
+        assert_eq!(records[0].4.as_deref(), Some("success"));
+        assert_eq!(records[0].6, Some(50), "actual saving should be 50");
+    }
+
+    #[tokio::test]
+    async fn decision_record_multiple_per_conversation() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("decision_multi.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let _id1 = db.store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500).unwrap();
+        let _id2 = db.store_decision_record(conv_id, "RetryWithFix", 0.7, "retry fix", 200).unwrap();
+        let _id3 = db.store_decision_record(conv_id, "DelegateToModel", 0.0, "no opt", 0).unwrap();
+
+        let records = db.query_decision_records(conv_id, 10).unwrap();
+        assert_eq!(records.len(), 3, "expected 3 records");
+        assert_eq!(records[0].1, "DelegateToModel", "most recent first");
+
+        // Limit query
+        let limited = db.query_decision_records(conv_id, 2).unwrap();
+        assert_eq!(limited.len(), 2, "expected 2 records");
+    }
+
+    #[tokio::test]
+    async fn decision_record_empty_query() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("decision_empty.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let records = db.query_decision_records(conv_id, 10).unwrap();
+        assert!(records.is_empty(), "no records yet");
+    }
+
+    // ── FailurePattern DB tests (v0.8) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn failure_pattern_store_and_retrieve_rich_data() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("failure_rich.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let assumptions = vec!["src/lib.rs".to_string(), "Cargo.toml".to_string()];
+        let files = vec!["src/lib.rs".to_string()];
+        let fp_id = db.store_failure_pattern(
+            conv_id, "compile_error", "add mutex",
+            "SQLite connection shared globally",
+            &assumptions, &files, None,
+        ).unwrap();
+        assert!(fp_id > 0);
+
+        // Retrieve by signature
+        let result = db.get_failure_pattern_by_signature(conv_id, "compile_error").unwrap();
+        assert!(result.is_some(), "should find the pattern");
+        let (fix, why, stored_assumptions, _) = result.unwrap();
+        assert_eq!(fix, "add mutex");
+        assert_eq!(why, "SQLite connection shared globally");
+        assert_eq!(stored_assumptions, assumptions);
+
+        // Retry count
+        let count = db.get_failure_retry_count(conv_id, "compile_error").unwrap();
+        assert_eq!(count, 1, "one failure stored");
+
+        // Non-existent signature
+        let missing = db.get_failure_pattern_by_signature(conv_id, "no_such_error").unwrap();
+        assert!(missing.is_none(), "should not find non-existent pattern");
+    }
+
+    #[tokio::test]
+    async fn get_recent_failure_patterns_returns_ordered_by_recency() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("failure_recent.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        // Store three patterns
+        let _id1 = db.store_failure_pattern(conv_id, "err_a", "fix_a", "why_a", &[], &[], None).unwrap();
+        let _id2 = db.store_failure_pattern(conv_id, "err_b", "fix_b", "why_b", &[], &[], None).unwrap();
+        let _id3 = db.store_failure_pattern(conv_id, "err_c", "fix_c", "why_c", &[], &[], None).unwrap();
+
+        // Get recent 2
+        let patterns = db.get_recent_failure_patterns(conv_id, 2).unwrap();
+        assert_eq!(patterns.len(), 2, "should return at most limit");
+        assert_eq!(patterns[0].signature, "err_c", "newest first");
+        assert_eq!(patterns[1].signature, "err_b", "second newest");
+
+        // Get all 3
+        let all = db.get_recent_failure_patterns(conv_id, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].signature, "err_c");
+        assert_eq!(all[2].signature, "err_a");
+
+        // Empty conversation
+        let empty = db.get_recent_failure_patterns(999, 5).unwrap();
+        assert!(empty.is_empty(), "no patterns for unknown conversation");
+    }
+
+    // ── Plan persistence ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_and_retrieve_plan() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("plan_store.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let steps = vec!["step 1".to_string(), "step 2".to_string()];
+        let assumptions = vec!["src/main.rs".to_string()];
+        let plan_id = db.store_plan_state(conv_id, "fix bug", &steps, &assumptions).unwrap();
+        assert!(plan_id > 0);
+
+        let result = db.get_active_plan(conv_id).unwrap();
+        assert!(result.is_some(), "should find the active plan");
+        let (_id, goal, pending, _completed, stored_assumptions) = result.unwrap();
+        assert_eq!(goal, "fix bug");
+        let pending_steps: Vec<String> = serde_json::from_value(pending).unwrap();
+        assert_eq!(pending_steps, vec!["step 1", "step 2"]);
+        let stored_assumptions: Vec<String> = serde_json::from_value(stored_assumptions).unwrap();
+        assert_eq!(stored_assumptions, vec!["src/main.rs"]);
+    }
+
+    #[tokio::test]
+    async fn update_plan_steps_works() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("plan_update.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        let steps = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let plan_id = db.store_plan_state(conv_id, "goal", &steps, &[]).unwrap();
+
+        // Mark first step as completed
+        let completed = vec!["a".to_string()];
+        db.update_plan_steps(plan_id, Some(&completed), None, None).unwrap();
+
+        let result = db.get_active_plan(conv_id).unwrap().unwrap();
+        let stored_completed: Vec<String> = serde_json::from_value(result.3).unwrap();
+        assert_eq!(stored_completed, vec!["a"]);
+
+        // Unknown plan ID (already deactivated) — no error, just 0 rows
+        let ok = db.update_plan_steps(999, None, None, Some(&["x".to_string()])).unwrap();
+        assert!(!ok, "no rows for non-existent plan");
+    }
+
+    // ── Execution Artifact Store ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_and_retrieve_artifact() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("artifact_store.db"))
+            .build()
+            .await
+            .unwrap();
+        let artifact = crate::artifacts::ExecutionArtifact::new(
+            "grep:abc123", "grep", "search init", "abc123",
+            "src/main.rs: found init()", vec!["src/main.rs".to_string()],
+            vec![], "deepseek-chat",
+        );
+        let id = db.store_artifact(&artifact).unwrap();
+        assert!(id > 0);
+
+        // Retrieve by key
+        let loaded = db.get_artifact_by_key("grep:abc123").unwrap();
+        assert!(loaded.is_some(), "should find by execution_key");
+        let a = loaded.unwrap();
+        assert_eq!(a.tool_name, "grep");
+        assert_eq!(a.args, "search init");
+        assert_eq!(a.result, "src/main.rs: found init()");
+        assert_eq!(a.dependent_files, vec!["src/main.rs"]);
+    }
+
+    #[tokio::test]
+    async fn store_tool_artifact_updates_cache_and_store() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("artifact_tool.db"))
+            .build()
+            .await
+            .unwrap();
+        let deps = vec!["src/lib.rs".to_string()];
+        let id = db.store_tool_artifact("grep", "search foo --pattern bar", "found bar", &deps).unwrap();
+        assert!(id > 0);
+
+        // Should also be findable via tool_cache (backward compat)
+        let (_cname, hash) = crate::tool_cache::cache_key("grep", "search foo --pattern bar");
+        let cached = db.tool_cache_get("grep", &hash).unwrap();
+        assert!(cached.is_some(), "should also be in tool_cache");
+
+        // Should be findable via artifact store
+        let by_tool = db.get_artifact_by_tool_hash("grep", &hash).unwrap();
+        assert!(by_tool.is_some(), "should find by tool+hash");
+        assert_eq!(by_tool.unwrap().result, "found bar");
+    }
+
+    // ── Replay session ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_execution_events_by_session_found() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("replay_session.db"))
+            .build()
+            .await
+            .unwrap();
+
+        // Insert events with replay_session_id
+        let session_id = "test_session_1";
+        db.store_execution_event_with_replay(
+            None, "TextDelta", r#"{"type":"text_delta","text":"hello"}"#,
+            1, Some(1), 1000, session_id,
+        ).unwrap();
+        db.store_execution_event_with_replay(
+            None, "TextDelta", r#"{"type":"text_delta","text":"world"}"#,
+            2, Some(1), 1001, session_id,
+        ).unwrap();
+
+        // Query by session
+        let events = db.get_execution_events_by_session(session_id).unwrap();
+        assert_eq!(events.len(), 2, "should find both events");
+        assert_eq!(events[0].2, "TextDelta", "first event kind matches");
+        assert_eq!(events[0].4, 1, "first seq_no matches");
+        assert_eq!(events[1].4, 2, "second seq_no matches");
+    }
+
+    #[tokio::test]
+    async fn get_execution_events_by_session_empty() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("replay_empty.db"))
+            .build()
+            .await
+            .unwrap();
+        let events = db.get_execution_events_by_session("nonexistent").unwrap();
+        assert!(events.is_empty(), "no events for unknown session");
+    }
+
+    #[tokio::test]
+    async fn list_replay_sessions_returns_grouped() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("replay_list.db"))
+            .build()
+            .await
+            .unwrap();
+
+        db.store_execution_event_with_replay(
+            None, "TextDelta", "{}", 1, Some(1), 1000, "session_a",
+        ).unwrap();
+        db.store_execution_event_with_replay(
+            None, "TextDelta", "{}", 2, Some(1), 1001, "session_a",
+        ).unwrap();
+        db.store_execution_event_with_replay(
+            None, "TextDelta", "{}", 1, Some(1), 2000, "session_b",
+        ).unwrap();
+
+        let sessions = db.list_replay_sessions(10).unwrap();
+        assert_eq!(sessions.len(), 2, "should find 2 sessions");
+        // session_a has 2 events, session_b has 1
+        let a = sessions.iter().find(|(sid, ..)| sid == "session_a").unwrap();
+        assert_eq!(a.1, 2, "session_a should have 2 events");
+        let b = sessions.iter().find(|(sid, ..)| sid == "session_b").unwrap();
+        assert_eq!(b.1, 1, "session_b should have 1 event");
+    }
+
+    #[tokio::test]
+    async fn replay_session_returns_stream_events_only() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("replay_full.db"))
+            .build()
+            .await
+            .unwrap();
+
+        let session_id = "full_test_session";
+        // Stream event
+        db.store_execution_event_with_replay(
+            None, "TextDelta", r#"{"type":"text_delta","text":"hello"}"#,
+            1, Some(1), 1000, session_id,
+        ).unwrap();
+        // Internal event (should be skipped)
+        db.store_execution_event_with_replay(
+            None, "execution_completed", r#"{"tool_name":"grep","outcome":"success"}"#,
+            2, Some(1), 1001, session_id,
+        ).unwrap();
+        // Another stream event (MessageEnd has no fields, easy to construct)
+        db.store_execution_event_with_replay(
+            None, "MessageEnd", r#"{"type":"message_end"}"#,
+            3, Some(1), 1002, session_id,
+        ).unwrap();
+
+        let result = crate::replay::replay_session(&db, session_id).unwrap();
+        assert_eq!(result.events.len(), 2, "should only include stream events");
+        assert_eq!(result.corrupt_count, 0, "no corrupt events");
+        // First event should be TextDelta
+        assert!(matches!(result.events[0].event, crate::protocol::canonical::StreamEvent::TextDelta { .. }));
+        // Second should be MessageEnd
+        assert!(matches!(result.events[1].event, crate::protocol::canonical::StreamEvent::MessageEnd));
+    }
+
+    // ── Online Evaluation ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_decision_outcomes_groups_by_action() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("online_eval.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
+
+        // Store some decisions and outcomes
+        let id1 = db.store_decision_record(conv_id, "ReuseToolCache", 0.9, "cache hit", 500).unwrap();
+        let id2 = db.store_decision_record(conv_id, "ReuseToolCache", 0.8, "cache hit", 400).unwrap();
+        let id3 = db.store_decision_record(conv_id, "RetryWithFix", 0.7, "retry", 200).unwrap();
+
+        // Mark outcomes
+        db.mark_decision_accepted(id1, true).unwrap();
+        db.evaluate_decision(id1, "success", Some(480)).unwrap();
+        db.mark_decision_accepted(id2, true).unwrap();
+        db.evaluate_decision(id2, "cache_invalidated", None).unwrap();
+        db.mark_decision_accepted(id3, true).unwrap();
+        db.evaluate_decision(id3, "success", Some(150)).unwrap();
+
+        // Query outcomes
+        let outcomes = db.query_decision_outcomes_by_action(100).unwrap();
+        assert_eq!(outcomes.len(), 2, "two action types");
+
+        let cache = outcomes.iter().find(|(a, ..)| a == "ReuseToolCache").unwrap();
+        assert_eq!(cache.1, 1, "ReuseToolCache: 1 success out of 2");
+        assert_eq!(cache.2, 2, "ReuseToolCache: 2 total");
+
+        let retry = outcomes.iter().find(|(a, ..)| a == "RetryWithFix").unwrap();
+        assert_eq!(retry.1, 1, "RetryWithFix: 1 success");
+        assert_eq!(retry.2, 1, "RetryWithFix: 1 total");
     }
 }

@@ -184,11 +184,13 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
 /// Check the tool cache for a pair of [ToolCallStart, ToolCallArgsDelta] events.
 /// Returns `(Some(cached_result), 2)` if hit, or `(None, 0)` if the first event
 /// at `offset` is not an interceptable tool call pair.
+/// On cache hit, records a decision record in the DB for feedback evaluation.
 fn check_tool_cache(
     events: &[StreamEvent],
     offset: usize,
     db: &std::sync::Arc<crate::db::Database>,
     cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
+    conv_id: i64,
 ) -> (Option<String>, usize) {
     if offset + 1 >= events.len() { return (None, 0); }
     if let StreamEvent::ToolCallStart { index: si, name, .. } = &events[offset] {
@@ -205,6 +207,15 @@ fn check_tool_cache(
                             c.record_cache_hit(name);
                         }
                         let transformed = crate::tool_cache::transform_result(name, result);
+                        // Record decision in DB for feedback evaluation loop
+                        let estimated_saving = transformed.len() as u64;
+                        let _ = db.store_decision_record(
+                            conv_id,
+                            "ReuseToolCache",
+                            0.8,
+                            &format!("cache hit for tool={name}, args={args_hash}"),
+                            estimated_saving,
+                        );
                         tracing::info!(target: "deeplossless",
                             tool=name, %args_hash, raw_len=result.len(), transformed_len=transformed.len(),
                             "cache hit — intercepting tool call");
@@ -250,7 +261,7 @@ pub(crate) fn process_events(
 ) -> anyhow::Result<bool> {
     let mut i = 0;
     while i < events.len() {
-        let (cached, consumed) = check_tool_cache(&events, i, &db, cycle);
+        let (cached, consumed) = check_tool_cache(&events, i, &db, cycle, conv_id);
         if let Some(text) = cached {
             let text_ev = StreamEvent::TextDelta { text };
             let kind = "TextDelta";
@@ -1850,6 +1861,27 @@ async fn lcm_chat_completions(
             } else {
                 (String::new(), 0)
             };
+
+            // Proactively load failure patterns + active plan, run the rule engine,
+            // and inject context so the agent knows about past failures and plan state
+            let (failure_context, plan_context) = {
+                let guard = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
+                let db = &state.storage.db;
+                let fc = crate::runtime::evaluate_failure_context(db, out.conv_id, &guard);
+                let pc = crate::runtime::evaluate_plan_context(db, out.conv_id, &guard, &guard.context_delta);
+                (fc, pc)
+            };
+            let ctx_text = match (failure_context.as_deref(), plan_context.as_deref()) {
+                (Some(fc), Some(pc)) => format!("{ctx_text}\n\n{fc}\n\n{pc}"),
+                (Some(fc), None) => {
+                    if ctx_text.is_empty() { fc.to_string() } else { format!("{ctx_text}\n\n{fc}") }
+                }
+                (None, Some(pc)) => {
+                    if ctx_text.is_empty() { pc.to_string() } else { format!("{ctx_text}\n\n{pc}") }
+                }
+                (None, None) => ctx_text,
+            };
+
             (Some(out.conv_id), ctx_text, ctx_tokens)
         }
         Err(e) => {
@@ -2904,12 +2936,11 @@ async fn lcm_cache_put(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
-    let (_name, hash) = crate::tool_cache::cache_key(tool, args);
-    if tool.is_empty() || hash.is_empty() {
+    if tool.is_empty() || args.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
     }
-    match state.storage.db.tool_cache_put(tool, &hash, result, &files) {
-        Ok(()) => Json(json!({"status": "cached", "tool": tool})).into_response(),
+    match state.storage.db.store_tool_artifact(tool, args, result, &files) {
+        Ok(_id) => Json(json!({"status": "cached", "tool": tool})).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
     }
 }
@@ -3201,6 +3232,29 @@ async fn lcm_failure_put(
             // Link to runtime metrics so repeated_failures stays accurate
             if let Ok(mut cycle) = state.runtime.cycle.lock() {
                 cycle.metrics.repeated_failures += 1;
+            }
+            // Record decision for feedback loop
+            let reason = if fix.is_empty() {
+                format!("failure pattern stored: signature={sig}, why_failed={why}")
+            } else {
+                format!("failure pattern stored: signature={sig}, attempted_fix={fix}")
+            };
+            let _ = state.storage.db.store_decision_record(
+                conv_id, "RetryWithFix", 0.7, &reason, 0,
+            );
+            // Evaluate any pending cache decisions — the failure may invalidate cache entries
+            if let Ok(records) = state.storage.db.query_decision_records(conv_id, 5) {
+                for (rec_id, action, _, accepted, outcome, _, _, _) in &records {
+                    if action == "ReuseToolCache" && *accepted != Some(false) && outcome.is_none() {
+                        let _ = state.storage.db.evaluate_decision(*rec_id, "cache_invalidated", Some(0));
+                    }
+                }
+            }
+            // Auto-snapshot on failure for recovery support
+            if let Err(e) = state.storage.dag.auto_snapshot_on_event(
+                conv_id, "failure", &format!("sig={sig}"),
+            ) {
+                tracing::warn!(target: "deeplossless::proxy", "auto-snapshot on failure: {e}");
             }
             Json(json!({"status": "stored", "id": id})).into_response()
         }

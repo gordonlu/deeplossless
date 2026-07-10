@@ -479,14 +479,13 @@ impl Summarizer {
                             }
                         }
                     } else if status.as_u16() == 429 {
-                        // Rate limited — jittered backoff (P0-3)
-                        let jitter_ms = jitter_millis(attempt);
-                        let delay = Duration::from_secs(2u64.pow(attempt))
-                            + Duration::from_millis(jitter_ms);
+                        // Rate limited — full-jitter exponential backoff
+                        let delay_ms = crate::runtime::full_jitter_backoff(2000, 60000, attempt as u32, jitter_seed());
+                        let delay = Duration::from_millis(delay_ms);
                         tracing::warn!(
                             target = "deeplossless::summarizer",
                             meta = ?meta,
-                            retry_delay_ms = delay.as_millis(),
+                            retry_delay_ms = delay_ms,
                             "rate limited (429) — retrying"
                         );
                         tokio::time::sleep(delay).await;
@@ -517,9 +516,8 @@ impl Summarizer {
                         "request failed"
                     );
                     if e.is_timeout() || e.is_connect() {
-                        let jitter_ms = jitter_millis(attempt);
-                        let delay = Duration::from_secs(2u64.pow(attempt))
-                            + Duration::from_millis(jitter_ms);
+                        let delay_ms = crate::runtime::full_jitter_backoff(1000, 30000, attempt as u32, jitter_seed());
+                        let delay = Duration::from_millis(delay_ms);
                         tokio::time::sleep(delay).await;
                         last_error = Some(anyhow::anyhow!("{e}"));
                         continue;
@@ -619,19 +617,27 @@ fn is_transient_error(e: &anyhow::Error) -> bool {
     crate::runtime::RetryClass::classify(&msg, status).is_retryable()
 }
 
-/// Deterministic pseudo-jitter from attempt number to avoid thundering herd.
-/// Returns 0..999 ms based on attempt number, seeded by current sub-millisecond time.
-pub(crate) fn jitter_millis(attempt: u32) -> u64 {
-    static SEED: AtomicU64 = AtomicU64::new(0);
-    if SEED.load(Ordering::Relaxed) == 0 {
-        // Use nanosecond time as a one-shot seed
+/// Shared jitter seed — initialized once from sub-millisecond system time.
+static JITTER_SEED: AtomicU64 = AtomicU64::new(0);
+
+/// Return the shared jitter seed, initializing lazily if needed.
+pub(crate) fn jitter_seed() -> u64 {
+    if JITTER_SEED.load(Ordering::Relaxed) == 0 {
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as u64;
-        SEED.store(ns.max(1), Ordering::Relaxed);
+        JITTER_SEED.store(ns.max(1), Ordering::Relaxed);
     }
-    let base = SEED.load(Ordering::Relaxed) ^ (attempt as u64);
+    JITTER_SEED.load(Ordering::Relaxed)
+}
+
+/// Deterministic pseudo-jitter from attempt number to avoid thundering herd.
+/// Returns 0..999 ms based on attempt number, seeded by current sub-millisecond time.
+#[allow(dead_code)]
+pub(crate) fn jitter_millis(attempt: u32) -> u64 {
+    let seed = jitter_seed();
+    let base = seed ^ (attempt as u64);
     // Multiplicative hash: splitmix64 finalizer
     let x = base.wrapping_mul(0x9E3779B97F4A7C15);
     let x = x ^ (x >> 33);

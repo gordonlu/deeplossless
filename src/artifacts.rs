@@ -192,6 +192,100 @@ impl DependencyIndex {
     }
 }
 
+// ── Execution Artifact ─────────────────────────────────────────────────
+
+/// A complete execution artifact — the record of a tool execution.
+///
+/// Artifact = input + dependency snapshot + output + environment context.
+/// This upgrades the tool cache from a simple key-value store to a full
+/// execution artifact system, supporting replay, dependency validation,
+/// and cache correctness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionArtifact {
+    pub id: i64,
+    /// Canonical execution key: tool_name + args_hash (for dedup/lookup).
+    pub execution_key: String,
+    /// Normalized tool name.
+    pub tool_name: String,
+    /// Full input arguments text (not just the hash).
+    pub args: String,
+    /// SHA-256 hash of arguments (for backward-compatible lookup).
+    pub args_hash: String,
+    /// Tool output / execution result.
+    pub result: String,
+    /// Files this execution depended on.
+    pub dependent_files: Vec<String>,
+    /// Content hashes of dependent files at execution time.
+    pub file_hashes: Vec<String>,
+    /// Runtime environment: model + provider + tool versions.
+    pub environment_fingerprint: String,
+    /// ISO-8601 timestamp of creation.
+    pub created_at: String,
+    /// Number of times this artifact has been reused (cache hits).
+    pub hit_count: i64,
+}
+
+impl ExecutionArtifact {
+    /// Create from execution components.
+    pub fn new(
+        execution_key: &str,
+        tool_name: &str,
+        args: &str,
+        args_hash: &str,
+        result: &str,
+        dependent_files: Vec<String>,
+        file_hashes: Vec<String>,
+        environment_fingerprint: &str,
+    ) -> Self {
+        Self {
+            id: 0,
+            execution_key: execution_key.to_string(),
+            tool_name: tool_name.to_string(),
+            args: args.to_string(),
+            args_hash: args_hash.to_string(),
+            result: result.to_string(),
+            dependent_files,
+            file_hashes,
+            environment_fingerprint: environment_fingerprint.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            hit_count: 0,
+        }
+    }
+
+    /// Record a dependency edge for each dependent file.
+    /// Returns the edges to persist.
+    pub fn dependency_edges(&self) -> Vec<(String, ArtifactVersion, DependencyKind)> {
+        self.dependent_files.iter().zip(self.file_hashes.iter())
+            .map(|(path, hash)| {
+                let av = ArtifactVersion {
+                    path: path.clone(),
+                    content_hash: hash.clone(),
+                    observed_at: self.created_at.clone(),
+                };
+                (self.execution_key.clone(), av, DependencyKind::Read)
+            })
+            .collect()
+    }
+}
+
+/// SQL migration for execution_artifacts table.
+pub const ARTIFACT_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS execution_artifacts (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        execution_key           TEXT NOT NULL,
+        tool_name               TEXT NOT NULL,
+        args                    TEXT NOT NULL DEFAULT '',
+        args_hash               TEXT NOT NULL,
+        result                  TEXT NOT NULL,
+        dependent_files         TEXT NOT NULL DEFAULT '[]',
+        file_hashes             TEXT NOT NULL DEFAULT '[]',
+        environment_fingerprint TEXT NOT NULL DEFAULT '',
+        created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+        hit_count               INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_artifact_exec_key ON execution_artifacts(execution_key);
+    CREATE INDEX IF NOT EXISTS idx_artifact_tool_hash ON execution_artifacts(tool_name, args_hash);";
+
 // ── SQL migration ─────────────────────────────────────────────────────
 
 pub const MIGRATION: &str = "
@@ -260,5 +354,37 @@ mod tests {
         idx.record("exec_grep", v1, DependencyKind::Read);
         idx.remove("exec_grep");
         assert!(idx.dependencies_of("src/main.rs").is_empty());
+    }
+
+    #[test]
+    fn execution_artifact_creates_dependency_edges() {
+        let artifact = ExecutionArtifact::new(
+            "grep:abc123", "grep", "search foo",
+            "abc123", "found 3 results",
+            vec!["src/main.rs".to_string()],
+            vec!["hash1".to_string()],
+            "deepseek-chat",
+        );
+        let edges = artifact.dependency_edges();
+        assert!(!edges.is_empty(), "should create an edge for each dependent file");
+        assert_eq!(edges[0].0, "grep:abc123", "execution_key should match");
+        assert_eq!(edges[0].1.path, "src/main.rs", "should reference the dependent file");
+        assert_eq!(edges[0].2, DependencyKind::Read, "default kind should be Read");
+    }
+
+    #[test]
+    fn execution_artifact_roundtrip_fields() {
+        let artifact = ExecutionArtifact::new(
+            "read_file:def456", "read_file", "/path/to/file.txt",
+            "def456", "file contents here",
+            vec!["/path/to/file.txt".to_string()],
+            vec!["hash2".to_string()],
+            "deepseek-chat",
+        );
+        assert_eq!(artifact.tool_name, "read_file");
+        assert_eq!(artifact.args, "/path/to/file.txt");
+        assert_eq!(artifact.result, "file contents here");
+        assert_eq!(artifact.hit_count, 0);
+        assert!(artifact.execution_key.contains("def456"));
     }
 }

@@ -867,19 +867,17 @@ async fn tool_cache_intercepts_tool_call() {
     let _shutdown = tx;
 
     let state = build_proxy_state(addr, "cache_intercept").await;
+    let db = state.storage.db.clone();
     // Pre-populate the tool cache — same args the upstream will "generate"
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
-    state
-        .storage
-        .db
-        .tool_cache_put(
-            &cname,
-            &args_hash,
-            "src/main.rs:42 found foo",
-            &["src/main.rs".to_string()],
-        )
-        .unwrap();
+    db.tool_cache_put(
+        &cname,
+        &args_hash,
+        "src/main.rs:42 found foo",
+        &["src/main.rs".to_string()],
+    )
+    .unwrap();
 
     let proxy_addr = start_proxy(state).await;
     let client = reqwest::Client::new();

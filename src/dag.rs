@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -824,11 +824,11 @@ impl DagEngine {
             .collect();
 
         // Delta compression: skip leaves with high content overlap to summaries already in result
-        let summary_texts: Vec<String> = result.iter()
+        let summary_owned: Vec<String> = result.iter()
             .filter(|n| n.level > 0)
             .map(|n| n.summary.clone())
             .collect();
-        let summary_refs: Vec<&str> = summary_texts.iter().map(|s| s.as_str()).collect();
+        let summary_refs: Vec<&str> = summary_owned.iter().map(|s| s.as_str()).collect();
 
         for node in recent.into_iter().rev() {
             if !injected_ids.insert(node.id) {
@@ -847,35 +847,61 @@ impl DagEngine {
             }
         }
 
-        // 3. If query provided, boost with scored retrieval results
-        // Only use results with valid DAG node IDs (source != "message").
-        // Message IDs map to the messages table, not dag_nodes, so get_node() returns None.
+        // 3. If query provided, boost with scored retrieval results (batched, graph-aware)
         if let Some(q) = query
             && let Ok(search_results) = self.db.search_unified(conv_id, q, 10)
         {
-            for sr in search_results.iter().take(5) {
-                if sr.source == "message" {
-                    continue; // message IDs are not valid dag_node IDs
-                }
-                if injected_ids.contains(&sr.id) {
-                    continue;
-                }
-                if let Ok(Some(node)) = self.db.get_node(sr.id) {
-                    let tc = node.token_count;
-                    if tc <= remaining {
-                        injected_ids.insert(node.id);
-                        result.push(node);
-                        remaining -= tc;
+            // Compute graph distances from the current result set (active nodes)
+            let active_ids: Vec<i64> = result.iter().map(|n| n.id).collect();
+            let distances = self.graph_bfs_distance(&active_ids, &graph);
+            let max_id = result.iter().map(|n| n.id).max().unwrap_or(0) as f64;
+
+            // Score each search result by combining semantic, graph, and recency
+            let mut scored: Vec<(f64, i64)> = search_results.iter()
+                .filter(|sr| sr.source != "message")
+                .filter(|sr| !injected_ids.contains(&sr.id))
+                .map(|sr| {
+                    let semantic = sr.bm25_score.unwrap_or(0.5).min(1.0).max(0.0); // normalize FTS5 rank
+                    let dist = distances.get(&sr.id).copied();
+                    let recency = if max_id > 0.0 {
+                        (sr.id as f64 / max_id).min(1.0)
+                    } else {
+                        0.5
+                    };
+                    let score = Self::graph_relevance_score(semantic, dist, recency);
+                    (score, sr.id)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let top_ids: Vec<i64> = scored.into_iter().take(5).map(|(_, id)| id).collect();
+            if !top_ids.is_empty() {
+                if let Ok(boost_nodes) = self.db.get_nodes_batch(&top_ids) {
+                    let node_map: std::collections::HashMap<i64, DagNode> = boost_nodes
+                        .into_iter()
+                        .map(|n| (n.id, n))
+                        .collect();
+                    for &nid in &top_ids {
+                        if injected_ids.contains(&nid) {
+                            continue;
+                        }
+                        if let Some(node) = node_map.get(&nid) {
+                            let tc = node.token_count;
+                            if tc <= remaining {
+                                injected_ids.insert(node.id);
+                                result.push(node.clone());
+                                remaining -= tc;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Record access for memory scoring (best-effort)
-        for node in &result {
-            if let Err(e) = self.db.touch_node(node.id) {
-                tracing::warn!(target: "deeplossless::dag", error = %e, node_id = node.id, "touch_node failed");
-            }
+        // Record access for memory scoring (best-effort, batched)
+        let touched_ids: Vec<i64> = result.iter().map(|n| n.id).collect();
+        if let Err(e) = self.db.batch_touch_nodes(&touched_ids) {
+            tracing::warn!(target: "deeplossless::dag", error = %e, "batch_touch_nodes failed");
         }
 
         Ok(result)
@@ -898,6 +924,74 @@ impl DagEngine {
             node.snippets.iter().map(|s| s.importance as f64).sum::<f64>() / node.snippets.len() as f64
         };
         (recency * 0.4 + freq * 0.3 + imp * 0.3).clamp(0.0, 1.0)
+    }
+
+    /// BFS from `source_ids` to compute shortest graph distance to every
+    /// reachable node in the DAG. Walks both parent and child edges.
+    /// Returns a map of node_id → distance (0 for source nodes themselves).
+    /// Unreachable nodes are absent from the map.
+    pub fn graph_bfs_distance(
+        &self,
+        source_ids: &[i64],
+        graph: &DagGraph,
+    ) -> HashMap<i64, usize> {
+        if source_ids.is_empty() {
+            return HashMap::new();
+        }
+        let mut dist: HashMap<i64, usize> = HashMap::new();
+        let mut queue: VecDeque<i64> = VecDeque::new();
+        for &sid in source_ids {
+            if dist.insert(sid, 0).is_none() {
+                queue.push_back(sid);
+            }
+        }
+
+        while let Some(cur) = queue.pop_front() {
+            let d = dist[&cur] + 1;
+            // Walk children (graph.children maps node → its child node IDs)
+            if let Some(children) = graph.children.get(&cur) {
+                for &child in children {
+                    if !dist.contains_key(&child) {
+                        dist.insert(child, d);
+                        queue.push_back(child);
+                    }
+                }
+            }
+            // Walk parents (each node's parent_ids field)
+            if let Some(node) = graph.nodes.get(&cur) {
+                for &pid in &node.parent_ids {
+                    if !dist.contains_key(&pid) {
+                        dist.insert(pid, d);
+                        queue.push_back(pid);
+                    }
+                }
+            }
+        }
+        dist
+    }
+
+    /// Compute a graph-aware relevance score combining semantic match,
+    /// graph distance from an active set, and recency.
+    ///
+    /// `semantic_score`: 0.0–1.0 from FTS5 or content similarity
+    /// `distance`: graph BFS distance from active set (None = unreachable)
+    /// `recency_factor`: 0.0–1.0 (higher = more recent)
+    ///
+    /// Weights: semantic 0.4, graph proximity 0.35, recency 0.25
+    pub fn graph_relevance_score(
+        semantic_score: f64,
+        distance: Option<usize>,
+        recency_factor: f64,
+    ) -> f64 {
+        let graph_score = match distance {
+            Some(0) => 1.0,       // in the active set
+            Some(1) => 0.8,       // direct neighbor
+            Some(2) => 0.5,       // two hops
+            Some(3) => 0.3,       // three hops
+            Some(d) => (1.0 / (d as f64)).max(0.05), // further away: decay
+            None => 0.05,         // unreachable: low baseline
+        };
+        semantic_score * 0.40 + graph_score * 0.35 + recency_factor * 0.25
     }
 
     /// Load all DAG nodes and edges for a conversation in 1-2 queries.
@@ -1265,6 +1359,42 @@ impl DagEngine {
             0, &boundary_hash, &integrity_hash,
         )?;
         // Enforce budget to prevent unbounded snapshot growth
+        let budget = self.db.policy_config.read()
+            .map(|c| c.snapshot_budget.clone())
+            .unwrap_or_default();
+        let _ = self.db.enforce_snapshot_budget(&budget);
+        Ok(())
+    }
+
+    /// Auto-snapshot for any lifecycle event (retry, failure, cancel).
+    /// Creates an Ephemeral-tier (L0) snapshot with a semantic event label.
+    /// No-op if snapshot mode is not Auto.
+    pub fn auto_snapshot_on_event(
+        &self, conv_id: i64, event: &str, detail: &str,
+    ) -> anyhow::Result<()> {
+        let config = self.db.policy_config.read()
+            .map(|c| c.snapshot_mode)
+            .unwrap_or(crate::runtime::SnapshotMode::Auto);
+        if !config.should_auto_snapshot() {
+            return Ok(());
+        }
+        let dag_root = self.current_revision().0;
+        let version_id = self.db.create_memory_version(
+            None, event, &format!("auto-snapshot on {event}: {detail}"), None,
+        )?;
+        let snapshot_data = serde_json::json!({
+            "conv_id": conv_id,
+            "event": event,
+            "detail": detail,
+            "revision": dag_root,
+        });
+        let data_str = serde_json::to_string(&snapshot_data)?;
+        let boundary_hash = crate::snapshot::compute_boundary_hash(&[(0_i64, &data_str)], 1);
+        let integrity_hash = crate::snapshot::compute_chain_hash(&[(0_i64, &data_str)]);
+        self.db.take_snapshot(
+            0, version_id, 0, &data_str, data_str.len() as i64, None,
+            0, &boundary_hash, &integrity_hash,
+        )?;
         let budget = self.db.policy_config.read()
             .map(|c| c.snapshot_budget.clone())
             .unwrap_or_default();
@@ -2117,5 +2247,66 @@ mod tests {
         let _n2 = engine.insert_leaf(conv_id, "remove", 5).unwrap();
         engine.rollback_to(n1.id).unwrap();
         assert!(engine.get_node(n1.id).unwrap().is_some(), "target node should be kept");
+    }
+
+    // ── Graph-aware retrieval ─────────────────────────────────────────
+
+    #[test]
+    fn graph_bfs_distance_source_in_set() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let n1 = engine.insert_leaf(conv_id, "node a", 10).unwrap();
+        let graph = engine.load_graph(conv_id).unwrap();
+        let dist = engine.graph_bfs_distance(&[n1.id], &graph);
+        assert_eq!(dist.get(&n1.id).copied(), Some(0), "source should have distance 0");
+    }
+
+    #[test]
+    fn graph_bfs_distance_parent_child() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let n1 = engine.insert_leaf(conv_id, "leaf", 10).unwrap();
+        let n2 = engine.compress_group(conv_id, &[n1.id], "summary", 5, 1).unwrap();
+        // n1 is leaf, n2 is summary (parent of n1)
+        let graph = engine.load_graph(conv_id).unwrap();
+
+        // Distance from n2 (summary) to n1 (leaf): n2 → child_ids → n1 = 1 hop
+        let dist = engine.graph_bfs_distance(&[n2.id], &graph);
+        assert_eq!(dist.get(&n1.id).copied(), Some(1), "leaf is child of summary");
+        assert_eq!(dist.get(&n2.id).copied(), Some(0), "source is distance 0");
+
+        // Distance from n1 (leaf) to n2 (summary): n1 → parent_ids → n2 = 1 hop
+        let dist2 = engine.graph_bfs_distance(&[n1.id], &graph);
+        assert_eq!(dist2.get(&n2.id).copied(), Some(1), "summary is parent of leaf");
+    }
+
+    #[test]
+    fn graph_bfs_distance_empty_source() {
+        let (db, conv_id) = setup_db();
+        let engine = DagEngine::builder().build(db);
+        let _n1 = engine.insert_leaf(conv_id, "leaf", 10).unwrap();
+        let graph = engine.load_graph(conv_id).unwrap();
+        let dist = engine.graph_bfs_distance(&[], &graph);
+        assert!(dist.is_empty(), "empty source set yields empty distances");
+    }
+
+    #[test]
+    fn graph_relevance_score_combines_factors() {
+        // High semantic + in active set + recent → near 1.0
+        let high = DagEngine::graph_relevance_score(1.0, Some(0), 1.0);
+        assert!(high > 0.8, "high score for relevant+connected+recent: {high}");
+
+        // Low semantic + unreachable + old → near 0.0
+        let low = DagEngine::graph_relevance_score(0.0, None, 0.0);
+        assert!(low < 0.2, "low score for irrelevant+unreachable+old: {low}");
+
+        // A node at distance 2 should score between extremes
+        let mid = DagEngine::graph_relevance_score(0.5, Some(2), 0.5);
+        assert!(mid > low && mid < high, "mid-range score should be between extremes: {mid}");
+
+        // Graph proximity should boost score
+        let with_graph = DagEngine::graph_relevance_score(0.5, Some(1), 0.5);
+        let without_graph = DagEngine::graph_relevance_score(0.5, None, 0.5);
+        assert!(with_graph > without_graph, "graph proximity should boost score: {with_graph} > {without_graph}");
     }
 }

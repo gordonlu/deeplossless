@@ -1,15 +1,107 @@
-//! RuntimeStateView — derived read-only state from the append-only
-//! event log. Phase 2.5: validates event schema completeness by
-//! computing runtime truth from events alone.
+//! RuntimeStateView + RuntimeStateProjection — pure event-sourced state.
 //!
-//! This is a PURE function: events in, state out. No mutation.
-//! Existing mutable projections remain as safety net — they are
-//! NOT replaced by this view until parity is validated.
+//! ## RuntimeStateView (stateless queries)
+//! Individual event-derived queries. Each call scans the event list.
+//! Best for one-off checks (e.g., "is cancellation pending?").
+//!
+//! ## RuntimeStateProjection (stateful fold)
+//! Accumulates state by folding RuntimeEvents. Single-pass.
+//! Best for building the full runtime state (metrics, failure streak, etc.).
+//!
+//! The projection pattern: `RuntimeEvent → apply(state) → state`
+//! This is the P0 #4 event sourcing pattern: events are the source of truth,
+//! the projection is derived purely from events.
 //!
 //! Scope: execution lifecycle, retry lifecycle, cancellation.
 //! OUT of scope: DAG, compaction, cache, observation.
 
 use crate::runtime_events::RuntimeEvent;
+
+/// Pure event-sourced projection of runtime state.
+///
+/// Accumulates state by folding [`RuntimeEvent`]s in order.
+/// Single-pass: one `apply()` call per event, O(n) total.
+///
+/// # Example
+/// ```ignore
+/// let mut proj = RuntimeStateProjection::new();
+/// for event in events { proj.apply(event); }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeStateProjection {
+    /// Total tokens spent (sum of ToolCallCompleted.tokens_spent).
+    pub tokens_spent: u64,
+    /// Number of cache hits (ToolCallCompleted with cache_hit=true).
+    pub cache_hits: u64,
+    /// Number of tool call completions.
+    pub completions: u64,
+    /// Number of tool call failures.
+    pub failures: u64,
+    /// Current failure streak (consecutive ToolCallFailed at end of log).
+    pub failure_streak: u32,
+    /// Error signature of the last failure, if any.
+    pub last_failure_signature: Option<String>,
+}
+
+impl RuntimeStateProjection {
+    /// Create an empty projection (all fields zeroed).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold a single event into this projection.
+    /// Call events in logical_seq order for correct results.
+    pub fn apply(&mut self, event: &RuntimeEvent) {
+        match event {
+            RuntimeEvent::ToolCallCompleted { tokens_spent, cache_hit, .. } => {
+                self.tokens_spent += tokens_spent;
+                self.completions += 1;
+                if *cache_hit {
+                    self.cache_hits += 1;
+                }
+                // Success resets the failure streak
+                self.failure_streak = 0;
+            }
+            RuntimeEvent::ToolCallFailed { error_signature, .. } => {
+                self.failures += 1;
+                self.failure_streak = self.failure_streak.saturating_add(1);
+                self.last_failure_signature = Some(error_signature.clone());
+            }
+            _ => {
+                // ExecutionStarted, ToolCallScheduled, RetryScheduled,
+                // RetryAborted, Cancellation* — no metrics effect
+            }
+        }
+    }
+
+    /// Build a projection by folding all events in order.
+    pub fn from_events(events: &[RuntimeEvent]) -> Self {
+        let mut proj = Self::new();
+        for event in events {
+            proj.apply(event);
+        }
+        proj
+    }
+
+    /// Cache misses = total completions − cache hits.
+    pub fn cache_misses(&self) -> u64 {
+        self.completions.saturating_sub(self.cache_hits)
+    }
+
+    /// Map this projection into a partial RuntimeMetrics.
+    /// Non-derivable fields (budget, reread_ratio, planning_reuse_ratio)
+    /// are set to their defaults.
+    pub fn to_metrics(&self) -> crate::runtime::RuntimeMetrics {
+        crate::runtime::RuntimeMetrics {
+            tokens_spent: self.tokens_spent,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses(),
+            repeated_failures: self.failures,
+            failure_streak: self.failure_streak,
+            ..Default::default()
+        }
+    }
+}
 
 /// Read-only derived state from an event log slice.
 /// Computed on demand; never cached or materialized.
@@ -435,6 +527,107 @@ mod tests {
             RuntimeEvent::CancellationAcknowledged { conv_id: 2, logical_seq: 11, tool_call_id: "tc_pending".into(), span_id: "sp_4".into() },
             RuntimeEvent::CancellationCompleted { conv_id: 2, logical_seq: 12, clean: true },
         ]
+    }
+
+    // ── RuntimeStateProjection tests ─────────────────────────────────
+
+    #[test]
+    fn projection_empty_events_produces_defaults() {
+        let proj = RuntimeStateProjection::from_events(&[]);
+        assert_eq!(proj.tokens_spent, 0);
+        assert_eq!(proj.cache_hits, 0);
+        assert_eq!(proj.completions, 0);
+        assert_eq!(proj.failures, 0);
+        assert_eq!(proj.failure_streak, 0);
+        assert!(proj.last_failure_signature.is_none());
+        assert_eq!(proj.cache_misses(), 0);
+    }
+
+    #[test]
+    fn projection_accumulates_tokens_and_completions() {
+        let proj = RuntimeStateProjection::from_events(&make_events());
+        assert_eq!(proj.tokens_spent, 150); // 100 + 50
+        assert_eq!(proj.completions, 2);
+        assert_eq!(proj.cache_hits, 1); // only conv 2's completion is cache_hit
+        assert_eq!(proj.cache_misses(), 1); // conv 1's completion is not cache_hit
+        assert_eq!(proj.failures, 1);
+    }
+
+    #[test]
+    fn projection_failure_streak_resets_on_success() {
+        // Two failures followed by a success → streak = 0
+        let events = vec![
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, error_signature: "E2".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "t3".into(), span_id: "s3".into(), attempt: 1, tokens_spent: 10, cache_hit: false, execution_unit_id: 0 },
+        ];
+        let proj = RuntimeStateProjection::from_events(&events);
+        assert_eq!(proj.failures, 2);
+        assert_eq!(proj.failure_streak, 0); // reset by success
+        assert_eq!(proj.last_failure_signature.as_deref(), Some("E2"));
+    }
+
+    #[test]
+    fn projection_failure_streak_increments_on_consecutive_failures() {
+        let events = vec![
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, error_signature: "E2".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "t3".into(), span_id: "s3".into(), attempt: 1, error_signature: "E3".into(), retryable: true, execution_unit_id: 0 },
+        ];
+        let proj = RuntimeStateProjection::from_events(&events);
+        assert_eq!(proj.failures, 3);
+        assert_eq!(proj.failure_streak, 3);
+    }
+
+    #[test]
+    fn projection_apply_incremental() {
+        let mut proj = RuntimeStateProjection::new();
+        assert_eq!(proj.tokens_spent, 0);
+
+        proj.apply(&RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, tokens_spent: 50, cache_hit: false, execution_unit_id: 0 });
+        assert_eq!(proj.tokens_spent, 50);
+        assert_eq!(proj.completions, 1);
+
+        proj.apply(&RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, tokens_spent: 25, cache_hit: true, execution_unit_id: 0 });
+        assert_eq!(proj.tokens_spent, 75);
+        assert_eq!(proj.cache_hits, 1);
+        assert_eq!(proj.completions, 2);
+
+        proj.apply(&RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "t3".into(), span_id: "s3".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 });
+        assert_eq!(proj.failures, 1);
+        assert_eq!(proj.failure_streak, 1);
+    }
+
+    #[test]
+    fn projection_to_metrics_maps_correctly() {
+        let mut proj = RuntimeStateProjection::new();
+        proj.apply(&RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, tokens_spent: 100, cache_hit: true, execution_unit_id: 0 });
+        proj.apply(&RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 });
+
+        let m = proj.to_metrics();
+        assert_eq!(m.tokens_spent, 100);
+        assert_eq!(m.cache_hits, 1);
+        assert_eq!(m.cache_misses, 0);
+        assert_eq!(m.repeated_failures, 1);
+        assert_eq!(m.failure_streak, 1);
+        // Non-derivable fields default
+        assert_eq!(m.reread_ratio, 0.0);
+        assert_eq!(m.budget_remaining_pct, 0.0);
+    }
+
+    #[test]
+    fn projection_irrelevant_events_ignored() {
+        let events = vec![
+            RuntimeEvent::ExecutionStarted { conv_id: 1, logical_seq: 1, profile: "minimal".into() },
+            RuntimeEvent::ToolCallScheduled { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1 },
+            RuntimeEvent::RetryScheduled { conv_id: 1, logical_seq: 3, tool_call_id: "t1".into(), attempt: 2, suggested_fix: "fix".into() },
+            RuntimeEvent::CancellationRequested { conv_id: 1, logical_seq: 4, source: crate::runtime_events::CancellationSource::Shutdown },
+        ];
+        let proj = RuntimeStateProjection::from_events(&events);
+        assert_eq!(proj.tokens_spent, 0);
+        assert_eq!(proj.completions, 0);
+        assert_eq!(proj.failures, 0);
+        assert_eq!(proj.failure_streak, 0);
     }
 
     #[test]

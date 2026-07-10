@@ -330,18 +330,17 @@ impl ChatPipeline {
                         }
                     }
 
-                    // Auto-populate tool cache from message history.
+                    // Auto-populate execution artifact store from message history.
+                    // Artifact = input (args) + dependency snapshot (files) + output (result).
                     if crate::tool_cache::is_cacheable(&unit.tool_name)
                         && !unit.tool_result.is_empty() {
-                        let (_name, args_hash) = crate::tool_cache::cache_key(
-                            &unit.tool_name, &unit.tool_args);
                         let dependent_files = crate::tool_cache::extract_dependent_files(
                             &unit.tool_name, &unit.tool_args);
-                        if let Err(e) = db.tool_cache_put(
-                            &unit.tool_name, &args_hash,
+                        if let Err(e) = db.store_tool_artifact(
+                            &unit.tool_name, &unit.tool_args,
                             &unit.tool_result, &dependent_files,
                         ) {
-                            tracing::warn!(target: "deeplossless::pipeline", "failed to cache tool result: {e}");
+                            tracing::warn!(target: "deeplossless::pipeline", "failed to store artifact: {e}");
                         }
                     }
                     // Auto-record failures from tool results
@@ -354,6 +353,13 @@ impl ChatPipeline {
                             &unit.tool_result,
                             &[], &[], None,
                         );
+                        // Auto-snapshot on auto-detected failure
+                        if let Err(e) = dag.auto_snapshot_on_event(
+                            conv_id, "failure", &format!("auto:{sig}"),
+                        ) {
+                            tracing::warn!(target: "deeplossless::pipeline",
+                                "auto-snapshot on failure: {e}");
+                        }
                         tracing::debug!(target: "deeplossless::pipeline",
                             conv_id, tool = %unit.tool_name,
                             "auto-recorded failure pattern");

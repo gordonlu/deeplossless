@@ -670,20 +670,20 @@ async fn review_and_compact(
     let cmd_start = std::time::Instant::now();
 
     for group in &plan.groups {
-        let text: String = plan.leaves.iter()
-            .filter(|n| group.node_ids.contains(&n.id))
-            .map(|n| n.summary.as_str())
-            .collect::<Vec<_>>()
-            .join("\n---\n");
+        // Single pass: collect text parts and sum token count simultaneously
+        let mut text_parts: Vec<&str> = Vec::new();
+        let mut old_tc: i64 = 0;
+        for leaf in &plan.leaves {
+            if group.node_ids.contains(&leaf.id) {
+                text_parts.push(leaf.summary.as_str());
+                old_tc += leaf.token_count;
+            }
+        }
+        let text = text_parts.join("\n---\n");
 
         if text.is_empty() {
             continue;
         }
-
-        let old_tc: i64 = plan.leaves.iter()
-            .filter(|n| group.node_ids.contains(&n.id))
-            .map(|n| n.token_count)
-            .sum();
 
         do_compress(conv_id, group.node_ids.clone(), text, old_tc, dag, summarizer, event_tx).await;
     }

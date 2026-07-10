@@ -757,6 +757,27 @@ pub const PLAN_MIGRATION: &str = "
     CREATE INDEX IF NOT EXISTS idx_plan_conv
         ON plan_states(conversation_id);";
 
+/// SQL migration for runtime_decision_records table.
+pub const DECISION_RECORDS_MIGRATION: &str = "
+    CREATE TABLE IF NOT EXISTS runtime_decision_records (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id         INTEGER NOT NULL REFERENCES conversations(id),
+        action                  TEXT NOT NULL,
+        confidence              REAL NOT NULL DEFAULT 0.0,
+        reason                  TEXT NOT NULL DEFAULT '',
+        accepted                INTEGER,
+        outcome                 TEXT,
+        estimated_token_saving  INTEGER NOT NULL DEFAULT 0,
+        actual_token_saving     INTEGER,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_decision_records_conv
+        ON runtime_decision_records(conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_decision_records_action
+        ON runtime_decision_records(action);
+    CREATE INDEX IF NOT EXISTS idx_decision_records_created
+        ON runtime_decision_records(created_at);";
+
 pub const EVENT_MIGRATION: &str = "
     CREATE TABLE IF NOT EXISTS execution_events (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -244,6 +244,54 @@ enum Commands {
         #[arg(long, short = 'n', default_value = "50")]
         limit: usize,
     },
+    /// Replay a recorded execution session.
+    /// Reconstructs the stream of events from the execution_events table
+    /// and prints them as JSON to stdout.
+    Replay {
+        /// The replay_session_id to replay. List recent sessions with --list.
+        session_id: Option<String>,
+        /// List recent replay sessions with their event counts.
+        #[arg(long)]
+        list: bool,
+    },
+}
+
+async fn run_replay(
+    db_path: &str,
+    session_id: Option<String>,
+    list: bool,
+) -> anyhow::Result<()> {
+    use deeplossless::db::Database;
+
+    let db = Database::builder().path(db_path).build().await?;
+
+    if list {
+        let sessions = db.list_replay_sessions(20)?;
+        if sessions.is_empty() {
+            println!("No replay sessions found.");
+            return Ok(());
+        }
+        println!("{:50} {:>8} {:>26}", "Session ID", "Events", "First Seen");
+        println!("{}", "-".repeat(90));
+        for (sid, count, first_seen, _last_epoch) in &sessions {
+            println!("{sid:50} {count:>8} {first_seen:>26}");
+        }
+        return Ok(());
+    }
+
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!(
+        "session_id is required. Use --list to see available sessions."
+    ))?;
+
+    let result = deeplossless::replay::replay_session(&db, &sid)?;
+    println!("{{\"session_id\": \"{sid}\", \"events\": [");
+    for (i, envelope) in result.events.iter().enumerate() {
+        let json = serde_json::to_string(&envelope.event)?;
+        if i > 0 { println!(","); }
+        print!("  {json}");
+    }
+    println!("\n], \"corrupt_count\": {}}}", result.corrupt_count);
+    Ok(())
 }
 
 async fn run_demo() -> anyhow::Result<()> {
@@ -260,7 +308,7 @@ async fn run_demo() -> anyhow::Result<()> {
     let conv_id = db.create_and_store("demo", &serde_json::json!([
         {"role":"user","content":"Hello, deeplossless!"}
     ]))?;
-    db.tool_cache_put("grep", "hello", "src/main.rs:42: found", &["src/main.rs".to_string()])?;
+    db.store_tool_artifact("grep", "hello --pattern init", "src/main.rs:42: found", &["src/main.rs".to_string()])?;
     let _ = db.tool_cache_get("grep", "hello")?;
     dag.insert_leaf(conv_id, "greeting", 5)?;
     dag.assemble_context(conv_id, 1000, None)?;
@@ -486,6 +534,9 @@ async fn main() -> anyhow::Result<()> {
         };
         return run_search(&cli.db_path, filter).await;
     }
+    if let Some(Commands::Replay { session_id, list }) = cli.command {
+        return run_replay(&cli.db_path.as_str(), session_id, list).await;
+    }
     let mut cli = cli;
 
     if let Some(ref torture_aces) = cli.torture_aces {
@@ -649,40 +700,42 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
-        dag_threshold: cli.dag_threshold,
-        summarizer_budget: cli.summarizer_budget,
-        upstream: cli.upstream,
-        upstream_path: cli.upstream_path,
-        db_path: cli.db_path,
-        api_key: cli.api_key,
-        admin_key: cli.admin_key,
-        summarizer_model: cli.summarizer_model,
-        rate_limit: cli.rate_limit,
-        runtime_profile: cli.runtime_profile,
-        dry_run: cli.dry_run,
-        log_dir: cli.log_dir,
-        record: cli.record,
-        passthrough: cli.passthrough,
-        // ACES drives its own scenario state machine — the deeplossless
-        // pipeline (storage, compactor, summarizer) is pure noise here
-        // and would call the mock's /v1/chat/completions from the
-        // summarizer, producing the "expected value at line 1 column 1"
-        // parse errors. Force the pipeline off in ACES mode.
-        no_pipeline: cli.no_pipeline || cli.torture_aces.is_some(),
-        no_header_mod: cli.no_header_mod,
-        lcm_context: cli.lcm_context,
-        cache_normalize: !cli.no_cache_normalize,
-        lcm_context_tokens: if cli.no_lcm_context { 0 } else { cli.lcm_context_tokens },
-        workspace,
-        reasoning_effort: match cli.reasoning_effort.as_str() {
-            "high" | "High" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::High),
-            "max" | "Max" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::Max),
-            "none" | "None" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::None),
-            _ => deeplossless::protocol::ReasoningEffortMode::Passthrough,
+        provider: deeplossless::runtime_coordinator::ProviderConfig {
+            upstream: cli.upstream,
+            upstream_path: cli.upstream_path,
+            api_key: cli.api_key,
+            admin_key: cli.admin_key,
+            reasoning_effort: match cli.reasoning_effort.as_str() {
+                "high" | "High" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::High),
+                "max" | "Max" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::Max),
+                "none" | "None" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::None),
+                _ => deeplossless::protocol::ReasoningEffortMode::Passthrough,
+            },
+            dsml_parse: cli.dsml_parse,
+            dsml_emit: cli.dsml_emit,
         },
-        dsml_parse: cli.dsml_parse,
-        dsml_emit: cli.dsml_emit,
-        quick_instruction: cli.quick_instruction,
+        storage: deeplossless::runtime_coordinator::StorageConfig {
+            db_path: cli.db_path,
+            dag_threshold: cli.dag_threshold,
+            summarizer_model: cli.summarizer_model,
+            summarizer_budget: cli.summarizer_budget,
+            workspace,
+            cache_normalize: !cli.no_cache_normalize,
+            lcm_context_tokens: if cli.no_lcm_context { 0 } else { cli.lcm_context_tokens },
+        },
+        runtime: deeplossless::runtime_coordinator::RuntimeConfig {
+            runtime_profile: cli.runtime_profile,
+            rate_limit: cli.rate_limit,
+            dry_run: cli.dry_run,
+            log_dir: cli.log_dir,
+            record: cli.record,
+            passthrough: cli.passthrough,
+            // ACES drives its own scenario state machine
+            no_pipeline: cli.no_pipeline || cli.torture_aces.is_some(),
+            no_header_mod: cli.no_header_mod,
+            lcm_context: cli.lcm_context,
+            quick_instruction: cli.quick_instruction,
+        },
         policy_config: deeplossless::runtime::RuntimePolicyConfig {
             audit_mode,
             snapshot_mode,

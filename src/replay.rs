@@ -542,6 +542,78 @@ mod tests {
     }
 }
 
+/// Replay all events for a session (identified by `replay_session_id`).
+/// Returns events ordered by insertion (id ASC) — the only stable
+/// global ordering across multiple execution units.
+pub fn replay_session(
+    db: &crate::db::Database,
+    session_id: &str,
+) -> Result<ReplayResult, ReplayError> {
+    let rows = db.get_execution_events_by_session(session_id)
+        .map_err(|e| ReplayError::Other(e))?;
+    if rows.is_empty() {
+        return Ok(ReplayResult { events: vec![], corrupt_count: 0 });
+    }
+
+    // Stream event kinds that are valid for replay
+    let is_stream_kind = |k: &str| matches!(k,
+        "TextDelta" | "ToolCallStart" | "ToolCallArgsDelta" | "ToolCallEnd"
+        | "ReasoningDelta" | "MessageStart" | "MessageEnd"
+        | "OutputItemAdded" | "OutputItemDone" | "FunctionCallArgumentsDone"
+        | "Done" | "Error"
+    );
+
+    let mut events = Vec::with_capacity(rows.len());
+    let mut skipped = 0usize;
+    for (_id, _exec_id, kind, payload, seq_no, _created_at, _epoch_ms) in &rows {
+        // Skip non-stream events (execution_completed, etc.) silently
+        if !is_stream_kind(kind) {
+            skipped += 1;
+            continue;
+        }
+
+        // Try parsing as StreamEvent directly (new format with "type" field)
+        let parsed = serde_json::from_str::<StreamEvent>(payload);
+        match parsed {
+            Ok(ev) => {
+                events.push(ReplayEventEnvelope {
+                    schema_version: EVENT_SCHEMA_VERSION,
+                    seq_no: *seq_no,
+                    event: ev,
+                });
+            }
+            Err(_) => {
+                // Fallback: inject event_kind as the "type" field (old format)
+                let injected = format!(
+                    r#"{{"type":"{kind}",{}"#,
+                    &payload[1.min(payload.len())..]
+                );
+                match serde_json::from_str::<StreamEvent>(&injected) {
+                    Ok(ev) => {
+                        events.push(ReplayEventEnvelope {
+                            schema_version: EVENT_SCHEMA_VERSION,
+                            seq_no: *seq_no,
+                            event: ev,
+                        });
+                    }
+                    Err(_) => {
+                        // Not parseable as a stream event — could still be useful
+                        // as a non-stream internal event that we skip.
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if skipped > 0 {
+        tracing::debug!(target: "deeplossless::replay",
+            "skipped {skipped} non-stream events during session replay");
+    }
+
+    Ok(ReplayResult { events, corrupt_count: 0 })
+}
+
 /// Replay protocol assertion — verifies that a replayed event sequence
 /// satisfies all critical-field invariants for the target provider.
 pub fn assert_replay_valid(
