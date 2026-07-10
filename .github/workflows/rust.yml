@@ -19,9 +19,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --lib
-        env:
-          RUSTFLAGS: -A warnings
+      - run: cargo clippy --lib -- -D warnings
 
   # Unit tests only (no external dependencies)
   unit-tests:

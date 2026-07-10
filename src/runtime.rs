@@ -1243,7 +1243,7 @@ impl OnlineEvaluator {
     /// Adjust a candidate's score based on historical success rate.
     /// High success → boost; low success → reduce; unknown → neutral.
     pub fn adjust_score(&self, candidate: &mut DecisionCandidate, rule_name: &str) {
-        let action = &candidate.decision.action.variant_name();
+        let action = candidate.decision.action.variant_name();
         let rate = self.success_rate(action);
         // Blend: final = score * (0.5 + 0.5 * rate)
         // At rate=1.0 → score * 1.0 (no change)
@@ -1475,7 +1475,7 @@ pub fn evaluate_plan_context(
     // Store a decision record so the runtime can track plan-related outcomes
     let _ = db.store_decision_record(
         conv_id,
-        &decision.action.variant_name(),
+        decision.action.variant_name(),
         decision.confidence,
         &decision.reason,
         decision.estimated_token_saving,

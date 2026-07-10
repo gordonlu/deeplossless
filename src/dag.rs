@@ -67,7 +67,7 @@ impl KnowledgeDag {
 
 /// In-memory snapshot of a conversation's DAG, used for batch-loaded
 /// context assembly (avoids N+1 DB roundtrips).
-struct DagGraph {
+pub(crate) struct DagGraph {
     nodes: HashMap<i64, DagNode>,
     children: HashMap<i64, Vec<i64>>,
 }
@@ -861,7 +861,7 @@ impl DagEngine {
                 .filter(|sr| sr.source != "message")
                 .filter(|sr| !injected_ids.contains(&sr.id))
                 .map(|sr| {
-                    let semantic = sr.bm25_score.unwrap_or(0.5).min(1.0).max(0.0); // normalize FTS5 rank
+                    let semantic = sr.bm25_score.unwrap_or(0.5).clamp(0.0, 1.0);
                     let dist = distances.get(&sr.id).copied();
                     let recency = if max_id > 0.0 {
                         (sr.id as f64 / max_id).min(1.0)
@@ -948,20 +948,18 @@ impl DagEngine {
 
         while let Some(cur) = queue.pop_front() {
             let d = dist[&cur] + 1;
-            // Walk children (graph.children maps node → its child node IDs)
             if let Some(children) = graph.children.get(&cur) {
                 for &child in children {
-                    if !dist.contains_key(&child) {
-                        dist.insert(child, d);
+                    if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(child) {
+                        e.insert(d);
                         queue.push_back(child);
                     }
                 }
             }
-            // Walk parents (each node's parent_ids field)
             if let Some(node) = graph.nodes.get(&cur) {
                 for &pid in &node.parent_ids {
-                    if !dist.contains_key(&pid) {
-                        dist.insert(pid, d);
+                    if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(pid) {
+                        e.insert(d);
                         queue.push_back(pid);
                     }
                 }

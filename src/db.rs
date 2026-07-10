@@ -2505,6 +2505,7 @@ impl Database {
     }
 
     /// Get full failure pattern data (with all fields) by signature.
+    #[allow(clippy::type_complexity)]
     pub fn get_failure_pattern_by_signature(
         &self, conv_id: i64, signature: &str,
     ) -> anyhow::Result<Option<(String, String, Vec<String>, String)>> {
@@ -2722,6 +2723,7 @@ impl Database {
     }
 
     /// Query decision records for a conversation (most recent first).
+    #[allow(clippy::type_complexity)]
     pub fn query_decision_records(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(i64, String, f64, Option<bool>, Option<String>, u64, Option<u64>, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
@@ -2832,6 +2834,7 @@ impl Database {
     /// Read all execution events for a replay session (by replay_session_id).
     /// Returns (id, execution_id, event_kind, event_payload, seq_no, created_at, epoch_ms)
     /// ordered by insertion order (id ascending) for deterministic replay.
+    #[allow(clippy::type_complexity)]
     pub fn get_execution_events_by_session(
         &self, session_id: &str,
     ) -> anyhow::Result<Vec<(i64, Option<i64>, String, String, i64, String, i64)>> {

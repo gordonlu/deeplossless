@@ -1,7 +1,6 @@
 /// DS4-14: ContextPack importance ordering.
 /// Wraps messages with computed importance scores and supports
 /// Preserve, ReverseChronological, or ByImportance ordering.
-
 /// 0/1 knapsack selector: given items with value and cost, select the subset
 /// within `capacity` that maximizes total value.
 ///

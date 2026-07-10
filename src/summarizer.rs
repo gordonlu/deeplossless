@@ -480,7 +480,7 @@ impl Summarizer {
                         }
                     } else if status.as_u16() == 429 {
                         // Rate limited — full-jitter exponential backoff
-                        let delay_ms = crate::runtime::full_jitter_backoff(2000, 60000, attempt as u32, jitter_seed());
+                        let delay_ms = crate::runtime::full_jitter_backoff(2000, 60000, attempt, jitter_seed());
                         let delay = Duration::from_millis(delay_ms);
                         tracing::warn!(
                             target = "deeplossless::summarizer",
@@ -516,7 +516,7 @@ impl Summarizer {
                         "request failed"
                     );
                     if e.is_timeout() || e.is_connect() {
-                        let delay_ms = crate::runtime::full_jitter_backoff(1000, 30000, attempt as u32, jitter_seed());
+                        let delay_ms = crate::runtime::full_jitter_backoff(1000, 30000, attempt, jitter_seed());
                         let delay = Duration::from_millis(delay_ms);
                         tokio::time::sleep(delay).await;
                         last_error = Some(anyhow::anyhow!("{e}"));

@@ -550,7 +550,7 @@ pub fn replay_session(
     session_id: &str,
 ) -> Result<ReplayResult, ReplayError> {
     let rows = db.get_execution_events_by_session(session_id)
-        .map_err(|e| ReplayError::Other(e))?;
+        .map_err(ReplayError::Other)?;
     if rows.is_empty() {
         return Ok(ReplayResult { events: vec![], corrupt_count: 0 });
     }
