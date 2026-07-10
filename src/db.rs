@@ -241,7 +241,7 @@ impl Database {
     }
 
     fn wal_size_bytes(&self) -> u64 {
-        let wal_path = format!("{}-wal", &self.db_path);
+        let wal_path = format!("{}-wal", self.db_path);
         std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
     }
 

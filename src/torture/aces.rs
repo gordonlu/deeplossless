@@ -224,18 +224,15 @@ pub(crate) fn extract_agent_cwd(body: &Value) -> Option<std::path::PathBuf> {
         Some(s) => s,
         None => {
             // content can be an array of blocks (Anthropic format)
-            if let Some(arr) = content.as_array() {
-                let mut buf = String::new();
-                for b in arr {
-                    if let Some(t) = b["text"].as_str() {
-                        buf.push_str(t);
-                        buf.push('\n');
-                    }
+            let arr = content.as_array()?;
+            let mut buf = String::new();
+            for b in arr {
+                if let Some(t) = b["text"].as_str() {
+                    buf.push_str(t);
+                    buf.push('\n');
                 }
-                Box::leak(buf.into_boxed_str()) as &str
-            } else {
-                return None;
             }
+            Box::leak(buf.into_boxed_str()) as &str
         }
     };
     for line in text.lines() {

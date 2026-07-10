@@ -1951,7 +1951,7 @@ async fn lcm_chat_completions(
         let session_fp = crate::session::fingerprint(&msgs, 3);
         let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str()).unwrap_or("");
-        let reasoning_key = format!("reasoning:{}:{}", &model, last_user.chars().take(80).collect::<String>());
+        let reasoning_key = format!("reasoning:{}:{}", model, last_user.chars().take(80).collect::<String>());
         tokio::spawn(async move {
             let req_start = std::time::Instant::now();
             let mut byte_stream = resp.bytes_stream();
