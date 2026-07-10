@@ -930,7 +930,7 @@ impl DagEngine {
     /// reachable node in the DAG. Walks both parent and child edges.
     /// Returns a map of node_id → distance (0 for source nodes themselves).
     /// Unreachable nodes are absent from the map.
-    pub fn graph_bfs_distance(
+    pub(crate) fn graph_bfs_distance(
         &self,
         source_ids: &[i64],
         graph: &DagGraph,

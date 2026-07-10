@@ -10,30 +10,60 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  # Fast checks first — fail early
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: clippy
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --lib -- -D warnings
 
-      - name: cargo check
-        run: cargo check --all-targets
+  # Unit tests only (no external dependencies)
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib
+        env:
+          RUSTFLAGS: -A warnings
+          RUST_LOG: error
 
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+  # Integration tests (may need external infra)
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --tests
+        env:
+          RUSTFLAGS: -A warnings
+          RUST_LOG: error
 
-      - name: cargo test
-        run: cargo test --all-targets
+  # Doc tests
+  doc:
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
-      - name: cargo doc
-        run: cargo doc --no-deps
-
+  # Protocol compatibility — torture scenarios (no LLM needed)
   protocol-compat:
     name: protocol compat (${{ matrix.format }})
     runs-on: ubuntu-latest
+    needs: [lint, unit-tests]
     strategy:
       fail-fast: false
       matrix:
@@ -43,9 +73,8 @@ jobs:
           - codex
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-
+      - uses: Swatinem/rust-cache@v2
       - name: cargo test (${{ matrix.format }})
         run: |
           case "$FORMAT" in
@@ -56,3 +85,5 @@ jobs:
           cargo test --lib torture::driver -- $FILTER --nocapture
         env:
           FORMAT: ${{ matrix.format }}
+          RUSTFLAGS: -A warnings
+          RUST_LOG: error
