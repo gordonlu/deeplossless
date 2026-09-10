@@ -78,7 +78,7 @@ jobs:
 
       - name: Format and test
         run: |
-          cargo fmt --check
+          cargo fmt
           cargo test --lib
           cargo clippy --lib -- -D warnings
       - name: Commit patch
