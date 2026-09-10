@@ -283,17 +283,17 @@ fn term_match_score(text_lower: &str, terms: &[String]) -> f64 {
 }
 
 fn resource_match_score(text_lower: &str, resources: &[String]) -> f64 {
-    resources
-        .iter()
-        .any(|resource| {
-            let raw = resource
-                .strip_prefix("file:")
-                .or_else(|| resource.strip_prefix("symbol:"))
-                .unwrap_or(resource);
-            !raw.is_empty() && text_lower.contains(&raw.to_lowercase())
-        })
-        .then_some(1.0)
-        .unwrap_or(0.0)
+    if resources.iter().any(|resource| {
+        let raw = resource
+            .strip_prefix("file:")
+            .or_else(|| resource.strip_prefix("symbol:"))
+            .unwrap_or(resource);
+        !raw.is_empty() && text_lower.contains(&raw.to_lowercase())
+    }) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 fn lexical_similarity(text_lower: &str, query_terms: &HashSet<String>) -> f64 {
