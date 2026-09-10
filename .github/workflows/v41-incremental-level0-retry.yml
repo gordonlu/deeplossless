@@ -21,7 +21,7 @@ jobs:
           python3 - <<'PY'
           import subprocess, textwrap
           old = subprocess.check_output(
-              ['git','show','HEAD^^^^^:.github/workflows/v41-incremental-level0.yml'],
+              ['git','show','aac712f0f8c44ca1a9f136f1b0f5a71ea748e1e4:.github/workflows/v41-incremental-level0.yml'],
               text=True,
           )
           start_marker = "          python3 - <<'PY'\n"
