@@ -1,7 +1,7 @@
 //! SQLite-backed persistence for exact source evidence and typed plan dependencies.
 //!
 //! This is intentionally implemented on top of the existing append-only
-//! `proxy_events` carrier first.  Callers only depend on [`SourceRef`] and this
+//! `proxy_events` carrier first. Callers depend on [`SourceRef`] and this
 //! facade, so the carrier can later move to a dedicated blob/table without
 //! changing projection semantics.
 
@@ -12,9 +12,12 @@ use serde_json::{json, Value};
 
 use crate::db::Database;
 use crate::event_store::{EventFilter, EventType, ProxyEvent};
-use crate::ground_truth::{PlanFactDependency, SourceRef, TruthStream};
+use crate::ground_truth::{
+    ExecutionFact, ExecutionStateProjection, PlanFactDependency, SourceRef, TruthStream,
+};
 
 const KIND_EXACT_SOURCE: &str = "ground_truth_exact_source";
+const KIND_EXECUTION_FACT: &str = "execution_fact";
 const KIND_PLAN_DEPENDENCY: &str = "plan_fact_dependency";
 
 /// SQLite-backed exact-evidence facade.
@@ -28,9 +31,6 @@ impl<'a> GroundTruthStore<'a> {
     }
 
     /// Persist UTF-8 evidence exactly as observed and return a verified SourceRef.
-    ///
-    /// `payload_ref` carries both the stable session bucket and row id. The
-    /// caller never needs to understand this representation.
     pub fn put_text(
         &self,
         stream: TruthStream,
@@ -41,8 +41,6 @@ impl<'a> GroundTruthStore<'a> {
         let provisional = SourceRef::new(stream.clone(), 0, payload.as_bytes());
         let event = ProxyEvent {
             id: None,
-            // `proxy_events` is the persistence carrier, not the semantic
-            // taxonomy. Metadata below identifies the exact-source record.
             event_type: EventType::Reasoning,
             session_id: session_id.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -66,7 +64,7 @@ impl<'a> GroundTruthStore<'a> {
         })
     }
 
-    /// Persist a JSON value using a deterministic serialization.
+    /// Persist a JSON value using deterministic serde_json serialization.
     pub fn put_json<T: Serialize>(
         &self,
         stream: TruthStream,
@@ -119,6 +117,60 @@ impl<'a> GroundTruthStore<'a> {
             .filter(|source| self.is_recoverable(source))
             .cloned()
             .collect()
+    }
+
+    /// Persist a projected execution fact. This row is not Ground Truth: its
+    /// evidence field must point back to exact source records.
+    pub fn put_execution_fact(
+        &self,
+        session_id: &str,
+        fact: &ExecutionFact,
+    ) -> anyhow::Result<i64> {
+        self.db.insert_proxy_event(&ProxyEvent {
+            id: None,
+            event_type: EventType::Reasoning,
+            session_id: session_id.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            tool_name: None,
+            path: None,
+            status: Some("projection_sidecar".into()),
+            content: serde_json::to_string(fact)?,
+            metadata: json!({
+                "deeplossless_kind": KIND_EXECUTION_FACT,
+                "fact_id": fact.id,
+                "fact_status": fact.status,
+            }),
+        })
+    }
+
+    /// Load the newest value for every fact id from the append-only sidecar.
+    pub fn load_execution_facts(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<ExecutionFact>> {
+        let events = self.db.query_proxy_events(&EventFilter {
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        })?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        // query_proxy_events is newest-first, so first row wins for each fact id.
+        for event in events {
+            if event.metadata.get("deeplossless_kind").and_then(Value::as_str)
+                != Some(KIND_EXECUTION_FACT)
+            {
+                continue;
+            }
+            let fact: ExecutionFact = match serde_json::from_str(&event.content) {
+                Ok(fact) => fact,
+                Err(_) => continue,
+            };
+            if seen.insert(fact.id.clone()) {
+                out.push(fact);
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
     }
 
     /// Persist a typed Plan→Fact dependency as append-only sidecar state.
@@ -178,6 +230,30 @@ impl<'a> GroundTruthStore<'a> {
         out.sort_by_key(|dep| (dep.step_index.unwrap_or(usize::MAX), dep.fact_id.clone()));
         Ok(out)
     }
+
+    /// Rebuild the semantic execution-state projection from persisted facts and
+    /// typed dependencies. The projection itself is disposable.
+    pub fn rebuild_execution_state(
+        &self,
+        session_id: &str,
+        plan_id: Option<i64>,
+        goal: Option<String>,
+        current_step: Option<String>,
+    ) -> anyhow::Result<ExecutionStateProjection> {
+        let mut state = ExecutionStateProjection {
+            goal,
+            active_plan_id: plan_id,
+            current_step,
+            ..Default::default()
+        };
+        for fact in self.load_execution_facts(session_id)? {
+            state.insert_fact(fact);
+        }
+        if let Some(plan_id) = plan_id {
+            state.plan_dependencies = self.load_plan_dependencies(session_id, plan_id)?;
+        }
+        Ok(state)
+    }
 }
 
 fn parse_payload_ref(payload_ref: &str) -> anyhow::Result<(&str, i64)> {
@@ -194,6 +270,7 @@ fn parse_payload_ref(payload_ref: &str) -> anyhow::Result<(&str, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ground_truth::{FactStatus, ResourceRef};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -211,6 +288,65 @@ mod tests {
         assert!(src.seq_no > 0);
         assert_eq!(store.materialize_text(&src).unwrap(), "full tool output");
         assert!(store.is_recoverable(&src));
+    }
+
+    #[tokio::test]
+    async fn facts_round_trip_and_state_rebuilds() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("facts.db"))
+            .build()
+            .await
+            .unwrap();
+        let store = GroundTruthStore::new(&db);
+        let source = store
+            .put_text(TruthStream::FileObservations, "s1", "enabled=true", "config")
+            .unwrap();
+        let mut fact = ExecutionFact::new("config-enabled", "feature is enabled");
+        fact.evidence.push(source);
+        fact.resources.push(ResourceRef::File {
+            path: "src/config.rs".into(),
+            content_hash: "abc".into(),
+        });
+        fact.status = FactStatus::Valid;
+        store.put_execution_fact("s1", &fact).unwrap();
+        let dep = PlanFactDependency {
+            plan_id: 7,
+            step_index: Some(0),
+            fact_id: fact.id.clone(),
+            required: true,
+        };
+        store.put_plan_dependency("s1", &dep).unwrap();
+
+        let state = store
+            .rebuild_execution_state(
+                "s1",
+                Some(7),
+                Some("ship feature".into()),
+                Some("run tests".into()),
+            )
+            .unwrap();
+        assert_eq!(state.goal.as_deref(), Some("ship feature"));
+        assert!(state.facts.contains_key("config-enabled"));
+        assert_eq!(state.plan_dependencies, vec![dep]);
+    }
+
+    #[tokio::test]
+    async fn newest_fact_projection_wins() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("fact-newest.db"))
+            .build()
+            .await
+            .unwrap();
+        let store = GroundTruthStore::new(&db);
+        let mut fact = ExecutionFact::new("f", "old statement");
+        store.put_execution_fact("s1", &fact).unwrap();
+        fact.statement = "new statement".into();
+        store.put_execution_fact("s1", &fact).unwrap();
+        let facts = store.load_execution_facts("s1").unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].statement, "new statement");
     }
 
     #[tokio::test]
