@@ -1,39 +1,54 @@
 //! # Protocol Adapters
 //!
-//! Provider-neutral, model-neutral, transport-neutral translation layer.
+//! Provider-neutral adapters used by the legacy Chat Completions / Anthropic
+//! compatibility path and by the execution/event normalization layer.
 //!
-//! ## Architecture
+//! ## Transport architecture
+//!
+//! DeepSeek's native Responses API no longer round-trips through this module:
 //!
 //! ```text
-//! OpenAI Responses / DeepSeek Chat / Anthropic Messages
-//!         ↓ adapter (dumb: parse → normalize → canonical IR)
-//!   ExecutionState { steps, artifacts, plan, failures }
-//!         ↓ runtime pipeline (DAG context, cache, failure detection)
-//!   ExecutionState (updated)
-//!         ↓ adapter (dumb: canonical IR → serialize to provider format)
-//! OpenAI Responses / DeepSeek Chat / Anthropic Messages
+//! OpenAI Responses client
+//!        ↓ native Responses transport
+//! DeepSeek /responses
+//!        ↓ native Responses SSE / JSON
+//! OpenAI Responses client
 //! ```
+//!
+//! The canonical adapters remain for the compatibility surface:
+//!
+//! ```text
+//! DeepSeek Chat / Anthropic Messages / legacy Responses fallback
+//!        ↓ parse → normalize → canonical IR
+//! execution/runtime pipeline
+//!        ↓ canonical IR → provider serialization
+//! provider compatibility transport
+//! ```
+//!
+//! `responses` is therefore a **legacy compatibility adapter**, used only when
+//! an upstream has no native `/responses` endpoint (404) and in compatibility
+//! tests/diagnostics. New native Responses features must not be implemented by
+//! translating them through `CanonicalRequest` or synthetic Responses SSE.
 //!
 //! ## Design rules
 //!
-//! 1. **IR is execution-centric, not message-centric.** `Message` is a
-//!    serialization artifact of provider adapters. The core runtime operates
-//!    on `ExecutionStep`, `ExecutionArtifact`, `PlanState`, `FailurePattern`.
-//! 2. **Provider adapters are dumb.** Only parse, normalize, serialize.
-//!    No business logic, no caching, no policy decisions.
-//! 3. **Provider payload never enters core runtime.** All provider-specific
-//!    fields are stripped during normalization.
-//! 4. **Tool results are first-class runtime objects.** Not just "assistant
-//!    message with tool content." This keeps cache/replay/provenance clean.
-//! 5. **Reasoning is a distinct artifact type, not text.** Enables future
-//!    distill/compact/reuse/invalidate operations on reasoning traces.
-//! 6. **Streaming is fully abstracted.** `StreamEvent` enum covers text
-//!    deltas, tool call deltas, reasoning deltas, and completion.
+//! 1. **Native Responses stays native.** Preserve Responses items and lifecycle
+//!    events end-to-end whenever the upstream supports `/responses`.
+//! 2. **IR is execution-centric, not message-centric.** `Message` is a
+//!    serialization artifact of compatibility adapters. The runtime operates
+//!    on execution steps, artifacts, plans, failures, and runtime events.
+//! 3. **Compatibility adapters are dumb.** Parse, normalize, serialize only;
+//!    no caching or policy decisions belong here.
+//! 4. **Tool results and reasoning are first-class execution artifacts.** They
+//!    must not be reduced to plain assistant text inside the core runtime.
+//! 5. **Provider payloads do not define runtime truth.** Runtime state is
+//!    derived from persisted execution events; protocol objects are transport.
 
 pub mod anthropic;
 pub mod canonical;
 pub mod chat_completions;
 pub mod dsml;
+/// Legacy Responses ↔ canonical adapter. Native DeepSeek Responses bypasses it.
 pub mod responses;
 pub mod streaming;
 
