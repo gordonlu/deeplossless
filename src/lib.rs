@@ -64,6 +64,7 @@
 
 #[allow(clippy::result_unit_err)]
 pub mod compactor;
+pub mod compaction_guard;
 pub mod dag;
 pub mod db;
 pub mod dependency_kind;
