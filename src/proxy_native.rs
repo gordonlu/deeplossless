@@ -19,6 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 
 use crate::event_store::EventType;
+use crate::ground_truth::TruthStream;
+use crate::ground_truth_store::GroundTruthStore;
 use crate::protocol::{ReasoningEffort, ReasoningEffortMode};
 use crate::AppState;
 
@@ -281,8 +283,22 @@ fn text_from_content(content: &Value) -> String {
 }
 
 fn observe_items(state: &AppState, session_id: &str, items: &[Value]) {
+    let truth = GroundTruthStore::new(&state.storage.db);
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+
+        // Persist the provider item before deriving any text/tool projection.
+        // Failure is observable but does not break proxy transport.
+        if let Err(error) = truth.put_json(
+            TruthStream::ProviderItems,
+            session_id,
+            item,
+            if item_type.is_empty() { "responses-item" } else { item_type },
+        ) {
+            tracing::warn!(target:"deeplossless::ground_truth", %session_id, %error,
+                "failed to persist exact Responses item");
+        }
+
         match item_type {
             "message" | "" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("");
@@ -384,8 +400,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     let upstream_headers = upstream.headers().clone();
 
     // Native-first compatibility: DeepSeek exposes /responses. Older OpenAI-
-    // compatible endpoints and our historical test mocks may only expose Chat
-    // Completions, so a route-level 404 falls back to the proven legacy adapter.
+    // compatible endpoints and historical mocks may only expose Chat Completions.
     if status == StatusCode::NOT_FOUND {
         tracing::debug!(target:"deeplossless::responses", %upstream_url, "native Responses unavailable; using legacy adapter");
         return legacy_responses_fallback(&state, &headers, &body).await;
@@ -518,13 +533,21 @@ fn model_entry(id: &str, version: &str, vision: bool) -> Value {
     })
 }
 
+fn legacy_alias_entry(id: &str) -> Value {
+    let mut entry = model_entry(id, "DeepSeek-V4.1-Flash", true);
+    entry["deprecated"] = json!(true);
+    entry["alias_for"] = json!("deepseek-flash");
+    entry
+}
+
 async fn list_models() -> Response {
     Json(json!({
         "object":"list",
         "data":[
-            model_entry("deepseek-v4-flash", "DeepSeek-V4-Flash-0731", false),
+            model_entry("deepseek-flash", "DeepSeek-V4.1-Flash", true),
             model_entry("deepseek-v4-pro", "DeepSeek-V4-Pro-0813", false),
-            model_entry("deepseek-v4-flash-vision-exp", "DeepSeek-V4-Flash-Vision-Exp", true)
+            legacy_alias_entry("deepseek-v4-flash"),
+            legacy_alias_entry("deepseek-v4-flash-vision-exp")
         ]
     })).into_response()
 }
@@ -561,9 +584,17 @@ mod tests {
     }
 
     #[test]
-    fn model_capabilities_keep_legacy_shape() {
-        let model = model_entry("deepseek-v4-flash", "v", false);
+    fn v41_flash_is_multimodal_current_model() {
+        let model = model_entry("deepseek-flash", "DeepSeek-V4.1-Flash", true);
         assert_eq!(model["capabilities"]["supports_tool_calls"], true);
         assert_eq!(model["supports_responses"], true);
+        assert_eq!(model["supports_vision"], true);
+    }
+
+    #[test]
+    fn legacy_flash_alias_points_to_current_flash() {
+        let model = legacy_alias_entry("deepseek-v4-flash");
+        assert_eq!(model["deprecated"], true);
+        assert_eq!(model["alias_for"], "deepseek-flash");
     }
 }
