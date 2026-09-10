@@ -4,7 +4,7 @@
 //! historical DAG nodes are re-scored when the current plan, resource changes,
 //! failure state or query makes them relevant again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::context_pack::DynamicSignals;
 use crate::dag::{DagEngine, DagNode};
@@ -42,7 +42,6 @@ impl DynamicContextHints {
                         match resource {
                             ResourceRef::File { path, .. } => {
                                 plan_terms.push(path.clone());
-                                changed_resources.push(format!("file:{path}"));
                             }
                             ResourceRef::Symbol { file_path, symbol, .. } => {
                                 plan_terms.push(file_path.clone());
@@ -76,11 +75,22 @@ impl DynamicContextHints {
             failure_terms,
         }
     }
+
+    pub fn has_execution_signal(&self) -> bool {
+        !self.plan_terms.is_empty()
+            || !self.changed_resources.is_empty()
+            || !self.failure_terms.is_empty()
+    }
 }
 
 /// Assemble normal DAG context, then dynamically recall older nodes that are
 /// strongly relevant to current execution state. The returned set remains
-/// token-budget bounded and duplicate-free.
+/// token-budget bounded, coverage-aware and duplicate-free.
+///
+/// When dynamic signals exist, 25% of the budget is initially reserved for
+/// recall so recent context cannot consume the entire window before an old but
+/// execution-critical node has a chance to compete. Any unused reserve is then
+/// filled from the normal context order.
 pub fn assemble_dynamic_context(
     dag: &DagEngine,
     conv_id: i64,
@@ -88,12 +98,32 @@ pub fn assemble_dynamic_context(
     query: Option<&str>,
     hints: &DynamicContextHints,
 ) -> anyhow::Result<Vec<DagNode>> {
-    let mut selected = dag.assemble_context(conv_id, token_budget, query)?;
-    let mut used_tokens: i64 = selected.iter().map(|node| node.token_count.max(0)).sum();
-    let mut selected_ids: HashSet<i64> = selected.iter().map(|node| node.id).collect();
+    let normal = dag.assemble_context(conv_id, token_budget, query)?;
+    if token_budget == 0 || !hints.has_execution_signal() {
+        return Ok(normal);
+    }
+
+    let reserve = (token_budget / 4).max(1);
+    let base_budget = token_budget.saturating_sub(reserve);
+    let mut selected = Vec::new();
+    let mut used_tokens = 0i64;
+    let mut selected_ids = HashSet::new();
     let mut covered_ids = HashSet::new();
-    for node in &selected {
-        covered_ids.extend(node.child_ids.iter().copied());
+
+    // Start from the ordinary selection but leave deterministic room for recall.
+    for node in &normal {
+        let tc = node.token_count.max(0);
+        if used_tokens + tc > base_budget as i64 {
+            continue;
+        }
+        add_node(
+            dag,
+            node.clone(),
+            &mut selected,
+            &mut selected_ids,
+            &mut covered_ids,
+            &mut used_tokens,
+        )?;
     }
 
     let candidates = dag.db().get_all_dag_nodes(conv_id)?;
@@ -106,6 +136,7 @@ pub fn assemble_dynamic_context(
             || covered_ids.contains(&node.id)
             || node.token_count <= 0
             || node.summary.is_empty()
+            || summary_would_duplicate_selected_leaf(dag, &node, &selected_ids)?
         {
             continue;
         }
@@ -122,23 +153,84 @@ pub fn assemble_dynamic_context(
         scored.push((score, node));
     }
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.1.id.cmp(&a.1.id))
+    });
     for (_score, node) in scored.into_iter().take(8) {
-        if selected_ids.contains(&node.id) || covered_ids.contains(&node.id) {
+        if selected_ids.contains(&node.id)
+            || covered_ids.contains(&node.id)
+            || summary_would_duplicate_selected_leaf(dag, &node, &selected_ids)?
+        {
             continue;
         }
         if used_tokens + node.token_count > token_budget as i64 {
             continue;
         }
-        if node.level > 0 {
-            covered_ids.extend(node.child_ids.iter().copied());
-        }
-        selected_ids.insert(node.id);
-        used_tokens += node.token_count;
-        selected.push(node);
+        add_node(
+            dag,
+            node,
+            &mut selected,
+            &mut selected_ids,
+            &mut covered_ids,
+            &mut used_tokens,
+        )?;
     }
 
+    // Give unused recall budget back to the ordinary assembler order.
+    for node in normal {
+        if selected_ids.contains(&node.id)
+            || covered_ids.contains(&node.id)
+            || summary_would_duplicate_selected_leaf(dag, &node, &selected_ids)?
+        {
+            continue;
+        }
+        let tc = node.token_count.max(0);
+        if used_tokens + tc > token_budget as i64 {
+            continue;
+        }
+        add_node(
+            dag,
+            node,
+            &mut selected,
+            &mut selected_ids,
+            &mut covered_ids,
+            &mut used_tokens,
+        )?;
+    }
+
+    debug_assert!(used_tokens <= token_budget as i64);
     Ok(selected)
+}
+
+fn add_node(
+    dag: &DagEngine,
+    node: DagNode,
+    selected: &mut Vec<DagNode>,
+    selected_ids: &mut HashSet<i64>,
+    covered_ids: &mut HashSet<i64>,
+    used_tokens: &mut i64,
+) -> anyhow::Result<()> {
+    if node.level > 0 {
+        covered_ids.extend(dag.covered_leaf_ids(node.id)?);
+    }
+    selected_ids.insert(node.id);
+    *used_tokens += node.token_count.max(0);
+    selected.push(node);
+    Ok(())
+}
+
+fn summary_would_duplicate_selected_leaf(
+    dag: &DagEngine,
+    node: &DagNode,
+    selected_ids: &HashSet<i64>,
+) -> anyhow::Result<bool> {
+    if node.level == 0 {
+        return Ok(false);
+    }
+    let covered = dag.covered_leaf_ids(node.id)?;
+    Ok(covered.iter().any(|id| selected_ids.contains(id)))
 }
 
 fn signals_for_node(
@@ -282,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn hints_derive_plan_and_resource_terms() {
+    fn hints_derive_plan_terms_without_falsely_marking_resource_changed() {
         use crate::ground_truth::{ExecutionFact, PlanFactDependency};
         let mut state = ExecutionStateProjection {
             goal: Some("fix config loader".into()),
@@ -304,6 +396,16 @@ mod tests {
         });
         let hints = DynamicContextHints::from_execution_state(&state);
         assert!(hints.plan_terms.iter().any(|term| term.contains("config")));
-        assert!(hints.changed_resources.iter().any(|term| term.contains("src/config.rs")));
+        assert!(hints.changed_resources.is_empty());
+    }
+
+    #[test]
+    fn execution_signal_detection_ignores_empty_hints() {
+        assert!(!DynamicContextHints::default().has_execution_signal());
+        assert!(DynamicContextHints {
+            plan_terms: vec!["src/lib.rs".into()],
+            ..Default::default()
+        }
+        .has_execution_signal());
     }
 }
