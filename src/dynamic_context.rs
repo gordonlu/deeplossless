@@ -31,10 +31,14 @@ impl DynamicContextHints {
             extend_terms(&mut plan_terms, step);
         }
         if let Some(plan_id) = state.active_plan_id {
+            // Both required and supporting typed dependencies contribute recall
+            // terms. Only `required` dependencies participate in the hard Plan
+            // continuation gate; supporting dependencies are safe hints that can
+            // bring old evidence back without forcing a replan.
             for dep in state
                 .plan_dependencies
                 .iter()
-                .filter(|dep| dep.plan_id == plan_id && dep.required)
+                .filter(|dep| dep.plan_id == plan_id)
             {
                 if let Some(fact) = state.facts.get(&dep.fact_id) {
                     extend_terms(&mut plan_terms, &fact.statement);
@@ -397,6 +401,29 @@ mod tests {
         let hints = DynamicContextHints::from_execution_state(&state);
         assert!(hints.plan_terms.iter().any(|term| term.contains("config")));
         assert!(hints.changed_resources.is_empty());
+    }
+
+    #[test]
+    fn supporting_dependency_also_contributes_recall_terms() {
+        use crate::ground_truth::{ExecutionFact, PlanFactDependency};
+        let mut state = ExecutionStateProjection {
+            active_plan_id: Some(9),
+            ..Default::default()
+        };
+        let mut fact = ExecutionFact::new("search-proof", "search touched src/router.rs");
+        fact.resources.push(ResourceRef::ToolResult {
+            call_id: "call_search".into(),
+            content_hash: "abc".into(),
+        });
+        state.insert_fact(fact);
+        state.plan_dependencies.push(PlanFactDependency {
+            plan_id: 9,
+            step_index: Some(0),
+            fact_id: "search-proof".into(),
+            required: false,
+        });
+        let hints = DynamicContextHints::from_execution_state(&state);
+        assert!(hints.plan_terms.iter().any(|term| term == "call_search"));
     }
 
     #[test]
