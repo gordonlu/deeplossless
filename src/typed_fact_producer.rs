@@ -1,0 +1,496 @@
+//! Conservative automatic production of typed execution facts.
+//!
+//! Facts are derived only from exact provider items already persisted in the
+//! Ground Truth ledger.  The producer deliberately avoids free-form LLM
+//! extraction: it emits facts only when the tool contract or a machine-readable
+//! result gives us something deterministic to say.
+
+use std::collections::{HashMap, HashSet};
+
+use serde_json::Value;
+
+use crate::db::Database;
+use crate::file_observation::{observe_file, FileObservation};
+use crate::ground_truth::{ExecutionFact, PlanFactDependency, ResourceRef, SourceRef, TruthStream};
+use crate::ground_truth_store::GroundTruthStore;
+use crate::tool_cache::{extract_dependent_files, ToolKind};
+
+/// Exact evidence for one item in the current Responses `input` array.
+#[derive(Debug, Clone)]
+pub struct ItemEvidence {
+    pub item_index: usize,
+    pub source: SourceRef,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoFactReport {
+    pub facts_created: usize,
+    pub dependencies_created: usize,
+    pub file_observations_created: usize,
+    pub facts_invalidated: usize,
+}
+
+/// Project deterministic typed facts from newly-arrived Responses tool outputs.
+///
+/// `history` is the native Responses history after local continuity expansion,
+/// so a tool output can resolve the matching earlier `function_call` /
+/// `custom_tool_call` by call id. `current_items` contains only newly-arrived
+/// client input, preventing old history from being projected repeatedly.
+pub fn produce_from_responses_items(
+    db: &Database,
+    session_id: &str,
+    conv_id: i64,
+    history: &[Value],
+    current_items: &[Value],
+    evidence: &[ItemEvidence],
+) -> anyhow::Result<AutoFactReport> {
+    let store = GroundTruthStore::new(db);
+    let mut report = AutoFactReport::default();
+    let evidence_by_index: HashMap<usize, SourceRef> = evidence
+        .iter()
+        .map(|item| (item.item_index, item.source.clone()))
+        .collect();
+
+    let mut existing_facts: HashMap<String, ExecutionFact> = store
+        .load_execution_facts(session_id)?
+        .into_iter()
+        .map(|fact| (fact.id.clone(), fact))
+        .collect();
+
+    let active_plan = db.get_active_plan(conv_id)?;
+    let (plan_id, goal, current_step) = match active_plan {
+        Some((id, goal, pending, _completed, _assumptions)) => {
+            let pending: Vec<String> = serde_json::from_value(pending).unwrap_or_default();
+            (Some(id), goal, pending.first().cloned().unwrap_or_default())
+        }
+        None => (None, String::new(), String::new()),
+    };
+    let plan_text = format!("{goal}\n{current_step}");
+    let mut existing_deps: HashSet<(i64, Option<usize>, String, bool)> = match plan_id {
+        Some(id) => store
+            .load_plan_dependencies(session_id, id)?
+            .into_iter()
+            .map(|dep| (dep.plan_id, dep.step_index, dep.fact_id, dep.required))
+            .collect(),
+        None => HashSet::new(),
+    };
+
+    for (index, item) in current_items.iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(item_type, "function_call_output" | "custom_tool_call_output") {
+            continue;
+        }
+        let Some(source) = evidence_by_index.get(&index).cloned() else {
+            // No immutable source means no typed fact. Never create an
+            // authoritative-looking projection from unmaterializable evidence.
+            continue;
+        };
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(call) = find_call(history, call_id) else {
+            continue;
+        };
+        let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let args = call_arguments(call);
+        let output = output_text(item.get("output"));
+        if output.is_empty() {
+            continue;
+        }
+        let kind = ToolKind::from_name(name);
+        let paths = extract_dependent_files(name, &args);
+
+        // A real read-file result is strong enough to establish a versioned
+        // FileObservation. This gives the fact a live-world invalidation key,
+        // rather than treating a historical tool result as timeless truth.
+        if kind == ToolKind::ReadFile && paths.len() == 1 {
+            let path = paths[0].clone();
+            let obs = observe_file(&path, &output);
+            let obs_source = store.put_json(
+                TruthStream::FileObservations,
+                session_id,
+                &obs,
+                "auto-read-file-observation",
+            )?;
+            db.store_file_observation(&obs)?;
+            report.file_observations_created += 1;
+
+            let current_resource = ResourceRef::File {
+                path: obs.path.clone(),
+                content_hash: obs.content_hash.clone(),
+            };
+            for fact in existing_facts.values_mut() {
+                if fact.invalidate_if_changed(&current_resource) {
+                    store.put_execution_fact(session_id, fact)?;
+                    report.facts_invalidated += 1;
+                }
+            }
+
+            let mut fact = ExecutionFact::new(
+                format!("file:{}", obs.path),
+                format!(
+                    "Observed {} at content version {} ({} lines, {} bytes).",
+                    obs.path, obs.content_hash, obs.line_count, obs.size_bytes
+                ),
+            );
+            fact.evidence.extend([source.clone(), obs_source.clone()]);
+            fact.resources.push(current_resource);
+            persist_fact_if_changed(&store, session_id, &mut existing_facts, fact.clone(), &mut report)?;
+
+            if let Some(id) = plan_id {
+                let required = exact_path_mentioned(&current_step, &obs.path);
+                let relevant = required || path_mentioned(&plan_text, &obs.path);
+                if relevant {
+                    persist_dependency_if_new(
+                        &store,
+                        session_id,
+                        &mut existing_deps,
+                        PlanFactDependency {
+                            plan_id: id,
+                            step_index: Some(0),
+                            fact_id: fact.id.clone(),
+                            required,
+                        },
+                        &mut report,
+                    )?;
+                }
+
+                // Symbol facts are created only when the active plan actually
+                // names the symbol. This keeps the sidecar compact and avoids
+                // manufacturing thousands of low-value declarations.
+                for symbol in plan_relevant_symbols(&obs, &plan_text).into_iter().take(32) {
+                    let mut symbol_fact = ExecutionFact::new(
+                        format!("symbol:{}::{symbol}", obs.path),
+                        format!("Symbol {symbol} is present in {} at content version {}.", obs.path, obs.content_hash),
+                    );
+                    symbol_fact.evidence.push(obs_source.clone());
+                    symbol_fact.resources.push(ResourceRef::Symbol {
+                        file_path: obs.path.clone(),
+                        symbol: symbol.clone(),
+                        content_hash: obs.content_hash.clone(),
+                    });
+                    persist_fact_if_changed(
+                        &store,
+                        session_id,
+                        &mut existing_facts,
+                        symbol_fact.clone(),
+                        &mut report,
+                    )?;
+                    persist_dependency_if_new(
+                        &store,
+                        session_id,
+                        &mut existing_deps,
+                        PlanFactDependency {
+                            plan_id: id,
+                            step_index: Some(0),
+                            fact_id: symbol_fact.id,
+                            required: current_step.contains(&symbol),
+                        },
+                        &mut report,
+                    )?;
+                }
+            }
+            continue;
+        }
+
+        // For shell/terminal execution, only emit a semantic fact when the
+        // result contains an explicit machine-readable exit code.  We do not
+        // infer success/failure from prose such as "looks good".
+        if kind == ToolKind::Bash {
+            if let Some(exit_code) = parse_exit_code(&output) {
+                let command = command_preview(&args);
+                let mut fact = ExecutionFact::new(
+                    format!("tool-result:{call_id}"),
+                    format!("Command {command} exited with code {exit_code}."),
+                );
+                fact.evidence.push(source.clone());
+                fact.resources.push(ResourceRef::ToolResult {
+                    call_id: call_id.to_string(),
+                    content_hash: source.content_hash.clone(),
+                });
+                persist_fact_if_changed(&store, session_id, &mut existing_facts, fact, &mut report)?;
+            }
+            continue;
+        }
+
+        // Deterministic read/search/diagnostic tools can safely establish the
+        // existence of exact evidence without interpreting its semantic meaning.
+        if matches!(kind, ToolKind::Grep | ToolKind::ListFiles | ToolKind::SymbolSearch | ToolKind::Diagnostics)
+            && !paths.is_empty()
+        {
+            let mut fact = ExecutionFact::new(
+                format!("tool-result:{call_id}"),
+                format!("Tool {name} returned exact evidence for {}.", paths.join(", ")),
+            );
+            fact.evidence.push(source.clone());
+            fact.resources.push(ResourceRef::ToolResult {
+                call_id: call_id.to_string(),
+                content_hash: source.content_hash.clone(),
+            });
+            persist_fact_if_changed(&store, session_id, &mut existing_facts, fact.clone(), &mut report)?;
+
+            if let Some(id) = plan_id
+                && paths.iter().any(|path| path_mentioned(&plan_text, path))
+            {
+                persist_dependency_if_new(
+                    &store,
+                    session_id,
+                    &mut existing_deps,
+                    PlanFactDependency {
+                        plan_id: id,
+                        step_index: Some(0),
+                        fact_id: fact.id,
+                        // Search evidence is useful for recall, but is not a
+                        // hard continuation gate because the searched file can
+                        // change after the historical result was produced.
+                        required: false,
+                    },
+                    &mut report,
+                )?;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn persist_fact_if_changed(
+    store: &GroundTruthStore<'_>,
+    session_id: &str,
+    existing: &mut HashMap<String, ExecutionFact>,
+    fact: ExecutionFact,
+    report: &mut AutoFactReport,
+) -> anyhow::Result<()> {
+    if existing.get(&fact.id) == Some(&fact) {
+        return Ok(());
+    }
+    store.put_execution_fact(session_id, &fact)?;
+    existing.insert(fact.id.clone(), fact);
+    report.facts_created += 1;
+    Ok(())
+}
+
+fn persist_dependency_if_new(
+    store: &GroundTruthStore<'_>,
+    session_id: &str,
+    existing: &mut HashSet<(i64, Option<usize>, String, bool)>,
+    dep: PlanFactDependency,
+    report: &mut AutoFactReport,
+) -> anyhow::Result<()> {
+    let key = (dep.plan_id, dep.step_index, dep.fact_id.clone(), dep.required);
+    if !existing.insert(key) {
+        return Ok(());
+    }
+    store.put_plan_dependency(session_id, &dep)?;
+    report.dependencies_created += 1;
+    Ok(())
+}
+
+fn find_call<'a>(history: &'a [Value], call_id: &str) -> Option<&'a Value> {
+    history.iter().rev().find(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call") | Some("custom_tool_call")
+        ) && item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            == Some(call_id)
+    })
+}
+
+fn call_arguments(call: &Value) -> String {
+    let value = call.get("arguments").or_else(|| call.get("input"));
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => serde_json::to_string(value).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+fn output_text(value: Option<&Value>) -> String {
+    let Some(value) = value else { return String::new(); };
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn parse_exit_code(text: &str) -> Option<i32> {
+    const MARKERS: &[&str] = &[
+        "Process exited with code ",
+        "process exited with code ",
+        "exit code: ",
+        "exit_code=",
+        "\"exit_code\":",
+    ];
+    for marker in MARKERS {
+        let Some(pos) = text.find(marker) else { continue; };
+        let tail = text[pos + marker.len()..].trim_start();
+        let token: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        if !token.is_empty() {
+            if let Ok(code) = token.parse() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn command_preview(args: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(args).ok();
+    let command = parsed
+        .as_ref()
+        .and_then(|value| value.get("command").or_else(|| value.get("cmd")))
+        .and_then(Value::as_str)
+        .unwrap_or(args)
+        .trim();
+    let preview: String = command.chars().take(120).collect();
+    if preview.is_empty() {
+        "<unknown>".into()
+    } else {
+        format!("`{preview}`")
+    }
+}
+
+fn exact_path_mentioned(text: &str, path: &str) -> bool {
+    if text.is_empty() || path.is_empty() {
+        return false;
+    }
+    let text = text.replace('\\', "/");
+    let path = path.replace('\\', "/");
+    text.contains(&path)
+}
+
+fn path_mentioned(text: &str, path: &str) -> bool {
+    if exact_path_mentioned(text, path) {
+        return true;
+    }
+    let normalized = path.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    basename.len() >= 3 && text.contains(basename)
+}
+
+fn plan_relevant_symbols(obs: &FileObservation, plan_text: &str) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for function in &obs.ast.functions {
+        if function.name.len() >= 2 && plan_text.contains(&function.name) {
+            symbols.push(function.name.clone());
+        }
+    }
+    for ty in &obs.ast.types {
+        if ty.name.len() >= 2 && plan_text.contains(&ty.name) {
+            symbols.push(ty.name.clone());
+        }
+    }
+    symbols.sort();
+    symbols.dedup();
+    symbols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::ground_truth_store::GroundTruthStore;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_codex_exit_code_without_guessing_from_prose() {
+        assert_eq!(parse_exit_code("Process exited with code 0\nFinal output:\nok"), Some(0));
+        assert_eq!(parse_exit_code("exit_code=101"), Some(101));
+        assert_eq!(parse_exit_code("tests look successful"), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_creates_versioned_fact_and_required_plan_dependency() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("auto-facts.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        let plan_id = db
+            .store_plan(conv_id, "fix config loader", &["inspect src/config.rs ConfigLoader".into()], &[])
+            .unwrap();
+
+        let call = json!({
+            "type":"function_call",
+            "call_id":"call_1",
+            "name":"read_file",
+            "arguments":"{\"path\":\"src/config.rs\"}"
+        });
+        let output = json!({
+            "type":"function_call_output",
+            "call_id":"call_1",
+            "output":"pub struct ConfigLoader;\nfn load() {}"
+        });
+        let truth = GroundTruthStore::new(&db);
+        let source = truth
+            .put_json(TruthStream::ProviderItems, "s1", &output, "function_call_output")
+            .unwrap();
+        let report = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call, output.clone()],
+            std::slice::from_ref(&output),
+            &[ItemEvidence { item_index: 0, source }],
+        )
+        .unwrap();
+
+        assert!(report.facts_created >= 2, "file + plan-relevant symbol fact");
+        assert_eq!(report.file_observations_created, 1);
+        let facts = truth.load_execution_facts("s1").unwrap();
+        assert!(facts.iter().any(|fact| fact.id == "file:src/config.rs"));
+        assert!(facts.iter().any(|fact| fact.id == "symbol:src/config.rs::ConfigLoader"));
+        let deps = truth.load_plan_dependencies("s1", plan_id).unwrap();
+        assert!(deps.iter().any(|dep| dep.fact_id == "file:src/config.rs" && dep.required));
+        assert!(deps.iter().any(|dep| dep.fact_id == "symbol:src/config.rs::ConfigLoader" && dep.required));
+    }
+
+    #[tokio::test]
+    async fn changed_read_invalidates_old_symbol_version_before_replacing_it() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("auto-invalidate.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        db.store_plan(conv_id, "fix loader", &["inspect src/config.rs ConfigLoader".into()], &[])
+            .unwrap();
+        let call = json!({"type":"function_call","call_id":"c1","name":"read_file","arguments":"{\"path\":\"src/config.rs\"}"});
+        let out1 = json!({"type":"function_call_output","call_id":"c1","output":"pub struct ConfigLoader;"});
+        let truth = GroundTruthStore::new(&db);
+        let src1 = truth.put_json(TruthStream::ProviderItems, "s1", &out1, "out").unwrap();
+        produce_from_responses_items(&db, "s1", conv_id, &[call.clone(), out1.clone()], std::slice::from_ref(&out1), &[ItemEvidence{item_index:0,source:src1}]).unwrap();
+
+        let call2 = json!({"type":"function_call","call_id":"c2","name":"read_file","arguments":"{\"path\":\"src/config.rs\"}"});
+        let out2 = json!({"type":"function_call_output","call_id":"c2","output":"pub struct ConfigLoader { pub enabled: bool }"});
+        let src2 = truth.put_json(TruthStream::ProviderItems, "s1", &out2, "out").unwrap();
+        let report = produce_from_responses_items(&db, "s1", conv_id, &[call, out1, call2, out2.clone()], std::slice::from_ref(&out2), &[ItemEvidence{item_index:0,source:src2}]).unwrap();
+        assert!(report.facts_invalidated >= 1);
+        let facts = truth.load_execution_facts("s1").unwrap();
+        let file_fact = facts.iter().find(|fact| fact.id == "file:src/config.rs").unwrap();
+        assert_eq!(file_fact.status, crate::ground_truth::FactStatus::Valid);
+    }
+}
