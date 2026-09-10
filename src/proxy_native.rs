@@ -287,8 +287,6 @@ fn observe_items(state: &AppState, session_id: &str, items: &[Value]) {
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
 
-        // Persist the provider item before deriving any text/tool projection.
-        // Failure is observable but does not break proxy transport.
         if let Err(error) = truth.put_json(
             TruthStream::ProviderItems,
             session_id,
@@ -360,14 +358,38 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     let session_id = response_session_id(&state, &request);
     let accept_sse = headers.get("accept").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("text/event-stream"));
     let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false) || accept_sse;
-    let (upstream_body, input_history, current_items) = build_upstream_body(&state, &request, &session_id, streaming);
+    let (mut upstream_body, input_history, current_items) = build_upstream_body(&state, &request, &session_id, streaming);
 
+    // Truth first, projections second. Native wire items are persisted exactly
+    // before the LCM shadow projection can summarize or truncate anything.
     observe_items(&state, &session_id, &current_items);
+
+    // Reconnect native Responses to DeepLossless's DAG/compaction/runtime path.
+    // This is an internal projection only; the upstream request stays native.
+    let model = upstream_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("deepseek-flash")
+        .to_string();
+    let projected = crate::responses_projection::project_and_assemble(
+        &state,
+        &session_id,
+        &model,
+        &current_items,
+    )
+    .await;
+    if state.lcm_context {
+        crate::responses_projection::inject_context(&mut upstream_body, &projected.context);
+    }
+
     let _ = state.storage.db.insert_event_simple(EventType::RequestStart, &session_id, "", json!({
         "source":"responses-native",
         "model":upstream_body.get("model").cloned().unwrap_or(Value::Null),
         "stream":streaming,
         "input_items":current_items.len(),
+        "projection_conv_id":projected.conv_id,
+        "typed_plan_used":projected.typed_plan_used,
+        "context_injected":state.lcm_context && !projected.context.is_empty(),
     }));
 
     if state.dry_run {
@@ -399,8 +421,6 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
 
-    // Native-first compatibility: DeepSeek exposes /responses. Older OpenAI-
-    // compatible endpoints and historical mocks may only expose Chat Completions.
     if status == StatusCode::NOT_FOUND {
         tracing::debug!(target:"deeplossless::responses", %upstream_url, "native Responses unavailable; using legacy adapter");
         return legacy_responses_fallback(&state, &headers, &body).await;
