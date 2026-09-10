@@ -62,12 +62,15 @@
 //! DAG mutations (insert node + back-link to sources) must be atomic.
 //! A database transaction wraps both operations.
 
+#[allow(clippy::result_unit_err)]
 pub mod compactor;
+pub mod compaction_guard;
 pub mod dag;
 pub mod db;
 pub mod dependency_kind;
 pub mod dependency_view;
 pub mod diff_events;
+pub mod dynamic_context;
 pub mod embeddings;
 pub mod artifacts;
 pub mod assistant_validation;
@@ -75,6 +78,8 @@ pub mod audit;
 pub mod event_store;
 pub mod execution;
 pub mod file_observation;
+pub mod ground_truth;
+pub mod ground_truth_store;
 pub mod parallel;
 pub mod provider;
 pub mod runtime;
@@ -82,14 +87,20 @@ pub mod runtime_events;
 pub mod runtime_invariants;
 pub mod runtime_state_view;
 pub mod tool_cache;
+#[allow(unused_mut)]
+pub mod typed_fact_producer;
 pub mod metrics;
 pub mod motif;
 pub mod mutation;
 pub mod pipeline;
 pub mod protocol;
+#[path = "proxy.rs"]
+pub mod proxy_legacy;
+#[path = "proxy_native.rs"]
 pub mod proxy;
 pub mod replay;
 pub mod response_store;
+pub mod responses_projection;
 pub mod responses_stream;
 pub mod session_store;
 pub mod runtime_coordinator;
@@ -115,7 +126,6 @@ pub struct RuntimeServices {
     pub cycle: Arc<StdMutex<runtime::ExecutionCycle>>,
     pub rate_limiter: Arc<runtime::RateLimiter>,
     /// Shutdown signal — notified when the runtime is stopping.
-    /// Background tasks MUST select on this to avoid orphan mutations.
     pub shutdown_notify: Arc<Notify>,
 }
 
@@ -133,8 +143,8 @@ pub struct StorageServices {
 pub struct AppState {
     // ── Upstream / Network ───────────────────────────────────────────
     pub upstream: String,
-    /// Path suffix appended to upstream when it doesn't already end with
-    /// /chat/completions. Default: /v1/chat/completions.
+    /// Path suffix used by the legacy Chat Completions handler.
+    /// Native Responses requests use `{upstream}/responses` directly.
     pub upstream_path: String,
     /// API key extracted from the first incoming request's Authorization header.
     pub api_key: Arc<StdMutex<Option<String>>>,
@@ -144,9 +154,8 @@ pub struct AppState {
     /// Cache stability tracker — records system prompt hashes to compute
     /// prompt cache stability metrics.  Keyed by conversation ID.
     pub cache_stability: Arc<StdMutex<std::collections::HashMap<i64, Vec<String>>>>,
-    /// Reasoning content cache — stores `reasoning_content` from DeepSeek responses
-    /// keyed by fingerprint, so it can be injected into the next turn's request.
-    /// Required by DeepSeek thinking mode: reasoning_content must be passed back.
+    /// Reasoning content cache retained for legacy Chat Completions continuity.
+    /// Native Responses continuity is persisted as Responses items instead.
     pub reasoning_cache: Arc<StdMutex<std::collections::HashMap<String, String>>>,
 
     // ── Storage ──────────────────────────────────────────────────────
