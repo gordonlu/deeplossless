@@ -87,6 +87,7 @@ pub mod runtime_events;
 pub mod runtime_invariants;
 pub mod runtime_state_view;
 pub mod tool_cache;
+#[allow(unused_mut)]
 pub mod typed_fact_producer;
 pub mod metrics;
 pub mod motif;
