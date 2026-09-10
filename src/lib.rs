@@ -87,6 +87,9 @@ pub mod motif;
 pub mod mutation;
 pub mod pipeline;
 pub mod protocol;
+#[path = "proxy.rs"]
+pub mod proxy_legacy;
+#[path = "proxy_native.rs"]
 pub mod proxy;
 pub mod replay;
 pub mod response_store;
@@ -133,8 +136,8 @@ pub struct StorageServices {
 pub struct AppState {
     // ── Upstream / Network ───────────────────────────────────────────
     pub upstream: String,
-    /// Path suffix appended to upstream when it doesn't already end with
-    /// /chat/completions. Default: /v1/chat/completions.
+    /// Path suffix used by the legacy Chat Completions handler.
+    /// Native Responses requests use `{upstream}/responses` directly.
     pub upstream_path: String,
     /// API key extracted from the first incoming request's Authorization header.
     pub api_key: Arc<StdMutex<Option<String>>>,
@@ -144,9 +147,8 @@ pub struct AppState {
     /// Cache stability tracker — records system prompt hashes to compute
     /// prompt cache stability metrics.  Keyed by conversation ID.
     pub cache_stability: Arc<StdMutex<std::collections::HashMap<i64, Vec<String>>>>,
-    /// Reasoning content cache — stores `reasoning_content` from DeepSeek responses
-    /// keyed by fingerprint, so it can be injected into the next turn's request.
-    /// Required by DeepSeek thinking mode: reasoning_content must be passed back.
+    /// Reasoning content cache retained for legacy Chat Completions continuity.
+    /// Native Responses continuity is persisted as Responses items instead.
     pub reasoning_cache: Arc<StdMutex<std::collections::HashMap<String, String>>>,
 
     // ── Storage ──────────────────────────────────────────────────────
