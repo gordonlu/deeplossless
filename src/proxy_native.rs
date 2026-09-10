@@ -4,6 +4,9 @@
 //! path keeps Responses wire semantics end-to-end and only falls back to the
 //! legacy Responses→Chat adapter when an upstream does not expose `/responses`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use axum::{
     body::Body,
     extract::{Path, Request, State},
@@ -14,7 +17,6 @@ use axum::{
 };
 use futures::StreamExt;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 
@@ -26,6 +28,7 @@ use crate::AppState;
 
 const LOCAL_SESSION_FIELD: &str = "_deeplossless_session_id";
 const STREAM_CHANNEL_CAPACITY: usize = 32;
+static NEXT_EPHEMERAL_SESSION: AtomicU64 = AtomicU64::new(1);
 type SseChunk = Result<axum::body::Bytes, std::convert::Infallible>;
 
 pub use crate::proxy_legacy::upstream_chat_url;
@@ -103,8 +106,15 @@ fn cached_api_key(state: &AppState) -> String {
 }
 
 fn remember_api_key(state: &AppState, headers: &HeaderMap) {
-    let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) else { return; };
-    let Some(bearer) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) else { return; };
+    let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    let Some(bearer) = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+    else {
+        return;
+    };
     let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
     if key.is_none() {
         *key = Some(bearer.to_string());
@@ -129,7 +139,10 @@ fn session_id_from_previous(state: &AppState, response_id: &str) -> Option<Strin
     match state.storage.db.get_response_object(response_id) {
         Ok(Some(resp)) => {
             let session_id = stored_session_id(&resp);
-            state.storage.response_store.insert(response_id.to_string(), resp);
+            state
+                .storage
+                .response_store
+                .insert(response_id.to_string(), resp);
             session_id
         }
         Ok(None) => None,
@@ -140,31 +153,46 @@ fn session_id_from_previous(state: &AppState, response_id: &str) -> Option<Strin
     }
 }
 
-fn fallback_session_id(body: &Value) -> String {
-    let seed = json!({
-        "instructions": body.get("instructions").cloned().unwrap_or(Value::Null),
-        "input": body.get("input").cloned().unwrap_or(Value::Null),
-    });
-    let digest = Sha256::digest(serde_json::to_vec(&seed).unwrap_or_default());
-    format!("responses:{}", hex::encode(&digest[..8]))
+/// Create a unique local continuity key for a new stateless Responses chain.
+/// Request-content hashes are intentionally not used: identical independent
+/// first turns must never share DAG/fact/session state.
+fn fallback_session_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_EPHEMERAL_SESSION.fetch_add(1, Ordering::Relaxed);
+    format!("responses:{now:x}:{sequence:x}")
 }
 
 fn response_session_id(state: &AppState, body: &Value) -> String {
-    if let Some(key) = body.get("prompt_cache_key").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(key) = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         return key.to_string();
     }
-    if let Some(previous) = body.get("previous_response_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(previous) = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if let Some(session_id) = session_id_from_previous(state, previous) {
             return session_id;
         }
     }
-    fallback_session_id(body)
+    fallback_session_id()
 }
 
 fn input_items(input: Option<&Value>) -> Vec<Value> {
     match input {
         Some(Value::Array(items)) => items.clone(),
-        Some(Value::String(text)) => vec![json!({"type":"message","role":"user","content":text})],
+        Some(Value::String(text)) => {
+            vec![json!({"type":"message","role":"user","content":text})]
+        }
         _ => Vec::new(),
     }
 }
@@ -215,10 +243,16 @@ fn build_upstream_body(
         .is_some_and(|s| !s.is_empty());
 
     let history = if has_previous {
-        state.storage.session_store.get(session_id)
+        state
+            .storage
+            .session_store
+            .get(session_id)
             .or_else(|| match state.storage.db.get_response_session(session_id) {
                 Ok(Some(items)) => {
-                    state.storage.session_store.replace(session_id, items.clone());
+                    state
+                        .storage
+                        .session_store
+                        .replace(session_id, items.clone());
                     Some(items)
                 }
                 Ok(None) => None,
@@ -254,12 +288,26 @@ fn strip_local_fields(mut response: Value) -> Value {
     response
 }
 
-fn store_response_and_session(state: &AppState, session_id: &str, input_history: &[Value], response: &Value) {
-    let Some(response_id) = response.get("id").and_then(Value::as_str) else { return; };
+fn store_response_and_session(
+    state: &AppState,
+    session_id: &str,
+    input_history: &[Value],
+    response: &Value,
+) {
+    let Some(response_id) = response.get("id").and_then(Value::as_str) else {
+        return;
+    };
     let mut stored = response.clone();
     stored[LOCAL_SESSION_FIELD] = json!(session_id);
-    state.storage.response_store.insert(response_id.to_string(), stored.clone());
-    if let Err(error) = state.storage.db.store_response_object(response_id, session_id, &stored) {
+    state
+        .storage
+        .response_store
+        .insert(response_id.to_string(), stored.clone());
+    if let Err(error) = state
+        .storage
+        .db
+        .store_response_object(response_id, session_id, &stored)
+    {
         tracing::warn!(target:"deeplossless::responses", %response_id, %error, "failed to persist response object");
     }
 
@@ -267,7 +315,10 @@ fn store_response_and_session(state: &AppState, session_id: &str, input_history:
     if let Some(output) = response.get("output").and_then(Value::as_array) {
         session.extend(output.iter().cloned());
     }
-    state.storage.session_store.replace(session_id, session.clone());
+    state
+        .storage
+        .session_store
+        .replace(session_id, session.clone());
     if let Err(error) = state.storage.db.store_response_session(session_id, &session) {
         tracing::warn!(target:"deeplossless::responses", %session_id, %error, "failed to persist response session");
     }
@@ -277,9 +328,16 @@ fn text_from_content(content: &Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
     }
-    content.as_array().map(|blocks| {
-        blocks.iter().filter_map(|block| block.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
-    }).unwrap_or_default()
+    content
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn observe_items(state: &AppState, session_id: &str, items: &[Value]) {
@@ -291,7 +349,11 @@ fn observe_items(state: &AppState, session_id: &str, items: &[Value]) {
             TruthStream::ProviderItems,
             session_id,
             item,
-            if item_type.is_empty() { "responses-item" } else { item_type },
+            if item_type.is_empty() {
+                "responses-item"
+            } else {
+                item_type
+            },
         ) {
             tracing::warn!(target:"deeplossless::ground_truth", %session_id, %error,
                 "failed to persist exact Responses item");
@@ -301,29 +363,65 @@ fn observe_items(state: &AppState, session_id: &str, items: &[Value]) {
             "message" | "" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("");
                 let text = text_from_content(item.get("content").unwrap_or(&Value::Null));
-                if text.is_empty() { continue; }
+                if text.is_empty() {
+                    continue;
+                }
                 let event_type = match role {
                     "user" | "developer" => EventType::UserMessage,
                     "assistant" => EventType::AssistantMessage,
                     _ => continue,
                 };
-                let _ = state.storage.db.insert_event_simple(event_type, session_id, &text, json!({"source":"responses-native","role":role}));
+                let _ = state.storage.db.insert_event_simple(
+                    event_type,
+                    session_id,
+                    &text,
+                    json!({"source":"responses-native","role":role}),
+                );
             }
             "reasoning" => {
-                let text = item.get("content").map(text_from_content).filter(|s| !s.is_empty())
-                    .or_else(|| item.get("summary").map(text_from_content)).unwrap_or_default();
+                let text = item
+                    .get("content")
+                    .map(text_from_content)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| item.get("summary").map(text_from_content))
+                    .unwrap_or_default();
                 if !text.is_empty() {
-                    let _ = state.storage.db.insert_event_simple(EventType::Reasoning, session_id, &text, json!({"source":"responses-native"}));
+                    let _ = state.storage.db.insert_event_simple(
+                        EventType::Reasoning,
+                        session_id,
+                        &text,
+                        json!({"source":"responses-native"}),
+                    );
                 }
             }
             "function_call" | "custom_tool_call" | "web_search_call" => {
-                let name = item.get("name").and_then(Value::as_str).unwrap_or(item_type);
-                let arguments = item.get("arguments").or_else(|| item.get("input")).cloned().unwrap_or(Value::Null);
-                let _ = state.storage.db.insert_event_simple(EventType::ToolCall, session_id, &format!("{name}({arguments})"), json!({"source":"responses-native","tool_name":name}));
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(item_type);
+                let arguments = item
+                    .get("arguments")
+                    .or_else(|| item.get("input"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let _ = state.storage.db.insert_event_simple(
+                    EventType::ToolCall,
+                    session_id,
+                    &format!("{name}({arguments})"),
+                    json!({"source":"responses-native","tool_name":name}),
+                );
             }
             "function_call_output" | "custom_tool_call_output" => {
-                let output = item.get("output").map(text_from_content).unwrap_or_default();
-                let _ = state.storage.db.insert_event_simple(EventType::ToolResult, session_id, &output, json!({"source":"responses-native","call_id":item.get("call_id").cloned().unwrap_or(Value::Null)}));
+                let output = item
+                    .get("output")
+                    .map(text_from_content)
+                    .unwrap_or_default();
+                let _ = state.storage.db.insert_event_simple(
+                    EventType::ToolResult,
+                    session_id,
+                    &output,
+                    json!({"source":"responses-native","call_id":item.get("call_id").cloned().unwrap_or(Value::Null)}),
+                );
             }
             _ => {}
         }
@@ -341,31 +439,60 @@ fn terminal_response_from_frame(frame: &str) -> Option<Value> {
         }
     }
     let event_name = event_name?;
-    if !matches!(event_name, "response.completed" | "response.incomplete" | "response.failed") {
+    if !matches!(
+        event_name,
+        "response.completed" | "response.incomplete" | "response.failed"
+    ) {
         return None;
     }
     let value: Value = serde_json::from_str(data?).ok()?;
     value.get("response").cloned()
 }
 
+/// Remove and return one complete SSE frame from a byte buffer. Supporting
+/// both LF and CRLF keeps the observer robust without ever changing the bytes
+/// forwarded to the client.
+fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n");
+    let (position, delimiter_len) = match (lf, crlf) {
+        (Some(a), Some(b)) if a <= b => (a, 2),
+        (Some(_), Some(b)) => (b, 4),
+        (Some(a), None) => (a, 2),
+        (None, Some(b)) => (b, 4),
+        (None, None) => return None,
+    };
+    let frame = buffer[..position].to_vec();
+    buffer.drain(..position + delimiter_len);
+    Some(frame)
+}
+
 async fn responses(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     let request: Value = match serde_json::from_str(&body) {
         Ok(value) => value,
-        Err(error) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", error.to_string()),
+        Err(error) => {
+            return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", error.to_string())
+        }
     };
 
     remember_api_key(&state, &headers);
     let session_id = response_session_id(&state, &request);
-    let accept_sse = headers.get("accept").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("text/event-stream"));
-    let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false) || accept_sse;
-    let (mut upstream_body, input_history, current_items) = build_upstream_body(&state, &request, &session_id, streaming);
+    let accept_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    let streaming = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || accept_sse;
+    let (mut upstream_body, input_history, current_items) =
+        build_upstream_body(&state, &request, &session_id, streaming);
 
-    // Truth first, projections second. Native wire items are persisted exactly
-    // before the LCM shadow projection can summarize or truncate anything.
     observe_items(&state, &session_id, &current_items);
 
-    // Reconnect native Responses to DeepLossless's DAG/compaction/runtime path.
-    // This is an internal projection only; the upstream request stays native.
     let model = upstream_body
         .get("model")
         .and_then(Value::as_str)
@@ -382,38 +509,59 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         crate::responses_projection::inject_context(&mut upstream_body, &projected.context);
     }
 
-    let _ = state.storage.db.insert_event_simple(EventType::RequestStart, &session_id, "", json!({
-        "source":"responses-native",
-        "model":upstream_body.get("model").cloned().unwrap_or(Value::Null),
-        "stream":streaming,
-        "input_items":current_items.len(),
-        "projection_conv_id":projected.conv_id,
-        "typed_plan_used":projected.typed_plan_used,
-        "context_injected":state.lcm_context && !projected.context.is_empty(),
-    }));
+    let _ = state.storage.db.insert_event_simple(
+        EventType::RequestStart,
+        &session_id,
+        "",
+        json!({
+            "source":"responses-native",
+            "model":upstream_body.get("model").cloned().unwrap_or(Value::Null),
+            "stream":streaming,
+            "input_items":current_items.len(),
+            "projection_conv_id":projected.conv_id,
+            "typed_plan_used":projected.typed_plan_used,
+            "context_injected":state.lcm_context && !projected.context.is_empty(),
+        }),
+    );
 
     if state.dry_run {
-        let out_dir = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(".")).join(".deeplossless");
+        let out_dir = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".deeplossless");
         let _ = std::fs::create_dir_all(&out_dir);
-        let _ = std::fs::write(out_dir.join("translated.json"), serde_json::to_string_pretty(&upstream_body).unwrap_or_default());
+        let _ = std::fs::write(
+            out_dir.join("translated.json"),
+            serde_json::to_string_pretty(&upstream_body).unwrap_or_default(),
+        );
         return Json(json!({
             "id":"resp_dry_run","object":"response","status":"completed",
             "model":upstream_body.get("model").cloned().unwrap_or(Value::Null),
             "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[dry-run] native Responses request saved to ~/.deeplossless/translated.json"}]}],
             "store":false
-        })).into_response();
+        }))
+        .into_response();
     }
 
     let upstream_url = upstream_responses_url(&state.upstream);
-    let upstream = match state.runtime.client.post(&upstream_url)
+    let upstream = match state
+        .runtime
+        .client
+        .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", cached_api_key(&state)))
         .header("Content-Type", "application/json")
         .json(&upstream_body)
-        .send().await
+        .send()
+        .await
     {
         Ok(response) => response,
         Err(error) => {
-            let _ = state.storage.db.insert_event_simple(EventType::Error, &session_id, &error.to_string(), json!({"source":"responses-native"}));
+            let _ = state.storage.db.insert_event_simple(
+                EventType::Error,
+                &session_id,
+                &error.to_string(),
+                json!({"source":"responses-native"}),
+            );
             return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", error.to_string());
         }
     };
@@ -428,40 +576,76 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
 
     if !status.is_success() {
         let bytes = upstream.bytes().await.unwrap_or_default();
-        let _ = state.storage.db.insert_event_simple(EventType::Error, &session_id, &String::from_utf8_lossy(&bytes), json!({"source":"responses-native","status":status.as_u16()}));
+        let _ = state.storage.db.insert_event_simple(
+            EventType::Error,
+            &session_id,
+            &String::from_utf8_lossy(&bytes),
+            json!({"source":"responses-native","status":status.as_u16()}),
+        );
         let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
         if let Some(content_type) = upstream_headers.get("content-type") {
-            response.headers_mut().insert("content-type", content_type.clone());
+            response
+                .headers_mut()
+                .insert("content-type", content_type.clone());
         }
         return response;
     }
 
     if streaming {
-        let content_type = upstream_headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
-        if !content_type.to_ascii_lowercase().contains("text/event-stream") {
+        let content_type = upstream_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+        {
             let raw = upstream.text().await.unwrap_or_default();
-            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("expected upstream text/event-stream, got {content_type}: {raw}"));
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_ERROR",
+                format!("expected upstream text/event-stream, got {content_type}: {raw}"),
+            );
         }
     }
 
     if !streaming {
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
-            Err(error) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", error.to_string()),
+            Err(error) => {
+                return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", error.to_string())
+            }
         };
         let response_value: Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
-            Err(error) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid upstream JSON: {error}")),
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "UPSTREAM_ERROR",
+                    format!("invalid upstream JSON: {error}"),
+                )
+            }
         };
-        let output = response_value.get("output").and_then(Value::as_array).cloned().unwrap_or_default();
+        let output = response_value
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         observe_items(&state, &session_id, &output);
         store_response_and_session(&state, &session_id, &input_history, &response_value);
-        let _ = state.storage.db.insert_event_simple(EventType::RequestEnd, &session_id, "", json!({"source":"responses-native","status":status.as_u16()}));
+        let _ = state.storage.db.insert_event_simple(
+            EventType::RequestEnd,
+            &session_id,
+            "",
+            json!({"source":"responses-native","status":status.as_u16()}),
+        );
         let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
         if let Some(content_type) = upstream_headers.get("content-type") {
-            response.headers_mut().insert("content-type", content_type.clone());
+            response
+                .headers_mut()
+                .insert("content-type", content_type.clone());
         }
         return response;
     }
@@ -471,54 +655,91 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     let stream_session_id = session_id.clone();
     tokio::spawn(async move {
         let mut upstream_stream = upstream.bytes_stream();
-        let mut parse_buffer = String::new();
+        let mut parse_buffer = Vec::<u8>::new();
         let mut terminal_response = None;
         while let Some(chunk) = upstream_stream.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    let _ = stream_state.storage.db.insert_event_simple(EventType::Error, &stream_session_id, &error.to_string(), json!({"source":"responses-native","phase":"stream"}));
+                    let _ = stream_state.storage.db.insert_event_simple(
+                        EventType::Error,
+                        &stream_session_id,
+                        &error.to_string(),
+                        json!({"source":"responses-native","phase":"stream"}),
+                    );
                     break;
                 }
             };
             if tx.send(Ok(bytes.clone())).await.is_err() {
                 break;
             }
-            parse_buffer.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(pos) = parse_buffer.find("\n\n") {
-                let frame = parse_buffer[..pos].to_string();
-                parse_buffer.drain(..pos + 2);
-                if let Some(response) = terminal_response_from_frame(&frame) {
-                    terminal_response = Some(response);
+            parse_buffer.extend_from_slice(&bytes);
+            while let Some(frame) = take_sse_frame(&mut parse_buffer) {
+                if let Ok(frame) = std::str::from_utf8(&frame) {
+                    if let Some(response) = terminal_response_from_frame(frame) {
+                        terminal_response = Some(response);
+                    }
                 }
             }
         }
         if let Some(response_value) = terminal_response {
-            let output = response_value.get("output").and_then(Value::as_array).cloned().unwrap_or_default();
+            let output = response_value
+                .get("output")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             observe_items(&stream_state, &stream_session_id, &output);
-            store_response_and_session(&stream_state, &stream_session_id, &input_history, &response_value);
+            store_response_and_session(
+                &stream_state,
+                &stream_session_id,
+                &input_history,
+                &response_value,
+            );
         }
-        let _ = stream_state.storage.db.insert_event_simple(EventType::RequestEnd, &stream_session_id, "", json!({"source":"responses-native","status":status.as_u16()}));
+        let _ = stream_state.storage.db.insert_event_simple(
+            EventType::RequestEnd,
+            &stream_session_id,
+            "",
+            json!({"source":"responses-native","status":status.as_u16()}),
+        );
     });
 
     let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
     *response.status_mut() = status;
-    response.headers_mut().insert("content-type", upstream_headers.get("content-type").cloned().unwrap_or_else(|| "text/event-stream; charset=utf-8".parse().unwrap()));
-    response.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
+    response.headers_mut().insert(
+        "content-type",
+        upstream_headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "text/event-stream; charset=utf-8".parse().unwrap()),
+    );
+    response
+        .headers_mut()
+        .insert("cache-control", "no-cache".parse().unwrap());
     response
 }
 
-async fn responses_retrieve(State(state): State<AppState>, Path(response_id): Path<String>) -> Response {
+async fn responses_retrieve(
+    State(state): State<AppState>,
+    Path(response_id): Path<String>,
+) -> Response {
     if let Some(response) = state.storage.response_store.get(&response_id) {
         return Json(strip_local_fields(response)).into_response();
     }
     match state.storage.db.get_response_object(&response_id) {
         Ok(Some(response)) => {
-            state.storage.response_store.insert(response_id, response.clone());
+            state
+                .storage
+                .response_store
+                .insert(response_id, response.clone());
             Json(strip_local_fields(response)).into_response()
         }
         Ok(None) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "response not found"),
-        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR", error.to_string()),
+        Err(error) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORAGE_ERROR",
+            error.to_string(),
+        ),
     }
 }
 
@@ -569,7 +790,8 @@ async fn list_models() -> Response {
             legacy_alias_entry("deepseek-v4-flash"),
             legacy_alias_entry("deepseek-v4-flash-vision-exp")
         ]
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -578,23 +800,57 @@ mod tests {
 
     #[test]
     fn responses_url_uses_native_resource() {
-        assert_eq!(upstream_responses_url("https://api.deepseek.com"), "https://api.deepseek.com/responses");
-        assert_eq!(upstream_responses_url("https://api.deepseek.com/v1"), "https://api.deepseek.com/v1/responses");
-        assert_eq!(upstream_responses_url("https://api.deepseek.com/v1/chat/completions"), "https://api.deepseek.com/v1/responses");
+        assert_eq!(
+            upstream_responses_url("https://api.deepseek.com"),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            upstream_responses_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/responses"
+        );
+        assert_eq!(
+            upstream_responses_url("https://api.deepseek.com/v1/chat/completions"),
+            "https://api.deepseek.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn new_fallback_sessions_are_unique_even_for_identical_requests() {
+        assert_ne!(fallback_session_id(), fallback_session_id());
     }
 
     #[test]
     fn merge_history_removes_only_exact_overlap() {
         let history = vec![json!({"id":1}), json!({"id":2})];
         let current = vec![json!({"id":2}), json!({"id":3})];
-        assert_eq!(merge_history(history, current), vec![json!({"id":1}), json!({"id":2}), json!({"id":3})]);
+        assert_eq!(
+            merge_history(history, current),
+            vec![json!({"id":1}), json!({"id":2}), json!({"id":3})]
+        );
     }
 
     #[test]
     fn terminal_frame_extracts_complete_response() {
-        let frame = concat!("event: response.completed\n", "data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n");
+        let frame = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n"
+        );
         let response = terminal_response_from_frame(frame).unwrap();
         assert_eq!(response["id"], "resp_1");
+    }
+
+    #[test]
+    fn sse_frame_parser_accepts_crlf_and_preserves_utf8_across_chunks() {
+        let event = "event: response.completed\r\ndata: {\"response\":{\"id\":\"响应_1\",\"output\":[]}}\r\n\r\n";
+        let bytes = event.as_bytes();
+        let split = event.find('响').unwrap() + 1;
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&bytes[..split]);
+        assert!(take_sse_frame(&mut buffer).is_none());
+        buffer.extend_from_slice(&bytes[split..]);
+        let frame = take_sse_frame(&mut buffer).unwrap();
+        let parsed = terminal_response_from_frame(std::str::from_utf8(&frame).unwrap()).unwrap();
+        assert_eq!(parsed["id"], "响应_1");
     }
 
     #[test]
