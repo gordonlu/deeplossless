@@ -533,7 +533,7 @@ async fn main() -> anyhow::Result<()> {
         return run_search(&cli.db_path, filter).await;
     }
     if let Some(Commands::Replay { session_id, list }) = cli.command {
-        return run_replay(&cli.db_path.as_str(), session_id, list).await;
+        return run_replay(cli.db_path.as_str(), session_id, list).await;
     }
     let mut cli = cli;
 
