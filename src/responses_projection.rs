@@ -13,6 +13,7 @@ use crate::dynamic_context::{assemble_dynamic_context, DynamicContextHints};
 use crate::ground_truth::{FactStatus, ResourceRef};
 use crate::ground_truth_store::GroundTruthStore;
 use crate::pipeline::render_dag_context;
+use crate::typed_fact_producer::AutoFactReport;
 use crate::AppState;
 
 const CONTEXT_WINDOW: usize = 1_000_000;
@@ -22,10 +23,12 @@ pub struct NativeProjectionOutput {
     pub conv_id: Option<i64>,
     pub context: String,
     pub typed_plan_used: bool,
+    pub auto_facts: AutoFactReport,
 }
 
-/// Persist the current turn as a lossless DAG projection, trigger background
-/// compaction, then assemble the working context for the native request.
+/// Persist the current turn as a lossless DAG projection, derive conservative
+/// typed facts from exact tool evidence, trigger background compaction, then
+/// assemble the working context for the native request.
 pub async fn project_and_assemble(
     state: &AppState,
     session_id: &str,
@@ -47,6 +50,31 @@ pub async fn project_and_assemble(
             tracing::warn!(target:"deeplossless::responses_projection", %error,
                 "failed to resolve native Responses conversation");
             return NativeProjectionOutput::default();
+        }
+    };
+
+    // Automatic facts are produced before dynamic recall so this same turn can
+    // immediately benefit from newly-observed file/symbol/tool evidence.
+    // The hot session may not exist after restart, so fall back to persisted
+    // native Responses history. The producer also searches current_items.
+    let history = state
+        .storage
+        .session_store
+        .get(session_id)
+        .or_else(|| state.storage.db.get_response_session(session_id).ok().flatten())
+        .unwrap_or_default();
+    let auto_facts = match crate::typed_fact_producer::produce_from_responses_items(
+        &state.storage.db,
+        session_id,
+        conv_id,
+        &history,
+        current_items,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::warn!(target:"deeplossless::typed_facts", %session_id, %error,
+                "automatic typed fact projection failed");
+            AutoFactReport::default()
         }
     };
 
@@ -145,6 +173,7 @@ pub async fn project_and_assemble(
         conv_id: Some(conv_id),
         context,
         typed_plan_used,
+        auto_facts,
     }
 }
 
