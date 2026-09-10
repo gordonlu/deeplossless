@@ -87,7 +87,6 @@ pub mod motif;
 pub mod mutation;
 pub mod parallel;
 pub mod pipeline;
-pub mod prefix_stability;
 pub mod protocol;
 pub mod provider;
 #[path = "proxy_native.rs"]

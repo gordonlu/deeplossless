@@ -23,7 +23,7 @@ between your client and the DeepSeek API:
 | **Failure Memory** | Stores failed reasoning paths (`why_failed` + `invalidated_assumptions`), not just error strings. Prevents error loop token waste |
 | **Plan Persistence** | Execution state (goal, steps, assumptions), not plan text. Avoids repeated planning |
 | **Execution Units** | Agent memory atoms: `think → act → observe → reflect` cycles with outcome inference |
-| **Runtime Policy** | Advisory decisions with confidence scores + estimated token savings |
+| **Runtime Policy** | Advisory decisions based on grounded execution state; model autonomy remains the default fallback |
 | **Event Sourcing** | Append-only execution_events table — every StreamEvent persisted for replay |
 | **Replay Engine** | Deterministic reconstruction of execution sequences from event log |
 | **Snapshot Isolation** | Copy-on-write memory versions with budget-aware retention tiers (L0–L3) |
@@ -71,13 +71,6 @@ Structured error taxonomy:
 | `ModelCrashed` | Upstream model returned crash signal |
 
 All errors implement `ErrorMeta` for structured logging and diagnostics.
-
-### Prefix Stability (`src/prefix_stability.rs`)
-
-Compares two text streams and reports their first difference position, stable
-prefix length (across multiple characters), and list of `DiffOp` operations.
-Used by the system prompt cache stability endpoint to detect when context
-changes invalidate cached prefixes.
 
 ### CLI Flags
 

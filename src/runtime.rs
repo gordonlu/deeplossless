@@ -1215,31 +1215,6 @@ impl DecisionRule for CacheReuseRule {
     }
 }
 
-struct RetryWithFixRule;
-impl DecisionRule for RetryWithFixRule {
-    fn name(&self) -> &'static str {
-        "retry_with_fix"
-    }
-    fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
-        let fh = state.failure_hint.as_ref()?;
-        if fh.suggested_fix.is_empty() {
-            return None;
-        }
-        if fh.retry_count >= RuntimeStrategy::from_profile(state.profile).max_retries_per_failure {
-            return None;
-        }
-        let score = if fh.why_failed.is_empty() { 0.5 } else { 0.75 };
-        Some(DecisionCandidate {
-            decision: RuntimeDecision::retry_with_fix(0, &fh.suggested_fix),
-            score,
-            evidence: vec![format!(
-                "failure pattern '{}' — fix: {} (retry #{})",
-                fh.signature, fh.suggested_fix, fh.retry_count
-            )],
-        })
-    }
-}
-
 struct ReplanRule;
 impl DecisionRule for ReplanRule {
     fn name(&self) -> &'static str {
@@ -1305,35 +1280,12 @@ impl DecisionRule for ContinuePlanRule {
     }
 }
 
-struct TokenCriticalRule;
-impl DecisionRule for TokenCriticalRule {
-    fn name(&self) -> &'static str {
-        "token_critical"
-    }
-    fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
-        if !state.metrics.is_token_critical() {
-            return None;
-        }
-        Some(DecisionCandidate {
-            decision: RuntimeDecision::compact_and_proceed(),
-            score: 0.45, // fallback — more specific optimizations (cache, plan, retry) have higher priority
-            evidence: vec![format!(
-                "token critical: budget={:.0}%, streak={}",
-                state.metrics.budget_remaining_pct * 100.0,
-                state.metrics.failure_streak
-            )],
-        })
-    }
-}
-
-/// Default set of decision rules (cache → retry → replan → continue → token).
+/// Default set of decision rules. Grounded execution signals only.
 pub fn default_rules() -> Vec<Box<dyn DecisionRule>> {
     vec![
         Box::new(CacheReuseRule),
-        Box::new(RetryWithFixRule),
         Box::new(ReplanRule),
         Box::new(ContinuePlanRule),
-        Box::new(TokenCriticalRule),
     ]
 }
 
@@ -1400,7 +1352,7 @@ impl RuleEngine {
         }
     }
 
-    /// Create an engine with the default rule set (cache/retry/replan/continue/token).
+    /// Create an engine with the default grounded rule set (cache/replan/continue).
     pub fn with_defaults() -> Self {
         Self {
             rules: default_rules(),
@@ -1515,62 +1467,35 @@ impl RuntimePolicy {
     }
 }
 
-/// Proactively load failure patterns for a conversation, run the rule engine,
-/// and return a context string to inject into the next request.
+/// Load recent failure evidence for the next request.
 ///
-/// This closes the gap between "failures are stored" and "failures influence
-/// the next execution" — the core of the FailurePattern → FailureHint →
-/// RetryWithFix → Outcome pipeline.
-///
-/// Returns `None` when no failure pattern applies (no patterns found, or the
-/// engine decides not to recommend an action).
+/// Historical fixes are evidence only. The runtime does not recommend replaying an old
+/// fix; the current model decides what to do with the recorded failure context.
 pub fn evaluate_failure_context(
     db: &crate::db::Database,
     conv_id: i64,
-    cycle: &ExecutionCycle,
+    _cycle: &ExecutionCycle,
 ) -> Option<String> {
     let patterns = db.get_recent_failure_patterns(conv_id, 3).ok()?;
-    if patterns.is_empty() {
-        return None;
+    let best = patterns.first()?;
+
+    let mut lines = vec![format!("[Previous failure evidence: {}]", best.signature)];
+    if !best.why_failed.is_empty() {
+        lines.push(format!("[Observed reason: {}]", best.why_failed));
     }
-
-    // Use the most recent pattern that has a suggested fix and why_failed
-    let best = patterns.iter().find(|p| !p.attempted_fix.is_empty())?;
-
-    let retry_count = db
-        .get_failure_retry_count(conv_id, &best.signature)
-        .ok()
-        .unwrap_or(0);
-
-    let failure_hint = FailureHint::from_failure_pattern(best, retry_count);
-
-    let state = RuntimeState {
-        profile: cycle.profile,
-        metrics: cycle.metrics.clone(),
-        cache_hit: None,
-        failure_hint: Some(failure_hint),
-        plan_hint: None,
-        context_delta: vec![],
-    };
-
-    let decision = RuleEngine::with_defaults().decide(&state);
-
-    match &decision.action {
-        RuntimeAction::RetryWithFix {
-            failure_id: _,
-            suggested_fix,
-        } => {
-            let sig = &best.signature;
-            let why = &best.why_failed;
-            let ctx = format!(
-                "[Previous attempt failed: {sig}]\n\
-                 [Suggested fix: {suggested_fix}]\n\
-                 [Why it failed before: {why}]"
-            );
-            Some(ctx)
-        }
-        _ => None,
+    if !best.attempted_fix.is_empty() {
+        lines.push(format!(
+            "[Previously attempted fix (historical evidence, not a recommendation): {}]",
+            best.attempted_fix
+        ));
     }
+    if !best.invalidated_assumptions.is_empty() {
+        lines.push(format!(
+            "[Invalidated assumptions: {}]",
+            best.invalidated_assumptions.join(", ")
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 /// Proactively load the active plan for a conversation, run the rule engine,
@@ -1658,8 +1583,6 @@ pub fn generate_report(
     session_duration_secs: u64,
 ) -> String {
     let m = &cycle.metrics;
-    let estimated_saved =
-        m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
     let total_hits = m.cache_hits + m.cache_misses;
     let hit_pct = if total_hits > 0 {
         m.cache_hits as f64 / total_hits as f64 * 100.0
@@ -1685,10 +1608,7 @@ pub fn generate_report(
         (m.planning_reuse_ratio * 100.0) as u64 / 10
     ));
 
-    out.push_str("## Inference Economics\n\n| Metric | Estimate |\n|--------|----------|\n");
-    out.push_str(&format!(
-        "| Estimated tokens avoided | ~{estimated_saved} |\n"
-    ));
+    out.push_str("## Observed Runtime\n\n| Metric | Value |\n|--------|-------|\n");
     out.push_str(&format!("| Tokens spent | {} |\n", m.tokens_spent));
     out.push_str(&format!(
         "| Budget remaining | {:.0}% |\n\n",
@@ -1746,8 +1666,6 @@ pub fn generate_svg_card(
     top_reused: &[(String, u64)],
 ) -> String {
     let m = &cycle.metrics;
-    let estimated_saved =
-        m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
     let total_hits = m.cache_hits + m.cache_misses;
     let hit_pct = if total_hits > 0 {
         m.cache_hits as f64 / total_hits as f64 * 100.0
@@ -1772,8 +1690,8 @@ pub fn generate_svg_card(
 
   <!-- Card 1 -->
   <rect x="50" y="215" width="260" height="100" rx="8" fill={card_bg}/>
-  <text x="180" y="255" font-family="monospace" font-size="15" fill={grey} text-anchor="middle">Tokens avoided</text>
-  <text x="180" y="295" font-family="monospace" font-size="32" font-weight="bold" fill={green} text-anchor="middle">~{estimated_saved}</text>
+  <text x="180" y="255" font-family="monospace" font-size="15" fill={grey} text-anchor="middle">Tool calls reused</text>
+  <text x="180" y="295" font-family="monospace" font-size="32" font-weight="bold" fill={green} text-anchor="middle">{cache_hits}</text>
 
   <!-- Card 2 -->
   <rect x="325" y="215" width="260" height="100" rx="8" fill={card_bg}/>
@@ -1794,7 +1712,7 @@ pub fn generate_svg_card(
         bg = c("0d1117"), card_bg = c("161b22"), grey = c("8b949e"),
         white = c("e6edf3"), border = c("30363d"), green = c("3fb950"),
         blue = c("58a6ff"), purple = c("d2a8ff"), orange = c("f0883e"),
-        label = label, estimated_saved = estimated_saved,
+        label = label,
         cache_hits = m.cache_hits,
         failures_broken = m.repeated_failures.min(m.cache_hits / 2),
         budget_pct = m.budget_remaining_pct * 100.0,
@@ -2097,11 +2015,11 @@ mod tests {
     }
 
     #[test]
-    fn token_critical_triggers_compact() {
+    fn token_pressure_does_not_override_model_by_default() {
         let mut state = make_state(RuntimeProfile::Efficient, None, None, None);
         state.metrics.budget_remaining_pct = 0.10;
         let d = RuntimePolicy::decide(&state);
-        assert!(matches!(d.action, RuntimeAction::CompactAndProceed));
+        assert!(matches!(d.action, RuntimeAction::DelegateToModel));
     }
 
     #[test]
@@ -2363,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_failure_context_returns_fix_context_with_pattern() {
+    fn evaluate_failure_context_returns_evidence_with_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = rt.block_on(async {
@@ -2389,10 +2307,7 @@ mod tests {
             .unwrap();
         let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
         let result = evaluate_failure_context(&db, conv_id, &cycle);
-        assert!(
-            result.is_some(),
-            "should return context with fix suggestion"
-        );
+        assert!(result.is_some(), "should return failure evidence");
         let ctx = result.unwrap();
         assert!(
             ctx.contains("ENOENT"),
@@ -2400,7 +2315,7 @@ mod tests {
         );
         assert!(
             ctx.contains("check file exists first"),
-            "context should mention the suggested fix"
+            "context should retain the historical fix as evidence"
         );
     }
 

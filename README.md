@@ -178,7 +178,7 @@ curl -sk https://localhost:8080/v1/lcm/runtime/report?label=fix+build
 ```
 # deeplossless session report: fix build
 50 turns · 180s duration · 42% cache reuse
-21 cache hits · 3 failure loops broken · ~8,400 tokens avoided
+21 exact cache reuses · 3 recorded failure loops
 ```
 
 ## Runtime Profiles
