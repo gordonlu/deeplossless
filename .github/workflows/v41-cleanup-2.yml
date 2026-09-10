@@ -1,0 +1,88 @@
+name: V4.1 Runtime Cleanup 2
+
+on:
+  push:
+    branches: [v41-runtime-cleanup-2]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v41-runtime-cleanup-2
+          fetch-depth: 0
+      - name: Apply semantic cleanup
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              n = s.count(old)
+              assert n == 1, f"{path}: expected one match, got {n}"
+              p.write_text(s.replace(old, new, 1))
+
+          # Runtime: exact deterministic cache reuse is correctness-driven, not profile-driven.
+          replace_once('src/runtime.rs', '''    /// How aggressively to reuse cache (0.0 = never, 1.0 = always if available).\n    pub cache_aggressiveness: f64,''', '''    /// Legacy compatibility knob. Built-in deterministic cache reuse no longer uses\n    /// profile-dependent aggressiveness; validity/freshness gates reuse instead.\n    pub cache_aggressiveness: f64,''')
+          replace_once('src/runtime.rs', '''    /// How much context to inject (0.0 = minimal delta only, 1.0 = full context).\n    pub context_injection_ratio: f64,''', '''    /// Legacy compatibility knob. Working-context selection is driven by provenance,\n    /// state relevance, and hard resource limits rather than a profile personality.\n    pub context_injection_ratio: f64,''')
+          replace_once('src/runtime.rs', '''    /// Token budget as fraction of total window.\n    pub token_budget_ratio: f64,''', '''    /// Legacy compatibility knob. Token budget is a resource/safety limit, not a\n    /// decision-quality signal in the default runtime policy.\n    pub token_budget_ratio: f64,''')
+          replace_once('src/runtime.rs', '''    /// Estimated token saving at decision time.\n    pub estimated_token_saving: u64,''', '''    /// Legacy telemetry field retained for wire/DB compatibility. Built-in policy\n    /// ranking does not use this value as a decision-quality signal.\n    pub estimated_token_saving: u64,''')
+          replace_once('src/runtime.rs', '''    /// Estimated token savings if this decision is accepted.\n    pub estimated_token_saving: u64,''', '''    /// Legacy telemetry field retained for API compatibility. Built-in decisions do\n    /// not rank or validate actions from speculative token-saving estimates.\n    pub estimated_token_saving: u64,''')
+
+          old = '''impl DecisionEvaluation {\n    /// Evaluate a decision outcome based on action type and execution results.\n    ///\n    /// * `action` — action variant name (from [`RuntimeAction::variant_name`])\n    /// * `estimated_tokens` — estimated token saving at decision time\n    /// * `actual_tokens` — actual tokens consumed during execution\n    /// * `failure_repeated` — whether the same failure pattern recurred (retries)\n    pub fn evaluate(\n        action: &str,\n        estimated_tokens: u64,\n        actual_tokens: u64,\n        failure_repeated: bool,\n    ) -> DecisionOutcome {\n        let success = match action {\n            "ReuseToolCache" => actual_tokens < estimated_tokens,\n            "RetryWithFix" => !failure_repeated,\n            "ContinuePlan" => !failure_repeated,\n            "CompactAndProceed" => actual_tokens < estimated_tokens / 2,\n            _ => !failure_repeated,\n        };\n        DecisionOutcome { success, estimated_tokens, actual_tokens, failure_repeated }\n    }'''
+          new = '''impl DecisionEvaluation {\n    /// Evaluate a decision outcome from observed execution behavior.\n    ///\n    /// Token counts are retained as telemetry for compatibility, but are not used to\n    /// decide whether an action was correct. Callers should record explicit invalidation\n    /// or failure evidence when an optimization is semantically wrong.\n    pub fn evaluate(\n        _action: &str,\n        estimated_tokens: u64,\n        actual_tokens: u64,\n        failure_repeated: bool,\n    ) -> DecisionOutcome {\n        let success = !failure_repeated;\n        DecisionOutcome { success, estimated_tokens, actual_tokens, failure_repeated }\n    }'''
+          replace_once('src/runtime.rs', old, new)
+
+          replace_once('src/runtime.rs', '''    pub fn retry_with_fix(failure_id: i64, fix: &str) -> Self {\n        Self {\n            action: RuntimeAction::RetryWithFix {\n                failure_id,\n                suggested_fix: fix.to_string(),\n            },\n            estimated_token_saving: fix.len() as u64 * 10, // rough estimate''', '''    pub fn retry_with_fix(failure_id: i64, fix: &str) -> Self {\n        Self {\n            action: RuntimeAction::RetryWithFix {\n                failure_id,\n                suggested_fix: fix.to_string(),\n            },\n            estimated_token_saving: 0''')
+          replace_once('src/runtime.rs', '''            estimated_token_saving: 500, // save one planning round''', '''            estimated_token_saving: 0''')
+          replace_once('src/runtime.rs', '''            estimated_token_saving: 1000,''', '''            estimated_token_saving: 0,''')
+
+          old = '''    fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {\n        let hit = state.cache_hit.as_ref()?;\n        let confidence = RuntimeStrategy::from_profile(state.profile).cache_aggressiveness;\n        if confidence <= 0.3 { return None; }\n        Some(DecisionCandidate {\n            decision: RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving),\n            score: confidence,\n            evidence: vec![format!("cache hit for {} (id={}, est_save={})", hit.tool_name, hit.cache_id, hit.estimated_token_saving)],\n        })\n    }'''
+          new = '''    fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {\n        let hit = state.cache_hit.as_ref()?;\n        // A cache candidate reaches this rule only after the cache layer's deterministic\n        // validity/freshness checks. Runtime profile must not downgrade exact reuse.\n        Some(DecisionCandidate {\n            decision: RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving),\n            score: 0.95,\n            evidence: vec![format!("valid deterministic cache hit for {} (id={})", hit.tool_name, hit.cache_id)],\n        })\n    }'''
+          replace_once('src/runtime.rs', old, new)
+
+          # Runtime tests: profile-independent exact reuse and token telemetry no longer defines success.
+          old = '''    fn cache_hit_confidence_scales_with_strategy() {\n        let s_min = RuntimeState { profile: RuntimeProfile::Minimal, ..make_state(RuntimeProfile::Minimal, None, None, None) };\n        let s_auto = RuntimeState { profile: RuntimeProfile::Autonomous, ..make_state(RuntimeProfile::Autonomous, None, None, None) };\n        let d1 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_min });\n        assert!(d1.confidence > 0.8, "minimal should be confident about cache");\n        let d2 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_auto });\n        assert!(d2.confidence < d1.confidence, "autonomous should be less aggressive about cache");\n    }'''
+          new = '''    fn valid_cache_hit_is_profile_independent() {\n        let s_min = RuntimeState { profile: RuntimeProfile::Minimal, ..make_state(RuntimeProfile::Minimal, None, None, None) };\n        let s_auto = RuntimeState { profile: RuntimeProfile::Autonomous, ..make_state(RuntimeProfile::Autonomous, None, None, None) };\n        let d1 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_min });\n        let d2 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_auto });\n        assert!(matches!(d1.action, RuntimeAction::ReuseToolCache { .. }));\n        assert!(matches!(d2.action, RuntimeAction::ReuseToolCache { .. }));\n        assert!((d1.confidence - d2.confidence).abs() < f64::EPSILON);\n    }'''
+          replace_once('src/runtime.rs', old, new)
+          replace_once('src/runtime.rs', '''    fn evaluate_cache_reuse_mismatch() {\n        let outcome = DecisionEvaluation::evaluate("ReuseToolCache", 500, 500, false);\n        assert!(!outcome.success);\n        assert_eq!(outcome.net_saving(), 0);\n    }''', '''    fn token_estimate_does_not_define_cache_success() {\n        let outcome = DecisionEvaluation::evaluate("ReuseToolCache", 500, 500, false);\n        assert!(outcome.success);\n        assert_eq!(outcome.net_saving(), 0);\n    }''')
+          replace_once('src/runtime.rs', '''    fn evaluate_compact_effective() {\n        let outcome = DecisionEvaluation::evaluate("CompactAndProceed", 1000, 150, false);\n        assert!(outcome.success);\n        assert_eq!(outcome.net_saving(), 850);\n    }''', '''    fn compact_success_is_not_inferred_from_token_ratio() {\n        let outcome = DecisionEvaluation::evaluate("CompactAndProceed", 1000, 150, false);\n        assert!(outcome.success);\n        assert_eq!(outcome.net_saving(), 850);\n    }''')
+
+          # Demo / CLI wording: translation is legacy diagnostic, native Responses is primary.
+          replace_once('src/main.rs', '''    /// Translate a saved Responses API request to Chat Completions format.\n    /// Reads the JSON file, runs the full protocol translation pipeline,\n    /// and pretty-prints the result. No API call is made.\n    Translate {''', '''    /// Legacy compatibility diagnostic: translate a saved Responses request to Chat Completions.\n    /// Native DeepSeek Responses traffic does not use this path.\n    Translate {''')
+          replace_once('src/main.rs', '''    println!("    Failure Memory           — avoids repeated failed fixes");''', '''    println!("    Failure Memory           — source-backed historical evidence");''')
+          replace_once('src/main.rs', '''    println!("    Protocol translation     — Responses API → Chat Completions");''', '''    println!("    Native Responses         — direct DeepSeek Responses transport");''')
+          replace_once('src/main.rs', '''    println!("    Runtime Policy           — advisory cache/retry/context decisions\\n");''', '''    println!("    Runtime Policy           — grounded cache/plan advisory decisions\\n");''')
+          replace_once('src/main.rs', '''/// Translate a saved Responses API request body to Chat Completions format.\n/// Reads the file, runs the full protocol translation pipeline, and prints\n/// the result. No API call is made — purely offline.''', '''/// Legacy compatibility diagnostic for the Responses-to-Chat fallback adapter.\n/// Native DeepSeek Responses requests bypass this translation path.''')
+
+          # Technical reference: remove stale primary-path/profile claims.
+          p = Path('docs/tech-reference.md')
+          s = p.read_text()
+          s = s.replace('''| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation. Zero-token reuse for grep/read_file/search |''', '''| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation and exact result replay for valid read/search hits |''')
+          s = s.replace('''| **Failure Memory** | Stores failed reasoning paths (`why_failed` + `invalidated_assumptions`), not just error strings. Prevents error loop token waste |''', '''| **Failure Memory** | Stores source-backed failure evidence (`why_failed` + `invalidated_assumptions`) for the current model; historical fixes are not automatically prescribed |''')
+          s = s.replace('''| **Execution Units** | Agent memory atoms: `think → act → observe → reflect` cycles with outcome inference |''', '''| **Execution Units** | Agent execution atoms (`think → act → observe → reflect`) with observed outcomes; free-form reasoning is retained as evidence rather than auto-labelled typed truth |''')
+          start = s.index('## Runtime Strategies\n')
+          end = s.index('\n## API Reference\n', start)
+          s = s[:start] + '''## Runtime Profiles\n\nRuntime profiles remain for configuration/backward compatibility, but the default policy no longer treats token-budget percentage or profile-specific context volume as decision-quality signals. Valid deterministic cache hits are reused independently of profile; Plan continuation/replan decisions are grounded in execution state and resource invalidation. Working-context size is a resource limit, not an autonomy personality.\n''' + s[end:]
+          s = s.replace('''POST /v1/responses                 — Responses API → Chat Completions (enables Codex + DeepSeek)''', '''POST /v1/responses                 — Native DeepSeek Responses transport; local state/projection handling; legacy Chat fallback only on unsupported providers''')
+          s = s.replace('''Model names are auto-mapped: `gpt-5*` → `deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.''', '''Generic OpenAI-style model names are mapped to current DeepSeek aliases; explicit DeepSeek model names are preserved for upstream routing.''')
+          p.write_text(s)
+          PY
+
+          git diff --check
+          cargo test --lib
+          cargo clippy --lib -- -D warnings
+          cargo test --tests
+      - name: Commit cleanup
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime.rs src/main.rs docs/tech-reference.md
+          git commit -m "refactor: remove token-estimate policy heuristics"
+          git push origin HEAD:v41-runtime-cleanup-2
