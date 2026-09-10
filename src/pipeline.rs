@@ -217,7 +217,8 @@ impl ChatPipeline {
                     .unwrap_or_default();
                 format!("rs_{}_{:x}", conv_id, now.as_nanos())
             };
-            db.store_messages(conv_id, &msgs)
+            let message_ids = db
+                .store_messages_with_ids(conv_id, &msgs)
                 .context("failed to store pipeline messages")?;
             // ── Post-commit analysis pass ────────────────────────
             // Runs AFTER store_messages committed the ingestion
@@ -240,12 +241,12 @@ impl ChatPipeline {
                 }
             }
             if let Some(arr) = msgs.as_array() {
-                for msg in arr {
+                for (msg, message_id) in arr.iter().zip(message_ids.iter().copied()) {
                     if let Some(content) = dag_leaf_content(msg) {
                         let raw_tokens = crate::tokenizer::count(&content) + overhead;
                         let tc = crate::tokenizer::correct(raw_tokens, correction) as i64;
-                        dag.insert_leaf(conv_id, &content, tc)
-                            .context("failed to create DAG leaf")?;
+                        dag.insert_message_leaf(conv_id, message_id, &content, tc)
+                            .context("failed to create source-backed DAG leaf")?;
                     }
                 }
                 // Group tool chains into execution units (Phase 1.5)

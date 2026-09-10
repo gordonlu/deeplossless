@@ -455,6 +455,14 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_model
                 ON embeddings(model);
+
+            -- One durable message row projects to at most one level-0 DAG leaf.
+            -- Sidecar keeps the DAG node schema stable while making projection idempotent.
+            CREATE TABLE IF NOT EXISTS message_dag_projection (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                dag_node_id INTEGER NOT NULL UNIQUE REFERENCES dag_nodes(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         ")?;
 
         // Graceful migration: add soft-delete columns if upgrading from earlier schema.
@@ -812,10 +820,24 @@ impl Database {
     }
 
     /// Persist a request's `messages` array into an existing conversation.
-    /// Also extracts structured events into `proxy_events` for search.
+    /// Existing callers that only need persistence can ignore stable row identities.
     pub fn store_messages(&self, conv_id: i64, messages: &serde_json::Value) -> anyhow::Result<()> {
+        self.store_messages_with_ids(conv_id, messages).map(|_| ())
+    }
+
+    /// Persist messages and return the durable message row ID for each input position.
+    ///
+    /// Full-history clients resend old messages every turn. Returning row IDs lets
+    /// rebuildable projections key themselves to durable source rows rather than the
+    /// transient request batch, so replaying the same history is idempotent.
+    pub fn store_messages_with_ids(
+        &self,
+        conv_id: i64,
+        messages: &serde_json::Value,
+    ) -> anyhow::Result<Vec<i64>> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
+        let mut message_ids = Vec::new();
 
         // Compute stable session fingerprint and feed the event index.
 
@@ -846,6 +868,7 @@ impl Database {
                     rusqlite::params![conv_id, content_hash],
                     |r| r.get(0),
                 )?;
+                message_ids.push(msg_id);
                 // Mirror into FTS5 index (ignore duplicates from message dedup)
                 let _ = tx.execute(
                     "INSERT OR REPLACE INTO messages_fts (rowid, content, role) VALUES (?1, ?2, ?3)",
@@ -864,7 +887,65 @@ impl Database {
             && let Err(e) = self.wal_checkpoint() {
                 tracing::warn!(target: "deeplossless::db", error = %e, "WAL checkpoint failed");
             }
-        Ok(())
+        Ok(message_ids)
+    }
+
+    /// Atomically create a level-0 DAG leaf for a durable message source if that
+    /// source has not been projected yet. Returns None when the projection already
+    /// exists, making cumulative-history replay idempotent.
+    pub fn insert_message_leaf_if_absent(
+        &self,
+        conv_id: i64,
+        message_id: i64,
+        summary: &str,
+        token_count: i64,
+    ) -> anyhow::Result<Option<DagNode>> {
+        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.unchecked_transaction()?;
+
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT dag_node_id FROM message_dag_projection WHERE message_id = ?1",
+                rusqlite::params![message_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if existing.is_some() {
+            return Ok(None);
+        }
+
+        let hash = Self::semantic_hash(summary, &[]);
+        tx.execute(
+            "INSERT INTO dag_nodes (conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash)
+             VALUES (?1, 0, ?2, ?3, '[]', '[]', '[]', 1, 0, 0, ?4)",
+            rusqlite::params![conv_id, summary, token_count, hash],
+        )?;
+        let node_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO message_dag_projection (message_id, dag_node_id) VALUES (?1, ?2)",
+            rusqlite::params![message_id, node_id],
+        )?;
+        tx.commit()?;
+
+        Ok(Some(DagNode {
+            id: node_id,
+            conversation_id: conv_id,
+            level: 0,
+            summary: summary.to_string(),
+            token_count,
+            parent_ids: Vec::new(),
+            child_ids: Vec::new(),
+            is_leaf: true,
+            is_join: false,
+            snippets: Vec::new(),
+            deleted: false,
+            semantic_hash: hash,
+            access_count: 0,
+            last_accessed_at: None,
+            reasoning: String::new(),
+            graph_revision: 0,
+            compaction_id: String::new(),
+        }))
     }
 
     /// Legacy: create conversation + store messages in one call.
@@ -4222,6 +4303,56 @@ mod tests {
         // Verify the conversation has exactly 1 message
         let total = db.total_conversation_tokens(conv_id).unwrap();
         assert!(total > 0);
+    }
+
+    #[tokio::test]
+    async fn store_messages_with_ids_reuses_durable_source_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("message_ids.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.find_or_create_conversation("ids", "test").unwrap();
+
+        let first = db.store_messages_with_ids(
+            conv_id,
+            &json!([{"role":"user","content":"a"}]),
+        ).unwrap();
+        let replay = db.store_messages_with_ids(
+            conv_id,
+            &json!([
+                {"role":"user","content":"a"},
+                {"role":"assistant","content":"b"}
+            ]),
+        ).unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(replay.len(), 2);
+        assert_eq!(first[0], replay[0]);
+        assert_ne!(replay[0], replay[1]);
+    }
+
+    #[tokio::test]
+    async fn message_leaf_projection_is_idempotent_by_source_row() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("message_leaf_projection.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.find_or_create_conversation("leaf-source", "test").unwrap();
+        let ids = db.store_messages_with_ids(
+            conv_id,
+            &json!([{"role":"assistant","content":"already persisted"}]),
+        ).unwrap();
+
+        let first = db.insert_message_leaf_if_absent(conv_id, ids[0], "already persisted", 4).unwrap();
+        let second = db.insert_message_leaf_if_absent(conv_id, ids[0], "already persisted", 4).unwrap();
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(db.get_leaf_nodes(conv_id).unwrap().len(), 1);
     }
 
     // ── P0: DAG node persistence ────────────────────────────────────────
