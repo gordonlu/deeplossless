@@ -14,7 +14,9 @@ async fn old_plan_relevant_leaf_reenters_working_context_under_budget() {
             .await
             .unwrap(),
     );
-    let dag = DagEngine::builder().build(db.clone());
+    // Pin the recent window so the fixture proves recall behavior rather than
+    // depending on the production default (currently 20 messages).
+    let dag = DagEngine::builder().recent_messages(4).build(db.clone());
     let conv_id = db
         .find_or_create_conversation("dynamic-recall", "deepseek-flash")
         .unwrap();
@@ -27,8 +29,8 @@ async fn old_plan_relevant_leaf_reenters_working_context_under_budget() {
         )
         .unwrap();
 
-    // Push the critical evidence well outside the ordinary recent-leaf window.
-    for i in 0..16 {
+    // Push the critical evidence outside the explicitly configured recent window.
+    for i in 0..8 {
         dag.insert_leaf(conv_id, &format!("recent unrelated event {i}"), 10)
             .unwrap();
     }
