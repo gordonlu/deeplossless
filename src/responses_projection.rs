@@ -86,9 +86,9 @@ pub async fn project_and_assemble(
     let dag = state.storage.dag.clone();
     let stored_messages = Value::Array(messages.clone());
     let ingest = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        db.store_messages(conv_id, &stored_messages)?;
+        let message_ids = db.store_messages_with_ids(conv_id, &stored_messages)?;
         if let Some(items) = stored_messages.as_array() {
-            for message in items {
+            for (message, message_id) in items.iter().zip(message_ids.iter().copied()) {
                 let role = message.get("role").and_then(Value::as_str).unwrap_or("");
                 if !matches!(role, "user" | "assistant" | "tool") {
                     continue;
@@ -105,7 +105,7 @@ pub async fn project_and_assemble(
                     raw_tokens,
                     dag.config().token_correction_factor,
                 ) as i64;
-                dag.insert_leaf(conv_id, content, token_count)?;
+                dag.insert_message_leaf(conv_id, message_id, content, token_count)?;
             }
         }
         Ok(())

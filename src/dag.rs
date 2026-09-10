@@ -388,6 +388,24 @@ impl DagEngine {
         Ok(node)
     }
 
+    /// Project one durable message row into the DAG exactly once.
+    /// Returns None if that source message already has a level-0 projection.
+    pub fn insert_message_leaf(
+        &self,
+        conv_id: i64,
+        message_id: i64,
+        summary: &str,
+        token_count: i64,
+    ) -> anyhow::Result<Option<DagNode>> {
+        let node = self
+            .db
+            .insert_message_leaf_if_absent(conv_id, message_id, summary, token_count)?;
+        if node.is_some() {
+            self.post_mutation(conv_id)?;
+        }
+        Ok(node)
+    }
+
     /// Like `compress_group` but also stores extracted snippets for
     /// lossless value preservation (Context-ReAct Snippet, §3.2).
     pub fn compress_group_with_snippets(
