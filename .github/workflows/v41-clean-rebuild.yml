@@ -1,0 +1,134 @@
+name: V4.1 Minimal Diff Rebuild
+
+on:
+  push:
+    branches: [v41-runtime-simplification]
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v41-runtime-simplification
+          fetch-depth: 0
+      - name: Rebuild source changes from master
+        run: |
+          git fetch origin master
+          git checkout origin/master -- src/execution.rs src/runtime.rs src/tool_cache.rs src/summarizer.rs src/main.rs src/lib.rs src/prefix_stability.rs
+          git rm src/prefix_stability.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def sub_once(path, pattern, replacement, flags=0):
+              p = Path(path)
+              s = p.read_text()
+              out, n = re.subn(pattern, replacement, s, count=1, flags=flags)
+              assert n == 1, f"{path}: expected one match, got {n} for {pattern[:80]!r}"
+              p.write_text(out)
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              n = s.count(old)
+              assert n == 1, f"{path}: expected one exact match, got {n}"
+              p.write_text(s.replace(old, new, 1))
+
+          # 1) Cached deterministic tool results must replay exactly.
+          sub_once(
+              'src/tool_cache.rs',
+              r'/// Transform a cached result before injecting it into the stream\.\n.*?\n}\n\n/// Convenience: compute cache key tuple',
+              '''/// Return the exact cached tool result.\n///\n/// Cache reuse is an execution optimization, not a context-compression step.\n/// A cache hit must preserve the observable semantics of executing the tool.\npub fn transform_result(_tool_name: &str, raw_result: &str) -> String {\n    raw_result.to_string()\n}\n\n/// Convenience: compute cache key tuple''',
+              re.S,
+          )
+          sub_once(
+              'src/tool_cache.rs',
+              r'    // ── Transform ─+\n.*?\n    // ── L2 invalidation',
+              '''    // ── Transform / exact replay ───────────────────────────────────────\n\n    #[test]\n    fn transform_read_file_preserves_exact_result() {\n        let raw = "pub fn foo() {\\n    let x = 1;\\n}\\n";\n        assert_eq!(transform_result("read_file", raw), raw);\n    }\n\n    #[test]\n    fn transform_list_files_preserves_all_entries() {\n        let raw = "a\\nb\\nc\\nd\\ne\\nf\\n";\n        assert_eq!(transform_result("list_files", raw), raw);\n    }\n\n    #[test]\n    fn transform_result_never_panics_on_weird_input() {\n        let raw = "\\0\\n\\x01\\n\\x02";\n        assert_eq!(transform_result("read_file", raw), raw);\n        assert_eq!(transform_result("unknown_tool", raw), raw);\n    }\n\n    // ── L2 invalidation''',
+              re.S,
+          )
+
+          # 2) Free-form reasoning is retained as evidence, not auto-labelled typed truth.
+          sub_once(
+              'src/execution.rs',
+              r'        let reasoning_steps = \{\n.*?\n        \};\n\n        Self \{',
+              '''        // Free-form model reasoning is evidence, not typed execution truth.\n        // Semantic labels require explicit evidence from the typed fact / validation pipeline.\n        let reasoning_steps = Vec::new();\n\n        Self {''',
+              re.S,
+          )
+
+          # 3) Explicit exit code 0 is success; only non-zero exit codes imply failure.
+          marker = '/// Group normalized messages into execution units.\n'
+          p = Path('src/execution.rs')
+          s = p.read_text()
+          assert marker in s
+          helper = '''fn parse_exit_code(text: &str) -> Option<i32> {\n    for marker in ["exit code", "exit_code", "exit status", "exit_status"] {\n        if let Some(pos) = text.find(marker) {\n            let tail = &text[pos + marker.len()..];\n            let token = tail\n                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '('))\n                .split(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';'))\n                .next()?;\n            if let Ok(code) = token.parse::<i32>() {\n                return Some(code);\n            }\n        }\n    }\n    None\n}\n\n'''
+          p.write_text(s.replace(marker, helper + marker, 1))
+          replace_once(
+              'src/execution.rs',
+              '''                // Infer outcome from result using structured patterns\n                let outcome = {\n                    let lower = tool_result.to_lowercase();\n                    if tool_result.contains("Error:") || tool_result.contains("error:")\n                        || tool_result.contains("error[") || tool_result.contains("Error[")\n                        || tool_result.contains("\\nerror") || tool_result.starts_with("error")\n                        || lower.contains("failed:") || lower.contains("exit code")\n                        || lower.contains("timed out") || lower.contains("permission denied")\n                        || lower.contains("not found") || lower.starts_with("err:")\n                    {''',
+              '''                // Infer outcome from result using structured patterns.\n                // An explicit zero exit code is success; only non-zero codes are failures.\n                let outcome = {\n                    let lower = tool_result.to_lowercase();\n                    let nonzero_exit = parse_exit_code(&lower).is_some_and(|code| code != 0);\n                    if tool_result.contains("Error:") || tool_result.contains("error:")\n                        || tool_result.contains("error[") || tool_result.contains("Error[")\n                        || tool_result.contains("\\nerror") || tool_result.starts_with("error")\n                        || lower.contains("failed:") || nonzero_exit\n                        || lower.contains("timed out") || lower.contains("permission denied")\n                        || lower.contains("not found") || lower.starts_with("err:")\n                    {'''
+          )
+
+          # 4) Default summarizer model follows the current Flash alias.
+          replace_once('src/summarizer.rs', 'model: "deepseek-v4-flash".to_string(),', 'model: "deepseek-flash".to_string(),')
+          replace_once('src/main.rs', '#[arg(long, default_value = "deepseek-v4-pro", env = "SUMMARIZER_MODEL")]', '#[arg(long, default_value = "deepseek-flash", env = "SUMMARIZER_MODEL")]')
+
+          # 5) Prefix stability was unused in the production path.
+          replace_once('src/lib.rs', 'pub mod prefix_stability;\n', '')
+
+          # 6) Default policy: grounded cache/plan signals only; no old-fix replay or token-pressure compaction.
+          sub_once('src/runtime.rs', r'\nstruct RetryWithFixRule;\nimpl DecisionRule for RetryWithFixRule \{.*?\n}\n\nstruct ReplanRule;', '\nstruct ReplanRule;', re.S)
+          sub_once('src/runtime.rs', r'\nstruct TokenCriticalRule;\nimpl DecisionRule for TokenCriticalRule \{.*?\n}\n\n/// Default set of decision rules \(cache → retry → replan → continue → token\)\.', '\n/// Default set of decision rules. Grounded execution signals only.', re.S)
+          replace_once(
+              'src/runtime.rs',
+              '''    vec![\n        Box::new(CacheReuseRule),\n        Box::new(RetryWithFixRule),\n        Box::new(ReplanRule),\n        Box::new(ContinuePlanRule),\n        Box::new(TokenCriticalRule),\n    ]''',
+              '''    vec![\n        Box::new(CacheReuseRule),\n        Box::new(ReplanRule),\n        Box::new(ContinuePlanRule),\n    ]'''
+          )
+          replace_once('src/runtime.rs', '/// Create an engine with the default rule set (cache/retry/replan/continue/token).', '/// Create an engine with the default grounded rule set (cache/replan/continue).')
+
+          # 7) Failure memory becomes evidence-only.
+          sub_once(
+              'src/runtime.rs',
+              r'/// Proactively load failure patterns for a conversation, run the rule engine,\n.*?\npub fn evaluate_failure_context\(\n.*?\n}\n\n/// Proactively load the active plan',
+              '''/// Load recent failure evidence for the next request.\n///\n/// Historical fixes are evidence only. The runtime does not recommend replaying an old\n/// fix; the current model decides what to do with the recorded failure context.\npub fn evaluate_failure_context(\n    db: &crate::db::Database,\n    conv_id: i64,\n    _cycle: &ExecutionCycle,\n) -> Option<String> {\n    let patterns = db.get_recent_failure_patterns(conv_id, 3).ok()?;\n    let best = patterns.first()?;\n\n    let mut lines = vec![format!("[Previous failure evidence: {}]", best.signature)];\n    if !best.why_failed.is_empty() {\n        lines.push(format!("[Observed reason: {}]", best.why_failed));\n    }\n    if !best.attempted_fix.is_empty() {\n        lines.push(format!(\n            "[Previously attempted fix (historical evidence, not a recommendation): {}]",\n            best.attempted_fix\n        ));\n    }\n    if !best.invalidated_assumptions.is_empty() {\n        lines.push(format!(\n            "[Invalidated assumptions: {}]",\n            best.invalidated_assumptions.join(", ")\n        ));\n    }\n    Some(lines.join("\\n"))\n}\n\n/// Proactively load the active plan''',
+              re.S,
+          )
+
+          # 8) Reports use observed metrics, not invented token-saving estimates.
+          replace_once('src/runtime.rs', '    let estimated_saved = m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;\n', '')
+          replace_once(
+              'src/runtime.rs',
+              '    out.push_str("## Inference Economics\\n\\n| Metric | Estimate |\\n|--------|----------|\\n");\n    out.push_str(&format!("| Estimated tokens avoided | ~{estimated_saved} |\\n"));\n',
+              '    out.push_str("## Observed Runtime\\n\\n| Metric | Value |\\n|--------|-------|\\n");\n'
+          )
+          replace_once('src/runtime.rs', '  <text x="180" y="255" font-family="monospace" font-size="15" fill={grey} text-anchor="middle">Tokens avoided</text>\n  <text x="180" y="295" font-family="monospace" font-size="32" font-weight="bold" fill={green} text-anchor="middle">~{estimated_saved}</text>', '  <text x="180" y="255" font-family="monospace" font-size="15" fill={grey} text-anchor="middle">Tool calls reused</text>\n  <text x="180" y="295" font-family="monospace" font-size="32" font-weight="bold" fill={green} text-anchor="middle">{cache_hits}</text>')
+          replace_once('src/runtime.rs', '        label = label, estimated_saved = estimated_saved,\n', '        label = label,\n')
+
+          # Runtime tests for the changed default semantics.
+          replace_once(
+              'src/runtime.rs',
+              '''    fn token_critical_triggers_compact() {\n        let mut state = make_state(RuntimeProfile::Efficient, None, None, None);\n        state.metrics.budget_remaining_pct = 0.10;\n        let d = RuntimePolicy::decide(&state);\n        assert!(matches!(d.action, RuntimeAction::CompactAndProceed));\n    }''',
+              '''    fn token_pressure_does_not_override_model_by_default() {\n        let mut state = make_state(RuntimeProfile::Efficient, None, None, None);\n        state.metrics.budget_remaining_pct = 0.10;\n        let d = RuntimePolicy::decide(&state);\n        assert!(matches!(d.action, RuntimeAction::DelegateToModel));\n    }'''
+          )
+          replace_once('src/runtime.rs', '    fn evaluate_failure_context_returns_fix_context_with_pattern() {', '    fn evaluate_failure_context_returns_evidence_with_pattern() {')
+          replace_once('src/runtime.rs', '        assert!(result.is_some(), "should return context with fix suggestion");', '        assert!(result.is_some(), "should return failure evidence");')
+          replace_once('src/runtime.rs', '        assert!(ctx.contains("check file exists first"), "context should mention the suggested fix");', '        assert!(ctx.contains("check file exists first"), "context should retain the historical fix as evidence");')
+          PY
+
+          git diff --check origin/master
+          echo "--- semantic diff stat ---"
+          git diff --stat origin/master
+          cargo test --lib
+          cargo clippy --lib -- -D warnings
+      - name: Commit minimal semantic diff
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "chore: minimize V4.1 runtime diff"
+          git push origin HEAD:v41-runtime-simplification
