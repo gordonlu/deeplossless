@@ -3,11 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 #[derive(Parser)]
-#[command(
-    name = "deeplossless",
-    version,
-    about = "Inference-aware execution runtime for AI coding agents"
-)]
+#[command(name = "deeplossless", version, about = "Inference-aware execution runtime for AI coding agents")]
 pub(crate) struct Cli {
     /// Listen address
     #[arg(long, default_value = "127.0.0.1")]
@@ -122,6 +118,7 @@ pub(crate) struct Cli {
     /// DeepSeek prefix cache hit rate. Use this flag to disable.
     #[arg(long)]
     no_cache_normalize: bool,
+
 
     /// Workspace root path for stable conversation identity.
     /// Auto-detected via `git rev-parse --show-toplevel` if not set.
@@ -259,7 +256,11 @@ enum Commands {
     },
 }
 
-async fn run_replay(db_path: &str, session_id: Option<String>, list: bool) -> anyhow::Result<()> {
+async fn run_replay(
+    db_path: &str,
+    session_id: Option<String>,
+    list: bool,
+) -> anyhow::Result<()> {
     use deeplossless::db::Database;
 
     let db = Database::builder().path(db_path).build().await?;
@@ -278,17 +279,15 @@ async fn run_replay(db_path: &str, session_id: Option<String>, list: bool) -> an
         return Ok(());
     }
 
-    let sid = session_id.ok_or_else(|| {
-        anyhow::anyhow!("session_id is required. Use --list to see available sessions.")
-    })?;
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!(
+        "session_id is required. Use --list to see available sessions."
+    ))?;
 
     let result = deeplossless::replay::replay_session(&db, &sid)?;
     println!("{{\"session_id\": \"{sid}\", \"events\": [");
     for (i, envelope) in result.events.iter().enumerate() {
         let json = serde_json::to_string(&envelope.event)?;
-        if i > 0 {
-            println!(",");
-        }
+        if i > 0 { println!(","); }
         print!("  {json}");
     }
     println!("\n], \"corrupt_count\": {}}}", result.corrupt_count);
@@ -298,35 +297,18 @@ async fn run_replay(db_path: &str, session_id: Option<String>, list: bool) -> an
 async fn run_demo() -> anyhow::Result<()> {
     use deeplossless::runtime::RuntimeProfile;
     let demo_db_path = std::env::temp_dir().join("deeplossless_demo.db");
-    let db = Arc::new(
-        deeplossless::db::Database::builder()
-            .path(&demo_db_path)
-            .build()
-            .await?,
-    );
-    let dag = Arc::new(
-        deeplossless::dag::DagEngine::builder()
-            .max_level(3)
-            .recent_messages(20)
-            .build(db.clone()),
-    );
+    let db = Arc::new(deeplossless::db::Database::builder()
+        .path(&demo_db_path).build().await?);
+    let dag = Arc::new(deeplossless::dag::DagEngine::builder()
+        .max_level(3).recent_messages(20).build(db.clone()));
     let _cycle = Arc::new(std::sync::Mutex::new(
-        deeplossless::runtime::ExecutionCycle::new(RuntimeProfile::Efficient),
-    ));
+        deeplossless::runtime::ExecutionCycle::new(RuntimeProfile::Efficient)));
 
     // Quick smoke test — insert a conversation to verify DB/DAG work
-    let conv_id = db.create_and_store(
-        "demo",
-        &serde_json::json!([
+    let conv_id = db.create_and_store("demo", &serde_json::json!([
         {"role":"user","content":"Hello, deeplossless!"}
-        ]),
-    )?;
-    db.store_tool_artifact(
-        "grep",
-        "hello --pattern init",
-        "src/main.rs:42: found",
-        &["src/main.rs".to_string()],
-    )?;
+    ]))?;
+    db.store_tool_artifact("grep", "hello --pattern init", "src/main.rs:42: found", &["src/main.rs".to_string()])?;
     let _ = db.tool_cache_get("grep", "hello")?;
     dag.insert_leaf(conv_id, "greeting", 5)?;
     dag.assemble_context(conv_id, 1000, None)?;
@@ -366,14 +348,9 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
         for (i, item) in input.iter().enumerate() {
             let typ = item["type"].as_str().unwrap_or("-");
             let role = item["role"].as_str().unwrap_or("-");
-            let call_id = item["call_id"]
-                .as_str()
-                .or_else(|| item["tool_call_id"].as_str());
+            let call_id = item["call_id"].as_str().or_else(|| item["tool_call_id"].as_str());
             let has_call_id = call_id.is_some();
-            println!(
-                "  [{i}] role={role} type={typ} call_id={}",
-                call_id.unwrap_or("-")
-            );
+            println!("  [{i}] role={role} type={typ} call_id={}", call_id.unwrap_or("-"));
             if role == "tool" && !has_call_id {
                 println!("    ⚠ role=tool but no tool_call_id/call_id!");
             }
@@ -387,35 +364,16 @@ fn run_translate(file: &str) -> anyhow::Result<()> {
     let chat_body = deeplossless::protocol::chat_completions::request_to_chat(&canonical);
 
     // Show translated messages
-    let msgs = chat_body["messages"]
-        .as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
+    let msgs = chat_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     println!("Translated messages ({}) — role:", msgs.len());
     for (i, msg) in msgs.iter().enumerate() {
         let role = msg["role"].as_str().unwrap_or("?");
         let has_tcid = msg.get("tool_call_id").is_some();
         let has_tc = msg.get("tool_calls").is_some();
-        let content_len = msg["content"]
-            .as_str()
-            .map(|s| s.len())
-            .or_else(|| msg["content"].as_array().map(|a| a.len()))
-            .unwrap_or(0);
-        let flags: Vec<&str> = if has_tcid {
-            vec!["tool_call_id"]
-        } else {
-            vec![]
-        };
+        let content_len = msg["content"].as_str().map(|s| s.len()).or_else(|| msg["content"].as_array().map(|a| a.len())).unwrap_or(0);
+        let flags: Vec<&str> = if has_tcid { vec!["tool_call_id"] } else { vec![] };
         let flags2: Vec<&str> = if has_tc { vec!["tool_calls"] } else { vec![] };
-        println!(
-            "  [{i}] role={role} content_len={content_len} flags={}{}",
-            flags.join(","),
-            if flags2.is_empty() {
-                String::new()
-            } else {
-                format!(",{}", flags2.join(","))
-            }
-        );
+        println!("  [{i}] role={role} content_len={content_len} flags={}{}", flags.join(","), if flags2.is_empty() { String::new() } else { format!(",{}", flags2.join(",")) });
         if role == "tool" && !has_tcid {
             println!("    ⚠ BUG: role=tool but missing tool_call_id!");
         }
@@ -448,10 +406,7 @@ fn run_trust() -> anyhow::Result<()> {
     println!();
     #[cfg(target_os = "windows")]
     {
-        println!(
-            "  setx SSL_CERT_FILE {}\\\\.deeplossless\\\\cert.pem",
-            std::env::var("USERPROFILE").unwrap_or_default()
-        );
+        println!("  setx SSL_CERT_FILE {}\\\\.deeplossless\\\\cert.pem", std::env::var("USERPROFILE").unwrap_or_default());
         println!();
         println!("Then restart your terminal or close+reopen VS Code.");
     }
@@ -494,25 +449,17 @@ fn run_drive(scenario: &str, format: &str) -> anyhow::Result<()> {
             anyhow::bail!("{fail} scenario(s) failed");
         }
     } else {
-        let outcome =
-            deeplossless::torture::driver::drive_scenario(scenario, format, &parent, verbose)
+        let outcome = deeplossless::torture::driver::drive_scenario(scenario, format, &parent, verbose)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if !outcome.success {
-            anyhow::bail!(
-                "scenario '{}' failed at state '{}'",
-                scenario,
-                outcome.terminal_state
-            );
+            anyhow::bail!("scenario '{}' failed at state '{}'", scenario, outcome.terminal_state);
         }
     }
 
     Ok(())
 }
 
-async fn run_search(
-    db_path: &str,
-    filter: deeplossless::event_store::EventFilter,
-) -> anyhow::Result<()> {
+async fn run_search(db_path: &str, filter: deeplossless::event_store::EventFilter) -> anyhow::Result<()> {
     let db = deeplossless::db::Database::builder()
         .path(db_path)
         .build()
@@ -574,16 +521,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Commands::Drive { scenario, format }) = cli.command {
         return run_drive(&scenario, &format);
     }
-    if let Some(Commands::Search {
-        event_type,
-        tool,
-        session,
-        status,
-        path,
-        content,
-        limit,
-    }) = cli.command
-    {
+    if let Some(Commands::Search { event_type, tool, session, status, path, content, limit }) = cli.command {
         use deeplossless::event_store::{EventFilter, EventType};
         let filter = EventFilter {
             event_type: event_type.as_deref().and_then(EventType::from_event_str),
@@ -628,8 +566,7 @@ async fn main() -> anyhow::Result<()> {
         }
         eprintln!("[aces] agent format: {}", cli.agent_format);
 
-        let mock_state =
-            deeplossless::torture::aces::start_mock(&scenarios, &cli.agent_format).await;
+        let mock_state = deeplossless::torture::aces::start_mock(&scenarios, &cli.agent_format).await;
         cli.upstream = "http://127.0.0.1:9000".into();
         eprintln!("[aces] proxy upstream set to mock on port 9000");
 
@@ -645,12 +582,8 @@ async fn main() -> anyhow::Result<()> {
             eprintln!();
             eprintln!("[aces] ── Run order ────────────────────────────────────");
             for (i, s) in scenarios.iter().enumerate() {
-                eprintln!(
-                    "[aces]   [{}/{}] {} — run agent with this scenario's prompt",
-                    i + 1,
-                    scenarios.len(),
-                    s
-                );
+                eprintln!("[aces]   [{}/{}] {} — run agent with this scenario's prompt",
+                    i + 1, scenarios.len(), s);
             }
             eprintln!();
             eprintln!("[aces] waiting for suite to complete (5s idle per scenario)...");
@@ -687,9 +620,7 @@ async fn main() -> anyhow::Result<()> {
         let ws = std::env::current_dir().ok();
         cli.upstream = "http://127.0.0.1:9000".into();
         eprintln!("[torture] proxy upstream set to mock on port 9000");
-        eprintln!(
-            "[torture] connect your agent via HTTP to http://127.0.0.1:8081/v1/chat/completions"
-        );
+        eprintln!("[torture] connect your agent via HTTP to http://127.0.0.1:8081/v1/chat/completions");
         eprintln!("[torture] or via HTTPS to https://127.0.0.1:8080/v1/chat/completions");
         ws
     } else {
@@ -765,9 +696,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref ws) = workspace {
         tracing::info!(workspace = %ws, "workspace identity");
     } else {
-        tracing::warn!(
-            "no workspace set — use --workspace or run from a git repo for stable conversation identity"
-        );
+        tracing::warn!("no workspace set — use --workspace or run from a git repo for stable conversation identity");
     }
 
     let cfg = deeplossless::runtime_coordinator::CoordinatorConfig {
@@ -777,15 +706,9 @@ async fn main() -> anyhow::Result<()> {
             api_key: cli.api_key,
             admin_key: cli.admin_key,
             reasoning_effort: match cli.reasoning_effort.as_str() {
-                "high" | "High" => deeplossless::protocol::ReasoningEffortMode::Override(
-                    deeplossless::protocol::ReasoningEffort::High,
-                ),
-                "max" | "Max" => deeplossless::protocol::ReasoningEffortMode::Override(
-                    deeplossless::protocol::ReasoningEffort::Max,
-                ),
-                "none" | "None" => deeplossless::protocol::ReasoningEffortMode::Override(
-                    deeplossless::protocol::ReasoningEffort::None,
-                ),
+                "high" | "High" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::High),
+                "max" | "Max" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::Max),
+                "none" | "None" => deeplossless::protocol::ReasoningEffortMode::Override(deeplossless::protocol::ReasoningEffort::None),
                 _ => deeplossless::protocol::ReasoningEffortMode::Passthrough,
             },
             dsml_parse: cli.dsml_parse,
@@ -798,11 +721,7 @@ async fn main() -> anyhow::Result<()> {
             summarizer_budget: cli.summarizer_budget,
             workspace,
             cache_normalize: !cli.no_cache_normalize,
-            lcm_context_tokens: if cli.no_lcm_context {
-                0
-            } else {
-                cli.lcm_context_tokens
-            },
+            lcm_context_tokens: if cli.no_lcm_context { 0 } else { cli.lcm_context_tokens },
         },
         runtime: deeplossless::runtime_coordinator::RuntimeConfig {
             runtime_profile: cli.runtime_profile,
@@ -831,11 +750,9 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: std::net::SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
     let addr_str = addr.to_string();
-    tracing::info!(
-        "deeplossless v{} listening on {addr_str} (built {})",
+    tracing::info!("deeplossless v{} listening on {addr_str} (built {})",
         env!("CARGO_PKG_VERSION"),
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
     tracing::info!("upstream: {upstream}");
     if coordinator.state.record.is_some() {
         tracing::info!(target: "deeplossless::record", "record flag enabled at startup");
@@ -848,15 +765,13 @@ async fn main() -> anyhow::Result<()> {
     let default_cert = format!("{tls_dir}/cert.pem");
     let default_key = format!("{tls_dir}/key.pem");
 
-    let (tls_cert_path, tls_key_path) = if let (Some(c), Some(k)) =
-        (cli.tls_cert.as_ref(), cli.tls_key.as_ref())
-    {
+    let (tls_cert_path, tls_key_path) =
+        if let (Some(c), Some(k)) = (cli.tls_cert.as_ref(), cli.tls_key.as_ref()) {
             (c.clone(), k.clone())
         } else {
             // Auto-generate self-signed cert — generated once, reused on restart.
             if !std::path::Path::new(&default_cert).exists() {
-            let cert =
-                rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
                 std::fs::write(&default_cert, cert.cert.pem())?;
                 std::fs::write(&default_key, cert.key_pair.serialize_pem())?;
                 tracing::info!("self-signed cert generated at {tls_dir}/");
@@ -864,13 +779,11 @@ async fn main() -> anyhow::Result<()> {
             (default_cert, default_key)
         };
 
-    let tls_config =
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
     tracing::info!("TLS enabled — HTTPS on {addr_str}");
-    if cli.tls_cert.is_none() && std::env::var("SSL_CERT_FILE").is_err() {
-        tracing::info!(
-            "Run `deeplossless trust` once to configure HTTPS certificate trust (sets SSL_CERT_FILE)."
-        );
+    if cli.tls_cert.is_none()
+        && std::env::var("SSL_CERT_FILE").is_err() {
+        tracing::info!("Run `deeplossless trust` once to configure HTTPS certificate trust (sets SSL_CERT_FILE).");
     }
 
     // Plain HTTP for sandboxed agents that can't trust self-signed certs (OpenClaw, etc.)
@@ -913,9 +826,7 @@ async fn main() -> anyhow::Result<()> {
             .serve(app.into_make_service())
             .await?;
     }
-    coordinator
-        .shutdown(std::time::Duration::from_secs(2))
-        .await;
+    coordinator.shutdown(std::time::Duration::from_secs(2)).await;
 
     tracing::info!("deeplossless stopped");
 
@@ -1046,9 +957,7 @@ async fn torture_start_mock() -> anyhow::Result<()> {
 
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind("127.0.0.1:9000").await {
-            Ok(listener) => {
-                axum::serve(listener, app).await.ok();
-            }
+            Ok(listener) => { axum::serve(listener, app).await.ok(); }
             Err(e) => eprintln!("[torture] failed to start mock server: {e}"),
         }
     });
@@ -1071,13 +980,8 @@ mod tests {
     #[test]
     fn tls_flags_accepted() {
         let args = Cli::try_parse_from([
-            "deeplossless",
-            "--tls-cert",
-            "/tmp/c.pem",
-            "--tls-key",
-            "/tmp/k.pem",
-        ])
-        .unwrap();
+            "deeplossless", "--tls-cert", "/tmp/c.pem", "--tls-key", "/tmp/k.pem",
+        ]).unwrap();
         assert_eq!(args.tls_cert.as_deref(), Some("/tmp/c.pem"));
         assert_eq!(args.tls_key.as_deref(), Some("/tmp/k.pem"));
     }

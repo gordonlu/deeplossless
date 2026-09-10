@@ -62,13 +62,9 @@
 //! DAG mutations (insert node + back-link to sources) must be atomic.
 //! A database transaction wraps both operations.
 
-pub mod artifacts;
-pub mod assistant_validation;
-pub mod audit;
-pub mod compaction_guard;
 #[allow(clippy::result_unit_err)]
 pub mod compactor;
-pub mod context_pack;
+pub mod compaction_guard;
 pub mod dag;
 pub mod db;
 pub mod dependency_kind;
@@ -76,43 +72,47 @@ pub mod dependency_view;
 pub mod diff_events;
 pub mod dynamic_context;
 pub mod embeddings;
+pub mod artifacts;
+pub mod assistant_validation;
+pub mod audit;
 pub mod event_store;
 pub mod execution;
 pub mod file_observation;
 pub mod ground_truth;
 pub mod ground_truth_store;
+pub mod parallel;
+pub mod provider;
+pub mod runtime;
+pub mod runtime_events;
+pub mod runtime_invariants;
+pub mod runtime_state_view;
+pub mod tool_cache;
+#[allow(unused_mut)]
+pub mod typed_fact_producer;
 pub mod metrics;
-pub mod model_error;
 pub mod motif;
 pub mod mutation;
-pub mod parallel;
 pub mod pipeline;
 pub mod protocol;
-pub mod provider;
-#[path = "proxy_native.rs"]
-pub mod proxy;
 #[path = "proxy.rs"]
 pub mod proxy_legacy;
+#[path = "proxy_native.rs"]
+pub mod proxy;
 pub mod replay;
 pub mod response_store;
 pub mod responses_projection;
 pub mod responses_stream;
-pub mod runtime;
-pub mod runtime_coordinator;
-pub mod runtime_events;
-pub mod runtime_invariants;
-pub mod runtime_state_view;
-pub mod session;
 pub mod session_store;
+pub mod runtime_coordinator;
+pub mod session;
+pub mod context_pack;
+pub mod model_error;
+pub mod think_tag;
 pub mod snapshot;
 pub mod snippet;
 pub mod summarizer;
-pub mod think_tag;
 pub mod tokenizer;
-pub mod tool_cache;
 pub mod torture;
-#[allow(unused_mut)]
-pub mod typed_fact_producer;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;

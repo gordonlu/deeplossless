@@ -1,9 +1,9 @@
-use futures::FutureExt;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::Notify;
+use futures::FutureExt;
 
 // ── Typed response schema (P0: replaces untyped Value parsing) ──────
 
@@ -135,31 +135,18 @@ pub struct SummarizerBuilder {
     shutdown_notify: Option<Arc<Notify>>,
 }
 
-impl SummarizerBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
 
-    pub fn model(mut self, model: &str) -> Self {
-        self.config.model = model.to_string();
-        self
-    }
-    pub fn upstream(mut self, url: &str) -> Self {
-        self.config.upstream = url.to_string();
-        self
-    }
-    pub fn api_key(mut self, key: &str) -> Self {
-        self.config.api_key = key.to_string();
-        self
-    }
+impl SummarizerBuilder {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn model(mut self, model: &str) -> Self { self.config.model = model.to_string(); self }
+    pub fn upstream(mut self, url: &str) -> Self { self.config.upstream = url.to_string(); self }
+    pub fn api_key(mut self, key: &str) -> Self { self.config.api_key = key.to_string(); self }
     pub fn offline_fallback_only(mut self) -> Self {
         self.config.offline_fallback_only = true;
         self
     }
-    pub fn fallback_max_tokens(mut self, n: usize) -> Self {
-        self.config.fallback_max_tokens = n;
-        self
-    }
+    pub fn fallback_max_tokens(mut self, n: usize) -> Self { self.config.fallback_max_tokens = n; self }
     pub fn reduction_threshold(mut self, t: f64) -> Self {
         self.config.reduction_threshold = t.clamp(0.0, 1.0);
         self
@@ -207,12 +194,8 @@ pub struct Summarizer {
 }
 
 impl Summarizer {
-    pub fn builder() -> SummarizerBuilder {
-        SummarizerBuilder::new()
-    }
-    pub fn config(&self) -> &SummarizerConfig {
-        &self.config
-    }
+    pub fn builder() -> SummarizerBuilder { SummarizerBuilder::new() }
+    pub fn config(&self) -> &SummarizerConfig { &self.config }
 
     /// Run the full escalation chain from Level 1 through Level 3.
     /// Guaranteed to converge (Level 3 never requires an LLM call).
@@ -232,29 +215,17 @@ impl Summarizer {
         let input_tokens = crate::tokenizer::count(text);
 
         if self.config.offline_fallback_only {
-            return Ok(self.deterministic_fallback(
-                text,
-                input_tokens,
-                "configured offline fallback",
-            ));
+            return Ok(self.deterministic_fallback(text, input_tokens, "configured offline fallback"));
         }
 
         // Budget check: cap total LLM calls to prevent runaway token burn
-        let count = self
-            .call_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count >= self.config.max_total_calls {
-            anyhow::bail!(
-                "summarizer budget exhausted ({} calls), falling to L3 deterministic",
-                count
-            );
+            anyhow::bail!("summarizer budget exhausted ({} calls), falling to L3 deterministic", count);
         }
 
         // Level 1: LLM preserve_details, target T tokens
-        let l1_fatal = match self
-            .try_level(text, SummaryLevel::Level1, input_tokens)
-            .await
-        {
+        let l1_fatal = match self.try_level(text, SummaryLevel::Level1, input_tokens).await {
             Ok(result) => return Ok(result),
             Err(e) => {
                 let fatal = !is_transient_error(&e);
@@ -283,10 +254,7 @@ impl Summarizer {
 
         // Level 2: only attempt if L1 error was transient
         if !l1_fatal {
-            match self
-                .try_level(text, SummaryLevel::Level2, input_tokens / 2)
-                .await
-            {
+            match self.try_level(text, SummaryLevel::Level2, input_tokens / 2).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     tracing::info!(
@@ -311,12 +279,7 @@ impl Summarizer {
         notify.notified().now_or_never().is_some()
     }
 
-    fn deterministic_fallback(
-        &self,
-        text: &str,
-        input_tokens: usize,
-        reason: &'static str,
-    ) -> SummaryResult {
+    fn deterministic_fallback(&self, text: &str, input_tokens: usize, reason: &'static str) -> SummaryResult {
         let truncated = self.truncate(text);
         let out_tokens = crate::tokenizer::count(&truncated);
         tracing::debug!(
@@ -403,9 +366,7 @@ impl Summarizer {
         let mode = match level {
             SummaryLevel::Level1 => "preserve_details",
             SummaryLevel::Level2 => "bullet_points",
-            SummaryLevel::Level3 => {
-                return Err(anyhow::anyhow!("Level3 should not reach llm_summarize"));
-            }
+            SummaryLevel::Level3 => return Err(anyhow::anyhow!("Level3 should not reach llm_summarize")),
         };
 
         let prompt = self.build_prompt(mode, target_tokens, text);
@@ -424,8 +385,8 @@ impl Summarizer {
         // Adaptive timeout: base + per-1000-tokens scaling, clamped (P0-4)
         let input_chars = text.chars().count();
         let estimated_input_tokens = input_chars / 3; // rough ~3 chars/token
-        let timeout_secs =
-            self.config.base_timeout_secs + (estimated_input_tokens as u64 / 1000) * 10;
+        let timeout_secs = self.config.base_timeout_secs
+            + (estimated_input_tokens as u64 / 1000) * 10;
         let timeout = Duration::from_secs(timeout_secs.min(120));
 
         let max_retries = self.config.max_retries;
@@ -456,16 +417,13 @@ impl Summarizer {
                     let status = resp.status();
                     // Capture headers before reading body (headers are available immediately)
                     let resp_headers = resp.headers().clone();
-                    let content_length = resp_headers
-                        .get("content-length")
+                    let content_length = resp_headers.get("content-length")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("-");
-                    let transfer_encoding = resp_headers
-                        .get("transfer-encoding")
+                    let transfer_encoding = resp_headers.get("transfer-encoding")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("-");
-                    let content_type = resp_headers
-                        .get("content-type")
+                    let content_type = resp_headers.get("content-type")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("-");
                     if status.is_success() {
@@ -489,9 +447,7 @@ impl Summarizer {
                         }
                         match serde_json::from_slice::<ChatCompletionResponse>(&body_bytes) {
                             Ok(parsed) => {
-                                if let Some(content) = parsed
-                                    .choices
-                                    .first()
+                                if let Some(content) = parsed.choices.first()
                                     .and_then(|c| c.message.content.as_deref())
                                 {
                                     tracing::debug!(
@@ -501,14 +457,13 @@ impl Summarizer {
                                     );
                                     return Ok(content.to_string());
                                 }
-                                last_error =
-                                    Some(anyhow::anyhow!("empty choice content in response"));
+                                last_error = Some(anyhow::anyhow!(
+                                    "empty choice content in response"
+                                ));
                             }
                             Err(e) => {
                                 let preview: String = String::from_utf8_lossy(&body_bytes)
-                                    .chars()
-                                    .take(500)
-                                    .collect();
+                                    .chars().take(500).collect();
                                 tracing::warn!(
                                     target = "deeplossless::summarizer",
                                     meta = ?meta,
@@ -525,12 +480,7 @@ impl Summarizer {
                         }
                     } else if status.as_u16() == 429 {
                         // Rate limited — full-jitter exponential backoff
-                        let delay_ms = crate::runtime::full_jitter_backoff(
-                            2000,
-                            60000,
-                            attempt,
-                            jitter_seed(),
-                        );
+                        let delay_ms = crate::runtime::full_jitter_backoff(2000, 60000, attempt, jitter_seed());
                         let delay = Duration::from_millis(delay_ms);
                         tracing::warn!(
                             target = "deeplossless::summarizer",
@@ -544,9 +494,7 @@ impl Summarizer {
                     } else {
                         let body_bytes = resp.bytes().await.unwrap_or_default();
                         let preview: String = String::from_utf8_lossy(&body_bytes)
-                            .chars()
-                            .take(300)
-                            .collect();
+                            .chars().take(300).collect();
                         tracing::warn!(
                             target = "deeplossless::summarizer",
                             meta = ?meta,
@@ -555,7 +503,9 @@ impl Summarizer {
                             body_preview = %preview,
                             "upstream error"
                         );
-                        last_error = Some(anyhow::anyhow!("HTTP {status}: {preview}"));
+                        last_error = Some(anyhow::anyhow!(
+                            "HTTP {status}: {preview}"
+                        ));
                     }
                 }
                 Err(e) => {
@@ -566,12 +516,7 @@ impl Summarizer {
                         "request failed"
                     );
                     if e.is_timeout() || e.is_connect() {
-                        let delay_ms = crate::runtime::full_jitter_backoff(
-                            1000,
-                            30000,
-                            attempt,
-                            jitter_seed(),
-                        );
+                        let delay_ms = crate::runtime::full_jitter_backoff(1000, 30000, attempt, jitter_seed());
                         let delay = Duration::from_millis(delay_ms);
                         tokio::time::sleep(delay).await;
                         last_error = Some(anyhow::anyhow!("{e}"));
@@ -583,11 +528,9 @@ impl Summarizer {
             break;
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!(
             "Level 1 & 2 unavailable after {max_retries} attempts, using Level 3 truncation"
-            )
-        }))
+        )))
     }
 
     /// Token-aware truncation (P0-5): preserves head and tail by actual
@@ -635,9 +578,7 @@ impl Summarizer {
             "token-aware truncation"
         );
 
-        let result = format!(
-            "{head}\n…(truncated, {total_tokens}→{head_tokens}+{tail_tokens} tokens)\n{tail}"
-        );
+        let result = format!("{head}\n…(truncated, {total_tokens}→{head_tokens}+{tail_tokens} tokens)\n{tail}");
 
         // Strict invariant: fallback output must not exceed input length (P0-9).
         let max_chars = text.chars().count();
@@ -761,19 +702,10 @@ mod tests {
     fn level3_truncation_short_text() {
         let s = Summarizer::builder().api_key("sk-test").build().unwrap();
         let text = "short text";
-        let result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(s.summarize_escalate(text))
-            .unwrap();
-        assert!(
-            result.level == SummaryLevel::Level3,
-            "expected level3, got {:?}",
-            result.level
-        );
-        assert!(
-            result.text.len() <= text.len(),
-            "result should fit within input length"
-        );
+        let result =
+            tokio::runtime::Runtime::new().unwrap().block_on(s.summarize_escalate(text)).unwrap();
+        assert!(result.level == SummaryLevel::Level3, "expected level3, got {:?}", result.level);
+        assert!(result.text.len() <= text.len(), "result should fit within input length");
     }
 
     #[test]
@@ -784,14 +716,9 @@ mod tests {
             .build()
             .unwrap();
         let long = "hello world this is a long message that should be truncated because it exceeds the max token limit";
-        let result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(s.summarize_escalate(long))
-            .unwrap();
-        assert!(
-            result.text.contains("(truncated"),
-            "should have truncation marker"
-        );
+        let result =
+            tokio::runtime::Runtime::new().unwrap().block_on(s.summarize_escalate(long)).unwrap();
+        assert!(result.text.contains("(truncated"), "should have truncation marker");
     }
 
     #[test]
