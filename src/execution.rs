@@ -374,39 +374,9 @@ impl ExecutionUnit {
         tool_call_id: &str,
     ) -> Self {
         let tool_args_json = serde_json::from_str(tool_args).ok();
-        let reasoning_steps = {
-            let mut steps = Vec::new();
-            if !reasoning_before.is_empty() {
-                let kind = match &outcome {
-                    ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked =>
-                        ReasoningKind::Failure,
-                    ExecutionOutcome::CacheHit | ExecutionOutcome::Replayed =>
-                        ReasoningKind::Validation,
-                    _ => ReasoningKind::Assumption,
-                };
-                steps.push(ReasoningStep {
-                    kind,
-                    content: reasoning_before.chars().take(300).collect(),
-                    execution_unit_id: None,
-                    derived_from: vec![],
-                });
-            }
-            if !reasoning_after.is_empty() {
-                let kind = match &outcome {
-                    ExecutionOutcome::Success => ReasoningKind::Resolution,
-                    ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked =>
-                        ReasoningKind::Hypothesis,
-                    _ => ReasoningKind::Validation,
-                };
-                steps.push(ReasoningStep {
-                    kind,
-                    content: reasoning_after.chars().take(300).collect(),
-                    execution_unit_id: None,
-                    derived_from: vec![],
-                });
-            }
-            steps
-        };
+        // Free-form model reasoning is evidence, not typed execution truth.
+        // Semantic labels require explicit evidence from the typed fact / validation pipeline.
+        let reasoning_steps = Vec::new();
 
         Self {
             id: 0,
@@ -443,6 +413,20 @@ impl ExecutionUnit {
             if after.is_empty() { "(none)" } else { &after },
         )
     }
+}
+
+fn parse_exit_code(text: &str) -> Option<i32> {
+    for marker in ["exit code", "exit_code", "exit status", "exit_status"] {
+        if let Some(pos) = text.find(marker) {
+            let tail = &text[pos + marker.len()..];
+            let token = tail
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '('))
+                .split(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';'))
+                .next()?;
+            if let Ok(code) = token.parse::<i32>() { return Some(code); }
+        }
+    }
+    None
 }
 
 /// Group normalized messages into execution units.
@@ -485,13 +469,15 @@ pub fn group_execution_chain(
                 }
                 last_tool_end = j; // remember furthest advance
 
-                // Infer outcome from result using structured patterns
+                // Infer outcome from result using structured patterns.
+                // An explicit zero exit code is success; only non-zero codes are failures.
                 let outcome = {
                     let lower = tool_result.to_lowercase();
+                    let nonzero_exit = parse_exit_code(&lower).is_some_and(|code| code != 0);
                     if tool_result.contains("Error:") || tool_result.contains("error:")
                         || tool_result.contains("error[") || tool_result.contains("Error[")
                         || tool_result.contains("\nerror") || tool_result.starts_with("error")
-                        || lower.contains("failed:") || lower.contains("exit code")
+                        || lower.contains("failed:") || nonzero_exit
                         || lower.contains("timed out") || lower.contains("permission denied")
                         || lower.contains("not found") || lower.starts_with("err:")
                     {

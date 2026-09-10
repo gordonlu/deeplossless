@@ -389,39 +389,12 @@ pub fn is_cacheable(tool_name: &str) -> bool {
     is_interceptable(tool_name)
 }
 
-/// Transform a cached result before injecting it into the stream.
-/// For read_file/list_files, extracts a structured summary (symbols, line count)
-/// instead of dumping raw file content into the conversation.
-/// For grep/search/diagnostics, returns the raw result unchanged.
-pub fn transform_result(tool_name: &str, raw_result: &str) -> String {
-    let kind = ToolKind::from_name(tool_name);
-    match kind {
-        ToolKind::ReadFile => {
-            let line_count = raw_result.lines().count();
-            let preview: String = raw_result.lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(3)
-                .map(|l| l.trim().chars().take(80).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if preview.is_empty() {
-                format!("[cached] {line_count} lines")
-            } else {
-                format!("[cached] {line_count} lines:\n{preview}")
-            }
-        }
-        ToolKind::ListFiles => {
-            let count = raw_result.lines().filter(|l| !l.trim().is_empty()).count();
-            let preview: String = raw_result.lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(5)
-                .map(|l| l.trim().chars().take(60).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("[cached] {count} entries:\n{preview}")
-        }
-        _ => raw_result.to_string(),
-    }
+/// Return the exact cached tool result.
+///
+/// Cache reuse is an execution optimization, not a context-compression step.
+/// A cache hit must preserve the observable semantics of executing the tool.
+pub fn transform_result(_tool_name: &str, raw_result: &str) -> String {
+    raw_result.to_string()
 }
 
 /// Convenience: compute cache key tuple `(tool_name, args_hash)`.
@@ -792,54 +765,25 @@ mod tests {
         assert!(!files.iter().any(|f| f.contains("--")));
     }
 
-    // ── Transform ─────────────────────────────────────────────────────
+    // ── Transform / exact replay ───────────────────────────────────────
 
     #[test]
-    fn transform_read_file_counts_lines() {
-        let result = transform_result("read_file", "pub fn foo() {\n    let x = 1;\n}\n\npub struct Bar {\n    x: i32,\n}\n\nfn baz() {}");
-        assert!(result.starts_with("[cached]"));
-        assert!(result.contains("lines"));
+    fn transform_read_file_preserves_exact_result() {
+        let raw = "pub fn foo() {\n    let x = 1;\n}\n";
+        assert_eq!(transform_result("read_file", raw), raw);
     }
 
     #[test]
-    fn transform_read_file_empty_is_safe() {
-        assert_eq!(transform_result("read_file", ""), "[cached] 0 lines");
-    }
-
-    #[test]
-    fn transform_list_files_bounded_preview() {
-        let result = transform_result("list_files", "src/main.rs\nsrc/lib.rs\n.git/config\nnode_modules/react/index.js\nCargo.toml");
-        assert!(result.starts_with("[cached]"), "got: {result}");
-        assert!(result.contains("entries"), "got: {result}");
-        // Preview shows first 5 non-empty lines — bounded, not parsed
-        assert!(result.contains("src/main.rs"), "preview should show first lines: {result}");
-        assert!(result.contains("Cargo.toml"), "preview should show first lines: {result}");
-    }
-
-    #[test]
-    fn transform_read_file_bounded_preview() {
-        let content = "line1\nline2\nline3\nline4\nline5\nline6";
-        let result = transform_result("read_file", content);
-        assert!(result.starts_with("[cached]"), "got: {result}");
-        assert!(result.contains("lines"), "got: {result}");
-        // Shows first 3 non-empty lines as preview
-        assert!(result.contains("line1"), "preview should show first lines: {result}");
-        // Line 6 should NOT appear (only first 3 lines)
-        assert!(!result.contains("line6"), "preview should be bounded: {result}");
-    }
-
-    #[test]
-    fn transform_grep_passes_through() {
-        let raw = "src/main.rs:42: found foo";
-        assert_eq!(transform_result("grep", raw), raw);
+    fn transform_list_files_preserves_all_entries() {
+        let raw = "a\nb\nc\nd\ne\nf\n";
+        assert_eq!(transform_result("list_files", raw), raw);
     }
 
     #[test]
     fn transform_result_never_panics_on_weird_input() {
-        transform_result("read_file", &"x".repeat(10000));
-        transform_result("list_files", "\0\n\x01\n\x02");
-        transform_result("grep", "\n\n\n");
-        transform_result("unknown_tool", "anything");
+        let raw = "\0\n\x01\n\x02";
+        assert_eq!(transform_result("read_file", raw), raw);
+        assert_eq!(transform_result("unknown_tool", raw), raw);
     }
 
     // ── L2 invalidation ───────────────────────────────────────────────

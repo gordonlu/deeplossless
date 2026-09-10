@@ -44,7 +44,7 @@ pub(crate) struct Cli {
     admin_key: Option<String>,
 
     /// Model used for background summarization (Level 1 & 2 LLM calls).
-    #[arg(long, default_value = "deepseek-v4-pro", env = "SUMMARIZER_MODEL")]
+    #[arg(long, default_value = "deepseek-flash", env = "SUMMARIZER_MODEL")]
     summarizer_model: String,
 
     /// Max requests per second (0 to disable rate limiting).

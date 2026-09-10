@@ -115,7 +115,7 @@ pub struct SummarizerConfig {
 impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
             upstream: "https://api.deepseek.com".to_string(),
             upstream_path: "/v1/chat/completions".to_string(),
             api_key: String::new(),
