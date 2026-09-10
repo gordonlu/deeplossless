@@ -188,7 +188,8 @@ pub struct ExecutionResult {
 pub struct RuntimeStrategy {
     pub profile: RuntimeProfile,
 
-    /// How aggressively to reuse cache (0.0 = never, 1.0 = always if available).
+    /// Legacy compatibility knob. Built-in deterministic cache reuse no longer uses
+    /// profile-dependent aggressiveness; validity/freshness gates reuse instead.
     pub cache_aggressiveness: f64,
 
     /// Maximum retries for the same failure before blocking.
@@ -197,13 +198,15 @@ pub struct RuntimeStrategy {
     /// Whether to allow speculative/reasoning-heavy paths.
     pub allow_speculative: bool,
 
-    /// How much context to inject (0.0 = minimal delta only, 1.0 = full context).
+    /// Legacy compatibility knob. Working-context selection is driven by provenance,
+    /// state relevance, and hard resource limits rather than a profile personality.
     pub context_injection_ratio: f64,
 
     /// Whether to freeze plans early (don't re-plan on minor changes).
     pub freeze_plans_early: bool,
 
-    /// Token budget as fraction of total window.
+    /// Legacy compatibility knob. Token budget is a resource/safety limit, not a
+    /// decision-quality signal in the default runtime policy.
     pub token_budget_ratio: f64,
 }
 
@@ -423,7 +426,8 @@ pub struct RuntimeDecisionRecord {
     /// Examples: "success", "cache_invalidated", "failure_repeated".
     pub outcome: Option<String>,
 
-    /// Estimated token saving at decision time.
+    /// Legacy telemetry field retained for wire/DB compatibility. Built-in policy
+    /// ranking does not use this value as a decision-quality signal.
     pub estimated_token_saving: u64,
 
     /// Actual token saving after execution (measured, not estimated).
@@ -489,25 +493,18 @@ impl DecisionOutcome {
 pub struct DecisionEvaluation;
 
 impl DecisionEvaluation {
-    /// Evaluate a decision outcome based on action type and execution results.
+    /// Evaluate a decision outcome from observed execution behavior.
     ///
-    /// * `action` — action variant name (from [`RuntimeAction::variant_name`])
-    /// * `estimated_tokens` — estimated token saving at decision time
-    /// * `actual_tokens` — actual tokens consumed during execution
-    /// * `failure_repeated` — whether the same failure pattern recurred (retries)
+    /// Token counts are retained as telemetry for compatibility, but are not used to
+    /// decide whether an action was correct. Callers should record explicit invalidation
+    /// or failure evidence when an optimization is semantically wrong.
     pub fn evaluate(
-        action: &str,
+        _action: &str,
         estimated_tokens: u64,
         actual_tokens: u64,
         failure_repeated: bool,
     ) -> DecisionOutcome {
-        let success = match action {
-            "ReuseToolCache" => actual_tokens < estimated_tokens,
-            "RetryWithFix" => !failure_repeated,
-            "ContinuePlan" => !failure_repeated,
-            "CompactAndProceed" => actual_tokens < estimated_tokens / 2,
-            _ => !failure_repeated,
-        };
+        let success = !failure_repeated;
         DecisionOutcome { success, estimated_tokens, actual_tokens, failure_repeated }
     }
 
@@ -537,7 +534,8 @@ pub struct RuntimeDecision {
     /// The recommended action.
     pub action: RuntimeAction,
 
-    /// Estimated token savings if this decision is accepted.
+    /// Legacy telemetry field retained for API compatibility. Built-in decisions do
+    /// not rank or validate actions from speculative token-saving estimates.
     pub estimated_token_saving: u64,
 
     /// Confidence in this recommendation (0.0–1.0).
@@ -587,7 +585,7 @@ impl RuntimeDecision {
                 failure_id,
                 suggested_fix: fix.to_string(),
             },
-            estimated_token_saving: fix.len() as u64 * 10, // rough estimate
+            estimated_token_saving: 0,
             confidence: if fix.is_empty() { 0.3 } else { 0.7 },
             reason: format!("known failure pattern — suggested fix: {fix}"),
             evidence: vec![],
@@ -600,7 +598,7 @@ impl RuntimeDecision {
                 step_index: step_idx,
                 step_description: step_desc.to_string(),
             },
-            estimated_token_saving: 500, // save one planning round
+            estimated_token_saving: 0,
             confidence: 0.85,
             reason: "active plan has pending steps".to_string(),
             evidence: vec![],
@@ -610,7 +608,7 @@ impl RuntimeDecision {
     pub fn compact_and_proceed() -> Self {
         Self {
             action: RuntimeAction::CompactAndProceed,
-            estimated_token_saving: 1000,
+            estimated_token_saving: 0,
             confidence: 0.6,
             reason: "token budget critical — compacting context".to_string(),
             evidence: vec![],
@@ -1121,12 +1119,12 @@ impl DecisionRule for CacheReuseRule {
     fn name(&self) -> &'static str { "cache_reuse" }
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
         let hit = state.cache_hit.as_ref()?;
-        let confidence = RuntimeStrategy::from_profile(state.profile).cache_aggressiveness;
-        if confidence <= 0.3 { return None; }
+        // A cache candidate reaches this rule only after deterministic validity/freshness
+        // checks. Runtime profile must not downgrade exact reuse.
         Some(DecisionCandidate {
             decision: RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving),
-            score: confidence,
-            evidence: vec![format!("cache hit for {} (id={}, est_save={})", hit.tool_name, hit.cache_id, hit.estimated_token_saving)],
+            score: 0.95,
+            evidence: vec![format!("valid deterministic cache hit for {} (id={})", hit.tool_name, hit.cache_id)],
         })
     }
 }
@@ -1772,13 +1770,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_confidence_scales_with_strategy() {
+    fn valid_cache_hit_is_profile_independent() {
         let s_min = RuntimeState { profile: RuntimeProfile::Minimal, ..make_state(RuntimeProfile::Minimal, None, None, None) };
         let s_auto = RuntimeState { profile: RuntimeProfile::Autonomous, ..make_state(RuntimeProfile::Autonomous, None, None, None) };
         let d1 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_min });
-        assert!(d1.confidence > 0.8, "minimal should be confident about cache");
         let d2 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_auto });
-        assert!(d2.confidence < d1.confidence, "autonomous should be less aggressive about cache");
+        assert!(matches!(d1.action, RuntimeAction::ReuseToolCache { .. }));
+        assert!(matches!(d2.action, RuntimeAction::ReuseToolCache { .. }));
+        assert!((d1.confidence - d2.confidence).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1878,9 +1877,9 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_cache_reuse_mismatch() {
+    fn token_estimate_does_not_define_cache_success() {
         let outcome = DecisionEvaluation::evaluate("ReuseToolCache", 500, 500, false);
-        assert!(!outcome.success);
+        assert!(outcome.success);
         assert_eq!(outcome.net_saving(), 0);
     }
 
@@ -1897,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_compact_effective() {
+    fn compact_success_is_not_inferred_from_token_ratio() {
         let outcome = DecisionEvaluation::evaluate("CompactAndProceed", 1000, 150, false);
         assert!(outcome.success);
         assert_eq!(outcome.net_saving(), 850);

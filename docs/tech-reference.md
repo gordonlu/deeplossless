@@ -19,10 +19,10 @@ between your client and the DeepSeek API:
 
 | Component | Role |
 |-----------|------|
-| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation. Zero-token reuse for grep/read_file/search |
-| **Failure Memory** | Stores failed reasoning paths (`why_failed` + `invalidated_assumptions`), not just error strings. Prevents error loop token waste |
+| **Tool Result Cache** | Deterministic `hash(tool + args)` cache with partial file-based invalidation and exact result replay for valid read/search hits |
+| **Failure Memory** | Stores source-backed failure evidence (`why_failed` + `invalidated_assumptions`) for the current model; historical fixes are not automatically prescribed |
 | **Plan Persistence** | Execution state (goal, steps, assumptions), not plan text. Avoids repeated planning |
-| **Execution Units** | Agent memory atoms: `think → act → observe → reflect` cycles with outcome inference |
+| **Execution Units** | Agent execution atoms (`think → act → observe → reflect`) with observed outcomes; free-form reasoning is retained as evidence rather than auto-labelled typed truth |
 | **Runtime Policy** | Advisory decisions based on grounded execution state; model autonomy remains the default fallback |
 | **Event Sourcing** | Append-only execution_events table — every StreamEvent persisted for replay |
 | **Replay Engine** | Deterministic reconstruction of execution sequences from event log |
@@ -94,29 +94,9 @@ Flags flow through: `CLI → CoordinatorConfig → AppState → CanonicalRequest
 - **Incremental reasoning is more scalable than ever-growing context.**
 - **Inspired more by incremental compilation than traditional chat memory.**
 
-## Runtime Strategies
+## Runtime Profiles
 
-The runtime policy layer is **advisory and configurable**: users can prioritize
-token efficiency, exploratory reasoning, or autonomous execution depending on
-workload. The agent/UI can accept, ignore, or override each recommendation.
-
-| Profile | Cache | Retries | Speculative | Context | Freeze Plans | Token Budget |
-|---------|-------|---------|-------------|---------|-------------|-------------|
-| **Minimal** | 100% | 1 | No | 20% | Yes | 30% |
-| **Efficient** | 80% | 2 | No | 50% | No | 60% |
-| **Exploratory** | 50% | 3 | Yes | 80% | No | 80% |
-| **Autonomous** | 30% | 5 | Yes | 100% | No | 95% |
-| **Custom** | user-defined | user-defined | user-defined | user-defined | user-defined | user-defined |
-
-Custom profile config via environment:
-```
-RUNTIME_CACHE=0-1
-RUNTIME_RETRIES=0-10
-RUNTIME_SPECULATIVE=true|false
-RUNTIME_CONTEXT=0-1
-RUNTIME_FREEZE=true|false
-RUNTIME_BUDGET=0.1-1
-```
+Runtime profiles remain for configuration/backward compatibility, but the default policy no longer treats token-budget percentage or profile-specific context volume as decision-quality signals. Valid deterministic cache hits are reused independently of profile; Plan continuation/replan decisions are grounded in execution state and resource invalidation. Working-context size is a resource limit, not an autonomy personality.
 
 ## API Reference
 
@@ -125,13 +105,13 @@ RUNTIME_BUDGET=0.1-1
 ```
 GET  /v1/models                    — List available models (auto-mapped)
 POST /v1/chat/completions          — OpenAI-compatible proxy, SSE streaming, DAG context injected
-POST /v1/responses                 — Responses API → Chat Completions (enables Codex + DeepSeek)
+POST /v1/responses                 — Native DeepSeek Responses transport; local state/projection handling; legacy Chat fallback only on unsupported providers
 GET  /v1/responses/{response_id}   — Retrieve a stored response by ID
 POST /v1/lcm/chat/completions      — Chat completions with DAG context injection
 POST /v1/lcm/inject                — Inject DAG context into messages array
 ```
 
-Model names are auto-mapped: `gpt-5*` → `deepseek-v4-pro`, `gpt-*-mini` → `deepseek-v4-flash`.
+Generic OpenAI-style model names are mapped to current DeepSeek aliases; explicit DeepSeek model names are preserved for upstream routing.
 
 ### Memory
 
