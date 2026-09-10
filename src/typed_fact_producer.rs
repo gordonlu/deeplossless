@@ -1,9 +1,9 @@
 //! Conservative automatic production of typed execution facts.
 //!
-//! Facts are derived only from exact provider items already persisted in the
-//! Ground Truth ledger.  The producer deliberately avoids free-form LLM
-//! extraction: it emits facts only when the tool contract or a machine-readable
-//! result gives us something deterministic to say.
+//! Facts are derived only from exact tool outputs persisted in the Ground Truth
+//! ledger. The producer deliberately avoids free-form LLM extraction: it emits
+//! facts only when the tool contract or a machine-readable result gives us
+//! something deterministic to say.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,16 +11,9 @@ use serde_json::Value;
 
 use crate::db::Database;
 use crate::file_observation::{observe_file, FileObservation};
-use crate::ground_truth::{ExecutionFact, PlanFactDependency, ResourceRef, SourceRef, TruthStream};
+use crate::ground_truth::{ExecutionFact, PlanFactDependency, ResourceRef, TruthStream};
 use crate::ground_truth_store::GroundTruthStore;
 use crate::tool_cache::{extract_dependent_files, ToolKind};
-
-/// Exact evidence for one item in the current Responses `input` array.
-#[derive(Debug, Clone)]
-pub struct ItemEvidence {
-    pub item_index: usize,
-    pub source: SourceRef,
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutoFactReport {
@@ -42,14 +35,9 @@ pub fn produce_from_responses_items(
     conv_id: i64,
     history: &[Value],
     current_items: &[Value],
-    evidence: &[ItemEvidence],
 ) -> anyhow::Result<AutoFactReport> {
     let store = GroundTruthStore::new(db);
     let mut report = AutoFactReport::default();
-    let evidence_by_index: HashMap<usize, SourceRef> = evidence
-        .iter()
-        .map(|item| (item.item_index, item.source.clone()))
-        .collect();
 
     let mut existing_facts: HashMap<String, ExecutionFact> = store
         .load_execution_facts(session_id)?
@@ -75,20 +63,15 @@ pub fn produce_from_responses_items(
         None => HashSet::new(),
     };
 
-    for (index, item) in current_items.iter().enumerate() {
+    for item in current_items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         if !matches!(item_type, "function_call_output" | "custom_tool_call_output") {
             continue;
         }
-        let Some(source) = evidence_by_index.get(&index).cloned() else {
-            // No immutable source means no typed fact. Never create an
-            // authoritative-looking projection from unmaterializable evidence.
-            continue;
-        };
         let Some(call_id) = item.get("call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
             continue;
         };
-        let Some(call) = find_call(history, call_id) else {
+        let Some(call) = find_call(history, current_items, call_id) else {
             continue;
         };
         let name = call.get("name").and_then(Value::as_str).unwrap_or("");
@@ -100,6 +83,17 @@ pub fn produce_from_responses_items(
         if output.is_empty() {
             continue;
         }
+
+        // Store a dedicated exact tool-payload copy. ProviderItems remains the
+        // transport ledger; ToolPayloads is the semantic evidence stream used
+        // by typed facts. Both are immutable and independently materializable.
+        let source = store.put_json(
+            TruthStream::ToolPayloads,
+            session_id,
+            item,
+            if item_type.is_empty() { "tool-output" } else { item_type },
+        )?;
+
         let kind = ToolKind::from_name(name);
         let paths = extract_dependent_files(name, &args);
 
@@ -164,7 +158,10 @@ pub fn produce_from_responses_items(
                 for symbol in plan_relevant_symbols(&obs, &plan_text).into_iter().take(32) {
                     let mut symbol_fact = ExecutionFact::new(
                         format!("symbol:{}::{symbol}", obs.path),
-                        format!("Symbol {symbol} is present in {} at content version {}.", obs.path, obs.content_hash),
+                        format!(
+                            "Symbol {symbol} is present in {} at content version {}.",
+                            obs.path, obs.content_hash
+                        ),
                     );
                     symbol_fact.evidence.push(obs_source.clone());
                     symbol_fact.resources.push(ResourceRef::Symbol {
@@ -187,7 +184,7 @@ pub fn produce_from_responses_items(
                             plan_id: id,
                             step_index: Some(0),
                             fact_id: symbol_fact.id,
-                            required: current_step.contains(&symbol),
+                            required: current_step.contains(symbol.as_str()),
                         },
                         &mut report,
                     )?;
@@ -197,7 +194,7 @@ pub fn produce_from_responses_items(
         }
 
         // For shell/terminal execution, only emit a semantic fact when the
-        // result contains an explicit machine-readable exit code.  We do not
+        // result contains an explicit machine-readable exit code. We do not
         // infer success/failure from prose such as "looks good".
         if kind == ToolKind::Bash {
             if let Some(exit_code) = parse_exit_code(&output) {
@@ -216,7 +213,7 @@ pub fn produce_from_responses_items(
             continue;
         }
 
-        // Deterministic read/search/diagnostic tools can safely establish the
+        // Deterministic search/diagnostic tools can safely establish the
         // existence of exact evidence without interpreting its semantic meaning.
         if matches!(kind, ToolKind::Grep | ToolKind::ListFiles | ToolKind::SymbolSearch | ToolKind::Diagnostics)
             && !paths.is_empty()
@@ -289,17 +286,21 @@ fn persist_dependency_if_new(
     Ok(())
 }
 
-fn find_call<'a>(history: &'a [Value], call_id: &str) -> Option<&'a Value> {
-    history.iter().rev().find(|item| {
-        matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("function_call") | Some("custom_tool_call")
-        ) && item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .or_else(|| item.get("id").and_then(Value::as_str))
-            == Some(call_id)
-    })
+fn find_call<'a>(history: &'a [Value], current: &'a [Value], call_id: &str) -> Option<&'a Value> {
+    current
+        .iter()
+        .rev()
+        .chain(history.iter().rev())
+        .find(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call") | Some("custom_tool_call")
+            ) && item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                == Some(call_id)
+        })
 }
 
 fn call_arguments(call: &Value) -> String {
@@ -429,7 +430,12 @@ mod tests {
             .unwrap();
         let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
         let plan_id = db
-            .store_plan(conv_id, "fix config loader", &["inspect src/config.rs ConfigLoader".into()], &[])
+            .store_plan_state(
+                conv_id,
+                "fix config loader",
+                &["inspect src/config.rs ConfigLoader".into()],
+                &[],
+            )
             .unwrap();
 
         let call = json!({
@@ -443,22 +449,18 @@ mod tests {
             "call_id":"call_1",
             "output":"pub struct ConfigLoader;\nfn load() {}"
         });
-        let truth = GroundTruthStore::new(&db);
-        let source = truth
-            .put_json(TruthStream::ProviderItems, "s1", &output, "function_call_output")
-            .unwrap();
         let report = produce_from_responses_items(
             &db,
             "s1",
             conv_id,
             &[call, output.clone()],
             std::slice::from_ref(&output),
-            &[ItemEvidence { item_index: 0, source }],
         )
         .unwrap();
 
         assert!(report.facts_created >= 2, "file + plan-relevant symbol fact");
         assert_eq!(report.file_observations_created, 1);
+        let truth = GroundTruthStore::new(&db);
         let facts = truth.load_execution_facts("s1").unwrap();
         assert!(facts.iter().any(|fact| fact.id == "file:src/config.rs"));
         assert!(facts.iter().any(|fact| fact.id == "symbol:src/config.rs::ConfigLoader"));
@@ -476,21 +478,58 @@ mod tests {
             .await
             .unwrap();
         let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
-        db.store_plan(conv_id, "fix loader", &["inspect src/config.rs ConfigLoader".into()], &[])
-            .unwrap();
+        db.store_plan_state(
+            conv_id,
+            "fix loader",
+            &["inspect src/config.rs ConfigLoader".into()],
+            &[],
+        )
+        .unwrap();
+
         let call = json!({"type":"function_call","call_id":"c1","name":"read_file","arguments":"{\"path\":\"src/config.rs\"}"});
         let out1 = json!({"type":"function_call_output","call_id":"c1","output":"pub struct ConfigLoader;"});
-        let truth = GroundTruthStore::new(&db);
-        let src1 = truth.put_json(TruthStream::ProviderItems, "s1", &out1, "out").unwrap();
-        produce_from_responses_items(&db, "s1", conv_id, &[call.clone(), out1.clone()], std::slice::from_ref(&out1), &[ItemEvidence{item_index:0,source:src1}]).unwrap();
+        produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call.clone(), out1.clone()],
+            std::slice::from_ref(&out1),
+        )
+        .unwrap();
 
         let call2 = json!({"type":"function_call","call_id":"c2","name":"read_file","arguments":"{\"path\":\"src/config.rs\"}"});
         let out2 = json!({"type":"function_call_output","call_id":"c2","output":"pub struct ConfigLoader { pub enabled: bool }"});
-        let src2 = truth.put_json(TruthStream::ProviderItems, "s1", &out2, "out").unwrap();
-        let report = produce_from_responses_items(&db, "s1", conv_id, &[call, out1, call2, out2.clone()], std::slice::from_ref(&out2), &[ItemEvidence{item_index:0,source:src2}]).unwrap();
+        let report = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call, out1, call2, out2.clone()],
+            std::slice::from_ref(&out2),
+        )
+        .unwrap();
         assert!(report.facts_invalidated >= 1);
+        let truth = GroundTruthStore::new(&db);
         let facts = truth.load_execution_facts("s1").unwrap();
         let file_fact = facts.iter().find(|fact| fact.id == "file:src/config.rs").unwrap();
         assert_eq!(file_fact.status, crate::ground_truth::FactStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn shell_fact_requires_explicit_exit_code() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("shell-facts.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        let call = json!({"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
+        let vague = json!({"type":"function_call_output","call_id":"c1","output":"tests look successful"});
+        let report = produce_from_responses_items(&db, "s1", conv_id, &[call.clone(), vague.clone()], std::slice::from_ref(&vague)).unwrap();
+        assert_eq!(report.facts_created, 0);
+
+        let exact = json!({"type":"function_call_output","call_id":"c1","output":"Process exited with code 0\nFinal output:\nok"});
+        let report = produce_from_responses_items(&db, "s1", conv_id, &[call, exact.clone()], std::slice::from_ref(&exact)).unwrap();
+        assert_eq!(report.facts_created, 1);
     }
 }
