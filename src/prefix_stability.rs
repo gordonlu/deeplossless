@@ -10,7 +10,9 @@ pub struct StabilityConfig {
 
 impl Default for StabilityConfig {
     fn default() -> Self {
-        Self { prefix_char_count: 100 }
+        Self {
+            prefix_char_count: 100,
+        }
     }
 }
 
@@ -58,43 +60,68 @@ impl PrefixStabilityChecker {
     /// Compute a token-level diff between old and new text.
     pub fn diff(&self, old: &str, new: &str) -> Vec<DiffOp> {
         if old == new {
-            return vec![DiffOp::Equal { text: old.to_string() }];
+            return vec![DiffOp::Equal {
+                text: old.to_string(),
+            }];
         }
         if old.is_empty() {
-            return vec![DiffOp::Insert { text: new.to_string() }];
+            return vec![DiffOp::Insert {
+                text: new.to_string(),
+            }];
         }
         if new.is_empty() {
-            return vec![DiffOp::Delete { text: old.to_string() }];
+            return vec![DiffOp::Delete {
+                text: old.to_string(),
+            }];
         }
 
         // Find common prefix
-        let prefix_len = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
+        let prefix_len = old
+            .bytes()
+            .zip(new.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
         let prefix = &old[..prefix_len];
 
         // Find common suffix (after differing section)
         let old_suffix = &old[prefix_len..];
         let new_suffix = &new[prefix_len..];
-        let suffix_len = old_suffix.bytes().rev().zip(new_suffix.bytes().rev())
-            .take_while(|(a, b)| a == b).count();
+        let suffix_len = old_suffix
+            .bytes()
+            .rev()
+            .zip(new_suffix.bytes().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
 
         let mut ops = Vec::new();
         if !prefix.is_empty() {
-            ops.push(DiffOp::Equal { text: prefix.to_string() });
+            ops.push(DiffOp::Equal {
+                text: prefix.to_string(),
+            });
         }
 
         let old_mid = &old[prefix_len..old.len() - suffix_len];
         let new_mid = &new[prefix_len..new.len() - suffix_len];
 
         if old_mid.is_empty() && !new_mid.is_empty() {
-            ops.push(DiffOp::Insert { text: new_mid.to_string() });
+            ops.push(DiffOp::Insert {
+                text: new_mid.to_string(),
+            });
         } else if new_mid.is_empty() && !old_mid.is_empty() {
-            ops.push(DiffOp::Delete { text: old_mid.to_string() });
+            ops.push(DiffOp::Delete {
+                text: old_mid.to_string(),
+            });
         } else if !old_mid.is_empty() && !new_mid.is_empty() {
-            ops.push(DiffOp::Replace { old: old_mid.to_string(), new: new_mid.to_string() });
+            ops.push(DiffOp::Replace {
+                old: old_mid.to_string(),
+                new: new_mid.to_string(),
+            });
         }
 
         if suffix_len > 0 {
-            ops.push(DiffOp::Equal { text: new[new.len() - suffix_len..].to_string() });
+            ops.push(DiffOp::Equal {
+                text: new[new.len() - suffix_len..].to_string(),
+            });
         }
 
         ops
@@ -107,7 +134,9 @@ mod tests {
 
     #[test]
     fn identical_prefix() {
-        let checker = PrefixStabilityChecker::new(StabilityConfig { prefix_char_count: 10 });
+        let checker = PrefixStabilityChecker::new(StabilityConfig {
+            prefix_char_count: 10,
+        });
         let (stable, prefix) = checker.check("hello world", "hello there");
         assert!(!stable, "prefix diverges at index 6: 'w' != 't'");
         assert_eq!(prefix, "hello ");
@@ -115,7 +144,9 @@ mod tests {
 
     #[test]
     fn diverging_prefix() {
-        let checker = PrefixStabilityChecker::new(StabilityConfig { prefix_char_count: 10 });
+        let checker = PrefixStabilityChecker::new(StabilityConfig {
+            prefix_char_count: 10,
+        });
         let (stable, prefix) = checker.check("abcdefghij", "abcxyzmnop");
         assert!(!stable);
         assert_eq!(prefix, "abc");
@@ -139,7 +170,9 @@ mod tests {
 
     #[test]
     fn short_text() {
-        let checker = PrefixStabilityChecker::new(StabilityConfig { prefix_char_count: 100 });
+        let checker = PrefixStabilityChecker::new(StabilityConfig {
+            prefix_char_count: 100,
+        });
         let (stable, _) = checker.check("hi", "hi");
         assert!(stable);
     }
@@ -148,21 +181,36 @@ mod tests {
     fn diff_equal() {
         let checker = PrefixStabilityChecker::new(StabilityConfig::default());
         let ops = checker.diff("hello", "hello");
-        assert_eq!(ops, vec![DiffOp::Equal { text: "hello".to_string() }]);
+        assert_eq!(
+            ops,
+            vec![DiffOp::Equal {
+                text: "hello".to_string()
+            }]
+        );
     }
 
     #[test]
     fn diff_insert() {
         let checker = PrefixStabilityChecker::new(StabilityConfig::default());
         let ops = checker.diff("", "hello");
-        assert_eq!(ops, vec![DiffOp::Insert { text: "hello".to_string() }]);
+        assert_eq!(
+            ops,
+            vec![DiffOp::Insert {
+                text: "hello".to_string()
+            }]
+        );
     }
 
     #[test]
     fn diff_delete() {
         let checker = PrefixStabilityChecker::new(StabilityConfig::default());
         let ops = checker.diff("hello", "");
-        assert_eq!(ops, vec![DiffOp::Delete { text: "hello".to_string() }]);
+        assert_eq!(
+            ops,
+            vec![DiffOp::Delete {
+                text: "hello".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -170,7 +218,18 @@ mod tests {
         let checker = PrefixStabilityChecker::new(StabilityConfig::default());
         let ops = checker.diff("abcdef", "abcxyz");
         assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0], DiffOp::Equal { text: "abc".to_string() });
-        assert_eq!(ops[1], DiffOp::Replace { old: "def".to_string(), new: "xyz".to_string() });
+        assert_eq!(
+            ops[0],
+            DiffOp::Equal {
+                text: "abc".to_string()
+            }
+        );
+        assert_eq!(
+            ops[1],
+            DiffOp::Replace {
+                old: "def".to_string(),
+                new: "xyz".to_string()
+            }
+        );
     }
 }

@@ -19,7 +19,10 @@ fn gen_cache_stress_has_hits() {
     let t = trace::gen_cache_stress("test", 10, 0.6);
     assert_eq!(t.turns.len(), 10);
     let zero_token_count = t.turns.iter().filter(|t| t.tokens == 0).count();
-    assert!(zero_token_count >= 4, "should have some cache hits at 60% rate");
+    assert!(
+        zero_token_count >= 4,
+        "should have some cache hits at 60% rate"
+    );
 }
 
 #[test]
@@ -46,7 +49,10 @@ fn scenario_trace_roundtrip_json() {
 #[test]
 fn builtin_traces_are_valid() {
     let traces = trace::builtin_traces();
-    assert!(!traces.is_empty(), "should have at least one built-in trace");
+    assert!(
+        !traces.is_empty(),
+        "should have at least one built-in trace"
+    );
     for t in &traces {
         assert!(!t.name.is_empty());
         assert!(!t.turns.is_empty());
@@ -61,8 +67,16 @@ fn base_template_render_uses_counter() {
         name: "test".into(),
         description: "".into(),
         turns: vec![
-            TurnSpec { role: "user".into(), content_template: "q{n}".into(), tool_calls: vec![] },
-            TurnSpec { role: "assistant".into(), content_template: "a{n}".into(), tool_calls: vec![] },
+            TurnSpec {
+                role: "user".into(),
+                content_template: "q{n}".into(),
+                tool_calls: vec![],
+            },
+            TurnSpec {
+                role: "assistant".into(),
+                content_template: "a{n}".into(),
+                tool_calls: vec![],
+            },
         ],
     };
     let trace = t.render();
@@ -85,7 +99,16 @@ fn builtin_templates_have_content() {
 #[test]
 fn mutation_duplicate_turn() {
     let base = &adversarial::builtin_templates()[0];
-    let trace = adversarial::generate(base, &[Mutation::DuplicateTurn { index: 0, times: 2, vary_context: false }], &[], "test");
+    let trace = adversarial::generate(
+        base,
+        &[Mutation::DuplicateTurn {
+            index: 0,
+            times: 2,
+            vary_context: false,
+        }],
+        &[],
+        "test",
+    );
     assert_eq!(trace.turns.len(), base.turns.len() + 2);
     assert_eq!(trace.turns[0].prompt, trace.turns[1].prompt);
     assert_eq!(trace.turns[1].prompt, trace.turns[2].prompt);
@@ -94,7 +117,16 @@ fn mutation_duplicate_turn() {
 #[test]
 fn mutation_duplicate_with_vary() {
     let base = &adversarial::builtin_templates()[0];
-    let trace = adversarial::generate(base, &[Mutation::DuplicateTurn { index: 0, times: 2, vary_context: true }], &[], "test");
+    let trace = adversarial::generate(
+        base,
+        &[Mutation::DuplicateTurn {
+            index: 0,
+            times: 2,
+            vary_context: true,
+        }],
+        &[],
+        "test",
+    );
     assert_eq!(trace.turns.len(), base.turns.len() + 2);
     assert_ne!(trace.turns[0].prompt, trace.turns[1].prompt);
     assert!(trace.turns[1].prompt.contains("[attempt 1]"));
@@ -104,8 +136,14 @@ fn mutation_duplicate_with_vary() {
 fn mutation_reorder_turns() {
     let base = &adversarial::builtin_templates()[0];
     let trace = adversarial::generate(base, &[Mutation::ReorderTurns { a: 0, b: 1 }], &[], "test");
-    assert_eq!(trace.turns[0].prompt, base.turns[1].content_template.replace("{n}", "1"));
-    assert_eq!(trace.turns[1].prompt, base.turns[0].content_template.replace("{n}", "0"));
+    assert_eq!(
+        trace.turns[0].prompt,
+        base.turns[1].content_template.replace("{n}", "1")
+    );
+    assert_eq!(
+        trace.turns[1].prompt,
+        base.turns[0].content_template.replace("{n}", "0")
+    );
 }
 
 #[test]
@@ -113,13 +151,24 @@ fn mutation_drop_turn() {
     let base = &adversarial::builtin_templates()[0];
     let trace = adversarial::generate(base, &[Mutation::DropTurn(0)], &[], "test");
     assert_eq!(trace.turns.len(), base.turns.len() - 1);
-    assert_eq!(trace.turns[0].prompt, base.turns[1].content_template.replace("{n}", "1"));
+    assert_eq!(
+        trace.turns[0].prompt,
+        base.turns[1].content_template.replace("{n}", "1")
+    );
 }
 
 #[test]
 fn mutation_identical_prompt() {
     let base = &adversarial::builtin_templates()[2];
-    let trace = adversarial::generate(base, &[Mutation::IdenticalPrompt { source: 0, target: 2 }], &[], "test");
+    let trace = adversarial::generate(
+        base,
+        &[Mutation::IdenticalPrompt {
+            source: 0,
+            target: 2,
+        }],
+        &[],
+        "test",
+    );
     assert_eq!(trace.turns[0].prompt, trace.turns[2].prompt);
 }
 
@@ -134,7 +183,10 @@ fn noise_trailing_whitespace() {
 fn noise_unicode_homoglyph() {
     let base = &adversarial::builtin_templates()[0];
     let trace = adversarial::generate(base, &[], &[(0, NoiseType::UnicodeHomoglyph)], "test");
-    assert_ne!(trace.turns[0].prompt, base.turns[0].content_template.replace("{n}", "0"));
+    assert_ne!(
+        trace.turns[0].prompt,
+        base.turns[0].content_template.replace("{n}", "0")
+    );
 }
 
 #[test]
@@ -158,9 +210,16 @@ fn adversarial_all_generated_unique_names() {
 #[test]
 fn full_pipeline_smoke() {
     let base = &adversarial::builtin_templates()[0];
-    let trace = adversarial::generate(base, &[
-        Mutation::DuplicateTurn { index: 0, times: 3, vary_context: false },
-    ], &[(1, NoiseType::TrailingWhitespace)], "smoke");
+    let trace = adversarial::generate(
+        base,
+        &[Mutation::DuplicateTurn {
+            index: 0,
+            times: 3,
+            vary_context: false,
+        }],
+        &[(1, NoiseType::TrailingWhitespace)],
+        "smoke",
+    );
 
     let json = serde_json::to_string(&trace).unwrap();
     let loaded: ScenarioTrace = serde_json::from_str(&json).unwrap();
@@ -192,10 +251,26 @@ fn scenario_score_search_before_edit() {
         pre_apply_used: false,
     };
     let score = score_run(&run);
-    assert!(score.reuse > 0.0, "should have reuse for search before edit (got {})", score.reuse);
-    assert!(score.tool_strategy > 0.0, "should have tool strategy (got {})", score.tool_strategy);
-    assert!(score.search_efficiency > 0.0, "search followed by read should score (got {})", score.search_efficiency);
-    assert!(score.context_efficiency > 0.0, "read followed by edit should score (got {})", score.context_efficiency);
+    assert!(
+        score.reuse > 0.0,
+        "should have reuse for search before edit (got {})",
+        score.reuse
+    );
+    assert!(
+        score.tool_strategy > 0.0,
+        "should have tool strategy (got {})",
+        score.tool_strategy
+    );
+    assert!(
+        score.search_efficiency > 0.0,
+        "search followed by read should score (got {})",
+        score.search_efficiency
+    );
+    assert!(
+        score.context_efficiency > 0.0,
+        "read followed by edit should score (got {})",
+        score.context_efficiency
+    );
 }
 
 #[test]
@@ -215,8 +290,14 @@ fn scenario_score_no_search_before_edit() {
     };
     let score = score_run(&run);
     // No searches and no reads → vacuous perfect (20/20)
-    assert_eq!(score.search_efficiency, 20.0, "no searches, no expected_search → vacuous perfect");
-    assert_eq!(score.context_efficiency, 20.0, "no reads, no expected_read → vacuous perfect");
+    assert_eq!(
+        score.search_efficiency, 20.0,
+        "no searches, no expected_search → vacuous perfect"
+    );
+    assert_eq!(
+        score.context_efficiency, 20.0,
+        "no reads, no expected_read → vacuous perfect"
+    );
     // Reached terminal but not verify → only 5/20 correctness goal
     assert_eq!(score.correctness, 5.0, "reached terminal but not verify");
 }
@@ -232,13 +313,19 @@ fn scenario_score_no_search_when_expected_is_penalty() {
         ],
         terminal_state: Some("success".into()),
         score: None,
-        expected_search: true,   // agent was supposed to search
+        expected_search: true, // agent was supposed to search
         expected_read: false,
         pre_apply_used: false,
     };
     let score = score_run(&run);
-    assert_eq!(score.search_efficiency, 0.0, "expected_search=true with 0 searches → 0/20");
-    assert_eq!(score.context_efficiency, 20.0, "read→edit within window → action counts");
+    assert_eq!(
+        score.search_efficiency, 0.0,
+        "expected_search=true with 0 searches → 0/20"
+    );
+    assert_eq!(
+        score.context_efficiency, 20.0,
+        "read→edit within window → action counts"
+    );
 }
 
 #[test]
@@ -259,61 +346,97 @@ fn scenario_score_verify_after_edit() {
         pre_apply_used: false,
     };
     let score = score_run(&run);
-    assert!(score.verification > 0.0, "should have verification (got {})", score.verification);
-    assert!(score.tool_strategy > 0.0, "should have tool strategy (got {})", score.tool_strategy);
-    assert!(score.correctness >= 10.0, "correctness should be >=10 (got {})", score.correctness);
+    assert!(
+        score.verification > 0.0,
+        "should have verification (got {})",
+        score.verification
+    );
+    assert!(
+        score.tool_strategy > 0.0,
+        "should have tool strategy (got {})",
+        score.tool_strategy
+    );
+    assert!(
+        score.correctness >= 10.0,
+        "correctness should be >=10 (got {})",
+        score.correctness
+    );
 }
 
 // ── Search Efficiency tests ───────────────────────────────────────
 
 #[test]
 fn search_efficiency_targeting_step_function() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_search_efficiency;
+    use crate::torture::scenario::*;
 
     // 3 files → targeting=1.0; no Read within window → to_read=0; novelty=1.0
     // (0 * 0.5 + 1.0 * 0.25 + 1.0 * 0.25) * 20 = 10.0
-    let three = vec![AgentEvent::Search("q".into(), "a.rs:1:x\nb.rs:1:x\nc.rs:1:x".into())];
+    let three = vec![AgentEvent::Search(
+        "q".into(),
+        "a.rs:1:x\nb.rs:1:x\nc.rs:1:x".into(),
+    )];
     let s = compute_search_efficiency(&three, false);
-    assert!((s - 10.0).abs() < 0.01, "3 files targeting=1.0, to_read=0, novelty=1.0 → 10.0 got {s}");
+    assert!(
+        (s - 10.0).abs() < 0.01,
+        "3 files targeting=1.0, to_read=0, novelty=1.0 → 10.0 got {s}"
+    );
 
     // 10 files → targeting=0.8; to_read=0; novelty=1.0
     // (0 * 0.5 + 0.8 * 0.25 + 1.0 * 0.25) * 20 = 0.45 * 20 = 9.0
     let ten = "a.rs:1:x\nb.rs:1:x\nc.rs:1:x\nd.rs:1:x\ne.rs:1:x\nf.rs:1:x\ng.rs:1:x\nh.rs:1:x\ni.rs:1:x\nj.rs:1:x";
     let events = vec![AgentEvent::Search("q".into(), ten.into())];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 9.0).abs() < 0.01, "10 files targeting=0.8 → 9.0 got {s}");
+    assert!(
+        (s - 9.0).abs() < 0.01,
+        "10 files targeting=0.8 → 9.0 got {s}"
+    );
 
     // 100 files → targeting=0.2; to_read=0; novelty=1.0
     // (0 * 0.5 + 0.2 * 0.25 + 1.0 * 0.25) * 20 = 6.0
-    let many = (0..100).map(|i| format!("f{i}.rs:1:x")).collect::<Vec<_>>().join("\n");
+    let many = (0..100)
+        .map(|i| format!("f{i}.rs:1:x"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let events = vec![AgentEvent::Search("q".into(), many)];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 6.0).abs() < 0.01, "100 files targeting=0.2 → 6.0 got {s}");
+    assert!(
+        (s - 6.0).abs() < 0.01,
+        "100 files targeting=0.2 → 6.0 got {s}"
+    );
 }
 
 #[test]
 fn search_efficiency_targeting_parse_failure_is_neutral() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_search_efficiency;
+    use crate::torture::scenario::*;
 
     // Empty result → parse fail → targeting=0.5 (neutral)
     // to_read=0; novelty=1.0
     // (0 * 0.5 + 0.5 * 0.25 + 1.0 * 0.25) * 20 = 0.375 * 20 = 7.5
     let events = vec![AgentEvent::Search("q".into(), String::new())];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 7.5).abs() < 0.01, "empty result → 0.5 neutral expected 7.5 got {s}");
+    assert!(
+        (s - 7.5).abs() < 0.01,
+        "empty result → 0.5 neutral expected 7.5 got {s}"
+    );
 
     // Plain text with no `:` → parse fail → same
-    let events = vec![AgentEvent::Search("q".into(), "no colons here just text".into())];
+    let events = vec![AgentEvent::Search(
+        "q".into(),
+        "no colons here just text".into(),
+    )];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 7.5).abs() < 0.01, "no-colon text → 0.5 expected 7.5 got {s}");
+    assert!(
+        (s - 7.5).abs() < 0.01,
+        "no-colon text → 0.5 expected 7.5 got {s}"
+    );
 }
 
 #[test]
 fn search_efficiency_to_read_window() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_search_efficiency;
+    use crate::torture::scenario::*;
 
     // Search → Read in same event window: to_read=1.0
     // 1 file → targeting=1.0; novelty=1.0
@@ -336,13 +459,16 @@ fn search_efficiency_to_read_window() {
         AgentEvent::Read("f.rs".into(), String::new()),
     ];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 10.0).abs() < 0.01, "search with no read in 3 events → to_read=0 expected 10.0 got {s}");
+    assert!(
+        (s - 10.0).abs() < 0.01,
+        "search with no read in 3 events → to_read=0 expected 10.0 got {s}"
+    );
 }
 
 #[test]
 fn search_efficiency_novelty_by_result_set_not_query() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_search_efficiency;
+    use crate::torture::scenario::*;
 
     // Same query, different result sets → novel
     // to_read=1.0 (both searches followed by read); targeting=1.0; novelty=1.0
@@ -354,7 +480,10 @@ fn search_efficiency_novelty_by_result_set_not_query() {
         AgentEvent::Read("db.rs".into(), String::new()),
     ];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 20.0).abs() < 0.01, "same query different result sets → novelty=1.0 got {s}");
+    assert!(
+        (s - 20.0).abs() < 0.01,
+        "same query different result sets → novelty=1.0 got {s}"
+    );
 
     // Same query, same result set → NOT novel
     // to_read=0.5 (first has read, second has no read within 3)
@@ -366,15 +495,18 @@ fn search_efficiency_novelty_by_result_set_not_query() {
         AgentEvent::Search("timeout".into(), "auth.rs:5:y\nlogin.rs:3:z".into()),
     ];
     let s = compute_search_efficiency(&events, false);
-    assert!((s - 12.5).abs() < 0.01, "same result set → novelty=0.5 expected 12.5 got {s}");
+    assert!(
+        (s - 12.5).abs() < 0.01,
+        "same result set → novelty=0.5 expected 12.5 got {s}"
+    );
 }
 
 // ── Context Efficiency tests ──────────────────────────────────────
 
 #[test]
 fn context_efficiency_read_to_action_window() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_context_efficiency;
+    use crate::torture::scenario::*;
 
     // Read → Edit within 5: counts
     let events = vec![
@@ -384,7 +516,10 @@ fn context_efficiency_read_to_action_window() {
     let s = compute_context_efficiency(&events, false);
     // read_to_action=1.0, precision=1.0 (read and edit same file), reread=0
     // (1.0 * 0.5 + 1.0 * 0.3 + 1.0 * 0.2) * 20 = 20.0
-    assert!((s - 20.0).abs() < 0.01, "read→edit same file → 20.0 got {s}");
+    assert!(
+        (s - 20.0).abs() < 0.01,
+        "read→edit same file → 20.0 got {s}"
+    );
 
     // Read with no follow-up action
     let events = vec![
@@ -394,13 +529,16 @@ fn context_efficiency_read_to_action_window() {
     let s = compute_context_efficiency(&events, false);
     // read_to_action=0, precision=0 (no edits), reread=0
     // (0 * 0.5 + 0 * 0.3 + 1.0 * 0.2) * 20 = 4.0
-    assert!((s - 4.0).abs() < 0.01, "read→done (no action) → 4.0 got {s}");
+    assert!(
+        (s - 4.0).abs() < 0.01,
+        "read→done (no action) → 4.0 got {s}"
+    );
 }
 
 #[test]
 fn context_efficiency_reread_within_window_no_penalty() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_context_efficiency;
+    use crate::torture::scenario::*;
 
     // Two reads of same file, within 10 events, no Edit between → no penalty
     let events = vec![
@@ -414,13 +552,16 @@ fn context_efficiency_reread_within_window_no_penalty() {
     // precision: f.rs read and edited → 1.0
     // reread: 1 re-read, within window, no Edit/Test between → no penalty → 0
     // (1.0 * 0.5 + 1.0 * 0.3 + 1.0 * 0.2) * 20 = 20.0
-    assert!((s - 20.0).abs() < 0.01, "reread within window → no penalty expected 20.0 got {s}");
+    assert!(
+        (s - 20.0).abs() < 0.01,
+        "reread within window → no penalty expected 20.0 got {s}"
+    );
 }
 
 #[test]
 fn context_efficiency_reread_with_edit_resets_window() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_context_efficiency;
+    use crate::torture::scenario::*;
 
     // Read → Edit → Read (re-read justified by Edit)
     let events = vec![
@@ -435,13 +576,16 @@ fn context_efficiency_reread_with_edit_resets_window() {
     // precision: 1.0
     // reread: 2nd read has Edit(Test) on f.rs between 1st and 2nd → had_action = true → no penalty
     // (0.5 * 0.5 + 1.0 * 0.3 + 1.0 * 0.2) * 20 = (0.25 + 0.30 + 0.20) * 20 = 15.0
-    assert!((s - 15.0).abs() < 0.01, "Read→Edit→Read should be 15.0 got {s}");
+    assert!(
+        (s - 15.0).abs() < 0.01,
+        "Read→Edit→Read should be 15.0 got {s}"
+    );
 }
 
 #[test]
 fn context_efficiency_reread_outside_window_penalized() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_context_efficiency;
+    use crate::torture::scenario::*;
 
     // 11 events of no-op filler, then re-read
     let mut events: Vec<AgentEvent> = vec![AgentEvent::Read("f.rs".into(), String::new())];
@@ -462,13 +606,16 @@ fn context_efficiency_reread_outside_window_penalized() {
     // precision: f.rs edited → 1.0
     // reread_penalty: 1/2 = 0.5
     // (0.5 * 0.5 + 1.0 * 0.3 + 0.5 * 0.2) * 20 = (0.25 + 0.30 + 0.10) * 20 = 13.0
-    assert!((s - 13.0).abs() < 0.01, "reread outside window → penalty expected 13.0 got {s}");
+    assert!(
+        (s - 13.0).abs() < 0.01,
+        "reread outside window → penalty expected 13.0 got {s}"
+    );
 }
 
 #[test]
 fn context_efficiency_precision_read_but_not_edited() {
-    use crate::torture::scenario::*;
     use crate::torture::scenario::compute_context_efficiency;
+    use crate::torture::scenario::*;
 
     // Read 3 files, edit 1 of them
     let events = vec![
@@ -486,7 +633,10 @@ fn context_efficiency_precision_read_but_not_edited() {
     // precision: 1/3 (a.rs read and edited, b.rs and c.rs read but not edited)
     // reread: 0
     // (1.0 * 0.5 + 0.333 * 0.3 + 1.0 * 0.2) * 20 = (0.5 + 0.1 + 0.2) * 20 = 16.0
-    assert!((s - 16.0).abs() < 0.5, "1/3 precision expected ~16.0 got {s}");
+    assert!(
+        (s - 16.0).abs() < 0.5,
+        "1/3 precision expected ~16.0 got {s}"
+    );
 }
 
 #[test]
@@ -580,8 +730,14 @@ fn scenario_extract_events_from_request() {
         ]
     });
     let events = extract_events_from_request(&body);
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Edit(_, _))), "should see edit");
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Done)), "should see Done after last assistant");
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Edit(_, _))),
+        "should see edit"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Done)),
+        "should see Done after last assistant"
+    );
 }
 
 #[test]
@@ -663,7 +819,7 @@ fn extract_cat_path_handles_shell_cat() {
         (r#"{"command":"  cat   src/lib.rs  "}"#, Some("src/lib.rs")),
         (r#"{"command":"ls -la"}"#, None),
         (r#"{"command":"grep foo bar"}"#, None),
-        (r#"{"command":"cat -n src/x"}"#, None),  // cat with flag, not the canonical form
+        (r#"{"command":"cat -n src/x"}"#, None), // cat with flag, not the canonical form
         (r#"{}"#, None),
     ];
     for (args, expected) in cases {
@@ -700,26 +856,44 @@ fn scenario_hidden_bug_loads() {
     use crate::torture::scenario::*;
     let scenario = Scenario::load("hidden_bug").expect("hidden_bug.yaml should load");
     assert_eq!(scenario.name, "hidden_bug");
-    assert!(scenario.states.len() >= 7, "should have many states, got {}", scenario.states.len());
-    let has_args = scenario.states.get("reading")
+    assert!(
+        scenario.states.len() >= 7,
+        "should have many states, got {}",
+        scenario.states.len()
+    );
+    let has_args = scenario
+        .states
+        .get("reading")
         .map(|s| s.args.contains_key("Read"))
         .unwrap_or(false);
     assert!(has_args, "reading state should have Read args");
     // Verify the transitions form a proper DAG (no dead states)
-    let all_next: std::collections::HashSet<&str> = scenario.states.values()
+    let all_next: std::collections::HashSet<&str> = scenario
+        .states
+        .values()
         .flat_map(|s| s.transitions.iter().map(|t| t.next_state()))
         .collect();
     // Every referenced next state must exist
     for next in &all_next {
-        assert!(scenario.states.contains_key(*next), "scenario '{s}' references non-existent state '{next}'",
-            s = scenario.name);
+        assert!(
+            scenario.states.contains_key(*next),
+            "scenario '{s}' references non-existent state '{next}'",
+            s = scenario.name
+        );
     }
     // Every non-terminal state must be reachable from start
     for state_name in scenario.states.keys() {
-        if scenario.states[state_name].finish || scenario.states[state_name].fail { continue; }
-        if state_name == &scenario.start { continue; }
-        assert!(all_next.contains(state_name.as_str()),
-            "scenario '{}': state '{state_name}' is unreachable from start", scenario.name);
+        if scenario.states[state_name].finish || scenario.states[state_name].fail {
+            continue;
+        }
+        if state_name == &scenario.start {
+            continue;
+        }
+        assert!(
+            all_next.contains(state_name.as_str()),
+            "scenario '{}': state '{state_name}' is unreachable from start",
+            scenario.name
+        );
     }
 }
 
@@ -733,25 +907,30 @@ fn scenario_all_load_and_validate() {
             panic!("scenario '{name}' failed to load: {e}");
         });
         // Check transitions reference valid states
-        let all_next: std::collections::HashSet<&str> = scenario.states.values()
+        let all_next: std::collections::HashSet<&str> = scenario
+            .states
+            .values()
             .flat_map(|s| s.transitions.iter().map(|t| t.next_state()))
             .collect();
         for next in &all_next {
-            assert!(scenario.states.contains_key(*next),
-                "scenario '{name}' references non-existent state '{next}'");
+            assert!(
+                scenario.states.contains_key(*next),
+                "scenario '{name}' references non-existent state '{next}'"
+            );
         }
     }
 }
 
 #[test]
 fn vfs_creates_files_on_disk() {
-    use crate::torture::scenario::*;
     use crate::torture::aces::create_vfs;
+    use crate::torture::scenario::*;
     // Load scenario from absolute path (relative would fail after chdir).
-    let scenario_path = std::path::Path::new("scenarios/hidden_bug.yaml").canonicalize()
+    let scenario_path = std::path::Path::new("scenarios/hidden_bug.yaml")
+        .canonicalize()
         .expect("scenarios/hidden_bug.yaml should be canonicalizable");
-    let scenario = Scenario::from_yaml(scenario_path.to_str().unwrap())
-        .expect("hidden_bug.yaml should load");
+    let scenario =
+        Scenario::from_yaml(scenario_path.to_str().unwrap()).expect("hidden_bug.yaml should load");
     // Use a tmp base path to avoid polluting the project tree.
     let base = std::env::temp_dir().join(format!("aces_vfs_test_{}", std::process::id()));
     let root = create_vfs(&scenario, &base).expect("vfs should create");
@@ -834,10 +1013,22 @@ fn resolve_args_substitutes_nested_strings() {
         "count": 1
     });
     let resolved = resolve_args(&args, root);
-    assert!(resolved.contains("/tmp/aces_vfs_x/src/config.sh"), "filePath should be substituted: {resolved}");
-    assert!(resolved.contains("\"TIMEOUT_DEFAULT=30\""), "oldString should be preserved");
-    assert!(resolved.contains("\"TIMEOUT_DEFAULT=60\""), "newString should be preserved");
-    assert!(resolved.contains("\"count\":1"), "non-string fields should be preserved");
+    assert!(
+        resolved.contains("/tmp/aces_vfs_x/src/config.sh"),
+        "filePath should be substituted: {resolved}"
+    );
+    assert!(
+        resolved.contains("\"TIMEOUT_DEFAULT=30\""),
+        "oldString should be preserved"
+    );
+    assert!(
+        resolved.contains("\"TIMEOUT_DEFAULT=60\""),
+        "newString should be preserved"
+    );
+    assert!(
+        resolved.contains("\"count\":1"),
+        "non-string fields should be preserved"
+    );
 }
 
 #[test]
@@ -862,10 +1053,17 @@ fn resolve_args_substitutes_deeply_nested_strings() {
     });
     let resolved = resolve_args(&args, root);
     let v: serde_json::Value = serde_json::from_str(&resolved).unwrap();
-    assert_eq!(v["apply_patch"]["operation"]["path"], "/tmp/aces_vfs_x/src/config.sh",
-        "nested path should be substituted, got: {resolved}");
+    assert_eq!(
+        v["apply_patch"]["operation"]["path"], "/tmp/aces_vfs_x/src/config.sh",
+        "nested path should be substituted, got: {resolved}"
+    );
     assert_eq!(v["apply_patch"]["operation"]["type"], "update_file");
-    assert!(v["apply_patch"]["operation"]["diff"].as_str().unwrap().contains("TIMEOUT_DEFAULT=30"));
+    assert!(
+        v["apply_patch"]["operation"]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("TIMEOUT_DEFAULT=30")
+    );
     assert_eq!(v["commands"][0], "/tmp/aces_vfs_x/a");
     assert_eq!(v["commands"][1], "/tmp/aces_vfs_x/b");
     assert_eq!(v["n"], 1);
@@ -905,17 +1103,38 @@ states:
     let sm = StateMachine::new(scenario);
     // Default format is openai → camelCase
     let openai_args = sm.current_tool_args_for("Edit", "openai").unwrap();
-    assert!(openai_args.get("filePath").is_some(), "openai args should have filePath: {openai_args}");
-    assert!(openai_args.get("oldString").is_some(), "openai args should have oldString");
-    assert!(openai_args.get("file_path").is_none(), "openai args should NOT have snake_case file_path");
+    assert!(
+        openai_args.get("filePath").is_some(),
+        "openai args should have filePath: {openai_args}"
+    );
+    assert!(
+        openai_args.get("oldString").is_some(),
+        "openai args should have oldString"
+    );
+    assert!(
+        openai_args.get("file_path").is_none(),
+        "openai args should NOT have snake_case file_path"
+    );
     // claude_code format → snake_case
     let cc_args = sm.current_tool_args_for("Edit", "claude_code").unwrap();
-    assert!(cc_args.get("file_path").is_some(), "claude_code args should have file_path: {cc_args}");
-    assert!(cc_args.get("old_string").is_some(), "claude_code args should have old_string");
-    assert!(cc_args.get("filePath").is_none(), "claude_code args should NOT have camelCase filePath");
+    assert!(
+        cc_args.get("file_path").is_some(),
+        "claude_code args should have file_path: {cc_args}"
+    );
+    assert!(
+        cc_args.get("old_string").is_some(),
+        "claude_code args should have old_string"
+    );
+    assert!(
+        cc_args.get("filePath").is_none(),
+        "claude_code args should NOT have camelCase filePath"
+    );
     // Unknown format → falls back to default
     let fallback = sm.current_tool_args_for("Edit", "unknown_format").unwrap();
-    assert!(fallback.get("filePath").is_some(), "unknown format should fall back to default: {fallback}");
+    assert!(
+        fallback.get("filePath").is_some(),
+        "unknown format should fall back to default: {fallback}"
+    );
 }
 
 #[test]
@@ -955,7 +1174,10 @@ states:
     assert!(!sm.is_stuck(5));
     // Bounce a <-> b several times
     for _ in 0..10 {
-        sm.feed(crate::torture::scenario::AgentEvent::Other("x".into(), "".into()));
+        sm.feed(crate::torture::scenario::AgentEvent::Other(
+            "x".into(),
+            "".into(),
+        ));
     }
     // 10 events, alternating a/b → each visited ~5-6 times
     let a_count = sm.visit_count("a");
@@ -964,7 +1186,10 @@ states:
     // The current state should be 'stuck' at threshold 5
     let cur = sm.current_state_name().to_string();
     if sm.visit_count(&cur) > 5 {
-        assert!(sm.is_stuck(5), "should report stuck when current state visited > 5 times");
+        assert!(
+            sm.is_stuck(5),
+            "should report stuck when current state visited > 5 times"
+        );
     }
 }
 
@@ -996,7 +1221,11 @@ states:
     let s = scenario.states.get("s").unwrap();
     assert_eq!(s.transitions.len(), 1);
     match &s.transitions[0] {
-        crate::torture::scenario::Transition::OnFileContains { file_path, contains, next } => {
+        crate::torture::scenario::Transition::OnFileContains {
+            file_path,
+            contains,
+            next,
+        } => {
             assert_eq!(file_path, "${VFS}/config.sh");
             assert_eq!(contains, "TIMEOUT_DEFAULT=60");
             assert_eq!(next, "done");
@@ -1056,7 +1285,10 @@ fn list_base_excludes_per_agent_variants() {
     let names = Scenario::list_base().expect("list_base should not fail");
     // No name in the result should contain a dot.
     for n in &names {
-        assert!(!n.contains('.'), "list_base returned per-agent variant '{n}'");
+        assert!(
+            !n.contains('.'),
+            "list_base returned per-agent variant '{n}'"
+        );
     }
     // Sanity: hidden_bug is a real base scenario in scenarios/.
     // Other per-agent variants like hidden_bug.claude_code should not appear.
@@ -1077,12 +1309,26 @@ fn load_with_format_prefers_per_agent_variant() {
     // Different file = different args conventions. Spot-check a
     // known divergence: the edit state uses snake_case in the
     // claude_code variant.
-    let edit_args = cc.states.get("understand_constraints").unwrap()
-        .args.get("Edit").expect("Edit args present");
-    assert!(edit_args.get("file_path").is_some(),
-        "claude_code variant should use snake_case file_path");
-    let edit_args_base = base.states.get("understand_constraints").unwrap()
-        .args.get("Edit").expect("Edit args present in base");
-    assert!(edit_args_base.get("filePath").is_some(),
-        "base variant should use camelCase filePath");
+    let edit_args = cc
+        .states
+        .get("understand_constraints")
+        .unwrap()
+        .args
+        .get("Edit")
+        .expect("Edit args present");
+    assert!(
+        edit_args.get("file_path").is_some(),
+        "claude_code variant should use snake_case file_path"
+    );
+    let edit_args_base = base
+        .states
+        .get("understand_constraints")
+        .unwrap()
+        .args
+        .get("Edit")
+        .expect("Edit args present in base");
+    assert!(
+        edit_args_base.get("filePath").is_some(),
+        "base variant should use camelCase filePath"
+    );
 }

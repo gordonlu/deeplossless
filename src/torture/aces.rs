@@ -12,7 +12,10 @@ use std::sync::Mutex;
 /// multiple names (suite mode). Per-agent variant selection happens
 /// inside [`Scenario::load_with_format`] so the same call works for
 /// both.
-pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::sync::Arc<std::sync::Mutex<SharedState>> {
+pub async fn start_mock(
+    scenario_names: &[String],
+    agent_format: &str,
+) -> std::sync::Arc<std::sync::Mutex<SharedState>> {
     if scenario_names.is_empty() {
         eprintln!("[aces] no scenarios provided");
         std::process::exit(1);
@@ -50,21 +53,25 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
         suite_complete: n == 1, // single-scenario: "suite" of one is done once scenario_complete fires
     }));
 
-    let app = axum::Router::new()
-        .route("/v1/chat/completions", axum::routing::post({
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
             let state = state.clone();
             move |body: axum::Json<Value>| {
                 let state = state.clone();
                 async move { handle_request(body.0, state).await }
             }
-        }));
+        }),
+    );
 
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind("127.0.0.1:9000").await {
             Ok(listener) => {
                 eprintln!("[aces] mock upstream listening on port 9000");
                 eprintln!("[aces] agent format: {agent_format}");
-                eprintln!("[aces] vfs will be created in the agent's working directory on first request");
+                eprintln!(
+                    "[aces] vfs will be created in the agent's working directory on first request"
+                );
                 axum::serve(listener, app).await.ok();
             }
             Err(e) => eprintln!("[aces] failed to start mock: {e}"),
@@ -88,7 +95,9 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             {
                 let mut s = watcher_state.lock().unwrap();
-                if s.suite_complete { return; }
+                if s.suite_complete {
+                    return;
+                }
                 if let (Some(_terminal_at), Some(last_req)) = (s.terminal_at, s.last_request_at) {
                     // We only need terminal_at to be set + idle duration
                     // to have elapsed. last_request_at is updated at the
@@ -102,23 +111,38 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
                         && last_req.elapsed() >= std::time::Duration::from_secs(IDLE_THRESHOLD_SECS)
                     {
                         s.scenario_complete = true;
-                        eprintln!("[aces] idle {}s after terminal — scenario complete", IDLE_THRESHOLD_SECS);
+                        eprintln!(
+                            "[aces] idle {}s after terminal — scenario complete",
+                            IDLE_THRESHOLD_SECS
+                        );
 
-                        let status = if s.machine.is_success() { "ok" } else { "give_up" };
+                        let status = if s.machine.is_success() {
+                            "ok"
+                        } else {
+                            "give_up"
+                        };
                         eprintln!("[aces]   → {}", status);
 
                         let next_idx = s.current_idx + 1;
                         if next_idx >= s.scenarios.len() {
                             s.suite_complete = true;
-                            eprintln!("[aces] suite complete: {}/{} scenarios finished", next_idx, s.scenarios.len());
+                            eprintln!(
+                                "[aces] suite complete: {}/{} scenarios finished",
+                                next_idx,
+                                s.scenarios.len()
+                            );
                             return;
                         }
 
                         // Advance to next scenario. Reset everything
                         // that was scenario-local: state machine,
                         // VFS root, idle tracking, terminal flag.
-                        eprintln!("[aces] advancing to scenario [{}/{}]: {}",
-                            next_idx + 1, s.scenarios.len(), s.scenarios[next_idx].0);
+                        eprintln!(
+                            "[aces] advancing to scenario [{}/{}]: {}",
+                            next_idx + 1,
+                            s.scenarios.len(),
+                            s.scenarios[next_idx].0
+                        );
                         s.current_idx = next_idx;
                         let (name, scenario) = s.scenarios[next_idx].clone();
                         s.machine = StateMachine::new(scenario);
@@ -136,7 +160,9 @@ pub async fn start_mock(scenario_names: &[String], agent_format: &str) -> std::s
                         let _ = name; // currently logged above
                     }
                 }
-                if s.suite_complete { return; }
+                if s.suite_complete {
+                    return;
+                }
             }
         }
     });
@@ -200,7 +226,10 @@ pub struct SharedState {
     pub suite_complete: bool,
 }
 
-pub(crate) fn create_vfs(scenario: &Scenario, base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn create_vfs(
+    scenario: &Scenario,
+    base: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
     let _ = std::fs::remove_dir_all(base);
     std::fs::create_dir_all(base)?;
     for (rel, content) in &scenario.vfs.files {
@@ -290,9 +319,12 @@ fn resolve_recursive(value: &Value, vfs_root: &std::path::Path) -> Value {
             }
             Value::Object(new_map)
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|v| resolve_recursive(v, vfs_root)).collect())
-        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| resolve_recursive(v, vfs_root))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -352,7 +384,8 @@ async fn handle_request(
     }
 
     let vfs_root_for_feed = s.vfs_root.clone();
-    let (is_terminal, advanced, had_events) = feed(&mut s.machine, &body, vfs_root_for_feed.as_deref());
+    let (is_terminal, advanced, had_events) =
+        feed(&mut s.machine, &body, vfs_root_for_feed.as_deref());
 
     // Apply the current state's pre-apply edits to the VFS. Done after
     // feed() so a transition into a new state triggers that state's
@@ -386,14 +419,16 @@ async fn handle_request(
         // via the terminal state's own `assistant` field.
         if !s.terminal_sent {
             s.terminal_sent = true;
-            let msg = s.machine.current_prompt()
-                .unwrap_or("Task complete.");
+            let msg = s.machine.current_prompt().unwrap_or("Task complete.");
             let content_event = format!(
                 "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"index\":0}}]}}\n\n",
                 serde_json::to_string(msg).unwrap_or_default()
             );
             let finish = "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":10,\"total_tokens\":10}}\n\n";
-            return (content_type(), format!("{}{}data: [DONE]\n\n", content_event, finish));
+            return (
+                content_type(),
+                format!("{}{}data: [DONE]\n\n", content_event, finish),
+            );
         } else {
             return (content_type(), "data: [DONE]\n\n".to_string());
         }
@@ -404,12 +439,20 @@ async fn handle_request(
     // to prevent infinite loops. If no events (first request), just return the
     // current state's tool call/text.
     if !advanced && had_events {
-        let expected_tools: Vec<String> = s.machine.current_tool_calls().iter().map(|t| t.to_string()).collect();
-        let expected_args: Vec<String> = expected_tools.iter().filter_map(|t| {
-            s.machine.current_tool_args_for(t, &s.agent_format).map(|a| {
-                format!("{}({})", t, serde_json::to_string(&a).unwrap_or_default())
+        let expected_tools: Vec<String> = s
+            .machine
+            .current_tool_calls()
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let expected_args: Vec<String> = expected_tools
+            .iter()
+            .filter_map(|t| {
+                s.machine
+                    .current_tool_args_for(t, &s.agent_format)
+                    .map(|a| format!("{}({})", t, serde_json::to_string(&a).unwrap_or_default()))
             })
-        }).collect();
+            .collect();
         let msg = format!(
             "I notice you're not using the expected tools. You must use: {}. Arguments: {}. Please call the correct tool now.",
             expected_tools.join(", "),
@@ -441,7 +484,10 @@ async fn handle_request(
 }
 
 fn content_type() -> [(axum::http::HeaderName, &'static str); 1] {
-    [(axum::http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")]
+    [(
+        axum::http::header::CONTENT_TYPE,
+        "text/event-stream; charset=utf-8",
+    )]
 }
 
 /// Scan a request body for telltale signs that a Claude Code plugin
@@ -456,19 +502,26 @@ fn detect_plugin_interference(body: &Value) -> Option<&'static str> {
         // Tool result messages: content is a string (Chat Completions format)
         if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
             if content.contains("<observed_from_primary_session>") {
-                return Some("tool result contains <observed_from_primary_session> (claude-mem plugin is active)");
+                return Some(
+                    "tool result contains <observed_from_primary_session> (claude-mem plugin is active)",
+                );
             }
             if content.contains("not enabled in this context") {
-                return Some("tool result contains 'not enabled in this context' (a plugin spawned a sub-session with --disallowedTools)");
+                return Some(
+                    "tool result contains 'not enabled in this context' (a plugin spawned a sub-session with --disallowedTools)",
+                );
             }
-            if content.contains("<system-reminder>") && content.contains("Return either one or more <observation>") {
+            if content.contains("<system-reminder>")
+                && content.contains("Return either one or more <observation>")
+            {
                 return Some("tool result contains a claude-mem observation prompt");
             }
         }
         // Assistant messages may carry tool_calls; args can contain text too
         if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tcs {
-                if let Some(args) = tc.get("function")
+                if let Some(args) = tc
+                    .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                 {
@@ -482,7 +535,11 @@ fn detect_plugin_interference(body: &Value) -> Option<&'static str> {
     None
 }
 
-fn feed(machine: &mut StateMachine, body: &Value, vfs_root: Option<&std::path::Path>) -> (bool, bool, bool) {
+fn feed(
+    machine: &mut StateMachine,
+    body: &Value,
+    vfs_root: Option<&std::path::Path>,
+) -> (bool, bool, bool) {
     let state_before = machine.current_state_name().to_string();
     // File-content transitions (e.g., on_file_contains) are evaluated
     // BEFORE event matching — they check the actual VFS file state, not
@@ -495,7 +552,10 @@ fn feed(machine: &mut StateMachine, body: &Value, vfs_root: Option<&std::path::P
     }
     let state_after_file_check = machine.current_state_name().to_string();
     if state_before != state_after_file_check {
-        eprintln!("[aces] state: {} → {} (file check)", state_before, state_after_file_check);
+        eprintln!(
+            "[aces] state: {} → {} (file check)",
+            state_before, state_after_file_check
+        );
         return (machine.is_terminal(), true, false);
     }
     let events = extract_events_from_request(body);
@@ -511,11 +571,15 @@ fn feed(machine: &mut StateMachine, body: &Value, vfs_root: Option<&std::path::P
     // Stuck-loop guard: if the same state has been entered more than
     // DEFAULT_MAX_STATE_VISITS times, force a terminal transition to
     // stop log spam and let the scenario settle.
-    if !machine.is_terminal() && machine.is_stuck(crate::torture::scenario::DEFAULT_MAX_STATE_VISITS) {
+    if !machine.is_terminal()
+        && machine.is_stuck(crate::torture::scenario::DEFAULT_MAX_STATE_VISITS)
+    {
         let visits = machine.visit_count(&state_after);
         eprintln!(
             "[aces] state {} visited {} times (>{}); forcing give_up to break loop",
-            state_after, visits, crate::torture::scenario::DEFAULT_MAX_STATE_VISITS
+            state_after,
+            visits,
+            crate::torture::scenario::DEFAULT_MAX_STATE_VISITS
         );
         if machine.scenario().states.contains_key("give_up") {
             machine.set_state("give_up");
@@ -536,11 +600,22 @@ fn feed(machine: &mut StateMachine, body: &Value, vfs_root: Option<&std::path::P
 /// the file's current text contains the expected substring, return the
 /// next state name. The `file_path` may include `${VFS}` which is
 /// resolved against the VFS root.
-pub(crate) fn check_file_transitions(machine: &StateMachine, vfs_root: &std::path::Path) -> Option<String> {
+pub(crate) fn check_file_transitions(
+    machine: &StateMachine,
+    vfs_root: &std::path::Path,
+) -> Option<String> {
     use crate::torture::scenario::Transition;
-    let state = machine.scenario().states.get(machine.current_state_name())?;
+    let state = machine
+        .scenario()
+        .states
+        .get(machine.current_state_name())?;
     for t in &state.transitions {
-        if let Transition::OnFileContains { file_path, contains, next } = t {
+        if let Transition::OnFileContains {
+            file_path,
+            contains,
+            next,
+        } = t
+        {
             let resolved = file_path.replace("${VFS}", &vfs_root.display().to_string());
             if let Ok(content) = std::fs::read_to_string(&resolved) {
                 if content.contains(contains.as_str()) {
@@ -567,10 +642,18 @@ pub(crate) fn apply_pre_apply(machine: &StateMachine, vfs_root: &std::path::Path
         None => return,
     };
     for edit in &state.pre_apply {
-        let FileEdit { file_path, from, to } = edit;
+        let FileEdit {
+            file_path,
+            from,
+            to,
+        } = edit;
         let resolved = file_path.replace("${VFS}", &vfs_root.display().to_string());
-        let Ok(content) = std::fs::read_to_string(&resolved) else { continue };
-        if !content.contains(from.as_str()) { continue; }
+        let Ok(content) = std::fs::read_to_string(&resolved) else {
+            continue;
+        };
+        if !content.contains(from.as_str()) {
+            continue;
+        }
         let new_content = content.replacen(from.as_str(), to.as_str(), 1);
         match std::fs::write(&resolved, &new_content) {
             Ok(()) => eprintln!("[aces] pre_apply: {} ({} → {})", resolved, from, to),

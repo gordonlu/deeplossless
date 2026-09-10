@@ -83,10 +83,15 @@ impl ThinkTagParser {
             // Check the tail for potential partial tag opener/closer
             let tail = &text[text.len().saturating_sub(max_tag_len)..];
             for i in (1..=max_tag_len).rev() {
-                if tail.len() < i { continue; }
+                if tail.len() < i {
+                    continue;
+                }
                 let suffix = &tail[tail.len() - i..];
                 // Could this be the start of <think> or </think>?
-                if "<think>".starts_with(suffix) || "</think>".starts_with(suffix) || "think>".starts_with(suffix) {
+                if "<think>".starts_with(suffix)
+                    || "</think>".starts_with(suffix)
+                    || "think>".starts_with(suffix)
+                {
                     let split = text.len() - i;
                     return (text[..split].to_string(), text[split..].to_string());
                 }
@@ -112,12 +117,16 @@ impl ThinkTagParser {
                     if let Some(pos) = remaining.find("<think>") {
                         let before = &remaining[..pos];
                         if !before.is_empty() {
-                            events.push(StreamEvent::TextDelta { text: before.to_string() });
+                            events.push(StreamEvent::TextDelta {
+                                text: before.to_string(),
+                            });
                         }
                         remaining = &remaining[pos + 7..];
                         self.state = ThinkTagState::InThinkTag;
                     } else {
-                        events.push(StreamEvent::TextDelta { text: remaining.to_string() });
+                        events.push(StreamEvent::TextDelta {
+                            text: remaining.to_string(),
+                        });
                         break;
                     }
                 }
@@ -125,19 +134,25 @@ impl ThinkTagParser {
                     if let Some(pos) = remaining.find("</think>") {
                         let reasoning = &remaining[..pos];
                         if !reasoning.is_empty() {
-                            events.push(StreamEvent::ReasoningDelta { text: reasoning.to_string() });
+                            events.push(StreamEvent::ReasoningDelta {
+                                text: reasoning.to_string(),
+                            });
                             self.reasoning_buffer.push_str(reasoning);
                         }
                         remaining = &remaining[pos + 8..];
                         self.state = ThinkTagState::InAnswer;
                     } else {
                         self.reasoning_buffer.push_str(remaining);
-                        events.push(StreamEvent::ReasoningDelta { text: remaining.to_string() });
+                        events.push(StreamEvent::ReasoningDelta {
+                            text: remaining.to_string(),
+                        });
                         break;
                     }
                 }
                 ThinkTagState::InAnswer => {
-                    events.push(StreamEvent::TextDelta { text: remaining.to_string() });
+                    events.push(StreamEvent::TextDelta {
+                        text: remaining.to_string(),
+                    });
                     break;
                 }
             }
@@ -189,7 +204,9 @@ mod tests {
         let events = p.feed_text("hello<think>deep thought</think> world");
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], StreamEvent::TextDelta { ref text } if text == "hello"));
-        assert!(matches!(events[1], StreamEvent::ReasoningDelta { ref text } if text == "deep thought"));
+        assert!(
+            matches!(events[1], StreamEvent::ReasoningDelta { ref text } if text == "deep thought")
+        );
         assert!(matches!(events[2], StreamEvent::TextDelta { ref text } if text == " world"));
         let result = p.finish();
         assert!(result.complete);
@@ -205,7 +222,9 @@ mod tests {
         // "nk>deep thought</think> done" — completes <think>, process normally
         let e2 = p.feed_text("nk>deep thought</think> done");
         assert_eq!(e2.len(), 2);
-        assert!(matches!(e2[0], StreamEvent::ReasoningDelta { ref text } if text == "deep thought"));
+        assert!(
+            matches!(e2[0], StreamEvent::ReasoningDelta { ref text } if text == "deep thought")
+        );
         assert!(matches!(e2[1], StreamEvent::TextDelta { ref text } if text == " done"));
         let result = p.finish();
         assert!(result.complete);

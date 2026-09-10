@@ -1,5 +1,7 @@
 use deeplossless::torture::adversarial;
-use deeplossless::torture::scenario::{Scenario, ScenarioRun, StateMachine, extract_events_from_request, score_run};
+use deeplossless::torture::scenario::{
+    Scenario, ScenarioRun, StateMachine, extract_events_from_request, score_run,
+};
 use deeplossless::torture::trace::ScenarioTrace;
 use serde_json::Value;
 
@@ -21,7 +23,9 @@ fn usage() {
     eprintln!("  target/release/torture gen");
     eprintln!("  target/release/torture list");
     eprintln!("  target/release/torture run hidden_bug");
-    eprintln!("  target/release/torture serve traces/simple_search_cache_identical.json --port 9000 --host 127.0.0.1");
+    eprintln!(
+        "  target/release/torture serve traces/simple_search_cache_identical.json --port 9000 --host 127.0.0.1"
+    );
 }
 
 fn list_traces() {
@@ -29,7 +33,12 @@ fn list_traces() {
     println!("Traces:");
     println!("  combined  — {} ({} turns)", t.description, t.turns.len());
     for adv in adversarial::all_adversarial() {
-        println!("  {}  — {} ({} turns)", adv.name, adv.description, adv.turns.len());
+        println!(
+            "  {}  — {} ({} turns)",
+            adv.name,
+            adv.description,
+            adv.turns.len()
+        );
     }
     if let Ok(scenarios) = Scenario::list() {
         if !scenarios.is_empty() {
@@ -44,7 +53,10 @@ fn list_traces() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 { usage(); std::process::exit(1); }
+    if args.len() < 2 {
+        usage();
+        std::process::exit(1);
+    }
 
     match args[1].as_str() {
         "list" => list_traces(),
@@ -84,7 +96,10 @@ fn main() {
             });
             let tmpl_path = format!("{}/template.json", out);
             std::fs::write(&tmpl_path, serde_json::to_string_pretty(&template).unwrap()).ok();
-            println!("Generated {}  (edit this to create custom traces)", tmpl_path);
+            println!(
+                "Generated {}  (edit this to create custom traces)",
+                tmpl_path
+            );
         }
 
         "adversarial" => {
@@ -115,7 +130,10 @@ fn main() {
             let mut port = 9000u16;
             let mut i = 3;
             while i < args.len() {
-                if args[i] == "--port" { i += 1; port = args[i].parse().unwrap_or(9000); }
+                if args[i] == "--port" {
+                    i += 1;
+                    port = args[i].parse().unwrap_or(9000);
+                }
                 i += 1;
             }
 
@@ -200,7 +218,9 @@ fn main() {
                 }));
 
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await.unwrap();
+                let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
                 axum::serve(listener, app).await.unwrap();
             });
         }
@@ -212,9 +232,17 @@ fn main() {
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--port" => { i += 1; port = args[i].parse().unwrap_or(9000); }
-                    "--host" => { i += 1; host = args.get(i).cloned().unwrap_or_else(|| "127.0.0.1".into()); }
-                    _ if trace_path.is_empty() => { trace_path = args[i].clone(); }
+                    "--port" => {
+                        i += 1;
+                        port = args[i].parse().unwrap_or(9000);
+                    }
+                    "--host" => {
+                        i += 1;
+                        host = args.get(i).cloned().unwrap_or_else(|| "127.0.0.1".into());
+                    }
+                    _ if trace_path.is_empty() => {
+                        trace_path = args[i].clone();
+                    }
                     _ => {}
                 }
                 i += 1;
@@ -225,10 +253,14 @@ fn main() {
             }
 
             let trace = ScenarioTrace::load(&trace_path).unwrap_or_else(|e| {
-                eprintln!("Error loading trace: {e}"); std::process::exit(1);
+                eprintln!("Error loading trace: {e}");
+                std::process::exit(1);
             });
             let total = trace.turns.len();
-            eprintln!("Serving {} turns from {} on http://{}:{}", total, trace_path, host, port);
+            eprintln!(
+                "Serving {} turns from {} on http://{}:{}",
+                total, trace_path, host, port
+            );
 
             let state = std::sync::Arc::new(MockServerState {
                 trace,
@@ -261,11 +293,16 @@ fn main() {
 
             eprintln!("Listening on http://{}:{}", host, port);
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await.unwrap();
+                let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
+                    .await
+                    .unwrap();
                 axum::serve(listener, app).await.unwrap();
             });
         }
 
-        _ => { usage(); std::process::exit(1); }
+        _ => {
+            usage();
+            std::process::exit(1);
+        }
     }
 }

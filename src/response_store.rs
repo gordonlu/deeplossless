@@ -44,7 +44,10 @@ impl ResponseStore {
     }
 
     pub fn get(&self, id: &str) -> Option<serde_json::Value> {
-        self.inner.lock().ok().and_then(|guard| guard.map.get(id).cloned())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.map.get(id).cloned())
     }
 
     pub fn len(&self) -> usize {

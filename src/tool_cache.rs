@@ -19,7 +19,9 @@ impl ToolName {
     pub fn new(name: &str) -> Self {
         Self(normalize_tool_name(name))
     }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for ToolName {
@@ -85,13 +87,19 @@ impl L1HotCache {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Look up a cached result. Returns the result (Arc clone, cheap bump)
     /// and hit count. Updates access sequence and moves key to back of LRU order.
     pub fn get(&self, tool_name: &str, args_hash: &str) -> Option<(Arc<str>, u64)> {
-        let key = CacheKey { tool_name: ToolName::new(tool_name), args_hash: args_hash.to_string() };
+        let key = CacheKey {
+            tool_name: ToolName::new(tool_name),
+            args_hash: args_hash.to_string(),
+        };
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = map.get_mut(&key) {
             e.hit_count += 1;
@@ -125,7 +133,10 @@ impl L1HotCache {
         dependent_files: &[String],
         file_hashes: &[String],
     ) {
-        let key = CacheKey { tool_name: ToolName::new(tool_name), args_hash: args_hash.to_string() };
+        let key = CacheKey {
+            tool_name: ToolName::new(tool_name),
+            args_hash: args_hash.to_string(),
+        };
         let seq = self.clock.fetch_add(1, Ordering::Relaxed);
 
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
@@ -173,13 +184,16 @@ impl L1HotCache {
             idx.entry(f.clone()).or_default().insert(key.clone());
         }
         ord.push_back(key.clone());
-        map.insert(key, CacheEntry {
-            result: Arc::from(result.to_string()),
-            dependent_files: dependent_files.to_vec(),
-            file_hashes: file_hashes.to_vec(),
-            hit_count: 1,
-            access_seq: seq,
-        });
+        map.insert(
+            key,
+            CacheEntry {
+                result: Arc::from(result.to_string()),
+                dependent_files: dependent_files.to_vec(),
+                file_hashes: file_hashes.to_vec(),
+                hit_count: 1,
+                access_seq: seq,
+            },
+        );
     }
 
     /// O(affected) invalidation. Uses reverse index to find affected keys directly.
@@ -217,7 +231,9 @@ impl L1HotCache {
             let should_keep = use_content_check
                 && map.get(key).is_some_and(|e| {
                     !e.file_hashes.is_empty()
-                        && e.file_hashes.iter().all(|h| new_hash_set.contains(h.as_str()))
+                        && e.file_hashes
+                            .iter()
+                            .all(|h| new_hash_set.contains(h.as_str()))
                 });
 
             if !should_keep {
@@ -319,33 +335,146 @@ const TOOL_KIND_REGISTRY: &[(&[&str], ToolKind)] = &[
     // ── Exact-match only. Add new aliases without fear of collision. ──
 
     // Deterministic, cacheable
-    (&["grep", "search_content", "search_code", "search_file",
-       "find_in_files", "rg", "ripgrep", "glob", "find_files",
-       "find_file", "supergrep", "xxgrep"], ToolKind::Grep),
-    (&["read_file", "read", "view_file", "view",
-       "get_file", "cat", "open_file"], ToolKind::ReadFile),
-    (&["list_files", "ls", "tree", "dir",
-       "directory_tree", "list"], ToolKind::ListFiles),
-    (&["symbol_search", "document_symbol", "workspace_symbol",
-       "symbols", "outline", "go_to_symbol"], ToolKind::SymbolSearch),
-    (&["diagnostics", "diagnostic", "lint", "lints",
-       "check", "errors", "problems"], ToolKind::Diagnostics),
-
+    (
+        &[
+            "grep",
+            "search_content",
+            "search_code",
+            "search_file",
+            "find_in_files",
+            "rg",
+            "ripgrep",
+            "glob",
+            "find_files",
+            "find_file",
+            "supergrep",
+            "xxgrep",
+        ],
+        ToolKind::Grep,
+    ),
+    (
+        &[
+            "read_file",
+            "read",
+            "view_file",
+            "view",
+            "get_file",
+            "cat",
+            "open_file",
+        ],
+        ToolKind::ReadFile,
+    ),
+    (
+        &["list_files", "ls", "tree", "dir", "directory_tree", "list"],
+        ToolKind::ListFiles,
+    ),
+    (
+        &[
+            "symbol_search",
+            "document_symbol",
+            "workspace_symbol",
+            "symbols",
+            "outline",
+            "go_to_symbol",
+        ],
+        ToolKind::SymbolSearch,
+    ),
+    (
+        &[
+            "diagnostics",
+            "diagnostic",
+            "lint",
+            "lints",
+            "check",
+            "errors",
+            "problems",
+        ],
+        ToolKind::Diagnostics,
+    ),
     // Non-deterministic / mutating — classified but NOT cached
-    (&["bash", "execute_command", "terminal", "shell",
-       "run", "exec", "cmd", "command"], ToolKind::Bash),
-    (&["write_to_file", "write", "write_file",
-       "create_file", "save", "new_file"], ToolKind::Write),
-    (&["edit", "edit_file", "replace_in_file", "apply_patch",
-       "replace", "multi_replace", "str_replace"], ToolKind::Edit),
-    (&["task", "todo_write", "todo", "subagent",
-       "agent", "delegate", "spawn"], ToolKind::Task),
-    (&["question", "ask", "ask_user", "confirm",
-       "ask_followup_question"], ToolKind::Question),
-    (&["web_search", "webfetch", "web_fetch",
-       "search_web", "fetch", "browser"], ToolKind::WebFetch),
-    (&["delete_files", "delete", "remove", "unlink",
-       "move", "rename", "mkdir", "create_directory", "new_dir"], ToolKind::FileOp),
+    (
+        &[
+            "bash",
+            "execute_command",
+            "terminal",
+            "shell",
+            "run",
+            "exec",
+            "cmd",
+            "command",
+        ],
+        ToolKind::Bash,
+    ),
+    (
+        &[
+            "write_to_file",
+            "write",
+            "write_file",
+            "create_file",
+            "save",
+            "new_file",
+        ],
+        ToolKind::Write,
+    ),
+    (
+        &[
+            "edit",
+            "edit_file",
+            "replace_in_file",
+            "apply_patch",
+            "replace",
+            "multi_replace",
+            "str_replace",
+        ],
+        ToolKind::Edit,
+    ),
+    (
+        &[
+            "task",
+            "todo_write",
+            "todo",
+            "subagent",
+            "agent",
+            "delegate",
+            "spawn",
+        ],
+        ToolKind::Task,
+    ),
+    (
+        &[
+            "question",
+            "ask",
+            "ask_user",
+            "confirm",
+            "ask_followup_question",
+        ],
+        ToolKind::Question,
+    ),
+    (
+        &[
+            "web_search",
+            "webfetch",
+            "web_fetch",
+            "search_web",
+            "fetch",
+            "browser",
+        ],
+        ToolKind::WebFetch,
+    ),
+    (
+        &[
+            "delete_files",
+            "delete",
+            "remove",
+            "unlink",
+            "move",
+            "rename",
+            "mkdir",
+            "create_directory",
+            "new_dir",
+        ],
+        ToolKind::FileOp,
+    ),
 ];
 
 impl ToolKind {
@@ -364,12 +493,19 @@ impl ToolKind {
     /// Tools with side effects are NOT cacheable.
     pub fn dependency_kind(&self) -> Option<crate::dependency_kind::DependencyKind> {
         match self {
-            ToolKind::Grep | ToolKind::WebFetch => Some(crate::dependency_kind::DependencyKind::SearchesFile),
-            ToolKind::ReadFile | ToolKind::ListFiles => Some(crate::dependency_kind::DependencyKind::ReadsFile),
+            ToolKind::Grep | ToolKind::WebFetch => {
+                Some(crate::dependency_kind::DependencyKind::SearchesFile)
+            }
+            ToolKind::ReadFile | ToolKind::ListFiles => {
+                Some(crate::dependency_kind::DependencyKind::ReadsFile)
+            }
             ToolKind::SymbolSearch => Some(crate::dependency_kind::DependencyKind::SearchesFile),
             ToolKind::Diagnostics => Some(crate::dependency_kind::DependencyKind::ReadsFile),
-            ToolKind::Bash | ToolKind::Write | ToolKind::Edit
-            | ToolKind::Task | ToolKind::Question
+            ToolKind::Bash
+            | ToolKind::Write
+            | ToolKind::Edit
+            | ToolKind::Task
+            | ToolKind::Question
             | ToolKind::FileOp => Some(crate::dependency_kind::DependencyKind::Derivation),
             ToolKind::Other => None, // unknown tools are NOT cacheable
         }
@@ -380,48 +516,26 @@ impl ToolKind {
 /// Only Grep, ReadFile, ListFiles, SymbolSearch, and Diagnostics are cacheable.
 /// Mutating tools (Edit/Write) and non-deterministic tools (Bash/Task) are skipped.
 pub fn is_interceptable(tool_name: &str) -> bool {
-    matches!(ToolKind::from_name(tool_name),
-        ToolKind::Grep | ToolKind::ReadFile | ToolKind::ListFiles
-        | ToolKind::SymbolSearch | ToolKind::Diagnostics)
+    matches!(
+        ToolKind::from_name(tool_name),
+        ToolKind::Grep
+            | ToolKind::ReadFile
+            | ToolKind::ListFiles
+            | ToolKind::SymbolSearch
+            | ToolKind::Diagnostics
+    )
 }
 
 pub fn is_cacheable(tool_name: &str) -> bool {
     is_interceptable(tool_name)
 }
 
-/// Transform a cached result before injecting it into the stream.
-/// For read_file/list_files, extracts a structured summary (symbols, line count)
-/// instead of dumping raw file content into the conversation.
-/// For grep/search/diagnostics, returns the raw result unchanged.
-pub fn transform_result(tool_name: &str, raw_result: &str) -> String {
-    let kind = ToolKind::from_name(tool_name);
-    match kind {
-        ToolKind::ReadFile => {
-            let line_count = raw_result.lines().count();
-            let preview: String = raw_result.lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(3)
-                .map(|l| l.trim().chars().take(80).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if preview.is_empty() {
-                format!("[cached] {line_count} lines")
-            } else {
-                format!("[cached] {line_count} lines:\n{preview}")
-            }
-        }
-        ToolKind::ListFiles => {
-            let count = raw_result.lines().filter(|l| !l.trim().is_empty()).count();
-            let preview: String = raw_result.lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(5)
-                .map(|l| l.trim().chars().take(60).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("[cached] {count} entries:\n{preview}")
-        }
-        _ => raw_result.to_string(),
-    }
+/// Return the exact cached tool result.
+///
+/// Cache reuse is an execution optimization, not a context-compression step.
+/// A cache hit must preserve the observable semantics of executing the tool.
+pub fn transform_result(_tool_name: &str, raw_result: &str) -> String {
+    raw_result.to_string()
 }
 
 /// Convenience: compute cache key tuple `(tool_name, args_hash)`.
@@ -434,12 +548,16 @@ pub fn cache_key(tool_name: &str, args: &str) -> (String, String) {
 // ── Normalize tool name ───────────────────────────────────────────────
 
 fn normalize_tool_name(name: &str) -> String {
-    let sanitized: String = name.trim().to_lowercase()
+    let sanitized: String = name
+        .trim()
+        .to_lowercase()
         .replace("..", "")
         .chars()
         .filter(|c| !matches!(c, '/' | '\\' | '"' | '\''))
         .collect();
-    if sanitized.is_empty() { return "unknown".into(); }
+    if sanitized.is_empty() {
+        return "unknown".into();
+    }
     // Map to canonical form via registry
     let kind = ToolKind::from_name(&sanitized);
     match kind {
@@ -448,8 +566,13 @@ fn normalize_tool_name(name: &str) -> String {
         ToolKind::ListFiles => "list_files".into(),
         ToolKind::SymbolSearch => "symbol_search".into(),
         ToolKind::Diagnostics => "diagnostics".into(),
-        ToolKind::Other | ToolKind::Bash | ToolKind::Write | ToolKind::Edit
-        | ToolKind::Task | ToolKind::Question | ToolKind::WebFetch
+        ToolKind::Other
+        | ToolKind::Bash
+        | ToolKind::Write
+        | ToolKind::Edit
+        | ToolKind::Task
+        | ToolKind::Question
+        | ToolKind::WebFetch
         | ToolKind::FileOp => sanitized,
     }
 }
@@ -477,7 +600,9 @@ pub fn extract_dependent_files(tool_name: &str, args: &str) -> Vec<String> {
         ToolKind::Grep => {
             if let Some(ref m) = arg_map {
                 for key in &["path", "directory", "dir", "pattern"] {
-                    if let Some(v) = m.get(*key) && looks_like_path_or_pattern(v) {
+                    if let Some(v) = m.get(*key)
+                        && looks_like_path_or_pattern(v)
+                    {
                         files.push(v.clone());
                     }
                 }
@@ -488,20 +613,36 @@ pub fn extract_dependent_files(tool_name: &str, args: &str) -> Vec<String> {
         }
         ToolKind::ListFiles => {
             if let Some(ref m) = arg_map
-                && let Some(v) = m.get("target_directory") { files.push(v.clone()); }
+                && let Some(v) = m.get("target_directory")
+            {
+                files.push(v.clone());
+            }
         }
         ToolKind::SymbolSearch => {
             if let Some(ref m) = arg_map
-                && let Some(v) = m.get("file_path") { files.push(v.clone()); }
+                && let Some(v) = m.get("file_path")
+            {
+                files.push(v.clone());
+            }
         }
-        ToolKind::Diagnostics | ToolKind::Other | ToolKind::Bash
-        | ToolKind::Write | ToolKind::Edit | ToolKind::Task
-        | ToolKind::Question | ToolKind::WebFetch | ToolKind::FileOp => {
+        ToolKind::Diagnostics
+        | ToolKind::Other
+        | ToolKind::Bash
+        | ToolKind::Write
+        | ToolKind::Edit
+        | ToolKind::Task
+        | ToolKind::Question
+        | ToolKind::WebFetch
+        | ToolKind::FileOp => {
             files.extend(extract_path_literals(args));
         }
     }
 
-    let mut result: Vec<String> = files.into_iter().collect::<HashSet<_>>().into_iter().collect();
+    let mut result: Vec<String> = files
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     result.sort();
     result
 }
@@ -510,10 +651,17 @@ fn extract_path_literals(text: &str) -> Vec<String> {
     let mut files = Vec::new();
     for word in text.split_whitespace() {
         let clean = word.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ':');
-        if clean.starts_with("http") || clean.starts_with("https") { continue; }
-        if clean.starts_with("--") || clean.starts_with('-') { continue; }
-        if (clean.contains('/') || clean.contains('\\') || (clean.contains('.') && clean.len() > 4 && !clean.contains("..")))
-            && clean.len() >= 2 && clean.len() <= 256
+        if clean.starts_with("http") || clean.starts_with("https") {
+            continue;
+        }
+        if clean.starts_with("--") || clean.starts_with('-') {
+            continue;
+        }
+        if (clean.contains('/')
+            || clean.contains('\\')
+            || (clean.contains('.') && clean.len() > 4 && !clean.contains("..")))
+            && clean.len() >= 2
+            && clean.len() <= 256
         {
             files.push(clean.to_string());
         }
@@ -545,12 +693,18 @@ impl CanonicalExecutionKey {
 
     /// Build from already-normalized components.
     pub fn from_parts(tool_name: ToolName, args_hash: String) -> Self {
-        Self { tool_name, args_hash }
+        Self {
+            tool_name,
+            args_hash,
+        }
     }
 
     /// Convert to cache key (same representation).
     pub fn to_cache_key(&self) -> CacheKey {
-        CacheKey { tool_name: self.tool_name.clone(), args_hash: self.args_hash.clone() }
+        CacheKey {
+            tool_name: self.tool_name.clone(),
+            args_hash: self.args_hash.clone(),
+        }
     }
 }
 
@@ -568,9 +722,14 @@ pub struct ToolCacheEntry {
 }
 
 pub fn should_invalidate(entry: &ToolCacheEntry, changed_files: &[String]) -> bool {
-    if changed_files.is_empty() { return false; }
+    if changed_files.is_empty() {
+        return false;
+    }
     let changed: HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
-    entry.dependent_files.iter().any(|f| changed.contains(f.as_str()))
+    entry
+        .dependent_files
+        .iter()
+        .any(|f| changed.contains(f.as_str()))
 }
 
 pub const MIGRATION: &str = "
@@ -598,7 +757,10 @@ mod tests {
     fn cache_key_roundtrip() {
         let k1 = CacheKey::new("grep", r#"{"pattern":"foo","path":"src"}"#);
         let k2 = CacheKey::new("search_content", r#"{"path":"src","pattern":"foo"}"#);
-        assert_eq!(k1, k2, "normalized args + tool name should produce equal keys");
+        assert_eq!(
+            k1, k2,
+            "normalized args + tool name should produce equal keys"
+        );
     }
 
     #[test]
@@ -633,7 +795,10 @@ mod tests {
         assert!(cache.get("grep", "key0").is_some());
         cache.put("grep", "overflow", "result", &[]);
         // key0 was recently accessed, so it should survive
-        assert!(cache.get("grep", "key0").is_some(), "recently accessed key should survive LRU");
+        assert!(
+            cache.get("grep", "key0").is_some(),
+            "recently accessed key should survive LRU"
+        );
     }
 
     #[test]
@@ -704,7 +869,10 @@ mod tests {
         let cache = L1HotCache::new(10);
         cache.put_with_hashes("grep", "h1", "r1", &["f.rs".into()], &["abc".into()]);
         // Same hash → entry survives
-        assert_eq!(cache.invalidate_with_hashes(&["f.rs".into()], &["abc".into()]), 0);
+        assert_eq!(
+            cache.invalidate_with_hashes(&["f.rs".into()], &["abc".into()]),
+            0
+        );
         assert!(cache.get("grep", "h1").is_some());
     }
 
@@ -713,16 +881,28 @@ mod tests {
         let cache = L1HotCache::new(10);
         cache.put_with_hashes("grep", "h1", "r1", &["f.rs".into()], &["old_hash".into()]);
         // Different hash → entry invalidated
-        assert_eq!(cache.invalidate_with_hashes(&["f.rs".into()], &["new_hash".into()]), 1);
+        assert_eq!(
+            cache.invalidate_with_hashes(&["f.rs".into()], &["new_hash".into()]),
+            1
+        );
         assert!(cache.get("grep", "h1").is_none());
     }
 
     #[test]
     fn content_hash_strict_matching_all_hashes_required() {
         let cache = L1HotCache::new(10);
-        cache.put_with_hashes("grep", "h1", "r1", &["a.rs".into(), "b.rs".into()], &["h_a".into(), "h_b".into()]);
+        cache.put_with_hashes(
+            "grep",
+            "h1",
+            "r1",
+            &["a.rs".into(), "b.rs".into()],
+            &["h_a".into(), "h_b".into()],
+        );
         // Only one hash matches → strict mode requires ALL → invalidate
-        assert_eq!(cache.invalidate_with_hashes(&["a.rs".into()], &["h_a".into()]), 1);
+        assert_eq!(
+            cache.invalidate_with_hashes(&["a.rs".into()], &["h_a".into()]),
+            1
+        );
         assert!(cache.get("grep", "h1").is_none());
     }
 
@@ -787,59 +967,33 @@ mod tests {
 
     #[test]
     fn extract_files_ignores_urls_and_flags() {
-        let files = extract_dependent_files("read_file", r#"read_file --path https://example.com --flag src/main.rs"#);
+        let files = extract_dependent_files(
+            "read_file",
+            r#"read_file --path https://example.com --flag src/main.rs"#,
+        );
         assert!(!files.iter().any(|f| f.contains("http")));
         assert!(!files.iter().any(|f| f.contains("--")));
     }
 
-    // ── Transform ─────────────────────────────────────────────────────
+    // ── Transform / exact replay ───────────────────────────────────────
 
     #[test]
-    fn transform_read_file_counts_lines() {
-        let result = transform_result("read_file", "pub fn foo() {\n    let x = 1;\n}\n\npub struct Bar {\n    x: i32,\n}\n\nfn baz() {}");
-        assert!(result.starts_with("[cached]"));
-        assert!(result.contains("lines"));
+    fn transform_read_file_preserves_exact_result() {
+        let raw = "pub fn foo() {\n    let x = 1;\n}\n";
+        assert_eq!(transform_result("read_file", raw), raw);
     }
 
     #[test]
-    fn transform_read_file_empty_is_safe() {
-        assert_eq!(transform_result("read_file", ""), "[cached] 0 lines");
-    }
-
-    #[test]
-    fn transform_list_files_bounded_preview() {
-        let result = transform_result("list_files", "src/main.rs\nsrc/lib.rs\n.git/config\nnode_modules/react/index.js\nCargo.toml");
-        assert!(result.starts_with("[cached]"), "got: {result}");
-        assert!(result.contains("entries"), "got: {result}");
-        // Preview shows first 5 non-empty lines — bounded, not parsed
-        assert!(result.contains("src/main.rs"), "preview should show first lines: {result}");
-        assert!(result.contains("Cargo.toml"), "preview should show first lines: {result}");
-    }
-
-    #[test]
-    fn transform_read_file_bounded_preview() {
-        let content = "line1\nline2\nline3\nline4\nline5\nline6";
-        let result = transform_result("read_file", content);
-        assert!(result.starts_with("[cached]"), "got: {result}");
-        assert!(result.contains("lines"), "got: {result}");
-        // Shows first 3 non-empty lines as preview
-        assert!(result.contains("line1"), "preview should show first lines: {result}");
-        // Line 6 should NOT appear (only first 3 lines)
-        assert!(!result.contains("line6"), "preview should be bounded: {result}");
-    }
-
-    #[test]
-    fn transform_grep_passes_through() {
-        let raw = "src/main.rs:42: found foo";
-        assert_eq!(transform_result("grep", raw), raw);
+    fn transform_list_files_preserves_all_entries() {
+        let raw = "a\nb\nc\nd\ne\nf\n";
+        assert_eq!(transform_result("list_files", raw), raw);
     }
 
     #[test]
     fn transform_result_never_panics_on_weird_input() {
-        transform_result("read_file", &"x".repeat(10000));
-        transform_result("list_files", "\0\n\x01\n\x02");
-        transform_result("grep", "\n\n\n");
-        transform_result("unknown_tool", "anything");
+        let raw = "\0\n\x01\n\x02";
+        assert_eq!(transform_result("read_file", raw), raw);
+        assert_eq!(transform_result("unknown_tool", raw), raw);
     }
 
     // ── L2 invalidation ───────────────────────────────────────────────
@@ -847,9 +1001,13 @@ mod tests {
     #[test]
     fn should_invalidate_on_dependency_change() {
         let entry = ToolCacheEntry {
-            id: 1, tool_name: "grep".into(), args_hash: "abc".into(),
-            result: "found".into(), dependent_files: vec!["src/main.rs".into()],
-            created_at: String::new(), hit_count: 1,
+            id: 1,
+            tool_name: "grep".into(),
+            args_hash: "abc".into(),
+            result: "found".into(),
+            dependent_files: vec!["src/main.rs".into()],
+            created_at: String::new(),
+            hit_count: 1,
         };
         assert!(should_invalidate(&entry, &["src/main.rs".into()]));
         assert!(!should_invalidate(&entry, &["README.md".into()]));
@@ -869,7 +1027,9 @@ mod tests {
                 let _ = c.get("grep", &format!("key{i}"));
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert_eq!(cache.len(), 4);
     }
 
@@ -887,7 +1047,9 @@ mod tests {
                 c.invalidate(&files);
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         // Should not panic — RwLock handles concurrent reads fine
         assert!(cache.len() <= 50);
     }
@@ -927,21 +1089,45 @@ mod tests {
         // Claude Code / OpenCode / Codex tool names
         let all_tools = [
             // ── Should be recognized AND interceptable ──
-            ("grep", true), ("search_content", true), ("search_file", true),
-            ("search_code", true), ("glob", true), ("find_files", true),
-            ("read_file", true), ("read", true), ("view", true), ("cat", true),
-            ("list_files", true), ("ls", true), ("tree", true),
-            ("symbol_search", true), ("document_symbol", true),
-            ("diagnostics", true), ("lint", true),
+            ("grep", true),
+            ("search_content", true),
+            ("search_file", true),
+            ("search_code", true),
+            ("glob", true),
+            ("find_files", true),
+            ("read_file", true),
+            ("read", true),
+            ("view", true),
+            ("cat", true),
+            ("list_files", true),
+            ("ls", true),
+            ("tree", true),
+            ("symbol_search", true),
+            ("document_symbol", true),
+            ("diagnostics", true),
+            ("lint", true),
             // ── Recognized but NOT interceptable ──
-            ("bash", false), ("execute_command", false), ("terminal", false),
-            ("write_to_file", false), ("write", false), ("create_file", false),
-            ("edit", false), ("replace_in_file", false), ("apply_patch", false),
+            ("bash", false),
+            ("execute_command", false),
+            ("terminal", false),
+            ("write_to_file", false),
+            ("write", false),
+            ("create_file", false),
+            ("edit", false),
+            ("replace_in_file", false),
+            ("apply_patch", false),
             ("str_replace", false),
-            ("task", false), ("todo_write", false), ("subagent", false),
-            ("question", false), ("ask_followup_question", false),
-            ("web_search", false), ("webfetch", false), ("web_fetch", false),
-            ("delete_files", false), ("move", false), ("mkdir", false),
+            ("task", false),
+            ("todo_write", false),
+            ("subagent", false),
+            ("question", false),
+            ("ask_followup_question", false),
+            ("web_search", false),
+            ("webfetch", false),
+            ("web_fetch", false),
+            ("delete_files", false),
+            ("move", false),
+            ("mkdir", false),
             // ── Should be recognized via substring: "xx" + "grep" ──
             ("supergrep", true),
             // ── NOT recognized → Other ──
@@ -951,17 +1137,23 @@ mod tests {
         for (name, should_be_interceptable) in &all_tools {
             let kind = ToolKind::from_name(name);
             if matches!(kind, ToolKind::Other) {
-                assert!(!should_be_interceptable,
-                    "tool '{name}' not recognized but expected to be; add to TOOL_KIND_REGISTRY");
+                assert!(
+                    !should_be_interceptable,
+                    "tool '{name}' not recognized but expected to be; add to TOOL_KIND_REGISTRY"
+                );
                 continue; // unrecognized, skip interceptable check
             }
             let acceptable = is_interceptable(name);
             if *should_be_interceptable {
-                assert!(acceptable,
-                    "tool '{name}' should be interceptable (kind={kind:?})");
+                assert!(
+                    acceptable,
+                    "tool '{name}' should be interceptable (kind={kind:?})"
+                );
             } else {
-                assert!(!acceptable,
-                    "tool '{name}' ({kind:?}) should NOT be interceptable");
+                assert!(
+                    !acceptable,
+                    "tool '{name}' ({kind:?}) should NOT be interceptable"
+                );
             }
         }
     }

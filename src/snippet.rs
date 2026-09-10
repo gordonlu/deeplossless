@@ -40,7 +40,9 @@ pub struct Snippet {
 pub fn rank_snippets(snippets: &[Snippet], top_k: usize) -> Vec<&Snippet> {
     let mut sorted: Vec<&Snippet> = snippets.iter().collect();
     sorted.sort_by(|a, b| {
-        b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal)
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.frequency.cmp(&b.frequency)) // lower freq = rarer = higher rank
             .then(b.content.len().cmp(&a.content.len())) // longer = more info
     });
@@ -84,7 +86,8 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
             if in_code {
-                let block: String = text.lines()
+                let block: String = text
+                    .lines()
                     .skip(code_start + 1)
                     .take(i - code_start - 1)
                     .collect::<Vec<_>>()
@@ -99,7 +102,7 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                             content: truncated,
                             source_node_id: source_node_id.to_string(),
                             frequency: 0,
-                        importance: 0.8,
+                            importance: 0.8,
                         });
                     } else {
                         for elem in structural {
@@ -108,7 +111,7 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                                 content: elem,
                                 source_node_id: source_node_id.to_string(),
                                 frequency: 0,
-                        importance: 0.85,
+                                importance: 0.85,
                             });
                         }
                     }
@@ -131,7 +134,7 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                 content: clean.to_string(),
                 source_node_id: source_node_id.to_string(),
                 frequency: 0,
-                        importance: 0.5,
+                importance: 0.5,
             });
         }
     }
@@ -143,17 +146,21 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
         let has_digit = clean.chars().any(|c| c.is_ascii_digit());
         let has_letter = clean.chars().any(|c| c.is_ascii_alphabetic());
         // Skip if the word contains both digits and letters (unit-laden)
-        if has_digit && has_letter { continue; }
+        if has_digit && has_letter {
+            continue;
+        }
         if let Ok(n) = clean.parse::<i64>()
-            && n > 9 && n < 1_000_000 {
-                snippets.push(Snippet {
-                    snippet_type: SnippetType::NumericConstant,
-                    content: clean.to_string(),
-                    source_node_id: source_node_id.to_string(),
-                    frequency: 0,
-                        importance: 0.5,
-                });
-            }
+            && n > 9
+            && n < 1_000_000
+        {
+            snippets.push(Snippet {
+                snippet_type: SnippetType::NumericConstant,
+                content: clean.to_string(),
+                source_node_id: source_node_id.to_string(),
+                frequency: 0,
+                importance: 0.5,
+            });
+        }
     }
 
     // 4. Percentages (e.g., "67%", "95%")
@@ -161,37 +168,50 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
         let clean = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '%' && c != '.');
         if clean.ends_with('%')
             && let Ok(n) = clean.trim_end_matches('%').parse::<i64>()
-                && (1..=100).contains(&n) {
-                    snippets.push(Snippet {
-                        snippet_type: SnippetType::NumericConstant,
-                        content: clean.to_string(),
-                        source_node_id: source_node_id.to_string(),
-                        frequency: 0,
-                        importance: 0.5,
-                    });
-                }
+            && (1..=100).contains(&n)
+        {
+            snippets.push(Snippet {
+                snippet_type: SnippetType::NumericConstant,
+                content: clean.to_string(),
+                source_node_id: source_node_id.to_string(),
+                frequency: 0,
+                importance: 0.5,
+            });
+        }
     }
 
     // 5. Proper nouns: capitalized multi-word terms, company names, model names
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.starts_with('-') { continue; }
+        if trimmed.starts_with('#') || trimmed.starts_with('-') {
+            continue;
+        }
         let lower = trimmed.to_lowercase();
         const KEY_PROPER_NOUNS: &[&str] = &[
-            "Gartner", "DeepSeek", "DeepSeek-V4", "Claude Opus", "OpenAI",
-            "Transformer", "DAG", "Context-ReAct", "FTS5", "SQLite",
+            "Gartner",
+            "DeepSeek",
+            "DeepSeek-V4",
+            "Claude Opus",
+            "OpenAI",
+            "Transformer",
+            "DAG",
+            "Context-ReAct",
+            "FTS5",
+            "SQLite",
         ];
         for pn in KEY_PROPER_NOUNS {
-            if trimmed.contains(pn) && !lower.starts_with(&pn.to_lowercase())
-                && !snippets.iter().any(|s| s.content == *pn) {
-                    snippets.push(Snippet {
-                        snippet_type: SnippetType::ProperNoun,
-                        content: pn.to_string(),
-                        source_node_id: source_node_id.to_string(),
-                        frequency: 0,
-                        importance: 0.5,
-                    });
-                }
+            if trimmed.contains(pn)
+                && !lower.starts_with(&pn.to_lowercase())
+                && !snippets.iter().any(|s| s.content == *pn)
+            {
+                snippets.push(Snippet {
+                    snippet_type: SnippetType::ProperNoun,
+                    content: pn.to_string(),
+                    source_node_id: source_node_id.to_string(),
+                    frequency: 0,
+                    importance: 0.5,
+                });
+            }
         }
     }
 
@@ -211,7 +231,7 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
                                 content: segment.to_string(),
                                 source_node_id: source_node_id.to_string(),
                                 frequency: 0,
-                        importance: 0.8,
+                                importance: 0.8,
                             });
                         }
                         in_quote = false;
@@ -225,9 +245,13 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
     }
 
     // Dedup by content, keep highest importance
-    snippets.sort_by(|a, b| a.content.cmp(&b.content).then(
-        a.importance.partial_cmp(&b.importance).unwrap_or(std::cmp::Ordering::Equal)
-    ));
+    snippets.sort_by(|a, b| {
+        a.content.cmp(&b.content).then(
+            a.importance
+                .partial_cmp(&b.importance)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
     snippets.dedup_by(|a, b| a.content == b.content);
 
     // Token-budget truncation: keep snippets up to ~500 tokens total
@@ -235,7 +259,9 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
     let mut used = 0;
     snippets.retain(|s| {
         let tc = crate::tokenizer::count(&s.content);
-        if used + tc > max_tokens { return false; }
+        if used + tc > max_tokens {
+            return false;
+        }
         used += tc;
         true
     });
@@ -246,7 +272,9 @@ pub fn extract_with_source(text: &str, source_node_id: &str) -> Vec<Snippet> {
 /// Truncate text to approximately `max_tokens` tokens.
 fn token_truncate(text: &str, max_tokens: usize) -> String {
     let tc = crate::tokenizer::count(text);
-    if tc <= max_tokens { return text.to_string(); }
+    if tc <= max_tokens {
+        return text.to_string();
+    }
     let ratio = max_tokens as f64 / tc as f64;
     let char_len = text.chars().count();
     let new_len = (char_len as f64 * ratio) as usize;
@@ -272,7 +300,8 @@ fn parse_with_tree_sitter(
     let mut stack: Vec<tree_sitter::Node> = root.children(&mut root.walk()).collect();
     while let Some(node) = stack.pop() {
         let kind = node.kind();
-        if decl_kinds.contains(&kind) || import_kinds.contains(&kind) || const_kinds.contains(&kind) {
+        if decl_kinds.contains(&kind) || import_kinds.contains(&kind) || const_kinds.contains(&kind)
+        {
             let text = &code[node.start_byte()..node.end_byte()];
             let first_line = text.lines().next().unwrap_or(text).trim();
             if !first_line.is_empty() && seen.insert(first_line.to_string()) {
@@ -294,45 +323,107 @@ fn parse_with_tree_sitter(
 fn extract_ast(code: &str, lang: &str) -> Option<Vec<String>> {
     let l = lang.to_lowercase();
     if l.contains("rust") || l.contains("rs") {
-        parse_with_tree_sitter(code, &tree_sitter_rust::LANGUAGE.into(),
-            &["function_item", "function_signature_item", "struct_item", "enum_item", "trait_item", "impl_item", "mod_item"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_rust::LANGUAGE.into(),
+            &[
+                "function_item",
+                "function_signature_item",
+                "struct_item",
+                "enum_item",
+                "trait_item",
+                "impl_item",
+                "mod_item",
+            ],
             &["use_declaration"],
-            &["const_item", "static_item"])
+            &["const_item", "static_item"],
+        )
     } else if l.contains("python") || l.contains("py") {
-        parse_with_tree_sitter(code, &tree_sitter_python::LANGUAGE.into(),
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_python::LANGUAGE.into(),
             &["function_definition", "class_definition"],
             &["import_statement", "import_from_statement"],
-            &[])
+            &[],
+        )
     } else if l.contains("typescript") || l.contains("ts") || l.contains("tsx") {
-        parse_with_tree_sitter(code, &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            &["function_declaration", "method_definition", "class_declaration", "interface_declaration", "type_alias_declaration"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &[
+                "function_declaration",
+                "method_definition",
+                "class_declaration",
+                "interface_declaration",
+                "type_alias_declaration",
+            ],
             &["import_statement"],
-            &["lexical_declaration", "variable_declaration"])
+            &["lexical_declaration", "variable_declaration"],
+        )
     } else if l.contains("javascript") || l.contains("js") || l.contains("jsx") {
-        parse_with_tree_sitter(code, &tree_sitter_javascript::LANGUAGE.into(),
-            &["function_declaration", "method_definition", "class_declaration"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_javascript::LANGUAGE.into(),
+            &[
+                "function_declaration",
+                "method_definition",
+                "class_declaration",
+            ],
             &["import_statement"],
-            &["lexical_declaration", "variable_declaration"])
+            &["lexical_declaration", "variable_declaration"],
+        )
     } else if l.contains("java") {
-        parse_with_tree_sitter(code, &tree_sitter_java::LANGUAGE.into(),
-            &["method_declaration", "class_declaration", "interface_declaration", "enum_declaration"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_java::LANGUAGE.into(),
+            &[
+                "method_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+            ],
             &["import_declaration"],
-            &["field_declaration"])
+            &["field_declaration"],
+        )
     } else if l.contains("c++") || l.contains("cpp") || l.contains("cxx") {
-        parse_with_tree_sitter(code, &tree_sitter_c::LANGUAGE.into(),
-            &["function_definition", "class_specifier", "struct_specifier", "enum_specifier"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_c::LANGUAGE.into(),
+            &[
+                "function_definition",
+                "class_specifier",
+                "struct_specifier",
+                "enum_specifier",
+            ],
             &["preproc_include"],
-            &["declaration"])
+            &["declaration"],
+        )
     } else if l.contains("c#") || l.contains("csharp") || l.contains("cs") {
-        parse_with_tree_sitter(code, &tree_sitter_c_sharp::LANGUAGE.into(),
-            &["method_declaration", "class_declaration", "interface_declaration", "struct_declaration", "enum_declaration"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_c_sharp::LANGUAGE.into(),
+            &[
+                "method_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+                "enum_declaration",
+            ],
             &["using_directive"],
-            &["field_declaration", "property_declaration"])
+            &["field_declaration", "property_declaration"],
+        )
     } else if l.contains("go") || l.contains("golang") {
-        parse_with_tree_sitter(code, &tree_sitter_go::LANGUAGE.into(),
-            &["function_declaration", "method_declaration", "type_declaration"],
+        parse_with_tree_sitter(
+            code,
+            &tree_sitter_go::LANGUAGE.into(),
+            &[
+                "function_declaration",
+                "method_declaration",
+                "type_declaration",
+            ],
             &["import_declaration"],
-            &["const_declaration", "var_declaration"])
+            &["const_declaration", "var_declaration"],
+        )
     } else {
         None
     }
@@ -361,9 +452,14 @@ fn extract_code_structure(code: &str, lang: &str) -> Vec<String> {
 
         // Rust: fn, struct, enum, trait, impl, use, const, mod, type
         if is_rust {
-            if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")
-                || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ") {
-                let sig = trimmed.trim_start_matches("pub ").trim_start_matches("async ");
+            if trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn ")
+            {
+                let sig = trimmed
+                    .trim_start_matches("pub ")
+                    .trim_start_matches("async ");
                 elements.push(truncate_to_line(sig, 120));
             }
             if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
@@ -387,7 +483,9 @@ fn extract_code_structure(code: &str, lang: &str) -> Vec<String> {
             if trimmed.starts_with("type ") && !trimmed.contains('<') {
                 elements.push(truncate_to_line(trimmed, 80));
             }
-            if (trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ")) && !trimmed.contains('{') {
+            if (trimmed.starts_with("mod ") || trimmed.starts_with("pub mod "))
+                && !trimmed.contains('{')
+            {
                 elements.push(truncate_to_line(trimmed, 60));
             }
         }
@@ -425,11 +523,17 @@ fn extract_code_structure(code: &str, lang: &str) -> Vec<String> {
 }
 
 fn truncate_to_line(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars { s.to_string() } else { format!("{}…", &s[..max_chars-1]) }
+    if s.len() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max_chars - 1])
+    }
 }
 
 fn looks_like_path(s: &str) -> bool {
-    if s.contains("//") || s.starts_with("http") { return false; }
+    if s.contains("//") || s.starts_with("http") {
+        return false;
+    }
     let has_sep = s.contains('/') || s.contains('\\');
     let has_dot = s.contains('.');
     let _has_src = s.contains("src") || s.contains("lib") || s.contains("bin");
@@ -455,7 +559,11 @@ mod tests {
     fn extract_code_block() {
         let text = "Here is the fix:\n```\nlet x = 42;\n```\nDone.";
         let snippets = extract(text);
-        assert!(snippets.iter().any(|s| s.snippet_type == SnippetType::CodeBlock));
+        assert!(
+            snippets
+                .iter()
+                .any(|s| s.snippet_type == SnippetType::CodeBlock)
+        );
     }
 
     #[test]
@@ -476,23 +584,39 @@ mod tests {
     fn extract_error_message() {
         let text = "Got error: `cannot find value X`";
         let snippets = extract(text);
-        assert!(snippets.iter().any(|s| s.snippet_type == SnippetType::ErrorMessage));
+        assert!(
+            snippets
+                .iter()
+                .any(|s| s.snippet_type == SnippetType::ErrorMessage)
+        );
     }
 
     #[test]
     fn extract_percentage() {
         let text = "Over 67% of projects fail, and 95% agree.";
         let snippets = extract(text);
-        assert!(snippets.iter().any(|s| s.content == "67%"), "should extract 67%");
-        assert!(snippets.iter().any(|s| s.content == "95%"), "should extract 95%");
+        assert!(
+            snippets.iter().any(|s| s.content == "67%"),
+            "should extract 67%"
+        );
+        assert!(
+            snippets.iter().any(|s| s.content == "95%"),
+            "should extract 95%"
+        );
     }
 
     #[test]
     fn extract_proper_nouns() {
         let text = "According to Gartner 2026, DeepSeek-V4 outperforms Claude Opus.";
         let snippets = extract(text);
-        assert!(snippets.iter().any(|s| s.content == "Gartner"), "should extract Gartner");
-        assert!(snippets.iter().any(|s| s.content == "DeepSeek-V4"), "should extract DeepSeek-V4");
+        assert!(
+            snippets.iter().any(|s| s.content == "Gartner"),
+            "should extract Gartner"
+        );
+        assert!(
+            snippets.iter().any(|s| s.content == "DeepSeek-V4"),
+            "should extract DeepSeek-V4"
+        );
     }
 
     #[test]
@@ -500,11 +624,17 @@ mod tests {
         let text = "latency over 500ms is unacceptable";
         let snippets = extract(text);
         // Unit-laden numbers (500ms) should NOT be extracted as bare numerics
-        assert!(!snippets.iter().any(|s| s.content == "500"), "should NOT extract 500ms as numeric 500");
+        assert!(
+            !snippets.iter().any(|s| s.content == "500"),
+            "should NOT extract 500ms as numeric 500"
+        );
         // But standalone numbers still work
         let text2 = "the port is 8080";
         let snippets2 = extract(text2);
-        assert!(snippets2.iter().any(|s| s.content == "8080"), "should extract standalone 8080");
+        assert!(
+            snippets2.iter().any(|s| s.content == "8080"),
+            "should extract standalone 8080"
+        );
     }
 
     #[test]
@@ -519,35 +649,61 @@ mod tests {
     fn small_numbers_not_extracted() {
         let text = "count is 3";
         let snippets = extract(text);
-        assert!(!snippets.iter().any(|s| s.content == "3"), "small numbers are noise");
+        assert!(
+            !snippets.iter().any(|s| s.content == "3"),
+            "small numbers are noise"
+        );
     }
 
     #[test]
     fn extract_code_structure_rust_functions() {
         let code = "fn main() {\n    let x = 42;\n}\n\npub fn process(data: &[u8]) -> Result<()> {\n    Ok(())\n}\n";
         let elems = extract_code_structure(code, "rust");
-        assert!(elems.iter().any(|e| e.contains("fn main")), "should extract fn main, got: {elems:?}");
-        assert!(elems.iter().any(|e| e.contains("fn process")), "should extract fn process, got: {elems:?}");
+        assert!(
+            elems.iter().any(|e| e.contains("fn main")),
+            "should extract fn main, got: {elems:?}"
+        );
+        assert!(
+            elems.iter().any(|e| e.contains("fn process")),
+            "should extract fn process, got: {elems:?}"
+        );
     }
 
     #[test]
     fn extract_code_structure_rust_types() {
         let code = "struct Point {\n    x: f64,\n    y: f64,\n}\n\nenum Color { Red, Green, Blue }\n\nimpl Point {\n    fn new() -> Self { Point { x: 0.0, y: 0.0 } }\n}";
         let elems = extract_code_structure(code, "rust");
-        assert!(elems.iter().any(|e| e.contains("struct Point")), "should extract struct");
-        assert!(elems.iter().any(|e| e.contains("enum Color")), "should extract enum");
-        assert!(elems.iter().any(|e| e.contains("impl Point")), "should extract impl");
+        assert!(
+            elems.iter().any(|e| e.contains("struct Point")),
+            "should extract struct"
+        );
+        assert!(
+            elems.iter().any(|e| e.contains("enum Color")),
+            "should extract enum"
+        );
+        assert!(
+            elems.iter().any(|e| e.contains("impl Point")),
+            "should extract impl"
+        );
     }
 
     #[test]
     fn extract_ast_code_block_in_text() {
         let text = "Here is the fix:\n```rust\nfn main() {\n    println!(\"hello\");\n}\npub struct Config { debug: bool }\n```";
         let snippets = extract(text);
-        let code_snippets: Vec<_> = snippets.iter().filter(|s| s.snippet_type == SnippetType::CodeBlock).collect();
+        let code_snippets: Vec<_> = snippets
+            .iter()
+            .filter(|s| s.snippet_type == SnippetType::CodeBlock)
+            .collect();
         assert!(!code_snippets.is_empty(), "should extract code snippets");
         // Should have extracted structural elements rather than raw block
         let has_fn = code_snippets.iter().any(|s| s.content.contains("fn main"));
-        let has_struct = code_snippets.iter().any(|s| s.content.contains("struct Config"));
-        assert!(has_fn || has_struct, "should extract structural elements, got: {code_snippets:?}");
+        let has_struct = code_snippets
+            .iter()
+            .any(|s| s.content.contains("struct Config"));
+        assert!(
+            has_fn || has_struct,
+            "should extract structural elements, got: {code_snippets:?}"
+        );
     }
 }

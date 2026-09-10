@@ -3,9 +3,9 @@
 //! Builds on `execution_events` and `execution_units` tables to provide
 //! a unified audit trail with filtering, aggregation, and report generation.
 
-use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::execution::{ExecutionOutcome, ExecutionUnit};
+use serde::{Deserialize, Serialize};
 
 // ── Audit record ───────────────────────────────────────────────────────
 
@@ -118,55 +118,101 @@ fn action_summary(kind: &str, detail: &serde_json::Value) -> String {
     match kind {
         "tool_call" => format!(
             "Tool call: {}",
-            detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("(unknown)"),
+            detail
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)"),
         ),
         "tool_result" => {
-            let name = detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("(unknown)");
-            let size = detail.get("result_size").and_then(|v| v.as_i64()).unwrap_or(0);
+            let name = detail
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let size = detail
+                .get("result_size")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             format!("Tool result: {} ({} bytes)", name, size)
         }
         "cache_hit" => format!(
             "Cache hit: {}",
-            detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("(unknown)"),
+            detail
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)"),
         ),
         "cache_stale" => format!(
             "Cache stale: {}",
-            detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("(unknown)"),
+            detail
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)"),
         ),
         "error" => format!(
             "Error in {}: {}",
-            detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("(unknown)"),
-            detail.get("error").and_then(|v| v.as_str()).unwrap_or("(no detail)"),
+            detail
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)"),
+            detail
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no detail)"),
         ),
         "retry" => format!(
             "Retry #{} of {}",
             detail.get("attempt").and_then(|v| v.as_i64()).unwrap_or(0),
-            detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("(unknown)"),
+            detail
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)"),
         ),
         "replay" => format!(
             "Replay: {} events from execution {}",
-            detail.get("event_count").and_then(|v| v.as_i64()).unwrap_or(0),
-            detail.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0),
+            detail
+                .get("event_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            detail
+                .get("execution_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
         ),
         "compaction" => format!(
             "Compacted {} nodes in conv {}",
-            detail.get("nodes_compacted").and_then(|v| v.as_i64()).unwrap_or(0),
+            detail
+                .get("nodes_compacted")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
             detail.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(0),
         ),
         "snapshot" => format!(
             "Snapshot taken (tier {}, exec {})",
             detail.get("tier").and_then(|v| v.as_i64()).unwrap_or(0),
-            detail.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0),
+            detail
+                .get("execution_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
         ),
         "session_start" => format!(
             "Session started: model={}",
-            detail.get("model").and_then(|v| v.as_str()).unwrap_or("(unknown)"),
+            detail
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)"),
         ),
         "session_end" => format!(
             "Session ended: {} units",
-            detail.get("total_units").and_then(|v| v.as_i64()).unwrap_or(0),
+            detail
+                .get("total_units")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
         ),
-        _ => format!("{}: {}", kind, serde_json::to_string(detail).unwrap_or_default()),
+        _ => format!(
+            "{}: {}",
+            kind,
+            serde_json::to_string(detail).unwrap_or_default()
+        ),
     }
 }
 
@@ -199,12 +245,28 @@ pub fn build_audit_trail(db: &Database, query: &AuditQuery) -> anyhow::Result<Ve
     // Skip conv_id=0 (default/unknown — not a real conversation)
     if let Some(conv_id) = query.conv_id.filter(|&id| id > 0) {
         if let Ok(events) = db.get_execution_events_by_conv(conv_id, limit) {
-            for (id, exec_id, event_kind, payload, _seq_no, created_at,
-                 span_id, parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms) in &events {
+            for (
+                id,
+                exec_id,
+                event_kind,
+                payload,
+                _seq_no,
+                created_at,
+                span_id,
+                parent_span_id,
+                span_mode,
+                parallel_group,
+                tool_call_id,
+                epoch_ms,
+            ) in &events
+            {
                 // event_kind "execution_completed" → map to tool_result/error/etc
                 let detail: serde_json::Value = serde_json::from_str(payload).unwrap_or_default();
                 let (action_kind, summary) = if event_kind == "execution_completed" {
-                    let tool_name = detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_name = detail
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let outcome = detail.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
                     let kind = outcome_to_kind_str(outcome);
                     let mut det = serde_json::json!({
@@ -303,7 +365,11 @@ pub fn build_audit_trail(db: &Database, query: &AuditQuery) -> anyhow::Result<Ve
                 }
             }
             if let Some(ref tn) = query.tool_name {
-                let detail_tool = r.detail.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                let detail_tool = r
+                    .detail
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if detail_tool != tn {
                     return false;
                 }
@@ -323,7 +389,9 @@ pub fn build_audit_trail(db: &Database, query: &AuditQuery) -> anyhow::Result<Ve
             if let Some(ref since) = query.since {
                 if r.epoch_ms > 0 {
                     if let Ok(since_epoch) = since.parse::<i64>() {
-                        if r.epoch_ms < since_epoch { return false; }
+                        if r.epoch_ms < since_epoch {
+                            return false;
+                        }
                     }
                 } else if !r.timestamp.is_empty() && r.timestamp.as_str() < since.as_str() {
                     return false;
@@ -332,7 +400,9 @@ pub fn build_audit_trail(db: &Database, query: &AuditQuery) -> anyhow::Result<Ve
             if let Some(ref until) = query.until {
                 if r.epoch_ms > 0 {
                     if let Ok(until_epoch) = until.parse::<i64>() {
-                        if r.epoch_ms > until_epoch { return false; }
+                        if r.epoch_ms > until_epoch {
+                            return false;
+                        }
                     }
                 } else if !r.timestamp.is_empty() && r.timestamp.as_str() > until.as_str() {
                     return false;
@@ -363,9 +433,9 @@ fn outcome_to_kind_str(outcome: &str) -> &str {
 /// Generate an aggregated audit report for a conversation (or all).
 /// Uses epoch_ms for stable ordering (P0 audit).
 pub fn build_audit_report(db: &Database, conv_id: Option<i64>) -> anyhow::Result<AuditReport> {
-    let cid = conv_id.ok_or_else(|| anyhow::anyhow!(
-        "conv_id is required; cross-conversation aggregation not yet implemented"
-    ))?;
+    let cid = conv_id.ok_or_else(|| {
+        anyhow::anyhow!("conv_id is required; cross-conversation aggregation not yet implemented")
+    })?;
     let limit = 5000;
     let units: Vec<ExecutionUnit> = db.get_execution_units(cid, limit)?;
 
@@ -375,7 +445,8 @@ pub fn build_audit_report(db: &Database, conv_id: Option<i64>) -> anyhow::Result
 
     let mut by_kind: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut by_tool: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut error_tools: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut error_tools: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     let mut total_actions = 0;
     let mut total_blocked = 0;
@@ -428,7 +499,8 @@ pub fn build_audit_report(db: &Database, conv_id: Option<i64>) -> anyhow::Result
 
     // Timeline: group by hour using epoch_ms for stable ordering
     // Fall back to created_at string if epoch_ms is 0 (legacy rows).
-    let mut hourly: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+    let mut hourly: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
     for u in &units {
         let hour_key = if u.epoch_ms > 0 {
             // Convert epoch_ms to hourly bucket: "2026-05-22T10" from Unix millis
@@ -446,13 +518,20 @@ pub fn build_audit_report(db: &Database, conv_id: Option<i64>) -> anyhow::Result
         }
         let entry = hourly.entry(hour_key).or_insert((0, 0));
         entry.0 += 1;
-        if matches!(u.outcome, ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked) {
+        if matches!(
+            u.outcome,
+            ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked
+        ) {
             entry.1 += 1;
         }
     }
     let timeline: Vec<TimelineEntry> = hourly
         .into_iter()
-        .map(|(period, (actions, errors))| TimelineEntry { period, actions, errors })
+        .map(|(period, (actions, errors))| TimelineEntry {
+            period,
+            actions,
+            errors,
+        })
         .collect();
 
     Ok(AuditReport {
@@ -492,7 +571,8 @@ pub fn build_join_only_timeline(records: &[AuditRecord]) -> Vec<AuditRecord> {
     }
 
     // Group records by parallel_group (non-empty groups only)
-    let mut groups: std::collections::HashMap<String, Vec<&AuditRecord>> = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<String, Vec<&AuditRecord>> =
+        std::collections::HashMap::new();
     let mut standalone: Vec<AuditRecord> = Vec::new();
 
     for r in records {
@@ -506,7 +586,8 @@ pub fn build_join_only_timeline(records: &[AuditRecord]) -> Vec<AuditRecord> {
     // Emit one summary record per parallel group
     for (_group_id, members) in groups {
         let branch_count = members.len();
-        let tool_names: Vec<&str> = members.iter()
+        let tool_names: Vec<&str> = members
+            .iter()
             .filter_map(|r| r.detail.get("tool_name").and_then(|v| v.as_str()))
             .collect();
         let summary = if tool_names.is_empty() {
@@ -573,7 +654,10 @@ pub fn generate_session_report(db: &Database, conv_id: i64) -> anyhow::Result<St
     out.push_str("--- Cache ---\n");
     out.push_str(&format!("  Hits: {}\n", report.cache_perf.hits));
     out.push_str(&format!("  Stale: {}\n", report.cache_perf.stale_hits));
-    out.push_str(&format!("  Hit rate: {:.1}%\n", report.cache_perf.hit_rate * 100.0));
+    out.push_str(&format!(
+        "  Hit rate: {:.1}%\n",
+        report.cache_perf.hit_rate * 100.0
+    ));
     out.push('\n');
 
     out.push_str("--- Top Tools ---\n");
@@ -584,7 +668,10 @@ pub fn generate_session_report(db: &Database, conv_id: i64) -> anyhow::Result<St
 
     out.push_str("--- Timeline ---\n");
     for entry in &report.timeline {
-        out.push_str(&format!("  {}: {} actions ({} errors)\n", entry.period, entry.actions, entry.errors));
+        out.push_str(&format!(
+            "  {}: {} actions ({} errors)\n",
+            entry.period, entry.actions, entry.errors
+        ));
     }
 
     Ok(out)
@@ -598,9 +685,7 @@ fn unit_to_audit(u: &ExecutionUnit) -> Option<AuditRecord> {
         "result_size": u.tool_result.len(),
     });
     if kind == "error" {
-        detail["error"] = serde_json::Value::String(
-            u.tool_result.chars().take(200).collect(),
-        );
+        detail["error"] = serde_json::Value::String(u.tool_result.chars().take(200).collect());
     }
 
     Some(AuditRecord {
@@ -634,7 +719,14 @@ mod tests {
             reasoning_before: String::new(),
             tool_name: tool.into(),
             tool_args: "{}".into(),
-            tool_result: if matches!(outcome, ExecutionOutcome::Blocked | ExecutionOutcome::RecoveredFailure) { "Error: fail".into() } else { "ok".into() },
+            tool_result: if matches!(
+                outcome,
+                ExecutionOutcome::Blocked | ExecutionOutcome::RecoveredFailure
+            ) {
+                "Error: fail".into()
+            } else {
+                "ok".into()
+            },
             reasoning_after: String::new(),
             outcome,
             related_nodes: vec![],
@@ -647,11 +739,23 @@ mod tests {
 
     #[test]
     fn outcome_to_kind_maps_correctly() {
-        assert_eq!(outcome_to_audit_kind(&ExecutionOutcome::Success), "tool_result");
-        assert_eq!(outcome_to_audit_kind(&ExecutionOutcome::RecoveredFailure), "error");
+        assert_eq!(
+            outcome_to_audit_kind(&ExecutionOutcome::Success),
+            "tool_result"
+        );
+        assert_eq!(
+            outcome_to_audit_kind(&ExecutionOutcome::RecoveredFailure),
+            "error"
+        );
         assert_eq!(outcome_to_audit_kind(&ExecutionOutcome::Blocked), "error");
-        assert_eq!(outcome_to_audit_kind(&ExecutionOutcome::CacheHit), "cache_hit");
-        assert_eq!(outcome_to_audit_kind(&ExecutionOutcome::Stale), "cache_stale");
+        assert_eq!(
+            outcome_to_audit_kind(&ExecutionOutcome::CacheHit),
+            "cache_hit"
+        );
+        assert_eq!(
+            outcome_to_audit_kind(&ExecutionOutcome::Stale),
+            "cache_stale"
+        );
         assert_eq!(outcome_to_audit_kind(&ExecutionOutcome::Replayed), "replay");
     }
 
@@ -681,7 +785,12 @@ mod tests {
         let u = sample_unit(ExecutionOutcome::Blocked, "build", "2026-05-22T10:00:00");
         let record = unit_to_audit(&u).unwrap();
         assert_eq!(record.action_kind, "error");
-        assert!(record.detail["error"].as_str().unwrap_or("").contains("fail"));
+        assert!(
+            record.detail["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("fail")
+        );
     }
 
     #[test]
@@ -704,7 +813,9 @@ mod tests {
         );
 
         // Simulate execution units for conv 42
-        let conv_id = db.find_or_create_conversation("audit_test_fp", "deepseek-v4-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("audit_test_fp", "deepseek-v4-flash")
+            .unwrap();
         for i in 0..5 {
             let outcome = if i < 3 {
                 "success"
@@ -713,9 +824,8 @@ mod tests {
             } else {
                 "cache_hit"
             };
-            db.store_execution_unit(
-                conv_id, "", "grep", "{}", "result", "", outcome, &[],
-            ).unwrap();
+            db.store_execution_unit(conv_id, "", "grep", "{}", "result", "", outcome, &[])
+                .unwrap();
         }
 
         let report = build_audit_report(&db, Some(conv_id)).unwrap();
@@ -736,17 +846,37 @@ mod tests {
                 .unwrap(),
         );
 
-        let conv_id = db.find_or_create_conversation("audit_trail_fp", "deepseek-v4-flash").unwrap();
-        db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
-        db.store_execution_unit(conv_id, "", "build", "{}", "Error: fail", "", "blocked", &[]).unwrap();
+        let conv_id = db
+            .find_or_create_conversation("audit_trail_fp", "deepseek-v4-flash")
+            .unwrap();
+        db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[])
+            .unwrap();
+        db.store_execution_unit(
+            conv_id,
+            "",
+            "build",
+            "{}",
+            "Error: fail",
+            "",
+            "blocked",
+            &[],
+        )
+        .unwrap();
 
         // Query all
-        let query = AuditQuery { conv_id: Some(conv_id), ..Default::default() };
+        let query = AuditQuery {
+            conv_id: Some(conv_id),
+            ..Default::default()
+        };
         let trail = build_audit_trail(&db, &query).unwrap();
         assert_eq!(trail.len(), 2);
 
         // Query by action kind
-        let query = AuditQuery { conv_id: Some(conv_id), action_kind: Some("error".into()), ..Default::default() };
+        let query = AuditQuery {
+            conv_id: Some(conv_id),
+            action_kind: Some("error".into()),
+            ..Default::default()
+        };
         let trail = build_audit_trail(&db, &query).unwrap();
         assert_eq!(trail.len(), 1);
         assert_eq!(trail[0].action_kind, "error");
@@ -764,9 +894,12 @@ mod tests {
                 .unwrap(),
         );
 
-        let conv_id = db.find_or_create_conversation("report_fp", "deepseek-v4-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("report_fp", "deepseek-v4-flash")
+            .unwrap();
         for outcome in &["success", "success", "blocked", "cache_hit", "recovered"] {
-            db.store_execution_unit(conv_id, "", "grep", "{}", "data", "", outcome, &[]).unwrap();
+            db.store_execution_unit(conv_id, "", "grep", "{}", "data", "", outcome, &[])
+                .unwrap();
         }
 
         let text = generate_session_report(&db, conv_id).unwrap();
@@ -789,20 +922,46 @@ mod tests {
                 .unwrap(),
         );
 
-        let conv_id = db.find_or_create_conversation("event_audit_fp", "deepseek-v4-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("event_audit_fp", "deepseek-v4-flash")
+            .unwrap();
         // store_execution_unit writes to both execution_units AND execution_events
-        db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[]).unwrap();
-        db.store_execution_unit(conv_id, "", "build", "{}", "Error: fail", "", "blocked", &[]).unwrap();
+        db.store_execution_unit(conv_id, "", "grep", "{}", "ok", "", "success", &[])
+            .unwrap();
+        db.store_execution_unit(
+            conv_id,
+            "",
+            "build",
+            "{}",
+            "Error: fail",
+            "",
+            "blocked",
+            &[],
+        )
+        .unwrap();
 
         // Query via build_audit_trail — should read from execution_events
-        let query = AuditQuery { conv_id: Some(conv_id), ..Default::default() };
+        let query = AuditQuery {
+            conv_id: Some(conv_id),
+            ..Default::default()
+        };
         let trail = build_audit_trail(&db, &query).unwrap();
-        assert_eq!(trail.len(), 2, "should read 2 records from execution_events");
+        assert_eq!(
+            trail.len(),
+            2,
+            "should read 2 records from execution_events"
+        );
 
         // Verify epoch_ms is populated (non-zero for event-sourced records)
         for record in &trail {
-            assert!(record.epoch_ms > 0, "epoch_ms must be populated from execution_events");
-            assert!(record.execution_id.is_some(), "execution_id must be set from execution_events");
+            assert!(
+                record.epoch_ms > 0,
+                "epoch_ms must be populated from execution_events"
+            );
+            assert!(
+                record.execution_id.is_some(),
+                "execution_id must be set from execution_events"
+            );
         }
 
         // Filter by epoch_ms range — exclude both records by using a future epoch
@@ -813,7 +972,10 @@ mod tests {
             ..Default::default()
         };
         let filtered = build_audit_trail(&db, &query).unwrap();
-        assert!(filtered.is_empty(), "epoch_ms_since in the future should return 0 records");
+        assert!(
+            filtered.is_empty(),
+            "epoch_ms_since in the future should return 0 records"
+        );
 
         // Include both records with a past epoch
         let query = AuditQuery {
@@ -823,7 +985,11 @@ mod tests {
             ..Default::default()
         };
         let all = build_audit_trail(&db, &query).unwrap();
-        assert_eq!(all.len(), 2, "epoch_ms range including both records should return 2");
+        assert_eq!(
+            all.len(),
+            2,
+            "epoch_ms range including both records should return 2"
+        );
     }
 
     #[tokio::test]
@@ -838,32 +1004,68 @@ mod tests {
                 .unwrap(),
         );
 
-        let conv_id = db.find_or_create_conversation("depends_on_fp", "deepseek-v4-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("depends_on_fp", "deepseek-v4-flash")
+            .unwrap();
 
         // Store two execution units with replay_session_id
         let rs_id = "test_replay_session_123";
-        let id1 = db.store_execution_unit_with_span(
-            conv_id, "", "grep", "{}", "ok", "", "success", &[],
-            "", "", "", "", "", rs_id,
-        ).unwrap();
-        let id2 = db.store_execution_unit_with_span(
-            conv_id, "", "build", "{}", "done", "", "success", &[],
-            "", "", "", "", "", rs_id,
-        ).unwrap();
+        let id1 = db
+            .store_execution_unit_with_span(
+                conv_id,
+                "",
+                "grep",
+                "{}",
+                "ok",
+                "",
+                "success",
+                &[],
+                "",
+                "",
+                "",
+                "",
+                "",
+                rs_id,
+            )
+            .unwrap();
+        let id2 = db
+            .store_execution_unit_with_span(
+                conv_id,
+                "",
+                "build",
+                "{}",
+                "done",
+                "",
+                "success",
+                &[],
+                "",
+                "",
+                "",
+                "",
+                "",
+                rs_id,
+            )
+            .unwrap();
 
         // Manually insert DependsOn edge (simulating pipeline behavior)
         db.insert_lineage_edge(id1, id2, "depends_on").unwrap();
 
         // Verify lineage_edges has the DependsOn edge
         let conn = db.writer_conn();
-        let mut stmt = conn.prepare(
-            "SELECT from_id, to_id, kind FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2"
-        ).unwrap();
-        let result: Option<(i64, i64, String)> = stmt.query_row(
-            rusqlite::params![id1, id2],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).ok();
-        assert!(result.is_some(), "DependsOn edge must exist in lineage_edges");
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_id, to_id, kind FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2",
+            )
+            .unwrap();
+        let result: Option<(i64, i64, String)> = stmt
+            .query_row(rusqlite::params![id1, id2], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .ok();
+        assert!(
+            result.is_some(),
+            "DependsOn edge must exist in lineage_edges"
+        );
         let (from, to, kind) = result.unwrap();
         assert_eq!(from, id1);
         assert_eq!(to, id2);
@@ -873,24 +1075,25 @@ mod tests {
     #[test]
     fn join_only_timeline_collapses_parallel_groups() {
         // Build sample records with parallel span_mode
-        let make_record = |id: i64, group: &str, tool: &str, kind: &str, epoch: i64| -> AuditRecord {
-            AuditRecord {
-                id,
-                timestamp: String::new(),
-                epoch_ms: epoch,
-                conv_id: Some(42),
-                execution_id: Some(id),
-                action_kind: kind.to_string(),
-                summary: format!("{}: {}", kind, tool),
-                detail: serde_json::json!({"tool_name": tool}),
-                span_id: format!("span_{}", id),
-                parent_span_id: "root".to_string(),
-                span_mode: "parallel".to_string(),
-                parallel_group: group.to_string(),
-                tool_call_id: format!("call_{}", id),
-                replay_session_id: String::new(),
-            }
-        };
+        let make_record =
+            |id: i64, group: &str, tool: &str, kind: &str, epoch: i64| -> AuditRecord {
+                AuditRecord {
+                    id,
+                    timestamp: String::new(),
+                    epoch_ms: epoch,
+                    conv_id: Some(42),
+                    execution_id: Some(id),
+                    action_kind: kind.to_string(),
+                    summary: format!("{}: {}", kind, tool),
+                    detail: serde_json::json!({"tool_name": tool}),
+                    span_id: format!("span_{}", id),
+                    parent_span_id: "root".to_string(),
+                    span_mode: "parallel".to_string(),
+                    parallel_group: group.to_string(),
+                    tool_call_id: format!("call_{}", id),
+                    replay_session_id: String::new(),
+                }
+            };
 
         let records = vec![
             make_record(1, "group_A", "grep", "tool_result", 1000),
@@ -904,22 +1107,35 @@ mod tests {
         let collapsed = build_join_only_timeline(&records);
 
         // Should have: 1 sequential + 2 group summaries = 3 records
-        assert_eq!(collapsed.len(), 3, "3 parallel groups → 2 collapsed, 1 standalone = 3");
+        assert_eq!(
+            collapsed.len(),
+            3,
+            "3 parallel groups → 2 collapsed, 1 standalone = 3"
+        );
 
         // Check standalone sequential record
-        let standalone: Vec<&AuditRecord> = collapsed.iter().filter(|r| r.action_kind != "parallel_group").collect();
+        let standalone: Vec<&AuditRecord> = collapsed
+            .iter()
+            .filter(|r| r.action_kind != "parallel_group")
+            .collect();
         assert_eq!(standalone.len(), 1);
         assert_eq!(standalone[0].tool_call_id, "call_4");
 
         // Check group A summary
-        let group_a: Vec<&AuditRecord> = collapsed.iter().filter(|r| r.parallel_group == "group_A").collect();
+        let group_a: Vec<&AuditRecord> = collapsed
+            .iter()
+            .filter(|r| r.parallel_group == "group_A")
+            .collect();
         assert_eq!(group_a.len(), 1);
         assert_eq!(group_a[0].action_kind, "parallel_group");
         assert!(group_a[0].summary.contains("grep"));
         assert!(group_a[0].summary.contains("3 branches"));
 
         // Check group B summary
-        let group_b: Vec<&AuditRecord> = collapsed.iter().filter(|r| r.parallel_group == "group_B").collect();
+        let group_b: Vec<&AuditRecord> = collapsed
+            .iter()
+            .filter(|r| r.parallel_group == "group_B")
+            .collect();
         assert_eq!(group_b.len(), 1);
         assert!(group_b[0].summary.contains("2 branches"));
     }

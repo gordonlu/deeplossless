@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::db::Database;
 
@@ -12,7 +12,9 @@ use crate::db::Database;
 pub struct NodeId(pub i64);
 
 impl NodeId {
-    pub fn as_i64(self) -> i64 { self.0 }
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
 }
 
 /// Monotonic graph revision counter.
@@ -22,8 +24,12 @@ impl NodeId {
 pub struct GraphRevision(pub i64);
 
 impl GraphRevision {
-    pub fn initial() -> Self { Self(0) }
-    pub fn next(self) -> Self { Self(self.0 + 1) }
+    pub fn initial() -> Self {
+        Self(0)
+    }
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
 }
 
 /// Execution-scoped DAG: tracks tool invocations, parallel branches, execution order.
@@ -34,21 +40,26 @@ pub struct ExecutionDag {
 }
 
 impl ExecutionDag {
-    pub fn new(db: Arc<Database>) -> Self { Self { db } }
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
 
     /// Record a tool execution edge in the execution graph.
     /// Uses `EdgeKind::Executes` to link assistant → tool_call → tool_result.
-    pub fn record_execution(
-        &self, from_node_id: i64, to_node_id: i64,
-    ) -> anyhow::Result<()> {
-        let _ = self.db.insert_edge(from_node_id, to_node_id, EdgeKind::Executes.as_str())?;
+    pub fn record_execution(&self, from_node_id: i64, to_node_id: i64) -> anyhow::Result<()> {
+        let _ = self
+            .db
+            .insert_edge(from_node_id, to_node_id, EdgeKind::Executes.as_str())?;
         Ok(())
     }
 
     /// Query the execution trace for a conversation (all Executes edges).
     pub fn execution_trace(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
         let all = self.db.get_edges_from(node_id)?;
-        Ok(all.into_iter().filter(|(_, _, kind)| kind == "executes").collect())
+        Ok(all
+            .into_iter()
+            .filter(|(_, _, kind)| kind == "executes")
+            .collect())
     }
 }
 
@@ -59,10 +70,14 @@ pub struct KnowledgeDag {
 }
 
 impl KnowledgeDag {
-    pub fn new(engine: Arc<DagEngine>) -> Self { Self { engine } }
+    pub fn new(engine: Arc<DagEngine>) -> Self {
+        Self { engine }
+    }
 
     /// Delegate to the full engine
-    pub fn engine(&self) -> &DagEngine { &self.engine }
+    pub fn engine(&self) -> &DagEngine {
+        &self.engine
+    }
 }
 
 /// In-memory snapshot of a conversation's DAG, used for batch-loaded
@@ -220,7 +235,9 @@ pub struct DagNode {
 
 impl DagNode {
     /// Stable identity wrapper.
-    pub fn node_id(&self) -> NodeId { NodeId(self.id) }
+    pub fn node_id(&self) -> NodeId {
+        NodeId(self.id)
+    }
 }
 
 /// Deterministic compaction ID: SHA-256 of (conv_id, sorted source_ids, level).
@@ -229,7 +246,16 @@ fn compaction_id(conv_id: i64, source_ids: &[i64], level: u8) -> String {
     use sha2::{Digest, Sha256};
     let mut sorted: Vec<i64> = source_ids.to_vec();
     sorted.sort_unstable();
-    let input = format!("{}:{}:{}", conv_id, sorted.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","), level);
+    let input = format!(
+        "{}:{}:{}",
+        conv_id,
+        sorted
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        level
+    );
     format!("{:x}", Sha256::digest(input.as_bytes()))
 }
 
@@ -240,9 +266,10 @@ pub struct DagEngineBuilder {
     config: DagConfig,
 }
 
-
 impl DagEngineBuilder {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn soft_threshold(mut self, ratio: f64) -> Self {
         self.config.soft_threshold_ratio = ratio.clamp(0.0, 1.0);
@@ -272,7 +299,7 @@ impl DagEngineBuilder {
                 crate::embeddings::EmbeddingConfig {
                     api_key: self.config.embedding_api_key.clone(),
                     ..Default::default()
-                }
+                },
             ))
         };
         DagEngine {
@@ -326,10 +353,16 @@ impl DagEngine {
 }
 
 impl DagEngine {
-    pub fn builder() -> DagEngineBuilder { DagEngineBuilder::new() }
+    pub fn builder() -> DagEngineBuilder {
+        DagEngineBuilder::new()
+    }
 
-    pub fn config(&self) -> &DagConfig { &self.config }
-    pub fn db(&self) -> &Database { &self.db }
+    pub fn config(&self) -> &DagConfig {
+        &self.config
+    }
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
 
     /// Compute effective max level for a conversation.
     /// If config.max_level > 0, that value is used.
@@ -338,7 +371,9 @@ impl DagEngine {
         if self.config.max_level > 0 {
             return self.config.max_level;
         }
-        let leaf_count = self.db.get_leaf_nodes(conv_id)
+        let leaf_count = self
+            .db
+            .get_leaf_nodes(conv_id)
             .map(|leaves| leaves.len())
             .unwrap_or(0);
         if leaf_count <= 8 {
@@ -382,8 +417,15 @@ impl DagEngine {
     // ── Mutations ──────────────────────────────────────────────────────
 
     /// Store a new leaf node (level 0) for raw messages.
-    pub fn insert_leaf(&self, conv_id: i64, summary: &str, token_count: i64) -> anyhow::Result<DagNode> {
-        let node = self.db.insert_dag_node(conv_id, 0, summary, token_count, &[], &[], true)?;
+    pub fn insert_leaf(
+        &self,
+        conv_id: i64,
+        summary: &str,
+        token_count: i64,
+    ) -> anyhow::Result<DagNode> {
+        let node = self
+            .db
+            .insert_dag_node(conv_id, 0, summary, token_count, &[], &[], true)?;
         self.post_mutation(conv_id)?;
         Ok(node)
     }
@@ -412,7 +454,8 @@ impl DagEngine {
         }
 
         // Revision pinning: snapshot source hashes to detect concurrent mutation (P0-8)
-        let source_hashes: Vec<(i64, String)> = source_ids.iter()
+        let source_hashes: Vec<(i64, String)> = source_ids
+            .iter()
             .filter_map(|id| self.db.get_node(*id).ok().flatten())
             .map(|n| (n.id, n.semantic_hash.clone()))
             .collect();
@@ -445,14 +488,26 @@ impl DagEngine {
         }
 
         // Post-compaction integrity audit (only in Full audit mode)
-        if self.db.policy_config.read().map(|c| c.audit_mode.should_write_audit()).unwrap_or(true) {
+        if self
+            .db
+            .policy_config
+            .read()
+            .map(|c| c.audit_mode.should_write_audit())
+            .unwrap_or(true)
+        {
             if let Err(e) = self.verify_compaction_integrity(&node, source_ids) {
                 tracing::warn!(target: "deeplossless::dag", error = %e, "post-compaction integrity check failed");
             }
         }
 
         // Auto-snapshot on semantic boundary (compaction) if snapshot mode is Auto
-        if self.db.policy_config.read().map(|c| c.snapshot_mode.should_auto_snapshot()).unwrap_or(false) {
+        if self
+            .db
+            .policy_config
+            .read()
+            .map(|c| c.snapshot_mode.should_auto_snapshot())
+            .unwrap_or(false)
+        {
             if let Err(e) = self.auto_snapshot_on_compaction(conv_id, &node) {
                 tracing::warn!(target: "deeplossless::dag", "auto-snapshot after compaction failed: {e}");
             }
@@ -469,7 +524,10 @@ impl DagEngine {
             "source_count": source_ids.len(),
             "token_reduction": token_count,
         });
-        if let Err(e) = self.db.update_node_reasoning(node.id, &reasoning.to_string()) {
+        if let Err(e) = self
+            .db
+            .update_node_reasoning(node.id, &reasoning.to_string())
+        {
             tracing::warn!(target: "deeplossless::dag", "update_node_reasoning failed: {e}");
         }
         self.post_mutation(conv_id)?;
@@ -498,9 +556,7 @@ impl DagEngine {
                     break;
                 }
             }
-            if !found
-                && let Some((sid, _)) = source_texts.first()
-            {
+            if !found && let Some((sid, _)) = source_texts.first() {
                 spans.push((*sid, 0, 0));
             }
         }
@@ -514,7 +570,8 @@ impl DagEngine {
             if self.db.has_path(*source_id, summary.id, 50)? {
                 return Err(anyhow::anyhow!(
                     "cycle detected: path from source {} back to summary {}",
-                    source_id, summary.id
+                    source_id,
+                    summary.id
                 ));
             }
         }
@@ -523,7 +580,11 @@ impl DagEngine {
 
     /// Post-compaction integrity audit: verify invariant that the new summary
     /// node has correct child_ids, edges, and parent_ids back-links (P0-12).
-    fn verify_compaction_integrity(&self, node: &DagNode, source_ids: &[i64]) -> anyhow::Result<()> {
+    fn verify_compaction_integrity(
+        &self,
+        node: &DagNode,
+        source_ids: &[i64],
+    ) -> anyhow::Result<()> {
         let source_set: std::collections::HashSet<i64> = source_ids.iter().copied().collect();
 
         // 1. Child_ids must equal source_ids
@@ -531,7 +592,8 @@ impl DagEngine {
         if child_set != source_set {
             anyhow::bail!(
                 "integrity fail: child_ids mismatch — expected {:?}, got {:?}",
-                source_ids, node.child_ids
+                source_ids,
+                node.child_ids
             );
         }
 
@@ -591,7 +653,8 @@ impl DagEngine {
         token_count: i64,
     ) -> anyhow::Result<DagNode> {
         // Determine level: one above the highest source level
-        let max_src_level = source_ids.iter()
+        let max_src_level = source_ids
+            .iter()
             .filter_map(|id| self.db.get_node(*id).ok().flatten())
             .map(|n| n.level)
             .max()
@@ -603,7 +666,13 @@ impl DagEngine {
 
         // Use the atomic insert which handles the transaction and writer lock
         let node = self.db.insert_summary_atomic(
-            conv_id, level, merged_text, token_count, source_ids, &[], &cid,
+            conv_id,
+            level,
+            merged_text,
+            token_count,
+            source_ids,
+            &[],
+            &cid,
         )?;
         let new_id = node.id;
 
@@ -617,7 +686,11 @@ impl DagEngine {
         for sid in source_ids {
             if self.db.has_path(*sid, new_id, 50)? {
                 self.db.purge_dag_node(new_id)?;
-                anyhow::bail!("cycle detected: path from source {} back to new node {}", sid, new_id);
+                anyhow::bail!(
+                    "cycle detected: path from source {} back to new node {}",
+                    sid,
+                    new_id
+                );
             }
         }
 
@@ -685,7 +758,14 @@ impl DagEngine {
             return Ok(existing);
         }
         // No match: create new, then store embedding for future dedup
-        let node = self.compress_group_with_snippets(conv_id, source_ids, summary, token_count, level, snippets)?;
+        let node = self.compress_group_with_snippets(
+            conv_id,
+            source_ids,
+            summary,
+            token_count,
+            level,
+            snippets,
+        )?;
         if let Some(ref embedder) = self.embedder {
             let text = format_summary_text(summary, snippets);
             if let Some(vec) = Self::embed_sync_if_safe(embedder, &text) {
@@ -696,13 +776,14 @@ impl DagEngine {
                 }
                 // Auto-merge: find similar nodes across sessions
                 if let Ok(Some((similar_id, _sim))) = self.db.find_nearest_embedding(&vec, 0.85)
-                    && similar_id != node.id {
-                        let _ = self.db.insert_edge(similar_id, node.id, "reuses");
-                        tracing::debug!(target: "deeplossless::dag",
+                    && similar_id != node.id
+                {
+                    let _ = self.db.insert_edge(similar_id, node.id, "reuses");
+                    tracing::debug!(target: "deeplossless::dag",
                             node_id = node.id, similar = similar_id,
                             "auto-merged across sessions");
-                    }
                 }
+            }
         }
         Ok(node)
     }
@@ -724,7 +805,10 @@ impl DagEngine {
         {
             Ok(rt) => rt,
             Err(e) => {
-                tracing::warn!(target = "deeplossless::dag", "embedding runtime build failed: {e}");
+                tracing::warn!(
+                    target = "deeplossless::dag",
+                    "embedding runtime build failed: {e}"
+                );
                 return None;
             }
         };
@@ -741,9 +825,13 @@ impl DagEngine {
 
         for _ in 0..max_depth {
             let current = std::mem::take(&mut stack);
-            if current.is_empty() { break; }
+            if current.is_empty() {
+                break;
+            }
             for nid in current {
-                if !visited.insert(nid) { continue; }
+                if !visited.insert(nid) {
+                    continue;
+                }
                 if let Some(node) = self.db.get_node(nid)? {
                     if node.is_leaf {
                         leaves.insert(node.id);
@@ -811,7 +899,9 @@ impl DagEngine {
         }
 
         // 2. Append most recent raw leaves NOT already covered by summaries
-        let mut leaves: Vec<_> = graph.nodes.values()
+        let mut leaves: Vec<_> = graph
+            .nodes
+            .values()
             .filter(|n| n.is_leaf && n.token_count > 0 && !n.summary.is_empty())
             .cloned()
             .collect();
@@ -824,7 +914,8 @@ impl DagEngine {
             .collect();
 
         // Delta compression: skip leaves with high content overlap to summaries already in result
-        let summary_owned: Vec<String> = result.iter()
+        let summary_owned: Vec<String> = result
+            .iter()
             .filter(|n| n.level > 0)
             .map(|n| n.summary.clone())
             .collect();
@@ -857,7 +948,8 @@ impl DagEngine {
             let max_id = result.iter().map(|n| n.id).max().unwrap_or(0) as f64;
 
             // Score each search result by combining semantic, graph, and recency
-            let mut scored: Vec<(f64, i64)> = search_results.iter()
+            let mut scored: Vec<(f64, i64)> = search_results
+                .iter()
                 .filter(|sr| sr.source != "message")
                 .filter(|sr| !injected_ids.contains(&sr.id))
                 .map(|sr| {
@@ -877,10 +969,8 @@ impl DagEngine {
             let top_ids: Vec<i64> = scored.into_iter().take(5).map(|(_, id)| id).collect();
             if !top_ids.is_empty() {
                 if let Ok(boost_nodes) = self.db.get_nodes_batch(&top_ids) {
-                    let node_map: std::collections::HashMap<i64, DagNode> = boost_nodes
-                        .into_iter()
-                        .map(|n| (n.id, n))
-                        .collect();
+                    let node_map: std::collections::HashMap<i64, DagNode> =
+                        boost_nodes.into_iter().map(|n| (n.id, n)).collect();
                     for &nid in &top_ids {
                         if injected_ids.contains(&nid) {
                             continue;
@@ -912,7 +1002,7 @@ impl DagEngine {
     pub fn compute_memory_score(&self, node: &DagNode) -> f64 {
         // Recency: never accessed = 0.5; recently accessed = higher
         let recency = match &node.last_accessed_at {
-            Some(_) => 0.8,  // has been accessed, actual time comparison would go here
+            Some(_) => 0.8, // has been accessed, actual time comparison would go here
             None => 0.3,
         };
         // Frequency: log-scaled access count, max contribution at ~100 accesses
@@ -921,7 +1011,11 @@ impl DagEngine {
         let imp = if node.snippets.is_empty() {
             0.5
         } else {
-            node.snippets.iter().map(|s| s.importance as f64).sum::<f64>() / node.snippets.len() as f64
+            node.snippets
+                .iter()
+                .map(|s| s.importance as f64)
+                .sum::<f64>()
+                / node.snippets.len() as f64
         };
         (recency * 0.4 + freq * 0.3 + imp * 0.3).clamp(0.0, 1.0)
     }
@@ -982,12 +1076,12 @@ impl DagEngine {
         recency_factor: f64,
     ) -> f64 {
         let graph_score = match distance {
-            Some(0) => 1.0,       // in the active set
-            Some(1) => 0.8,       // direct neighbor
-            Some(2) => 0.5,       // two hops
-            Some(3) => 0.3,       // three hops
+            Some(0) => 1.0,                          // in the active set
+            Some(1) => 0.8,                          // direct neighbor
+            Some(2) => 0.5,                          // two hops
+            Some(3) => 0.3,                          // three hops
             Some(d) => (1.0 / (d as f64)).max(0.05), // further away: decay
-            None => 0.05,         // unreachable: low baseline
+            None => 0.05,                            // unreachable: low baseline
         };
         semantic_score * 0.40 + graph_score * 0.35 + recency_factor * 0.25
     }
@@ -1002,7 +1096,10 @@ impl DagEngine {
             children.insert(node.id, node.child_ids.clone());
             node_map.insert(node.id, node);
         }
-        Ok(DagGraph { nodes: node_map, children })
+        Ok(DagGraph {
+            nodes: node_map,
+            children,
+        })
     }
 
     /// Batch-load version of collect_summary_chain that uses cached graph
@@ -1022,7 +1119,9 @@ impl DagEngine {
             if seen.len() > self.config.max_fanout {
                 break;
             }
-            let Some(node) = graph.nodes.get(&nid) else { continue; };
+            let Some(node) = graph.nodes.get(&nid) else {
+                continue;
+            };
             if node.level == 0 {
                 continue;
             }
@@ -1050,12 +1149,20 @@ impl DagEngine {
     }
 
     /// Search across all sessions for semantically relevant nodes.
-    pub fn search_cross_session(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(i64, i64, String, String)>> {
+    pub fn search_cross_session(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(i64, i64, String, String)>> {
         self.db.search_cross_session(query, limit)
     }
 
     /// Search execution memory for similar bugs, tool chains, or code edits.
-    pub fn search_execution_memory(&self, query: &str, limit: usize) -> anyhow::Result<Vec<crate::execution::ExecutionUnitRef>> {
+    pub fn search_execution_memory(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::execution::ExecutionUnitRef>> {
         self.db.search_execution_memory(query, limit)
     }
 
@@ -1066,8 +1173,8 @@ impl DagEngine {
     /// For tree structures this matches DFS order; for true DAG with shared
     /// children, it ensures a stable, reproducible output.
     pub fn topological_sort(&self, root_id: i64) -> anyhow::Result<Vec<DagNode>> {
-        use std::collections::{BinaryHeap, HashMap, VecDeque};
         use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashMap, VecDeque};
 
         let mut in_degree: HashMap<i64, usize> = HashMap::new();
         let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
@@ -1077,7 +1184,9 @@ impl DagEngine {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::from([root_id]);
         while let Some(nid) = queue.pop_front() {
-            if !visited.insert(nid) { continue; }
+            if !visited.insert(nid) {
+                continue;
+            }
             if let Some(node) = self.db.get_node(nid)? {
                 node_map.insert(nid, node);
                 in_degree.entry(nid).or_insert(0);
@@ -1088,7 +1197,9 @@ impl DagEngine {
                     queue.push_back(child);
                 }
             }
-            if visited.len() > self.config.max_fanout { break; }
+            if visited.len() > self.config.max_fanout {
+                break;
+            }
         }
 
         // Kahn: start with nodes that have no incoming edges
@@ -1108,7 +1219,9 @@ impl DagEngine {
             }
             if let Some(children) = adj.get(&nid) {
                 for child in children {
-                    let deg = in_degree.get_mut(child).expect("child node missing from in_degree map");
+                    let deg = in_degree
+                        .get_mut(child)
+                        .expect("child node missing from in_degree map");
                     *deg -= 1;
                     if *deg == 0 {
                         let clevel = node_map.get(child).map(|n| n.level as i64).unwrap_or(0);
@@ -1141,7 +1254,9 @@ impl DagEngine {
         }
 
         while let Some(id) = stack.pop() {
-            if !reachable.insert(id) { continue; }
+            if !reachable.insert(id) {
+                continue;
+            }
             if let Some(node) = self.db.get_node(id)? {
                 // Edges are the source of truth (P0-4).
                 for (_, to_id, _kind) in self.db.get_edges_from(id)? {
@@ -1161,7 +1276,8 @@ impl DagEngine {
                 // Protect shared nodes: if referenced from another conversation, keep
                 let incoming = self.db.get_edges_to(node.id).unwrap_or_default();
                 let has_external_ref = incoming.iter().any(|(from_id, _, _)| {
-                    self.db.get_node(*from_id)
+                    self.db
+                        .get_node(*from_id)
                         .ok()
                         .flatten()
                         .map(|n| n.conversation_id != conv_id)
@@ -1186,7 +1302,8 @@ impl DagEngine {
     /// is never deleted. Returns count of nodes deleted.
     pub fn gc_by_score(&self, conv_id: i64, max_to_delete: usize) -> anyhow::Result<usize> {
         let all_nodes = self.db.get_all_dag_nodes(conv_id)?;
-        let mut scored: Vec<(&DagNode, f64)> = all_nodes.iter()
+        let mut scored: Vec<(&DagNode, f64)> = all_nodes
+            .iter()
             .filter(|n| !n.is_leaf) // never delete raw leaves
             .map(|n| (n, self.compute_memory_score(n)))
             .collect();
@@ -1203,8 +1320,12 @@ impl DagEngine {
             // Protect shared nodes
             let incoming = self.db.get_edges_to(node.id).unwrap_or_default();
             let has_external = incoming.iter().any(|(from_id, _, _)| {
-                self.db.get_node(*from_id).ok().flatten()
-                    .map(|n| n.conversation_id != conv_id).unwrap_or(false)
+                self.db
+                    .get_node(*from_id)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.conversation_id != conv_id)
+                    .unwrap_or(false)
             });
             if has_external {
                 continue;
@@ -1218,7 +1339,9 @@ impl DagEngine {
     /// Rollback: soft-delete the target node and all nodes created after it
     /// in the same conversation.  Returns the count of deleted nodes.
     pub fn rollback_to(&self, node_id: i64) -> anyhow::Result<usize> {
-        let target = self.db.get_node(node_id)?
+        let target = self
+            .db
+            .get_node(node_id)?
             .ok_or_else(|| anyhow::anyhow!("node {} not found", node_id))?;
         let mut deleted = 0usize;
         // Soft-delete all non-deleted nodes with id >= target_id in the same conversation
@@ -1257,7 +1380,8 @@ impl DagEngine {
                     }
                 } else {
                     issues.push(format!(
-                        "orphan-parent: node {} parent_ids contains non-existent {}", node.id, pid
+                        "orphan-parent: node {} parent_ids contains non-existent {}",
+                        node.id, pid
                     ));
                 }
             }
@@ -1271,7 +1395,8 @@ impl DagEngine {
                     }
                 } else {
                     issues.push(format!(
-                        "orphan-child: node {} child_ids contains non-existent/deleted {}", node.id, cid
+                        "orphan-child: node {} child_ids contains non-existent/deleted {}",
+                        node.id, cid
                     ));
                 }
             }
@@ -1293,7 +1418,8 @@ impl DagEngine {
                 for cid in &node.child_ids {
                     if self.db.has_path(*cid, node.id, 20).unwrap_or(false) {
                         issues.push(format!(
-                            "cycle: path exists from child {} back to parent {}", cid, node.id
+                            "cycle: path exists from child {} back to parent {}",
+                            cid, node.id
                         ));
                     }
                 }
@@ -1310,7 +1436,10 @@ impl DagEngine {
         let mut out = String::new();
         writeln!(out, "digraph LCM_DAG {{")?;
         writeln!(out, "    rankdir=BT;")?;
-        writeln!(out, "    node [shape=box, style=filled, fontname=\"monospace\"];")?;
+        writeln!(
+            out,
+            "    node [shape=box, style=filled, fontname=\"monospace\"];"
+        )?;
 
         for node in self.db.get_all_dag_nodes(conv_id)? {
             let color = match node.level {
@@ -1326,7 +1455,11 @@ impl DagEngine {
                 html_escape_token(&node.summary, 30),
                 node.token_count,
             );
-            writeln!(out, "    n{} [label=\"{}\", fillcolor={color}];", node.id, label)?;
+            writeln!(
+                out,
+                "    n{} [label=\"{}\", fillcolor={color}];",
+                node.id, label
+            )?;
             for pid in &node.parent_ids {
                 writeln!(out, "    n{} -> n{};", node.id, pid)?;
             }
@@ -1339,7 +1472,9 @@ impl DagEngine {
     /// Creates an Ephemeral-tier snapshot with the current DAG state.
     fn auto_snapshot_on_compaction(&self, conv_id: i64, node: &DagNode) -> anyhow::Result<()> {
         let version_id = self.db.create_memory_version(
-            None, "compaction", &format!("auto-snapshot after compaction to level {}", node.level),
+            None,
+            "compaction",
+            &format!("auto-snapshot after compaction to level {}", node.level),
             Some(node.id),
         )?;
         let snapshot_data = serde_json::json!({
@@ -1353,11 +1488,21 @@ impl DagEngine {
         let boundary_hash = crate::snapshot::compute_boundary_hash(&[(0_i64, &data_str)], 1);
         let integrity_hash = crate::snapshot::compute_chain_hash(&[(0_i64, &data_str)]);
         self.db.take_snapshot(
-            0, version_id, 0, &data_str, data_str.len() as i64, None,
-            0, &boundary_hash, &integrity_hash,
+            0,
+            version_id,
+            0,
+            &data_str,
+            data_str.len() as i64,
+            None,
+            0,
+            &boundary_hash,
+            &integrity_hash,
         )?;
         // Enforce budget to prevent unbounded snapshot growth
-        let budget = self.db.policy_config.read()
+        let budget = self
+            .db
+            .policy_config
+            .read()
             .map(|c| c.snapshot_budget.clone())
             .unwrap_or_default();
         let _ = self.db.enforce_snapshot_budget(&budget);
@@ -1368,9 +1513,15 @@ impl DagEngine {
     /// Creates an Ephemeral-tier (L0) snapshot with a semantic event label.
     /// No-op if snapshot mode is not Auto.
     pub fn auto_snapshot_on_event(
-        &self, conv_id: i64, event: &str, detail: &str,
+        &self,
+        conv_id: i64,
+        event: &str,
+        detail: &str,
     ) -> anyhow::Result<()> {
-        let config = self.db.policy_config.read()
+        let config = self
+            .db
+            .policy_config
+            .read()
             .map(|c| c.snapshot_mode)
             .unwrap_or(crate::runtime::SnapshotMode::Auto);
         if !config.should_auto_snapshot() {
@@ -1378,7 +1529,10 @@ impl DagEngine {
         }
         let dag_root = self.current_revision().0;
         let version_id = self.db.create_memory_version(
-            None, event, &format!("auto-snapshot on {event}: {detail}"), None,
+            None,
+            event,
+            &format!("auto-snapshot on {event}: {detail}"),
+            None,
         )?;
         let snapshot_data = serde_json::json!({
             "conv_id": conv_id,
@@ -1390,10 +1544,20 @@ impl DagEngine {
         let boundary_hash = crate::snapshot::compute_boundary_hash(&[(0_i64, &data_str)], 1);
         let integrity_hash = crate::snapshot::compute_chain_hash(&[(0_i64, &data_str)]);
         self.db.take_snapshot(
-            0, version_id, 0, &data_str, data_str.len() as i64, None,
-            0, &boundary_hash, &integrity_hash,
+            0,
+            version_id,
+            0,
+            &data_str,
+            data_str.len() as i64,
+            None,
+            0,
+            &boundary_hash,
+            &integrity_hash,
         )?;
-        let budget = self.db.policy_config.read()
+        let budget = self
+            .db
+            .policy_config
+            .read()
             .map(|c| c.snapshot_budget.clone())
             .unwrap_or_default();
         let _ = self.db.enforce_snapshot_budget(&budget);
@@ -1417,7 +1581,9 @@ fn html_escape_token(text: &str, max_tokens: usize) -> String {
             c => out.push(c),
         }
     }
-    if crate::tokenizer::count(text) > max_tokens { out.push('…'); }
+    if crate::tokenizer::count(text) > max_tokens {
+        out.push('…');
+    }
     out
 }
 
@@ -1504,14 +1670,16 @@ fn content_overlap(leaf: &str, summaries: &[&str]) -> f64 {
         return 0.0;
     }
     let leaf_bytes = leaf.as_bytes();
-    let leaf_trigrams: std::collections::HashSet<[u8; 3]> = leaf_bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+    let leaf_trigrams: std::collections::HashSet<[u8; 3]> =
+        leaf_bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
     if leaf_trigrams.is_empty() {
         return 0.0;
     }
     let mut best = 0.0;
     for summary in summaries {
         let s_bytes = summary.as_bytes();
-        let s_trigrams: std::collections::HashSet<[u8; 3]> = s_bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+        let s_trigrams: std::collections::HashSet<[u8; 3]> =
+            s_bytes.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
         let intersection = leaf_trigrams.intersection(&s_trigrams).count();
         let overlap = intersection as f64 / leaf_trigrams.len() as f64;
         if overlap > best {
@@ -1530,9 +1698,15 @@ fn split_sentences(text: &str) -> Vec<(usize, &str)> {
 
     for (i, &b) in bytes.iter().enumerate() {
         let is_boundary = matches!(b, b'.' | b'\n' | b'!' | b'?');
-        let is_cjk_period = i + 2 < bytes.len()
-            && bytes[i] == 0xE3 && bytes[i+1] == 0x80 && bytes[i+2] == 0x82;
-        let boundary_end = if is_cjk_period { i + 3 } else if is_boundary { i + 1 } else { 0 };
+        let is_cjk_period =
+            i + 2 < bytes.len() && bytes[i] == 0xE3 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0x82;
+        let boundary_end = if is_cjk_period {
+            i + 3
+        } else if is_boundary {
+            i + 1
+        } else {
+            0
+        };
         if boundary_end > 0 && boundary_end > start {
             let sent = text[start..boundary_end].trim();
             if !sent.is_empty() {
@@ -1561,7 +1735,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = std::thread::spawn(move || {
             tokio::runtime::Runtime::new().unwrap().block_on(
-                Database::builder().path(dir.path().join("dag_test.db")).build()
+                Database::builder()
+                    .path(dir.path().join("dag_test.db"))
+                    .build(),
             )
         })
         .join()
@@ -1569,7 +1745,10 @@ mod tests {
         .unwrap();
         let db = Arc::new(db);
         let conv_id = db
-            .create_and_store("test", &serde_json::json!([{"role": "user", "content": "hi"}]))
+            .create_and_store(
+                "test",
+                &serde_json::json!([{"role": "user", "content": "hi"}]),
+            )
             .unwrap();
         (db, conv_id)
     }
@@ -1611,7 +1790,10 @@ mod tests {
             engine.insert_leaf(conv_id, &format!("msg {i}"), 5).unwrap();
         }
         let level_many = engine.effective_max_level(conv_id);
-        assert!(level_many >= 4, "50 leaves should need >3 levels, got {level_many}");
+        assert!(
+            level_many >= 4,
+            "50 leaves should need >3 levels, got {level_many}"
+        );
 
         // Explicit override
         let engine2 = DagEngine::builder().max_level(5).build(setup_db().0);
@@ -1630,7 +1812,9 @@ mod tests {
         // Create leaves
         let mut leaves = Vec::new();
         for i in 0..8 {
-            let leaf = engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap();
+            let leaf = engine
+                .insert_leaf(conv_id, &format!("msg {i}"), 10)
+                .unwrap();
             leaves.push(leaf);
         }
 
@@ -1926,7 +2110,9 @@ mod tests {
 
         // Mark these as summaries by setting level > 0 via direct DB insert
         // (insert_leaf creates level-0 nodes; for merge we need summary nodes)
-        let merged = engine.merge_nodes(conv_id, &[a.id, b.id], "merged AB", 8).unwrap();
+        let merged = engine
+            .merge_nodes(conv_id, &[a.id, b.id], "merged AB", 8)
+            .unwrap();
         assert_eq!(merged.level, 1);
         assert_eq!(merged.child_ids.len(), 2);
         assert!(merged.child_ids.contains(&a.id));
@@ -1936,7 +2122,10 @@ mod tests {
         let edges = db.get_edges_from(merged.id).unwrap();
         assert_eq!(edges.len(), 2, "should have exactly 2 refines edges");
         let kinds: Vec<&str> = edges.iter().map(|(_, _, k)| k.as_str()).collect();
-        assert!(kinds.iter().all(|k| k == &"refines"), "all edges should be refines");
+        assert!(
+            kinds.iter().all(|k| k == &"refines"),
+            "all edges should be refines"
+        );
     }
 
     #[test]
@@ -1992,7 +2181,10 @@ mod tests {
         let summary2 = engine
             .dedup_and_reuse(conv_id, &[a.id], "identical summary", 8, 1, &[])
             .unwrap();
-        assert_eq!(summary2.id, summary1.id, "dedup should return existing node");
+        assert_eq!(
+            summary2.id, summary1.id,
+            "dedup should return existing node"
+        );
         assert_eq!(summary2.semantic_hash, summary1.semantic_hash);
     }
 
@@ -2004,7 +2196,9 @@ mod tests {
         let _a = engine.insert_leaf(conv_id, "unique leaf", 5).unwrap();
 
         // Non-existing summary should not be found
-        let result = engine.find_similar_node("never seen before text", &[]).unwrap();
+        let result = engine
+            .find_similar_node("never seen before text", &[])
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -2022,7 +2216,10 @@ mod tests {
             .unwrap();
 
         let issues = engine.validate_dag(conv_id).unwrap();
-        assert!(issues.is_empty(), "healthy DAG should have no issues, got: {issues:?}");
+        assert!(
+            issues.is_empty(),
+            "healthy DAG should have no issues, got: {issues:?}"
+        );
     }
 
     #[test]
@@ -2032,20 +2229,32 @@ mod tests {
 
         let _a = engine.insert_leaf(conv_id, "A", 5).unwrap();
         // Insert a node that references a non-existent child
-        db.insert_dag_node(conv_id, 1, "orphan summary", 10, &[], &[99999], false).unwrap();
+        db.insert_dag_node(conv_id, 1, "orphan summary", 10, &[], &[99999], false)
+            .unwrap();
 
         let issues = engine.validate_dag(conv_id).unwrap();
         assert!(!issues.is_empty(), "should detect orphan child reference");
-        assert!(issues.iter().any(|i| i.contains("orphan-child")), "should report orphan-child");
+        assert!(
+            issues.iter().any(|i| i.contains("orphan-child")),
+            "should report orphan-child"
+        );
     }
 
     #[test]
     fn sentence_splitter_handles_english_and_cjk() {
         let sents = split_sentences("Hello world. This is Rust.\nNew line here!Right?");
-        assert!(sents.len() >= 3, "expected at least 3 sentences, got {}", sents.len());
+        assert!(
+            sents.len() >= 3,
+            "expected at least 3 sentences, got {}",
+            sents.len()
+        );
 
         let sents_cjk = split_sentences("你好世界。这是Rust。\n新行");
-        assert!(sents_cjk.len() >= 2, "expected at least 2 CJK sentences, got {}", sents_cjk.len());
+        assert!(
+            sents_cjk.len() >= 2,
+            "expected at least 2 CJK sentences, got {}",
+            sents_cjk.len()
+        );
     }
 
     // ── insert_leaf edge cases ──────────────────────────────────────────
@@ -2076,7 +2285,12 @@ mod tests {
         let (db, conv_id) = setup_db();
         let engine = DagEngine::builder().build(db);
         let ids: Vec<i64> = (0..5)
-            .map(|i| engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap().id)
+            .map(|i| {
+                engine
+                    .insert_leaf(conv_id, &format!("msg {i}"), 10)
+                    .unwrap()
+                    .id
+            })
             .collect();
         let leaves = engine.get_leaves(conv_id).unwrap();
         assert_eq!(leaves.len(), 5);
@@ -2092,11 +2306,15 @@ mod tests {
         let (db, conv_id) = setup_db();
         let engine = DagEngine::builder().max_level(3).build(db);
         for i in 0..6 {
-            engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap();
+            engine
+                .insert_leaf(conv_id, &format!("msg {i}"), 10)
+                .unwrap();
         }
         let leaves = engine.get_leaves(conv_id).unwrap();
         let ids: Vec<i64> = leaves.iter().map(|n| n.id).collect();
-        engine.compress_group(conv_id, &ids[0..4], "summary of 0-3", 15, 1).unwrap();
+        engine
+            .compress_group(conv_id, &ids[0..4], "summary of 0-3", 15, 1)
+            .unwrap();
 
         let context = engine.assemble_context(conv_id, 500, None).unwrap();
         let has_summary = context.iter().any(|n| n.level > 0);
@@ -2120,11 +2338,16 @@ mod tests {
             .max_level(3)
             .build(db);
         for i in 0..10 {
-            engine.insert_leaf(conv_id, &format!("msg {i}"), 10).unwrap();
+            engine
+                .insert_leaf(conv_id, &format!("msg {i}"), 10)
+                .unwrap();
         }
         let context = engine.assemble_context(conv_id, 1000, None).unwrap();
         let leaf_count = context.iter().filter(|n| n.is_leaf).count();
-        assert!(leaf_count <= 3, "should keep at most 3 recent leaf messages, got {leaf_count}");
+        assert!(
+            leaf_count <= 3,
+            "should keep at most 3 recent leaf messages, got {leaf_count}"
+        );
     }
 
     // ── GC: collect_garbage with actual nodes ──────────────────────────
@@ -2136,14 +2359,28 @@ mod tests {
         // Create two leaves and compress them into level 1 summary
         let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
         let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
-        let s1 = engine.compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1).unwrap();
+        let s1 = engine
+            .compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1)
+            .unwrap();
         // Create a level 3 summary as the tip, so level 2 nodes are NOT tips
-        engine.compress_group(conv_id, &[s1.id], "higher summary", 5, 3).unwrap();
+        engine
+            .compress_group(conv_id, &[s1.id], "higher summary", 5, 3)
+            .unwrap();
         // Insert an isolated level 2 node directly — not a tip, not a leaf, no edges to it
-        let orphan_id = db.insert_dag_node(conv_id, 2, "isolated", 10, &[], &[], false).unwrap().id;
+        let orphan_id = db
+            .insert_dag_node(conv_id, 2, "isolated", 10, &[], &[], false)
+            .unwrap()
+            .id;
         let ghosts = engine.collect_garbage(conv_id, false).unwrap();
-        assert_eq!(ghosts, vec![orphan_id], "isolated non-leaf below max level should be collected");
-        assert!(engine.get_node(orphan_id).unwrap().is_none(), "orphan should be purged");
+        assert_eq!(
+            ghosts,
+            vec![orphan_id],
+            "isolated non-leaf below max level should be collected"
+        );
+        assert!(
+            engine.get_node(orphan_id).unwrap().is_none(),
+            "orphan should be purged"
+        );
     }
 
     #[test]
@@ -2152,7 +2389,9 @@ mod tests {
         let engine = DagEngine::builder().max_level(3).build(db.clone());
         let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
         let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
-        engine.compress_group(conv_id, &[a.id, b.id], "summary", 8, 1).unwrap();
+        engine
+            .compress_group(conv_id, &[a.id, b.id], "summary", 8, 1)
+            .unwrap();
         let ghosts = engine.collect_garbage(conv_id, false).unwrap();
         assert!(ghosts.is_empty(), "reachable nodes should not be collected");
         assert!(engine.get_node(a.id).unwrap().is_some());
@@ -2165,8 +2404,12 @@ mod tests {
         let engine = DagEngine::builder().max_level(3).build(db.clone());
         // Insert level 1 summary and a level 2 summary as tip, leaving level 1 unreachable
         let leaf = engine.insert_leaf(conv_id, "leaf", 5).unwrap();
-        let s1 = engine.compress_group(conv_id, &[leaf.id], "level 1", 3, 1).unwrap();
-        engine.compress_group(conv_id, &[s1.id], "level 2 tip", 3, 2).unwrap();
+        let s1 = engine
+            .compress_group(conv_id, &[leaf.id], "level 1", 3, 1)
+            .unwrap();
+        engine
+            .compress_group(conv_id, &[s1.id], "level 2 tip", 3, 2)
+            .unwrap();
         // Insert more leaves so level 1 is not a tip
         engine.insert_leaf(conv_id, "extra", 5).unwrap();
         // Now level 1 summary is not a tip node (level 2 is max), and edges go
@@ -2174,7 +2417,10 @@ mod tests {
         // GC result depends on topology, so just verify dry_run doesn't purge.
         let ghosts = engine.collect_garbage(conv_id, true).unwrap();
         for gid in &ghosts {
-            assert!(engine.get_node(*gid).unwrap().is_some(), "dry_run should not purge node {gid}");
+            assert!(
+                engine.get_node(*gid).unwrap().is_some(),
+                "dry_run should not purge node {gid}"
+            );
         }
     }
 
@@ -2186,10 +2432,15 @@ mod tests {
         let engine = DagEngine::builder().max_level(3).build(db);
         // Create some leaves and a summary (non-leaf, should have low score)
         let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
-        engine.compress_group(conv_id, &[a.id], "low value summary", 3, 1).unwrap();
+        engine
+            .compress_group(conv_id, &[a.id], "low value summary", 3, 1)
+            .unwrap();
         let deleted = engine.gc_by_score(conv_id, 10).unwrap();
         // The summary (level 1, low token count, old) should be deleted
-        assert!(deleted >= 1, "should delete at least one low-score non-leaf");
+        assert!(
+            deleted >= 1,
+            "should delete at least one low-score non-leaf"
+        );
     }
 
     #[test]
@@ -2198,7 +2449,10 @@ mod tests {
         let engine = DagEngine::builder().max_level(3).build(db);
         let leaf = engine.insert_leaf(conv_id, "important leaf", 5).unwrap();
         let _deleted = engine.gc_by_score(conv_id, 10).unwrap();
-        assert!(engine.get_node(leaf.id).unwrap().is_some(), "leaves should never be deleted by gc_by_score");
+        assert!(
+            engine.get_node(leaf.id).unwrap().is_some(),
+            "leaves should never be deleted by gc_by_score"
+        );
     }
 
     #[test]
@@ -2207,7 +2461,9 @@ mod tests {
         let engine = DagEngine::builder().max_level(3).build(db);
         for i in 0..3 {
             let a = engine.insert_leaf(conv_id, &format!("a{i}"), 5).unwrap();
-            engine.compress_group(conv_id, &[a.id], &format!("summary {i}"), 3, 1).unwrap();
+            engine
+                .compress_group(conv_id, &[a.id], &format!("summary {i}"), 3, 1)
+                .unwrap();
         }
         let deleted = engine.gc_by_score(conv_id, 1).unwrap();
         assert!(deleted <= 1, "should respect max_to_delete limit");
@@ -2225,8 +2481,20 @@ mod tests {
         let deleted = engine.rollback_to(n1.id).unwrap();
         assert_eq!(deleted, 2, "nodes after target should be deleted");
         assert!(engine.get_node(n1.id).unwrap().is_some());
-        assert!(engine.get_node(n2.id).unwrap().map(|n| n.deleted).unwrap_or(true));
-        assert!(engine.get_node(n3.id).unwrap().map(|n| n.deleted).unwrap_or(true));
+        assert!(
+            engine
+                .get_node(n2.id)
+                .unwrap()
+                .map(|n| n.deleted)
+                .unwrap_or(true)
+        );
+        assert!(
+            engine
+                .get_node(n3.id)
+                .unwrap()
+                .map(|n| n.deleted)
+                .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -2244,7 +2512,10 @@ mod tests {
         let n1 = engine.insert_leaf(conv_id, "keep", 5).unwrap();
         let _n2 = engine.insert_leaf(conv_id, "remove", 5).unwrap();
         engine.rollback_to(n1.id).unwrap();
-        assert!(engine.get_node(n1.id).unwrap().is_some(), "target node should be kept");
+        assert!(
+            engine.get_node(n1.id).unwrap().is_some(),
+            "target node should be kept"
+        );
     }
 
     // ── Graph-aware retrieval ─────────────────────────────────────────
@@ -2256,7 +2527,11 @@ mod tests {
         let n1 = engine.insert_leaf(conv_id, "node a", 10).unwrap();
         let graph = engine.load_graph(conv_id).unwrap();
         let dist = engine.graph_bfs_distance(&[n1.id], &graph);
-        assert_eq!(dist.get(&n1.id).copied(), Some(0), "source should have distance 0");
+        assert_eq!(
+            dist.get(&n1.id).copied(),
+            Some(0),
+            "source should have distance 0"
+        );
     }
 
     #[test]
@@ -2264,18 +2539,28 @@ mod tests {
         let (db, conv_id) = setup_db();
         let engine = DagEngine::builder().build(db);
         let n1 = engine.insert_leaf(conv_id, "leaf", 10).unwrap();
-        let n2 = engine.compress_group(conv_id, &[n1.id], "summary", 5, 1).unwrap();
+        let n2 = engine
+            .compress_group(conv_id, &[n1.id], "summary", 5, 1)
+            .unwrap();
         // n1 is leaf, n2 is summary (parent of n1)
         let graph = engine.load_graph(conv_id).unwrap();
 
         // Distance from n2 (summary) to n1 (leaf): n2 → child_ids → n1 = 1 hop
         let dist = engine.graph_bfs_distance(&[n2.id], &graph);
-        assert_eq!(dist.get(&n1.id).copied(), Some(1), "leaf is child of summary");
+        assert_eq!(
+            dist.get(&n1.id).copied(),
+            Some(1),
+            "leaf is child of summary"
+        );
         assert_eq!(dist.get(&n2.id).copied(), Some(0), "source is distance 0");
 
         // Distance from n1 (leaf) to n2 (summary): n1 → parent_ids → n2 = 1 hop
         let dist2 = engine.graph_bfs_distance(&[n1.id], &graph);
-        assert_eq!(dist2.get(&n2.id).copied(), Some(1), "summary is parent of leaf");
+        assert_eq!(
+            dist2.get(&n2.id).copied(),
+            Some(1),
+            "summary is parent of leaf"
+        );
     }
 
     #[test]
@@ -2292,7 +2577,10 @@ mod tests {
     fn graph_relevance_score_combines_factors() {
         // High semantic + in active set + recent → near 1.0
         let high = DagEngine::graph_relevance_score(1.0, Some(0), 1.0);
-        assert!(high > 0.8, "high score for relevant+connected+recent: {high}");
+        assert!(
+            high > 0.8,
+            "high score for relevant+connected+recent: {high}"
+        );
 
         // Low semantic + unreachable + old → near 0.0
         let low = DagEngine::graph_relevance_score(0.0, None, 0.0);
@@ -2300,11 +2588,17 @@ mod tests {
 
         // A node at distance 2 should score between extremes
         let mid = DagEngine::graph_relevance_score(0.5, Some(2), 0.5);
-        assert!(mid > low && mid < high, "mid-range score should be between extremes: {mid}");
+        assert!(
+            mid > low && mid < high,
+            "mid-range score should be between extremes: {mid}"
+        );
 
         // Graph proximity should boost score
         let with_graph = DagEngine::graph_relevance_score(0.5, Some(1), 0.5);
         let without_graph = DagEngine::graph_relevance_score(0.5, None, 0.5);
-        assert!(with_graph > without_graph, "graph proximity should boost score: {with_graph} > {without_graph}");
+        assert!(
+            with_graph > without_graph,
+            "graph proximity should boost score: {with_graph} > {without_graph}"
+        );
     }
 }

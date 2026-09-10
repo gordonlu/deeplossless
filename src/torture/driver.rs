@@ -163,7 +163,11 @@ pub fn drive_scenario_with_options(
 }
 
 /// Drive every base scenario in sequence, returning per-scenario outcomes.
-pub fn drive_suite(format: &str, vfs_parent: &Path, verbose: bool) -> Vec<Result<DriveOutcome, String>> {
+pub fn drive_suite(
+    format: &str,
+    vfs_parent: &Path,
+    verbose: bool,
+) -> Vec<Result<DriveOutcome, String>> {
     let names = match Scenario::list_base() {
         Ok(n) if !n.is_empty() => n,
         Ok(_) => return vec![Err("no base scenarios found in scenarios/".to_string())],
@@ -184,7 +188,10 @@ pub fn drive_suite(format: &str, vfs_parent: &Path, verbose: bool) -> Vec<Result
     }
 
     if verbose {
-        let ok = out.iter().filter(|o| o.as_ref().map(|o| o.success).unwrap_or(false)).count();
+        let ok = out
+            .iter()
+            .filter(|o| o.as_ref().map(|o| o.success).unwrap_or(false))
+            .count();
         let err = out.len() - ok;
         eprintln!("\n=== result: {ok} ok, {err} fail ===");
     }
@@ -200,14 +207,25 @@ fn short_path(path: &str, vfs_root: &Path) -> String {
         path[root_str.len()..].trim_start_matches('/').to_string()
     } else {
         let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() <= 3 { path.to_string() }
-        else { format!("{}/{}/{}", segments[0], segments[1], segments[segments.len()-1]) }
+        if segments.len() <= 3 {
+            path.to_string()
+        } else {
+            format!(
+                "{}/{}/{}",
+                segments[0],
+                segments[1],
+                segments[segments.len() - 1]
+            )
+        }
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() }
-    else { format!("{}…", &s[..max.saturating_sub(1)]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
 }
 
 /// Execute a single tool call against the VFS and return the resulting event.
@@ -281,7 +299,10 @@ fn execute_tool_call(tool: &str, args: &serde_json::Value, vfs_root: &Path) -> A
         "Grep" | "grep" | "rg" | "search" | "search_file" | "find_in_files" => {
             let query = serde_json::to_string(args).unwrap_or_default();
             let (stdout, _, _) = run_bash(
-                &format!("grep -rn '{}' . 2>/dev/null | head -50", query.escape_default()),
+                &format!(
+                    "grep -rn '{}' . 2>/dev/null | head -50",
+                    query.escape_default()
+                ),
                 vfs_root,
             );
             AgentEvent::Search(query, stdout)
@@ -306,7 +327,10 @@ fn execute_tool_call(tool: &str, args: &serde_json::Value, vfs_root: &Path) -> A
             // Unknown tool — emit Other event so the state machine's
             // on_tool fallback can still advance.
             AgentEvent::Other(
-                format!("{other}({})", serde_json::to_string(args).unwrap_or_default()),
+                format!(
+                    "{other}({})",
+                    serde_json::to_string(args).unwrap_or_default()
+                ),
                 String::new(),
             )
         }
@@ -490,7 +514,8 @@ mod tests {
     #[test]
     fn drive_01_fix_test_failure_claude_code() {
         let parent = temp_parent("01_cc");
-        let outcome = drive_scenario("01_fix_test_failure", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("01_fix_test_failure", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -498,7 +523,8 @@ mod tests {
     #[test]
     fn drive_02_add_feature_claude_code() {
         let parent = temp_parent("02_cc");
-        let outcome = drive_scenario("02_add_feature", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("02_add_feature", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -506,7 +532,8 @@ mod tests {
     #[test]
     fn drive_03_refactor_rename_claude_code() {
         let parent = temp_parent("03_cc");
-        let outcome = drive_scenario("03_refactor_rename", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("03_refactor_rename", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -514,7 +541,8 @@ mod tests {
     #[test]
     fn drive_04_search_to_fix_claude_code() {
         let parent = temp_parent("04_cc");
-        let outcome = drive_scenario("04_search_to_fix", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("04_search_to_fix", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -522,7 +550,8 @@ mod tests {
     #[test]
     fn drive_05_multi_file_edit_claude_code() {
         let parent = temp_parent("05_cc");
-        let outcome = drive_scenario("05_multi_file_edit", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("05_multi_file_edit", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -530,7 +559,8 @@ mod tests {
     #[test]
     fn drive_06_debug_from_logs_claude_code() {
         let parent = temp_parent("06_cc");
-        let outcome = drive_scenario("06_debug_from_logs", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("06_debug_from_logs", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -538,7 +568,8 @@ mod tests {
     #[test]
     fn drive_07_security_fix_claude_code() {
         let parent = temp_parent("07_cc");
-        let outcome = drive_scenario("07_security_fix", "claude_code", &parent, false).expect("drive");
+        let outcome =
+            drive_scenario("07_security_fix", "claude_code", &parent, false).expect("drive");
         assert!(outcome.success, "expected success, got {outcome:?}");
         assert_eq!(outcome.terminal_state, "verify");
     }
@@ -563,7 +594,10 @@ mod tests {
     fn drive_suite_runs_all_base_scenarios() {
         let parent = temp_parent("suite");
         let outcomes = drive_suite("claude_code", &parent, false);
-        assert!(!outcomes.is_empty(), "suite should have at least one scenario");
+        assert!(
+            !outcomes.is_empty(),
+            "suite should have at least one scenario"
+        );
         let failures: Vec<_> = outcomes
             .iter()
             .filter(|o| o.is_err() || !o.as_ref().unwrap().success)

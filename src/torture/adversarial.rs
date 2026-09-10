@@ -21,15 +21,23 @@ pub struct BaseTemplate {
 impl BaseTemplate {
     /// Render into a ScenarioTrace, substituting {n} with a counter.
     pub fn render(&self) -> ScenarioTrace {
-        let turns: Vec<Turn> = self.turns.iter().enumerate().map(|(i, spec)| {
-            let prompt = spec.content_template.replace("{n}", &i.to_string());
-            Turn {
-                prompt,
-                completion: format!("response to: {}", spec.content_template.replace("{n}", &i.to_string())),
-                tokens: 50,
-                tool_calls: spec.tool_calls.clone(),
-            }
-        }).collect();
+        let turns: Vec<Turn> = self
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let prompt = spec.content_template.replace("{n}", &i.to_string());
+                Turn {
+                    prompt,
+                    completion: format!(
+                        "response to: {}",
+                        spec.content_template.replace("{n}", &i.to_string())
+                    ),
+                    tokens: 50,
+                    tool_calls: spec.tool_calls.clone(),
+                }
+            })
+            .collect();
         ScenarioTrace {
             name: self.name.clone(),
             description: self.description.clone(),
@@ -45,35 +53,104 @@ pub fn builtin_templates() -> Vec<BaseTemplate> {
             name: "simple_search".into(),
             description: "Create files, then search and edit them".into(),
             turns: vec![
-                TurnSpec { role: "user".into(), content_template: "create a Rust project with a lib.rs that has a foo function".into(), tool_calls: vec!["bash".into()] },
-                TurnSpec { role: "assistant".into(), content_template: "project created".into(), tool_calls: vec![] },
-                TurnSpec { role: "user".into(), content_template: "find the foo function".into(), tool_calls: vec!["grep".into()] },
-                TurnSpec { role: "assistant".into(), content_template: "found in src/lib.rs: fn foo()".into(), tool_calls: vec![] },
-                TurnSpec { role: "user".into(), content_template: "change foo to return 42".into(), tool_calls: vec!["edit".into()] },
-                TurnSpec { role: "assistant".into(), content_template: "edited".into(), tool_calls: vec![] },
-                TurnSpec { role: "user".into(), content_template: "show me the file".into(), tool_calls: vec!["read".into()] },
-                TurnSpec { role: "assistant".into(), content_template: "```rust\nfn foo() -> i32 { 42 }\n```".into(), tool_calls: vec![] },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "create a Rust project with a lib.rs that has a foo function"
+                        .into(),
+                    tool_calls: vec!["bash".into()],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "project created".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "find the foo function".into(),
+                    tool_calls: vec!["grep".into()],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "found in src/lib.rs: fn foo()".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "change foo to return 42".into(),
+                    tool_calls: vec!["edit".into()],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "edited".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "show me the file".into(),
+                    tool_calls: vec!["read".into()],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "```rust\nfn foo() -> i32 { 42 }\n```".into(),
+                    tool_calls: vec![],
+                },
             ],
         },
         BaseTemplate {
             name: "multi_tool".into(),
             description: "Multiple tool calls in parallel".into(),
             turns: vec![
-                TurnSpec { role: "user".into(), content_template: "create config files for dev, staging, and prod".into(), tool_calls: vec!["bash".into()] },
-                TurnSpec { role: "assistant".into(), content_template: "configs created".into(), tool_calls: vec![] },
-                TurnSpec { role: "user".into(), content_template: "read all config files and find the port setting".into(), tool_calls: vec!["read".into(), "glob".into(), "grep".into()] },
-                TurnSpec { role: "assistant".into(), content_template: "found port 8080 in all configs".into(), tool_calls: vec![] },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "create config files for dev, staging, and prod".into(),
+                    tool_calls: vec!["bash".into()],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "configs created".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "read all config files and find the port setting".into(),
+                    tool_calls: vec!["read".into(), "glob".into(), "grep".into()],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "found port 8080 in all configs".into(),
+                    tool_calls: vec![],
+                },
             ],
         },
         BaseTemplate {
             name: "follow_up".into(),
             description: "User asks question, assistant answers, user follows up".into(),
             turns: vec![
-                TurnSpec { role: "user".into(), content_template: "what is the capital of France".into(), tool_calls: vec![] },
-                TurnSpec { role: "assistant".into(), content_template: "Paris".into(), tool_calls: vec![] },
-                TurnSpec { role: "user".into(), content_template: "what about Germany".into(), tool_calls: vec![] },
-                TurnSpec { role: "assistant".into(), content_template: "Berlin".into(), tool_calls: vec![] },
-                TurnSpec { role: "user".into(), content_template: "population of {n}".into(), tool_calls: vec!["search".into()] },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "what is the capital of France".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "Paris".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "what about Germany".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "assistant".into(),
+                    content_template: "Berlin".into(),
+                    tool_calls: vec![],
+                },
+                TurnSpec {
+                    role: "user".into(),
+                    content_template: "population of {n}".into(),
+                    tool_calls: vec!["search".into()],
+                },
             ],
         },
     ]
@@ -84,7 +161,11 @@ pub fn builtin_templates() -> Vec<BaseTemplate> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Mutation {
     /// Repeat a turn N times. If `vary_context`, slightly change the prompt each time.
-    DuplicateTurn { index: usize, times: usize, vary_context: bool },
+    DuplicateTurn {
+        index: usize,
+        times: usize,
+        vary_context: bool,
+    },
     /// Swap two turns.
     ReorderTurns { a: usize, b: usize },
     /// Remove a turn.
@@ -119,7 +200,12 @@ fn inject_noise(text: &str, noise: &NoiseType) -> String {
 // ── Adversarial pipeline ──────────────────────────────────────────
 
 /// Generate an adversarial trace from a base template + mutations.
-pub fn generate(base: &BaseTemplate, mutations: &[Mutation], noises: &[(usize, NoiseType)], suffix: &str) -> ScenarioTrace {
+pub fn generate(
+    base: &BaseTemplate,
+    mutations: &[Mutation],
+    noises: &[(usize, NoiseType)],
+    suffix: &str,
+) -> ScenarioTrace {
     let mut trace = base.render();
     trace.name = format!("{}_{}", trace.name, suffix);
 
@@ -140,7 +226,11 @@ pub fn generate(base: &BaseTemplate, mutations: &[Mutation], noises: &[(usize, N
 
 fn apply_mutation(trace: &mut ScenarioTrace, mutation: &Mutation) {
     match mutation {
-        Mutation::DuplicateTurn { index, times, vary_context } => {
+        Mutation::DuplicateTurn {
+            index,
+            times,
+            vary_context,
+        } => {
             let idx = *index;
             let times = *times;
             let vary = *vary_context;
@@ -197,9 +287,31 @@ fn apply_mutation(trace: &mut ScenarioTrace, mutation: &Mutation) {
 pub fn gen_cache_adversarial() -> Vec<ScenarioTrace> {
     let base = &builtin_templates()[0]; // simple_search
     vec![
-        generate(base, &[Mutation::IdenticalPrompt { source: 0, target: 2 }], &[], "cache_identical"),
-        generate(base, &[Mutation::DuplicateTurn { index: 0, times: 3, vary_context: false }], &[], "cache_duplicate"),
-        generate(base, &[], &[(0, NoiseType::UnicodeHomoglyph)], "cache_homoglyph"),
+        generate(
+            base,
+            &[Mutation::IdenticalPrompt {
+                source: 0,
+                target: 2,
+            }],
+            &[],
+            "cache_identical",
+        ),
+        generate(
+            base,
+            &[Mutation::DuplicateTurn {
+                index: 0,
+                times: 3,
+                vary_context: false,
+            }],
+            &[],
+            "cache_duplicate",
+        ),
+        generate(
+            base,
+            &[],
+            &[(0, NoiseType::UnicodeHomoglyph)],
+            "cache_homoglyph",
+        ),
     ]
 }
 
@@ -209,14 +321,43 @@ pub fn gen_loop_adversarial() -> Vec<ScenarioTrace> {
     let base = &builtin_templates()[0];
     vec![
         // ABAB pattern
-        generate(base, &[Mutation::DuplicateTurn { index: 0, times: 5, vary_context: true }], &[], "loop_abab"),
+        generate(
+            base,
+            &[Mutation::DuplicateTurn {
+                index: 0,
+                times: 5,
+                vary_context: true,
+            }],
+            &[],
+            "loop_abab",
+        ),
         // Same prompt repeated
-        generate(base, &[Mutation::DuplicateTurn { index: 0, times: 3, vary_context: false }], &[], "loop_identical"),
+        generate(
+            base,
+            &[Mutation::DuplicateTurn {
+                index: 0,
+                times: 3,
+                vary_context: false,
+            }],
+            &[],
+            "loop_identical",
+        ),
         // Identical prompts at different positions
-        generate(base, &[
-            Mutation::IdenticalPrompt { source: 0, target: 2 },
-            Mutation::IdenticalPrompt { source: 0, target: 3 },
-        ], &[], "loop_identical_across_turns"),
+        generate(
+            base,
+            &[
+                Mutation::IdenticalPrompt {
+                    source: 0,
+                    target: 2,
+                },
+                Mutation::IdenticalPrompt {
+                    source: 0,
+                    target: 3,
+                },
+            ],
+            &[],
+            "loop_identical_across_turns",
+        ),
     ]
 }
 
@@ -226,9 +367,19 @@ pub fn gen_state_adversarial() -> Vec<ScenarioTrace> {
     let base = &builtin_templates()[1]; // multi_tool
     vec![
         // Swap tool calls between turns
-        generate(base, &[Mutation::SwapToolCalls { a: 0, b: 1 }], &[], "state_swap_tools"),
+        generate(
+            base,
+            &[Mutation::SwapToolCalls { a: 0, b: 1 }],
+            &[],
+            "state_swap_tools",
+        ),
         // Reorder turns
-        generate(base, &[Mutation::ReorderTurns { a: 0, b: 1 }], &[], "state_reorder"),
+        generate(
+            base,
+            &[Mutation::ReorderTurns { a: 0, b: 1 }],
+            &[],
+            "state_reorder",
+        ),
         // Drop a turn
         generate(base, &[Mutation::DropTurn(0)], &[], "state_drop_turn"),
     ]

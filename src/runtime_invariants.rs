@@ -38,9 +38,12 @@ pub fn assert_projection_parity(
     expected_completions: usize,
 ) {
     let diffs = RuntimeStateView::projection_parity_check(
-        events, conv_id,
-        expected_tokens, expected_cache_hits,
-        expected_failures, expected_completions,
+        events,
+        conv_id,
+        expected_tokens,
+        expected_cache_hits,
+        expected_failures,
+        expected_completions,
     );
     debug_assert!(
         diffs.is_empty(),
@@ -59,7 +62,9 @@ pub fn assert_cancellation_well_formed(events: &[RuntimeEvent], conv_id: i64) {
     let mut last_completed_seq: Option<i64> = None;
 
     for e in events {
-        if e.conv_id() != conv_id { continue; }
+        if e.conv_id() != conv_id {
+            continue;
+        }
         match e {
             RuntimeEvent::CancellationRequested { logical_seq, .. } => {
                 requested_count += 1;
@@ -94,8 +99,16 @@ pub fn assert_retry_attempt_monotonic(events: &[RuntimeEvent], tool_call_id: &st
     let mut last_attempt: u32 = 0;
     for e in events {
         let attempt = match e {
-            RuntimeEvent::RetryScheduled { tool_call_id: tcid, attempt, .. } if tcid == tool_call_id => Some(*attempt),
-            RuntimeEvent::ToolCallScheduled { tool_call_id: tcid, attempt, .. } if tcid == tool_call_id => Some(*attempt),
+            RuntimeEvent::RetryScheduled {
+                tool_call_id: tcid,
+                attempt,
+                ..
+            } if tcid == tool_call_id => Some(*attempt),
+            RuntimeEvent::ToolCallScheduled {
+                tool_call_id: tcid,
+                attempt,
+                ..
+            } if tcid == tool_call_id => Some(*attempt),
             _ => None,
         };
         if let Some(a) = attempt {
@@ -117,7 +130,9 @@ pub fn check_cancellation_well_formed(events: &[RuntimeEvent], conv_id: i64) -> 
     let mut completed = false;
 
     for e in events {
-        if e.conv_id() != conv_id { continue; }
+        if e.conv_id() != conv_id {
+            continue;
+        }
         match e {
             RuntimeEvent::CancellationRequested { .. } => {
                 if requested && !completed {
@@ -141,7 +156,9 @@ pub fn check_cancellation_well_formed(events: &[RuntimeEvent], conv_id: i64) -> 
     }
 
     if requested && !completed {
-        issues.push(format!("conv={conv_id}: pending CancellationRequested never resolved"));
+        issues.push(format!(
+            "conv={conv_id}: pending CancellationRequested never resolved"
+        ));
     }
 
     issues
@@ -155,8 +172,25 @@ mod tests {
     #[test]
     fn monotonic_seq_passes_for_ordered_events() {
         let events = vec![
-            RuntimeEvent::ToolCallScheduled { conv_id: 1, logical_seq: 1, tool_name: "g".into(), tool_call_id: "c1".into(), span_id: "s1".into(), attempt: 1 },
-            RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 2, tool_name: "g".into(), tool_call_id: "c1".into(), span_id: "s1".into(), attempt: 1, tokens_spent: 10, cache_hit: false, execution_unit_id: 1 },
+            RuntimeEvent::ToolCallScheduled {
+                conv_id: 1,
+                logical_seq: 1,
+                tool_name: "g".into(),
+                tool_call_id: "c1".into(),
+                span_id: "s1".into(),
+                attempt: 1,
+            },
+            RuntimeEvent::ToolCallCompleted {
+                conv_id: 1,
+                logical_seq: 2,
+                tool_name: "g".into(),
+                tool_call_id: "c1".into(),
+                span_id: "s1".into(),
+                attempt: 1,
+                tokens_spent: 10,
+                cache_hit: false,
+                execution_unit_id: 1,
+            },
         ];
         assert_monotonic_logical_seq(&events, 1); // should not panic
     }
@@ -165,8 +199,22 @@ mod tests {
     #[should_panic(expected = "LOGICAL_SEQ")]
     fn monotonic_seq_panics_on_duplicate() {
         let events = vec![
-            RuntimeEvent::ToolCallScheduled { conv_id: 1, logical_seq: 1, tool_name: "g".into(), tool_call_id: "c1".into(), span_id: "s1".into(), attempt: 1 },
-            RuntimeEvent::ToolCallScheduled { conv_id: 1, logical_seq: 1, tool_name: "g".into(), tool_call_id: "c2".into(), span_id: "s2".into(), attempt: 1 },
+            RuntimeEvent::ToolCallScheduled {
+                conv_id: 1,
+                logical_seq: 1,
+                tool_name: "g".into(),
+                tool_call_id: "c1".into(),
+                span_id: "s1".into(),
+                attempt: 1,
+            },
+            RuntimeEvent::ToolCallScheduled {
+                conv_id: 1,
+                logical_seq: 1,
+                tool_name: "g".into(),
+                tool_call_id: "c2".into(),
+                span_id: "s2".into(),
+                attempt: 1,
+            },
         ];
         assert_monotonic_logical_seq(&events, 1);
     }
@@ -174,9 +222,21 @@ mod tests {
     #[test]
     fn cancellation_check_passes_for_normal_lifecycle() {
         let events = vec![
-            RuntimeEvent::ExecutionStarted { conv_id: 1, logical_seq: 1, profile: "e".into() },
-            RuntimeEvent::CancellationRequested { conv_id: 1, logical_seq: 2, source: CancellationSource::Shutdown },
-            RuntimeEvent::CancellationCompleted { conv_id: 1, logical_seq: 3, clean: true },
+            RuntimeEvent::ExecutionStarted {
+                conv_id: 1,
+                logical_seq: 1,
+                profile: "e".into(),
+            },
+            RuntimeEvent::CancellationRequested {
+                conv_id: 1,
+                logical_seq: 2,
+                source: CancellationSource::Shutdown,
+            },
+            RuntimeEvent::CancellationCompleted {
+                conv_id: 1,
+                logical_seq: 3,
+                clean: true,
+            },
         ];
         let issues = check_cancellation_well_formed(&events, 1);
         assert!(issues.is_empty(), "issues: {:?}", issues);
@@ -184,9 +244,11 @@ mod tests {
 
     #[test]
     fn cancellation_check_detects_orphan_completion() {
-        let events = vec![
-            RuntimeEvent::CancellationCompleted { conv_id: 1, logical_seq: 1, clean: true },
-        ];
+        let events = vec![RuntimeEvent::CancellationCompleted {
+            conv_id: 1,
+            logical_seq: 1,
+            clean: true,
+        }];
         let issues = check_cancellation_well_formed(&events, 1);
         assert!(!issues.is_empty());
     }

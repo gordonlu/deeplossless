@@ -47,7 +47,6 @@ pub const CANCELLATION_SOURCE_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RuntimeEvent {
     // ── Execution lifecycle ─────────────────────────────────────────
-
     /// An execution cycle has started for a conversation.
     ExecutionStarted {
         conv_id: i64,
@@ -96,7 +95,6 @@ pub enum RuntimeEvent {
     },
 
     // ── Retry lifecycle ─────────────────────────────────────────────
-
     /// A retry has been scheduled for a previously failed tool call.
     RetryScheduled {
         conv_id: i64,
@@ -116,7 +114,6 @@ pub enum RuntimeEvent {
     },
 
     // ── Cancellation lifecycle ──────────────────────────────────────
-
     /// A cancellation has been requested (shutdown, timeout, client disconnect).
     CancellationRequested {
         conv_id: i64,

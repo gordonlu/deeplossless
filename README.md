@@ -7,8 +7,8 @@
 
 # deeplossless
 
-An **inference-aware coding runtime** that reduces repeated work in long AI
-coding sessions. It sits as an OpenAI-compatible proxy between your client
+A **durable execution-state runtime** for long AI coding sessions. It preserves exact
+evidence, avoids repeated execution, and gives agents a rebuildable working state. It sits as an OpenAI-compatible proxy between your client
 and the DeepSeek API.
 
 ```bash
@@ -17,7 +17,7 @@ deeplossless --api-key sk-...
 # Point any OpenAI-compatible client at https://localhost:8080/v1
 ```
 
-Long context windows are not memory. Repeated inference is waste.
+Long context windows are useful. Durable execution state is different.
 
 ---
 
@@ -62,10 +62,11 @@ cargo test --test simulated_session -- --nocapture
 
 ## What Gets Reused
 
-- **Repeated tool calls** — cached results returned inline, zero API tokens spent
-- **File reads** — structured summaries instead of raw content dumps
-- **Failed fixes** — remembers what didn't work and why
-- **Plans** — persists execution state across turns, avoids replanning
+- **Repeated deterministic tool calls** — exact cached results, invalidated when dependencies change
+- **File observations** — versioned evidence instead of stale conversational recollection
+- **Failed attempts** — preserves what failed and why as evidence, without forcing an old fix
+- **Plans** — persists typed execution state and revalidates dependencies
+- **Working context** — recalls and compacts projections while Ground Truth stays exact
 
 ## Configuration
 
@@ -78,7 +79,7 @@ cargo test --test simulated_session -- --nocapture
 | `--upstream` | `https://api.deepseek.com` | Upstream API base URL |
 | `--db-path` | `~/.deeplossless/lcm.db` | SQLite database path |
 | `--rate-limit` | `100` | Max requests/second |
-| `--summarizer-model` | `deepseek-v4-pro` | Model for background summarization |
+| `--summarizer-model` | `deepseek-flash` | Model for optional background summarization |
 | `--dry-run` | disabled | Save request bodies, skip upstream |
 | `--log-dir` | disabled | Per-request JSON logging |
 | `--record` | disabled | Record raw request/response for protocol debugging |
@@ -126,9 +127,9 @@ wire_api = "responses"    # for Codex Responses API
 codex
 ```
 
-Protocol translation and tool cache interception work transparently.
-The proxy translates Codex's Responses API requests to DeepSeek Chat Completions,
-and converts streaming responses back to Responses SSE format.
+DeepSeek Responses requests stay native end-to-end. DeepLossless records exact provider
+items, derives execution state and working context internally, then forwards native Responses
+JSON/SSE without translating it through Chat Completions.
 
 ### Claude Code (Anthropic Messages API)
 

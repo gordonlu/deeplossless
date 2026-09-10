@@ -13,11 +13,26 @@ pub enum ModelError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Severity { Critical, Error, Warning, Info }
+pub enum Severity {
+    Critical,
+    Error,
+    Warning,
+    Info,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Recoverability { Retryable, Degradable, Terminal }
+pub enum Recoverability {
+    Retryable,
+    Degradable,
+    Terminal,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ErrorPhase { Receive, Parse, Route, Emit, Persist }
+pub enum ErrorPhase {
+    Receive,
+    Parse,
+    Route,
+    Emit,
+    Persist,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RetryHint {
     Backoff { base_ms: u64 },
@@ -51,7 +66,9 @@ impl ModelError {
 
     pub fn status_code(&self) -> u16 {
         match self {
-            ModelError::Upstream(UpstreamError::AuthenticationFailed | UpstreamError::PermissionDenied) => 401,
+            ModelError::Upstream(
+                UpstreamError::AuthenticationFailed | UpstreamError::PermissionDenied,
+            ) => 401,
             ModelError::Upstream(UpstreamError::RateLimited) => 429,
             ModelError::Upstream(UpstreamError::ModelNotFound) => 404,
             ModelError::Upstream(UpstreamError::QuotaExceeded) => 402,
@@ -59,7 +76,9 @@ impl ModelError {
             ModelError::Upstream(UpstreamError::Timeout) => 504,
             ModelError::Upstream(UpstreamError::ConnectionFailed) => 503,
             ModelError::Context(ContextError::ContextTooLong) => 413,
-            ModelError::Routing(RoutingError::ReasoningEffortNotSupported | RoutingError::InvalidReasoningEffort) => 400,
+            ModelError::Routing(
+                RoutingError::ReasoningEffortNotSupported | RoutingError::InvalidReasoningEffort,
+            ) => 400,
             ModelError::Routing(RoutingError::ModelRouteUnavailable) => 503,
             _ => 502,
         }
@@ -83,28 +102,44 @@ impl ModelError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UpstreamError {
-    RateLimited, AuthenticationFailed, PermissionDenied,
-    ModelNotFound, QuotaExceeded, ServerError, Timeout, ConnectionFailed,
+    RateLimited,
+    AuthenticationFailed,
+    PermissionDenied,
+    ModelNotFound,
+    QuotaExceeded,
+    ServerError,
+    Timeout,
+    ConnectionFailed,
 }
 
 impl UpstreamError {
     fn meta(&self) -> ErrorMeta {
         match self {
             UpstreamError::RateLimited => ErrorMeta {
-                severity: Severity::Warning, recoverability: Recoverability::Retryable,
-                retry_hint: Some(RetryHint::Backoff { base_ms: 1000 }), phase: ErrorPhase::Receive,
+                severity: Severity::Warning,
+                recoverability: Recoverability::Retryable,
+                retry_hint: Some(RetryHint::Backoff { base_ms: 1000 }),
+                phase: ErrorPhase::Receive,
             },
             UpstreamError::AuthenticationFailed | UpstreamError::PermissionDenied => ErrorMeta {
-                severity: Severity::Critical, recoverability: Recoverability::Terminal,
-                retry_hint: None, phase: ErrorPhase::Receive,
+                severity: Severity::Critical,
+                recoverability: Recoverability::Terminal,
+                retry_hint: None,
+                phase: ErrorPhase::Receive,
             },
             UpstreamError::ModelNotFound | UpstreamError::QuotaExceeded => ErrorMeta {
-                severity: Severity::Error, recoverability: Recoverability::Terminal,
-                retry_hint: None, phase: ErrorPhase::Receive,
+                severity: Severity::Error,
+                recoverability: Recoverability::Terminal,
+                retry_hint: None,
+                phase: ErrorPhase::Receive,
             },
-            UpstreamError::ServerError | UpstreamError::Timeout | UpstreamError::ConnectionFailed => ErrorMeta {
-                severity: Severity::Error, recoverability: Recoverability::Retryable,
-                retry_hint: Some(RetryHint::Backoff { base_ms: 500 }), phase: ErrorPhase::Receive,
+            UpstreamError::ServerError
+            | UpstreamError::Timeout
+            | UpstreamError::ConnectionFailed => ErrorMeta {
+                severity: Severity::Error,
+                recoverability: Recoverability::Retryable,
+                retry_hint: Some(RetryHint::Backoff { base_ms: 500 }),
+                phase: ErrorPhase::Receive,
             },
         }
     }
@@ -114,14 +149,22 @@ impl UpstreamError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProtocolError {
-    InvalidJson, MissingChoices, MissingDelta,
-    UnsupportedResponseShape, MixedProtocolShape,
+    InvalidJson,
+    MissingChoices,
+    MissingDelta,
+    UnsupportedResponseShape,
+    MixedProtocolShape,
     InvalidContent { detail: String },
 }
 
 impl ProtocolError {
     fn meta(&self) -> ErrorMeta {
-        ErrorMeta { severity: Severity::Error, recoverability: Recoverability::Degradable, retry_hint: None, phase: ErrorPhase::Parse }
+        ErrorMeta {
+            severity: Severity::Error,
+            recoverability: Recoverability::Degradable,
+            retry_hint: None,
+            phase: ErrorPhase::Parse,
+        }
     }
 }
 
@@ -129,18 +172,28 @@ impl ProtocolError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamError {
-    InvalidSseLine, InvalidJsonEvent, StreamInterrupted,
-    DoneWithoutFinishReason, EventAfterDone,
+    InvalidSseLine,
+    InvalidJsonEvent,
+    StreamInterrupted,
+    DoneWithoutFinishReason,
+    EventAfterDone,
 }
 
 impl StreamError {
     fn meta(&self) -> ErrorMeta {
         match self {
             StreamError::StreamInterrupted => ErrorMeta {
-                severity: Severity::Error, recoverability: Recoverability::Retryable,
-                retry_hint: Some(RetryHint::Backoff { base_ms: 200 }), phase: ErrorPhase::Parse,
+                severity: Severity::Error,
+                recoverability: Recoverability::Retryable,
+                retry_hint: Some(RetryHint::Backoff { base_ms: 200 }),
+                phase: ErrorPhase::Parse,
             },
-            _ => ErrorMeta { severity: Severity::Warning, recoverability: Recoverability::Degradable, retry_hint: None, phase: ErrorPhase::Parse },
+            _ => ErrorMeta {
+                severity: Severity::Warning,
+                recoverability: Recoverability::Degradable,
+                retry_hint: None,
+                phase: ErrorPhase::Parse,
+            },
         }
     }
 }
@@ -149,14 +202,21 @@ impl StreamError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReasoningError {
-    StructuredReasoningMalformed, ReasoningMixedIntoContent,
-    ThinkTagUnclosed, ThinkTagInFinalAnswer,
+    StructuredReasoningMalformed,
+    ReasoningMixedIntoContent,
+    ThinkTagUnclosed,
+    ThinkTagInFinalAnswer,
     ReasoningStateMissingForToolChain,
 }
 
 impl ReasoningError {
     fn meta(&self) -> ErrorMeta {
-        ErrorMeta { severity: Severity::Warning, recoverability: Recoverability::Degradable, retry_hint: None, phase: ErrorPhase::Parse }
+        ErrorMeta {
+            severity: Severity::Warning,
+            recoverability: Recoverability::Degradable,
+            retry_hint: None,
+            phase: ErrorPhase::Parse,
+        }
     }
 }
 
@@ -164,19 +224,33 @@ impl ReasoningError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolCallError {
-    ToolCallsMalformed, DsmlMalformed, DsmlIncomplete, UnknownTool,
-    MissingRequiredArgument, UnexpectedArgument, ArgumentTypeMismatch,
-    ArgumentsJsonInvalid, ToolCallIdMissing, DuplicateToolCallId,
+    ToolCallsMalformed,
+    DsmlMalformed,
+    DsmlIncomplete,
+    UnknownTool,
+    MissingRequiredArgument,
+    UnexpectedArgument,
+    ArgumentTypeMismatch,
+    ArgumentsJsonInvalid,
+    ToolCallIdMissing,
+    DuplicateToolCallId,
 }
 
 impl ToolCallError {
     fn meta(&self) -> ErrorMeta {
         match self {
             ToolCallError::DsmlIncomplete => ErrorMeta {
-                severity: Severity::Warning, recoverability: Recoverability::Degradable,
-                retry_hint: Some(RetryHint::RequestModelFix), phase: ErrorPhase::Parse,
+                severity: Severity::Warning,
+                recoverability: Recoverability::Degradable,
+                retry_hint: Some(RetryHint::RequestModelFix),
+                phase: ErrorPhase::Parse,
             },
-            _ => ErrorMeta { severity: Severity::Error, recoverability: Recoverability::Degradable, retry_hint: None, phase: ErrorPhase::Parse },
+            _ => ErrorMeta {
+                severity: Severity::Error,
+                recoverability: Recoverability::Degradable,
+                retry_hint: None,
+                phase: ErrorPhase::Parse,
+            },
         }
     }
 }
@@ -185,18 +259,28 @@ impl ToolCallError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContextError {
-    ContextTooLong, StablePrefixTooLarge, DynamicSuffixTooLarge,
-    EvidencePackTooLarge, ToolSchemaTooLarge,
+    ContextTooLong,
+    StablePrefixTooLarge,
+    DynamicSuffixTooLarge,
+    EvidencePackTooLarge,
+    ToolSchemaTooLarge,
 }
 
 impl ContextError {
     fn meta(&self) -> ErrorMeta {
         match self {
             ContextError::ContextTooLong => ErrorMeta {
-                severity: Severity::Error, recoverability: Recoverability::Degradable,
-                retry_hint: Some(RetryHint::CompressContext), phase: ErrorPhase::Route,
+                severity: Severity::Error,
+                recoverability: Recoverability::Degradable,
+                retry_hint: Some(RetryHint::CompressContext),
+                phase: ErrorPhase::Route,
             },
-            _ => ErrorMeta { severity: Severity::Warning, recoverability: Recoverability::Degradable, retry_hint: None, phase: ErrorPhase::Route },
+            _ => ErrorMeta {
+                severity: Severity::Warning,
+                recoverability: Recoverability::Degradable,
+                retry_hint: None,
+                phase: ErrorPhase::Route,
+            },
         }
     }
 }
@@ -205,18 +289,27 @@ impl ContextError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RoutingError {
-    ModelRouteUnavailable, InvalidReasoningEffort,
-    ReasoningEffortNotSupported, FallbackExhausted,
+    ModelRouteUnavailable,
+    InvalidReasoningEffort,
+    ReasoningEffortNotSupported,
+    FallbackExhausted,
 }
 
 impl RoutingError {
     fn meta(&self) -> ErrorMeta {
         match self {
             RoutingError::InvalidReasoningEffort => ErrorMeta {
-                severity: Severity::Error, recoverability: Recoverability::Degradable,
-                retry_hint: Some(RetryHint::ReduceReasoningEffort), phase: ErrorPhase::Route,
+                severity: Severity::Error,
+                recoverability: Recoverability::Degradable,
+                retry_hint: Some(RetryHint::ReduceReasoningEffort),
+                phase: ErrorPhase::Route,
             },
-            _ => ErrorMeta { severity: Severity::Error, recoverability: Recoverability::Terminal, retry_hint: None, phase: ErrorPhase::Route },
+            _ => ErrorMeta {
+                severity: Severity::Error,
+                recoverability: Recoverability::Terminal,
+                retry_hint: None,
+                phase: ErrorPhase::Route,
+            },
         }
     }
 }
@@ -225,12 +318,20 @@ impl RoutingError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeError {
-    CacheReadFailed, CacheWriteFailed, PersistenceFailed, Cancellation,
+    CacheReadFailed,
+    CacheWriteFailed,
+    PersistenceFailed,
+    Cancellation,
 }
 
 impl RuntimeError {
     fn meta(&self) -> ErrorMeta {
-        ErrorMeta { severity: Severity::Warning, recoverability: Recoverability::Degradable, retry_hint: None, phase: ErrorPhase::Persist }
+        ErrorMeta {
+            severity: Severity::Warning,
+            recoverability: Recoverability::Degradable,
+            retry_hint: None,
+            phase: ErrorPhase::Persist,
+        }
     }
 }
 
@@ -284,7 +385,10 @@ mod tests {
     #[test]
     fn test_classify_upstream_401() {
         let err = classify_upstream(401, "invalid api key");
-        assert_eq!(err, ModelError::Upstream(UpstreamError::AuthenticationFailed));
+        assert_eq!(
+            err,
+            ModelError::Upstream(UpstreamError::AuthenticationFailed)
+        );
     }
 
     #[test]

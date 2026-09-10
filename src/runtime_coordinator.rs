@@ -2,7 +2,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::AppState;
-use crate::runtime::{BackgroundTasks, RateLimiter, RuntimeProfile, ExecutionCycle, RuntimePolicyConfig};
+use crate::runtime::{
+    BackgroundTasks, ExecutionCycle, RateLimiter, RuntimePolicyConfig, RuntimeProfile,
+};
 
 /// Config for the LCM proxy / upstream provider connection.
 #[derive(Clone)]
@@ -81,7 +83,9 @@ impl RuntimeCoordinator {
         };
         let dag = Arc::new(dag_builder.build(db.clone()));
 
-        let initial_api_key = provider.api_key.clone()
+        let initial_api_key = provider
+            .api_key
+            .clone()
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
 
         let compactor_config = crate::compactor::CompactorConfig {
@@ -90,7 +94,11 @@ impl RuntimeCoordinator {
                 upstream: provider.upstream.clone(),
                 upstream_path: provider.upstream_path.clone(),
                 model: storage.summarizer_model.clone(),
-                max_total_calls: if storage.summarizer_budget == 0 { u64::MAX } else { storage.summarizer_budget },
+                max_total_calls: if storage.summarizer_budget == 0 {
+                    u64::MAX
+                } else {
+                    storage.summarizer_budget
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -100,18 +108,18 @@ impl RuntimeCoordinator {
         let tasks = Arc::new(BackgroundTasks::new());
         let shutdown_flag = tasks.shutdown_flag();
 
-        let compactor = Arc::new(Mutex::new(
-            crate::compactor::Compactor::new(db.clone(), compactor_config, Some(&tasks)),
-        ));
+        let compactor = Arc::new(Mutex::new(crate::compactor::Compactor::new(
+            db.clone(),
+            compactor_config,
+            Some(&tasks),
+        )));
 
         // Spawn background mutation engine
-        let mutation_engine = Arc::new(
-            crate::mutation::MutationEngine::new(
-                crate::mutation::MutationConfig::default(),
-                db.clone(),
-                dag.clone(),
-            ),
-        );
+        let mutation_engine = Arc::new(crate::mutation::MutationEngine::new(
+            crate::mutation::MutationConfig::default(),
+            db.clone(),
+            dag.clone(),
+        ));
         let mutation_handle = crate::mutation::spawn_mutation_cycle(
             mutation_engine,
             crate::mutation::MutationConfig::default().interval_secs,
@@ -141,9 +149,9 @@ impl RuntimeCoordinator {
             compactor,
             runtime: crate::RuntimeServices {
                 client,
-                cycle: Arc::new(std::sync::Mutex::new(
-                    ExecutionCycle::new(RuntimeProfile::from_str(&runtime.runtime_profile)),
-                )),
+                cycle: Arc::new(std::sync::Mutex::new(ExecutionCycle::new(
+                    RuntimeProfile::from_str(&runtime.runtime_profile),
+                ))),
                 rate_limiter: limiter.clone(),
                 shutdown_notify: shutdown_notify.clone(),
             },
@@ -192,7 +200,9 @@ impl RuntimeCoordinator {
             .layer(axum::middleware::from_fn(crate::metrics::middleware))
             .layer(tower_http::catch_panic::CatchPanicLayer::new())
             .layer(tower_http::cors::CorsLayer::permissive())
-            .layer(tower_http::limit::RequestBodyLimitLayer::new(100 * 1024 * 1024))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                100 * 1024 * 1024,
+            ))
     }
 
     /// Graceful shutdown following strict ordering:
@@ -211,7 +221,9 @@ impl RuntimeCoordinator {
         // Step 3: send compactor shutdown — breaks its recv() loop
         {
             let mut compactor = self.state.compactor.lock().await;
-            let _ = compactor.send_command(crate::compactor::CompactCommand::Shutdown).await;
+            let _ = compactor
+                .send_command(crate::compactor::CompactCommand::Shutdown)
+                .await;
         }
         tracing::info!(target: "deeplossless", "shutdown: compactor shutdown sent");
 

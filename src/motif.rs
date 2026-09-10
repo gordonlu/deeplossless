@@ -51,15 +51,29 @@ impl ExecutionMotif {
 
 /// Parse the age in days between two ISO-8601 timestamps.
 fn parse_age_days(seen: &str, now: &str) -> f64 {
-    if seen.is_empty() { return 0.0; }
+    if seen.is_empty() {
+        return 0.0;
+    }
     // Simple parse: take the date portion (YYYY-MM-DD)
     let parse_date = |s: &str| -> Option<(i32, u32, u32)> {
         let parts: Vec<&str> = s.split('T').next()?.split('-').collect();
-        if parts.len() != 3 { return None; }
-        Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+        if parts.len() != 3 {
+            return None;
+        }
+        Some((
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        ))
     };
-    let (sy, sm, sd) = match parse_date(seen) { Some(v) => v, None => return 0.0 };
-    let (ny, nm, nd) = match parse_date(now) { Some(v) => v, None => return 0.0 };
+    let (sy, sm, sd) = match parse_date(seen) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    let (ny, nm, nd) = match parse_date(now) {
+        Some(v) => v,
+        None => return 0.0,
+    };
     let seen_days = sy as f64 * 365.0 + sm as f64 * 30.0 + sd as f64;
     let now_days = ny as f64 * 365.0 + nm as f64 * 30.0 + nd as f64;
     (now_days - seen_days).max(0.0)
@@ -162,11 +176,8 @@ impl MotifExtractor {
         }
 
         // Step 3: Hoist unit_map — build once, not per-motif (P0-1)
-        let unit_map: HashMap<i64, &crate::execution::ExecutionUnit> = unit_groups
-            .values()
-            .flatten()
-            .map(|u| (u.id, u))
-            .collect();
+        let unit_map: HashMap<i64, &crate::execution::ExecutionUnit> =
+            unit_groups.values().flatten().map(|u| (u.id, u)).collect();
 
         for stats in ngram_counts.values_mut() {
             let mut success_count = 0usize;
@@ -213,8 +224,8 @@ impl MotifExtractor {
             };
 
             // Confidence: normalized by total occurrences, not total units (P0-12)
-            let confidence = (stats.occurrence_count as f64 / total_occurrences.max(1) as f64)
-                .min(1.0);
+            let confidence =
+                (stats.occurrence_count as f64 / total_occurrences.max(1) as f64).min(1.0);
 
             let mut conv_ids: Vec<i64> = stats.conversation_ids.into_iter().collect();
             conv_ids.sort();
@@ -246,7 +257,10 @@ impl MotifExtractor {
 
     /// Convert a slice of execution units to (id, tool_name) pairs.
     fn to_tool_sequence(&self, units: &[crate::execution::ExecutionUnit]) -> Vec<(i64, String)> {
-        units.iter().map(|u| (u.id, canonicalize_tool_name(&u.tool_name))).collect()
+        units
+            .iter()
+            .map(|u| (u.id, canonicalize_tool_name(&u.tool_name)))
+            .collect()
     }
 
     /// Deduplicate consecutive identical tool names, keeping the first unit ID.
@@ -350,7 +364,13 @@ mod tests {
     use super::*;
     use crate::execution::{ExecutionOutcome, ExecutionUnit};
 
-    fn make_unit(id: i64, conv_id: i64, tool: &str, outcome: ExecutionOutcome, tokens: usize) -> ExecutionUnit {
+    fn make_unit(
+        id: i64,
+        conv_id: i64,
+        tool: &str,
+        outcome: ExecutionOutcome,
+        tokens: usize,
+    ) -> ExecutionUnit {
         ExecutionUnit {
             id,
             conversation_id: conv_id,
@@ -400,17 +420,21 @@ mod tests {
 
         // Pattern: grep → read_file appears twice
         let mut groups = HashMap::new();
-        groups.insert(1, vec![
-            make_unit(1, 1, "grep", ExecutionOutcome::Success, 10),
-            make_unit(2, 1, "read_file", ExecutionOutcome::Success, 20),
-            make_unit(3, 1, "edit_file", ExecutionOutcome::Success, 30),
-            make_unit(4, 1, "grep", ExecutionOutcome::Success, 10),
-            make_unit(5, 1, "read_file", ExecutionOutcome::Success, 20),
-            make_unit(6, 1, "build", ExecutionOutcome::Success, 40),
-        ]);
+        groups.insert(
+            1,
+            vec![
+                make_unit(1, 1, "grep", ExecutionOutcome::Success, 10),
+                make_unit(2, 1, "read_file", ExecutionOutcome::Success, 20),
+                make_unit(3, 1, "edit_file", ExecutionOutcome::Success, 30),
+                make_unit(4, 1, "grep", ExecutionOutcome::Success, 10),
+                make_unit(5, 1, "read_file", ExecutionOutcome::Success, 20),
+                make_unit(6, 1, "build", ExecutionOutcome::Success, 40),
+            ],
+        );
 
         let motifs = extractor.extract(&groups);
-        let grep_read: Vec<&ExecutionMotif> = motifs.iter()
+        let grep_read: Vec<&ExecutionMotif> = motifs
+            .iter()
             .filter(|m| m.tool_chain == vec!["grep", "read_file"])
             .collect();
         assert!(!grep_read.is_empty(), "grep→read_file should be detected");
@@ -428,14 +452,18 @@ mod tests {
         });
 
         let mut groups = HashMap::new();
-        groups.insert(1, vec![
-            make_unit(1, 1, "grep", ExecutionOutcome::Success, 10),
-            make_unit(2, 1, "build", ExecutionOutcome::Blocked, 100),
-        ]);
+        groups.insert(
+            1,
+            vec![
+                make_unit(1, 1, "grep", ExecutionOutcome::Success, 10),
+                make_unit(2, 1, "build", ExecutionOutcome::Blocked, 100),
+            ],
+        );
 
         let motifs = extractor.extract(&groups);
         // grep→build appears once
-        let gb: Vec<&ExecutionMotif> = motifs.iter()
+        let gb: Vec<&ExecutionMotif> = motifs
+            .iter()
             .filter(|m| m.tool_chain == vec!["grep", "build"])
             .collect();
         if let Some(m) = gb.first() {
@@ -447,7 +475,9 @@ mod tests {
     fn dedup_compresses_consecutive_identical() {
         let extractor = MotifExtractor::new(MotifConfig::default());
         let seq: Vec<(i64, String)> = vec![
-            (1, "grep".into()), (2, "grep".into()), (3, "read_file".into()),
+            (1, "grep".into()),
+            (2, "grep".into()),
+            (3, "read_file".into()),
         ];
         let deduped = extractor.dedup_consecutive_seq(&seq);
         assert_eq!(deduped.len(), 2);
@@ -464,20 +494,30 @@ mod tests {
 
         // Same pattern in two conversations
         let mut groups = HashMap::new();
-        groups.insert(1, vec![
-            make_unit(1, 1, "list_files", ExecutionOutcome::Success, 5),
-            make_unit(2, 1, "grep", ExecutionOutcome::Success, 10),
-        ]);
-        groups.insert(2, vec![
-            make_unit(3, 2, "list_files", ExecutionOutcome::Success, 5),
-            make_unit(4, 2, "grep", ExecutionOutcome::Success, 10),
-        ]);
+        groups.insert(
+            1,
+            vec![
+                make_unit(1, 1, "list_files", ExecutionOutcome::Success, 5),
+                make_unit(2, 1, "grep", ExecutionOutcome::Success, 10),
+            ],
+        );
+        groups.insert(
+            2,
+            vec![
+                make_unit(3, 2, "list_files", ExecutionOutcome::Success, 5),
+                make_unit(4, 2, "grep", ExecutionOutcome::Success, 10),
+            ],
+        );
 
         let motifs = extractor.extract(&groups);
-        let lf: Vec<&ExecutionMotif> = motifs.iter()
+        let lf: Vec<&ExecutionMotif> = motifs
+            .iter()
             .filter(|m| m.tool_chain == vec!["list_files", "grep"])
             .collect();
-        assert!(!lf.is_empty(), "cross-conversation pattern should be detected");
+        assert!(
+            !lf.is_empty(),
+            "cross-conversation pattern should be detected"
+        );
         if let Some(m) = lf.first() {
             assert_eq!(m.occurrence_count, 2);
             assert_eq!(m.conversation_ids.len(), 2);
@@ -509,7 +549,11 @@ mod tests {
         ];
 
         let matched = find_motif_matches(&units, &motif);
-        assert_eq!(matched.len(), 4, "two motif matches × 2 unique unit IDs each = 4");
+        assert_eq!(
+            matched.len(),
+            4,
+            "two motif matches × 2 unique unit IDs each = 4"
+        );
     }
 
     #[test]
@@ -529,10 +573,13 @@ mod tests {
         });
 
         let mut groups = HashMap::new();
-        groups.insert(1, vec![
-            make_unit(1, 1, "grep", ExecutionOutcome::Success, 10),
-            make_unit(2, 1, "build", ExecutionOutcome::Success, 10),
-        ]);
+        groups.insert(
+            1,
+            vec![
+                make_unit(1, 1, "grep", ExecutionOutcome::Success, 10),
+                make_unit(2, 1, "build", ExecutionOutcome::Success, 10),
+            ],
+        );
 
         let motifs = extractor.extract(&groups);
         assert!(motifs.is_empty(), "only 1 occurrence, min is 5");

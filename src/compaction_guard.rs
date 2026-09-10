@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 use crate::ground_truth::{
-    validate_compaction, CompactionValidationReport, ExecutionStateProjection, SourceRef,
+    CompactionValidationReport, ExecutionStateProjection, SourceRef, validate_compaction,
 };
 use crate::ground_truth_store::GroundTruthStore;
 
@@ -102,9 +102,7 @@ fn risk_score(report: &CompactionValidationReport, source_count: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ground_truth::{
-        ExecutionFact, PlanFactDependency, TruthStream,
-    };
+    use crate::ground_truth::{ExecutionFact, PlanFactDependency, TruthStream};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -117,7 +115,12 @@ mod tests {
             .unwrap();
         let store = GroundTruthStore::new(&db);
         let src = store
-            .put_text(TruthStream::ToolPayloads, "s1", "cargo test: ok", "test-output")
+            .put_text(
+                TruthStream::ToolPayloads,
+                "s1",
+                "cargo test: ok",
+                "test-output",
+            )
             .unwrap();
 
         let mut state = ExecutionStateProjection {
@@ -150,7 +153,12 @@ mod tests {
             .unwrap();
         let store = GroundTruthStore::new(&db);
         let mut src = store
-            .put_text(TruthStream::ToolPayloads, "s1", "exact output", "tool-output")
+            .put_text(
+                TruthStream::ToolPayloads,
+                "s1",
+                "exact output",
+                "tool-output",
+            )
             .unwrap();
         src.payload_ref = Some("proxy-event:s1:999999".into());
 
@@ -182,17 +190,13 @@ mod tests {
             ..Default::default()
         };
         let mut required = ExecutionFact::new("required", "r");
-        required.evidence.push(SourceRef::new(
-            TruthStream::ExecutionEvents,
-            1,
-            b"r",
-        ));
+        required
+            .evidence
+            .push(SourceRef::new(TruthStream::ExecutionEvents, 1, b"r"));
         let mut optional = ExecutionFact::new("optional", "o");
-        optional.evidence.push(SourceRef::new(
-            TruthStream::ExecutionEvents,
-            2,
-            b"o",
-        ));
+        optional
+            .evidence
+            .push(SourceRef::new(TruthStream::ExecutionEvents, 2, b"o"));
         state.insert_fact(required);
         state.insert_fact(optional);
         state.plan_dependencies.push(PlanFactDependency {

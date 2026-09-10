@@ -76,10 +76,7 @@ impl SnapshotTier {
 pub enum SnapshotPayload {
     /// L0: lightweight state for crash recovery and short replay.
     /// Stores only the last event seq_no and event count.
-    Ephemeral {
-        last_seq_no: i64,
-        event_count: u32,
-    },
+    Ephemeral { last_seq_no: i64, event_count: u32 },
     /// L1: structured memory topology + execution state.
     /// A compressed projection of the relevant event subsequence.
     Structural {
@@ -252,7 +249,10 @@ mod tests {
 
     #[test]
     fn payload_ephemeral_round_trip() {
-        let p = SnapshotPayload::Ephemeral { last_seq_no: 42, event_count: 10 };
+        let p = SnapshotPayload::Ephemeral {
+            last_seq_no: 42,
+            event_count: 10,
+        };
         let json = serde_json::to_string(&p).unwrap();
         let back: SnapshotPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_seq_no(), 42);
@@ -296,7 +296,10 @@ mod tests {
 
     #[test]
     fn empty_payload_last_seq_no_is_zero() {
-        let p = SnapshotPayload::Ephemeral { last_seq_no: 0, event_count: 0 };
+        let p = SnapshotPayload::Ephemeral {
+            last_seq_no: 0,
+            event_count: 0,
+        };
         assert_eq!(p.last_seq_no(), 0);
         assert_eq!(p.event_count(), 0);
     }

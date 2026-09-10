@@ -135,7 +135,6 @@ impl RuntimeProfile {
             Self::Custom => "custom",
         }
     }
-
 }
 
 // ── Runtime Mode ─────────────────────────────────────────────────────
@@ -159,9 +158,15 @@ pub enum RuntimeMode {
 }
 
 impl RuntimeMode {
-    pub fn is_live(&self) -> bool { matches!(self, Self::Live) }
-    pub fn is_replay(&self) -> bool { matches!(self, Self::Replay { .. }) }
-    pub fn is_dry_run(&self) -> bool { matches!(self, Self::DryRun) }
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live)
+    }
+    pub fn is_replay(&self) -> bool {
+        matches!(self, Self::Replay { .. })
+    }
+    pub fn is_dry_run(&self) -> bool {
+        matches!(self, Self::DryRun)
+    }
 }
 
 /// Separates execution output from side effects (A-4).
@@ -328,10 +333,7 @@ pub struct FailureHint {
 
 impl FailureHint {
     /// Build from a stored [`crate::execution::FailurePattern`].
-    pub fn from_failure_pattern(
-        fp: &crate::execution::FailurePattern,
-        retry_count: u32,
-    ) -> Self {
+    pub fn from_failure_pattern(fp: &crate::execution::FailurePattern, retry_count: u32) -> Self {
         Self {
             signature: fp.signature.clone(),
             suggested_fix: fp.attempted_fix.clone(),
@@ -360,11 +362,20 @@ pub struct PlanHint {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum RuntimeAction {
     /// Tool result found in cache — skip execution.
-    ReuseToolCache { tool_name: String, cache_hit_id: i64 },
+    ReuseToolCache {
+        tool_name: String,
+        cache_hit_id: i64,
+    },
     /// Known failure fix available — apply it.
-    RetryWithFix { failure_id: i64, suggested_fix: String },
+    RetryWithFix {
+        failure_id: i64,
+        suggested_fix: String,
+    },
     /// Active plan has pending steps — continue.
-    ContinuePlan { step_index: usize, step_description: String },
+    ContinuePlan {
+        step_index: usize,
+        step_description: String,
+    },
     /// Plan assumptions invalid — re-plan needed.
     Replan { reason: String },
     /// Request more context before proceeding.
@@ -508,17 +519,31 @@ impl DecisionEvaluation {
             "CompactAndProceed" => actual_tokens < estimated_tokens / 2,
             _ => !failure_repeated,
         };
-        DecisionOutcome { success, estimated_tokens, actual_tokens, failure_repeated }
+        DecisionOutcome {
+            success,
+            estimated_tokens,
+            actual_tokens,
+            failure_repeated,
+        }
     }
 
     /// Apply evaluation result to a decision record.
     pub fn apply(record: &mut RuntimeDecisionRecord, outcome: &DecisionOutcome) {
         if outcome.success {
-            record.mark_outcome("success", Some(outcome.actual_tokens.min(outcome.estimated_tokens)));
+            record.mark_outcome(
+                "success",
+                Some(outcome.actual_tokens.min(outcome.estimated_tokens)),
+            );
         } else {
             let reason = match record.action.as_str() {
                 "ReuseToolCache" => "cache_mismatch",
-                "RetryWithFix" => if outcome.failure_repeated { "failure_repeated" } else { "fix_ineffective" },
+                "RetryWithFix" => {
+                    if outcome.failure_repeated {
+                        "failure_repeated"
+                    } else {
+                        "fix_ineffective"
+                    }
+                }
                 "CompactAndProceed" => "re_expansion",
                 _ => "ineffective",
             };
@@ -776,19 +801,25 @@ impl ExecutionCycle {
     pub fn record_execution_started(&mut self, conv_id: i64, profile: &str) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::ExecutionStarted {
-            conv_id, logical_seq: seq,
+            conv_id,
+            logical_seq: seq,
             profile: profile.to_string(),
         });
     }
 
     /// Append ToolCallScheduled event.
     pub fn record_tool_call_scheduled(
-        &mut self, conv_id: i64, tool_name: &str,
-        tool_call_id: &str, span_id: &str, attempt: u32,
+        &mut self,
+        conv_id: i64,
+        tool_name: &str,
+        tool_call_id: &str,
+        span_id: &str,
+        attempt: u32,
     ) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::ToolCallScheduled {
-            conv_id, logical_seq: seq,
+            conv_id,
+            logical_seq: seq,
             tool_name: tool_name.to_string(),
             tool_call_id: tool_call_id.to_string(),
             span_id: span_id.to_string(),
@@ -798,13 +829,20 @@ impl ExecutionCycle {
 
     /// Append ToolCallCompleted event, then update metrics projection.
     pub fn record_tool_call_completed(
-        &mut self, conv_id: i64, tool_name: &str,
-        tool_call_id: &str, span_id: &str, attempt: u32,
-        tokens_spent: u64, cache_hit: bool, execution_unit_id: i64,
+        &mut self,
+        conv_id: i64,
+        tool_name: &str,
+        tool_call_id: &str,
+        span_id: &str,
+        attempt: u32,
+        tokens_spent: u64,
+        cache_hit: bool,
+        execution_unit_id: i64,
     ) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::ToolCallCompleted {
-            conv_id, logical_seq: seq,
+            conv_id,
+            logical_seq: seq,
             tool_name: tool_name.to_string(),
             tool_call_id: tool_call_id.to_string(),
             span_id: span_id.to_string(),
@@ -822,13 +860,20 @@ impl ExecutionCycle {
 
     /// Append ToolCallFailed event, then update projection.
     pub fn record_tool_call_failed(
-        &mut self, conv_id: i64, tool_name: &str,
-        tool_call_id: &str, span_id: &str, attempt: u32,
-        error_signature: &str, retryable: bool, execution_unit_id: i64,
+        &mut self,
+        conv_id: i64,
+        tool_name: &str,
+        tool_call_id: &str,
+        span_id: &str,
+        attempt: u32,
+        error_signature: &str,
+        retryable: bool,
+        execution_unit_id: i64,
     ) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::ToolCallFailed {
-            conv_id, logical_seq: seq,
+            conv_id,
+            logical_seq: seq,
             tool_name: tool_name.to_string(),
             tool_call_id: tool_call_id.to_string(),
             span_id: span_id.to_string(),
@@ -844,12 +889,16 @@ impl ExecutionCycle {
 
     /// Append RetryScheduled event.
     pub fn record_retry_scheduled(
-        &mut self, conv_id: i64, tool_call_id: &str,
-        attempt: u32, suggested_fix: &str,
+        &mut self,
+        conv_id: i64,
+        tool_call_id: &str,
+        attempt: u32,
+        suggested_fix: &str,
     ) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::RetryScheduled {
-            conv_id, logical_seq: seq,
+            conv_id,
+            logical_seq: seq,
             tool_call_id: tool_call_id.to_string(),
             attempt,
             suggested_fix: suggested_fix.to_string(),
@@ -858,12 +907,16 @@ impl ExecutionCycle {
 
     /// Append RetryAborted event.
     pub fn record_retry_aborted(
-        &mut self, conv_id: i64, tool_call_id: &str,
-        total_attempts: u32, reason: &str,
+        &mut self,
+        conv_id: i64,
+        tool_call_id: &str,
+        total_attempts: u32,
+        reason: &str,
     ) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::RetryAborted {
-            conv_id, logical_seq: seq,
+            conv_id,
+            logical_seq: seq,
             tool_call_id: tool_call_id.to_string(),
             total_attempts,
             reason: reason.to_string(),
@@ -872,32 +925,43 @@ impl ExecutionCycle {
 
     /// Append CancellationRequested event.
     pub fn record_cancellation_requested(
-        &mut self, conv_id: i64,
+        &mut self,
+        conv_id: i64,
         source: crate::runtime_events::CancellationSource,
     ) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::CancellationRequested {
-            conv_id, logical_seq: seq, source,
+            conv_id,
+            logical_seq: seq,
+            source,
         });
     }
 
     /// Append CancellationAcknowledged event.
     pub fn record_cancellation_acknowledged(
-        &mut self, conv_id: i64, tool_call_id: &str, span_id: &str,
+        &mut self,
+        conv_id: i64,
+        tool_call_id: &str,
+        span_id: &str,
     ) {
         let seq = crate::execution::next_logical_seq();
-        self.append_event(crate::runtime_events::RuntimeEvent::CancellationAcknowledged {
-            conv_id, logical_seq: seq,
-            tool_call_id: tool_call_id.to_string(),
-            span_id: span_id.to_string(),
-        });
+        self.append_event(
+            crate::runtime_events::RuntimeEvent::CancellationAcknowledged {
+                conv_id,
+                logical_seq: seq,
+                tool_call_id: tool_call_id.to_string(),
+                span_id: span_id.to_string(),
+            },
+        );
     }
 
     /// Append CancellationCompleted event.
     pub fn record_cancellation_completed(&mut self, conv_id: i64, clean: bool) {
         let seq = crate::execution::next_logical_seq();
         self.append_event(crate::runtime_events::RuntimeEvent::CancellationCompleted {
-            conv_id, logical_seq: seq, clean,
+            conv_id,
+            logical_seq: seq,
+            clean,
         });
     }
 
@@ -1002,7 +1066,10 @@ pub enum RetryClass {
 impl RetryClass {
     /// Whether this error class is retryable at the same escalation level.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient | Self::RateLimited | Self::QualityInsufficient)
+        matches!(
+            self,
+            Self::Transient | Self::RateLimited | Self::QualityInsufficient
+        )
     }
 
     /// Whether this error should skip escalation to the next LLM level
@@ -1018,8 +1085,12 @@ impl RetryClass {
         if http_status == Some(429) || msg.contains("rate limit") || msg.contains("429") {
             return Self::RateLimited;
         }
-        if msg.contains("timeout") || msg.contains("connection") || msg.contains("timed out")
-            || msg.contains("dns") || msg.contains("refused") || msg.contains("reset")
+        if msg.contains("timeout")
+            || msg.contains("connection")
+            || msg.contains("timed out")
+            || msg.contains("dns")
+            || msg.contains("refused")
+            || msg.contains("reset")
         {
             return Self::Transient;
         }
@@ -1066,7 +1137,10 @@ pub struct RetryBackoff {
 
 impl RetryBackoff {
     pub fn new(max_retries: u32) -> Self {
-        Self { max_retries: max_retries.min(5), seed: std::sync::atomic::AtomicU64::new(0) }
+        Self {
+            max_retries: max_retries.min(5),
+            seed: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Compute exponential backoff delay with full jitter, in milliseconds.
@@ -1098,7 +1172,8 @@ impl RetryBackoff {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos() as u64;
-            self.seed.store(ns.max(1), std::sync::atomic::Ordering::Relaxed);
+            self.seed
+                .store(ns.max(1), std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -1112,31 +1187,44 @@ pub trait DecisionRule: Send + Sync {
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate>;
 }
 
-
-
 // ── Built-in rules ─────────────────────────────────────────────────
 
 struct CacheReuseRule;
 impl DecisionRule for CacheReuseRule {
-    fn name(&self) -> &'static str { "cache_reuse" }
+    fn name(&self) -> &'static str {
+        "cache_reuse"
+    }
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
         let hit = state.cache_hit.as_ref()?;
         let confidence = RuntimeStrategy::from_profile(state.profile).cache_aggressiveness;
-        if confidence <= 0.3 { return None; }
+        if confidence <= 0.3 {
+            return None;
+        }
         Some(DecisionCandidate {
-            decision: RuntimeDecision::cache_hit(&hit.tool_name, hit.cache_id, hit.estimated_token_saving),
+            decision: RuntimeDecision::cache_hit(
+                &hit.tool_name,
+                hit.cache_id,
+                hit.estimated_token_saving,
+            ),
             score: confidence,
-            evidence: vec![format!("cache hit for {} (id={}, est_save={})", hit.tool_name, hit.cache_id, hit.estimated_token_saving)],
+            evidence: vec![format!(
+                "cache hit for {} (id={}, est_save={})",
+                hit.tool_name, hit.cache_id, hit.estimated_token_saving
+            )],
         })
     }
 }
 
 struct RetryWithFixRule;
 impl DecisionRule for RetryWithFixRule {
-    fn name(&self) -> &'static str { "retry_with_fix" }
+    fn name(&self) -> &'static str {
+        "retry_with_fix"
+    }
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
         let fh = state.failure_hint.as_ref()?;
-        if fh.suggested_fix.is_empty() { return None; }
+        if fh.suggested_fix.is_empty() {
+            return None;
+        }
         if fh.retry_count >= RuntimeStrategy::from_profile(state.profile).max_retries_per_failure {
             return None;
         }
@@ -1144,31 +1232,50 @@ impl DecisionRule for RetryWithFixRule {
         Some(DecisionCandidate {
             decision: RuntimeDecision::retry_with_fix(0, &fh.suggested_fix),
             score,
-            evidence: vec![format!("failure pattern '{}' — fix: {} (retry #{})", fh.signature, fh.suggested_fix, fh.retry_count)],
+            evidence: vec![format!(
+                "failure pattern '{}' — fix: {} (retry #{})",
+                fh.signature, fh.suggested_fix, fh.retry_count
+            )],
         })
     }
 }
 
 struct ReplanRule;
 impl DecisionRule for ReplanRule {
-    fn name(&self) -> &'static str { "replan" }
+    fn name(&self) -> &'static str {
+        "replan"
+    }
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
         let ph = state.plan_hint.as_ref()?;
-        if ph.pending_step_count == 0 { return None; }
+        if ph.pending_step_count == 0 {
+            return None;
+        }
         let changed: std::collections::HashSet<&str> =
             state.context_delta.iter().map(|s| s.as_str()).collect();
-        let invalidated: Vec<&str> = ph.assumptions.iter()
+        let invalidated: Vec<&str> = ph
+            .assumptions
+            .iter()
             .filter(|a| changed.contains(a.as_str()))
             .map(|s| s.as_str())
             .collect();
-        if invalidated.is_empty() { return None; }
-        let evidence = invalidated.iter().map(|a| format!("assumption '{}' invalidated by file change", a)).collect();
+        if invalidated.is_empty() {
+            return None;
+        }
+        let evidence = invalidated
+            .iter()
+            .map(|a| format!("assumption '{}' invalidated by file change", a))
+            .collect();
         Some(DecisionCandidate {
             decision: RuntimeDecision {
-                action: RuntimeAction::Replan { reason: format!("assumptions changed: {:?}", invalidated) },
+                action: RuntimeAction::Replan {
+                    reason: format!("assumptions changed: {:?}", invalidated),
+                },
                 estimated_token_saving: 0,
                 confidence: 0.8,
-                reason: format!("plan assumptions invalidated by file changes: {:?}", invalidated),
+                reason: format!(
+                    "plan assumptions invalidated by file changes: {:?}",
+                    invalidated
+                ),
                 evidence: vec![],
             },
             score: 0.8,
@@ -1179,27 +1286,42 @@ impl DecisionRule for ReplanRule {
 
 struct ContinuePlanRule;
 impl DecisionRule for ContinuePlanRule {
-    fn name(&self) -> &'static str { "continue_plan" }
+    fn name(&self) -> &'static str {
+        "continue_plan"
+    }
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
         let ph = state.plan_hint.as_ref()?;
-        if ph.pending_step_count == 0 { return None; }
+        if ph.pending_step_count == 0 {
+            return None;
+        }
         Some(DecisionCandidate {
             decision: RuntimeDecision::continue_plan(0, &ph.goal),
             score: 0.7,
-            evidence: vec![format!("plan #{} active — {} pending steps", ph.plan_id, ph.pending_step_count)],
+            evidence: vec![format!(
+                "plan #{} active — {} pending steps",
+                ph.plan_id, ph.pending_step_count
+            )],
         })
     }
 }
 
 struct TokenCriticalRule;
 impl DecisionRule for TokenCriticalRule {
-    fn name(&self) -> &'static str { "token_critical" }
+    fn name(&self) -> &'static str {
+        "token_critical"
+    }
     fn evaluate(&self, state: &RuntimeState) -> Option<DecisionCandidate> {
-        if !state.metrics.is_token_critical() { return None; }
+        if !state.metrics.is_token_critical() {
+            return None;
+        }
         Some(DecisionCandidate {
             decision: RuntimeDecision::compact_and_proceed(),
             score: 0.45, // fallback — more specific optimizations (cache, plan, retry) have higher priority
-            evidence: vec![format!("token critical: budget={:.0}%, streak={}", state.metrics.budget_remaining_pct * 100.0, state.metrics.failure_streak)],
+            evidence: vec![format!(
+                "token critical: budget={:.0}%, streak={}",
+                state.metrics.budget_remaining_pct * 100.0,
+                state.metrics.failure_streak
+            )],
         })
     }
 }
@@ -1218,13 +1340,14 @@ pub fn default_rules() -> Vec<Box<dyn DecisionRule>> {
 /// Tracks historical decision outcomes and adjusts confidence scores
 /// based on past success rates per action type (Online Evaluation).
 pub struct OnlineEvaluator {
-    history: Vec<(String, u64, u64)>,  // (action_type, successes, total)
+    history: Vec<(String, u64, u64)>, // (action_type, successes, total)
 }
 
 impl OnlineEvaluator {
     /// Load recent outcomes from the database.
     pub fn load(db: &crate::db::Database, window: usize) -> Self {
-        let history = db.query_decision_outcomes_by_action(window)
+        let history = db
+            .query_decision_outcomes_by_action(window)
             .unwrap_or_default();
         Self { history }
     }
@@ -1271,12 +1394,18 @@ pub struct RuleEngine {
 impl RuleEngine {
     /// Create a new engine with the given rules. Rules are evaluated in order.
     pub fn new(rules: Vec<Box<dyn DecisionRule>>) -> Self {
-        Self { rules, evaluator: None }
+        Self {
+            rules,
+            evaluator: None,
+        }
     }
 
     /// Create an engine with the default rule set (cache/retry/replan/continue/token).
     pub fn with_defaults() -> Self {
-        Self { rules: default_rules(), evaluator: None }
+        Self {
+            rules: default_rules(),
+            evaluator: None,
+        }
     }
 
     /// Attach an online evaluator for adaptive score adjustment.
@@ -1321,7 +1450,11 @@ impl RuleEngine {
                 evidence: vec![],
             };
         }
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates.remove(0)
     }
 }
@@ -1357,19 +1490,24 @@ impl RuntimePolicy {
             profile: cycle.profile,
             metrics: cycle.metrics.clone(),
             cache_hit: has_tool_cache_hit.map(|(tool_name, cache_id, estimated_token_saving)| {
-                CacheHit { tool_name: tool_name.to_string(), cache_id, estimated_token_saving }
-            }),
-            failure_hint: has_recent_failure.map(|(signature, suggested_fix)| {
-                FailureHint {
-                    signature: signature.to_string(),
-                    suggested_fix: suggested_fix.to_string(),
-                    why_failed: String::new(),
-                    invalidated_assumptions: vec![],
-                    retry_count: 0,
+                CacheHit {
+                    tool_name: tool_name.to_string(),
+                    cache_id,
+                    estimated_token_saving,
                 }
             }),
-            plan_hint: has_active_plan.map(|(plan_id, goal, pending_step_count)| {
-                PlanHint { plan_id, goal: goal.to_string(), pending_step_count, assumptions: vec![] }
+            failure_hint: has_recent_failure.map(|(signature, suggested_fix)| FailureHint {
+                signature: signature.to_string(),
+                suggested_fix: suggested_fix.to_string(),
+                why_failed: String::new(),
+                invalidated_assumptions: vec![],
+                retry_count: 0,
+            }),
+            plan_hint: has_active_plan.map(|(plan_id, goal, pending_step_count)| PlanHint {
+                plan_id,
+                goal: goal.to_string(),
+                pending_step_count,
+                assumptions: vec![],
             }),
             context_delta: cycle.context_delta.clone(),
         };
@@ -1399,7 +1537,10 @@ pub fn evaluate_failure_context(
     // Use the most recent pattern that has a suggested fix and why_failed
     let best = patterns.iter().find(|p| !p.attempted_fix.is_empty())?;
 
-    let retry_count = db.get_failure_retry_count(conv_id, &best.signature).ok().unwrap_or(0);
+    let retry_count = db
+        .get_failure_retry_count(conv_id, &best.signature)
+        .ok()
+        .unwrap_or(0);
 
     let failure_hint = FailureHint::from_failure_pattern(best, retry_count);
 
@@ -1415,7 +1556,10 @@ pub fn evaluate_failure_context(
     let decision = RuleEngine::with_defaults().decide(&state);
 
     match &decision.action {
-        RuntimeAction::RetryWithFix { failure_id: _, suggested_fix } => {
+        RuntimeAction::RetryWithFix {
+            failure_id: _,
+            suggested_fix,
+        } => {
             let sig = &best.signature;
             let why = &best.why_failed;
             let ctx = format!(
@@ -1482,7 +1626,10 @@ pub fn evaluate_plan_context(
     );
 
     match &decision.action {
-        RuntimeAction::ContinuePlan { step_index: _, step_description } => {
+        RuntimeAction::ContinuePlan {
+            step_index: _,
+            step_description,
+        } => {
             let next = pending_steps.first()?;
             Some(format!(
                 "[Plan active: {goal}]\n\
@@ -1490,14 +1637,12 @@ pub fn evaluate_plan_context(
                  [Step description: {step_description}]"
             ))
         }
-        RuntimeAction::Replan { reason } => {
-            Some(format!(
-                "[Plan needs replanning: {goal}]\n\
+        RuntimeAction::Replan { reason } => Some(format!(
+            "[Plan needs replanning: {goal}]\n\
                  [Reason: {reason}]\n\
                  [Pending steps: {}]",
-                pending_steps.join(", ")
-            ))
-        }
+            pending_steps.join(", ")
+        )),
         _ => None,
     }
 }
@@ -1513,24 +1658,42 @@ pub fn generate_report(
     session_duration_secs: u64,
 ) -> String {
     let m = &cycle.metrics;
-    let estimated_saved = m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
+    let estimated_saved =
+        m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
     let total_hits = m.cache_hits + m.cache_misses;
-    let hit_pct = if total_hits > 0 { m.cache_hits as f64 / total_hits as f64 * 100.0 } else { 0.0 };
+    let hit_pct = if total_hits > 0 {
+        m.cache_hits as f64 / total_hits as f64 * 100.0
+    } else {
+        0.0
+    };
 
     let mut out = String::new();
-    out.push_str(&format!("# deeplossless session report: {session_label}\n\n"));
+    out.push_str(&format!(
+        "# deeplossless session report: {session_label}\n\n"
+    ));
     out.push_str(&format!("**{turn_count} turns** · **{session_duration_secs}s duration** · **{hit_pct:.0}% cache reuse**\n\n"));
 
     out.push_str("## Execution Reuse\n\n| Metric | Count |\n|--------|-------|\n");
     out.push_str(&format!("| Cache hits | {} |\n", m.cache_hits));
     out.push_str(&format!("| Cache misses | {} |\n", m.cache_misses));
-    out.push_str(&format!("| Failure loops broken | {} |\n", m.repeated_failures.min(m.cache_hits / 2)));
-    out.push_str(&format!("| Plans resumed | {} |\n\n", (m.planning_reuse_ratio * 100.0) as u64 / 10));
+    out.push_str(&format!(
+        "| Failure loops broken | {} |\n",
+        m.repeated_failures.min(m.cache_hits / 2)
+    ));
+    out.push_str(&format!(
+        "| Plans resumed | {} |\n\n",
+        (m.planning_reuse_ratio * 100.0) as u64 / 10
+    ));
 
     out.push_str("## Inference Economics\n\n| Metric | Estimate |\n|--------|----------|\n");
-    out.push_str(&format!("| Estimated tokens avoided | ~{estimated_saved} |\n"));
+    out.push_str(&format!(
+        "| Estimated tokens avoided | ~{estimated_saved} |\n"
+    ));
     out.push_str(&format!("| Tokens spent | {} |\n", m.tokens_spent));
-    out.push_str(&format!("| Budget remaining | {:.0}% |\n\n", m.budget_remaining_pct * 100.0));
+    out.push_str(&format!(
+        "| Budget remaining | {:.0}% |\n\n",
+        m.budget_remaining_pct * 100.0
+    ));
 
     out.push_str("## Runtime Overhead\n\n| Metric | Value |\n|--------|-------|\n");
     out.push_str("| Average cache lookup | <50μs |\n");
@@ -1547,18 +1710,28 @@ pub fn generate_report(
     }
 
     let mut observations: Vec<String> = Vec::new();
-    if hit_pct > 30.0 { observations.push("Runtime reuse kicked in repeatedly.".into()); }
+    if hit_pct > 30.0 {
+        observations.push("Runtime reuse kicked in repeatedly.".into());
+    }
     if m.repeated_failures > 0 {
         let s = if m.repeated_failures > 1 { "s" } else { "" };
-        observations.push(format!("Stopped {} potential failure loop{}.", m.repeated_failures, s));
+        observations.push(format!(
+            "Stopped {} potential failure loop{}.",
+            m.repeated_failures, s
+        ));
     }
     if m.cache_hits > 10 {
         let s = if m.cache_hits > 1 { "s" } else { "" };
-        observations.push(format!("Prevented {} redundant tool call{}.", m.cache_hits, s));
+        observations.push(format!(
+            "Prevented {} redundant tool call{}.",
+            m.cache_hits, s
+        ));
     }
     if !observations.is_empty() {
         out.push_str("## Highlights\n\n");
-        for obs in &observations { out.push_str(&format!("- {obs}\n")); }
+        for obs in &observations {
+            out.push_str(&format!("- {obs}\n"));
+        }
     }
 
     out
@@ -1573,9 +1746,14 @@ pub fn generate_svg_card(
     top_reused: &[(String, u64)],
 ) -> String {
     let m = &cycle.metrics;
-    let estimated_saved = m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
+    let estimated_saved =
+        m.cache_hits * 350 + m.cache_misses.saturating_sub(m.repeated_failures) * 100;
     let total_hits = m.cache_hits + m.cache_misses;
-    let hit_pct = if total_hits > 0 { m.cache_hits as f64 / total_hits as f64 * 100.0 } else { 0.0 };
+    let hit_pct = if total_hits > 0 {
+        m.cache_hits as f64 / total_hits as f64 * 100.0
+    } else {
+        0.0
+    };
 
     // Truncate label
     let label: String = session_label.chars().take(40).collect();
@@ -1651,9 +1829,7 @@ impl ExecutionCompactor {
     /// Distill tool call sequence into a reasoning summary.
     /// Input: (tool_name, args, result_summary) triples.
     /// Output: "Tried approach A. Failed because X. Final fix: Y."
-    pub fn distill(
-        tool_sequence: &[(String, String, String)],
-    ) -> String {
+    pub fn distill(tool_sequence: &[(String, String, String)]) -> String {
         if tool_sequence.is_empty() {
             return String::new();
         }
@@ -1662,7 +1838,8 @@ impl ExecutionCompactor {
         let mut final_fix = String::new();
 
         for (i, (name, _args, result)) in tool_sequence.iter().enumerate() {
-            let is_error = result.contains("Error") || result.contains("error") || result.contains("fail");
+            let is_error =
+                result.contains("Error") || result.contains("error") || result.contains("fail");
 
             if is_error {
                 let brief: String = result.chars().take(100).collect();
@@ -1726,11 +1903,15 @@ impl RateLimiter {
             *guard = now;
             return true;
         }
-        let prev = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         prev < self.max_per_sec
     }
 
-    pub fn max_per_sec(&self) -> u64 { self.max_per_sec }
+    pub fn max_per_sec(&self) -> u64 {
+        self.max_per_sec
+    }
 }
 
 // ── Background Tasks (lifecycle management) ────────────────────────────
@@ -1773,12 +1954,20 @@ impl BackgroundTasks {
 
     /// Signal shutdown and await all handles with a timeout.
     pub async fn shutdown(self: &std::sync::Arc<Self>, timeout: std::time::Duration) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let deadline = tokio::time::Instant::now() + timeout;
-        let handles = self.handles.lock().ok().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+        let handles = self
+            .handles
+            .lock()
+            .ok()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
         for handle in handles {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() { break; }
+            if remaining.is_zero() {
+                break;
+            }
             let _ = tokio::time::timeout(remaining, handle).await;
         }
     }
@@ -1829,26 +2018,75 @@ mod tests {
         assert!(s.freeze_plans_early);
     }
 
-    fn make_state(profile: RuntimeProfile, cache: Option<(&str, i64, u64)>, failure: Option<(&str, &str)>, plan: Option<(i64, &str, usize)>) -> RuntimeState {
-        let metrics = RuntimeMetrics { budget_remaining_pct: 1.0, ..RuntimeMetrics::default() };
+    fn make_state(
+        profile: RuntimeProfile,
+        cache: Option<(&str, i64, u64)>,
+        failure: Option<(&str, &str)>,
+        plan: Option<(i64, &str, usize)>,
+    ) -> RuntimeState {
+        let metrics = RuntimeMetrics {
+            budget_remaining_pct: 1.0,
+            ..RuntimeMetrics::default()
+        };
         RuntimeState {
             profile,
             metrics,
-            cache_hit: cache.map(|(t, id, save)| CacheHit { tool_name: t.to_string(), cache_id: id, estimated_token_saving: save }),
-            failure_hint: failure.map(|(sig, fix)| FailureHint { signature: sig.to_string(), suggested_fix: fix.to_string(), why_failed: String::new(), invalidated_assumptions: vec![], retry_count: 0 }),
-            plan_hint: plan.map(|(id, goal, count)| PlanHint { plan_id: id, goal: goal.to_string(), pending_step_count: count, assumptions: vec![] }),
+            cache_hit: cache.map(|(t, id, save)| CacheHit {
+                tool_name: t.to_string(),
+                cache_id: id,
+                estimated_token_saving: save,
+            }),
+            failure_hint: failure.map(|(sig, fix)| FailureHint {
+                signature: sig.to_string(),
+                suggested_fix: fix.to_string(),
+                why_failed: String::new(),
+                invalidated_assumptions: vec![],
+                retry_count: 0,
+            }),
+            plan_hint: plan.map(|(id, goal, count)| PlanHint {
+                plan_id: id,
+                goal: goal.to_string(),
+                pending_step_count: count,
+                assumptions: vec![],
+            }),
             context_delta: vec![],
         }
     }
 
     #[test]
     fn cache_hit_confidence_scales_with_strategy() {
-        let s_min = RuntimeState { profile: RuntimeProfile::Minimal, ..make_state(RuntimeProfile::Minimal, None, None, None) };
-        let s_auto = RuntimeState { profile: RuntimeProfile::Autonomous, ..make_state(RuntimeProfile::Autonomous, None, None, None) };
-        let d1 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_min });
-        assert!(d1.confidence > 0.8, "minimal should be confident about cache");
-        let d2 = RuntimePolicy::decide(&RuntimeState { cache_hit: Some(CacheHit { tool_name: "grep".into(), cache_id: 42, estimated_token_saving: 500 }), ..s_auto });
-        assert!(d2.confidence < d1.confidence, "autonomous should be less aggressive about cache");
+        let s_min = RuntimeState {
+            profile: RuntimeProfile::Minimal,
+            ..make_state(RuntimeProfile::Minimal, None, None, None)
+        };
+        let s_auto = RuntimeState {
+            profile: RuntimeProfile::Autonomous,
+            ..make_state(RuntimeProfile::Autonomous, None, None, None)
+        };
+        let d1 = RuntimePolicy::decide(&RuntimeState {
+            cache_hit: Some(CacheHit {
+                tool_name: "grep".into(),
+                cache_id: 42,
+                estimated_token_saving: 500,
+            }),
+            ..s_min
+        });
+        assert!(
+            d1.confidence > 0.8,
+            "minimal should be confident about cache"
+        );
+        let d2 = RuntimePolicy::decide(&RuntimeState {
+            cache_hit: Some(CacheHit {
+                tool_name: "grep".into(),
+                cache_id: 42,
+                estimated_token_saving: 500,
+            }),
+            ..s_auto
+        });
+        assert!(
+            d2.confidence < d1.confidence,
+            "autonomous should be less aggressive about cache"
+        );
     }
 
     #[test]
@@ -1870,8 +2108,16 @@ mod tests {
     fn distill_failure_then_success() {
         let seq = vec![
             ("grep".into(), "pattern".into(), "found 0 results".into()),
-            ("compile".into(), "".into(), "Error: missing dep tokio".into()),
-            ("cargo add".into(), "tokio".into(), "Success: added tokio v1.42".into()),
+            (
+                "compile".into(),
+                "".into(),
+                "Error: missing dep tokio".into(),
+            ),
+            (
+                "cargo add".into(),
+                "tokio".into(),
+                "Success: added tokio v1.42".into(),
+            ),
         ];
         let distilled = ExecutionCompactor::distill(&seq);
         assert!(distilled.contains("failed"));
@@ -1884,7 +2130,10 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("grep"));
         assert!(json.contains("ReuseToolCache"));
-        assert!(json.contains("evidence"), "evidence field should be serialized");
+        assert!(
+            json.contains("evidence"),
+            "evidence field should be serialized"
+        );
     }
 
     #[test]
@@ -1957,13 +2206,19 @@ mod tests {
     #[test]
     fn evaluate_retry_with_fix_worked() {
         let outcome = DecisionEvaluation::evaluate("RetryWithFix", 200, 300, false);
-        assert!(outcome.success, "fix cost more than estimate but solved the problem");
+        assert!(
+            outcome.success,
+            "fix cost more than estimate but solved the problem"
+        );
     }
 
     #[test]
     fn evaluate_retry_with_fix_failed() {
         let outcome = DecisionEvaluation::evaluate("RetryWithFix", 200, 600, true);
-        assert!(!outcome.success, "cost exceeded estimate and failure repeated");
+        assert!(
+            !outcome.success,
+            "cost exceeded estimate and failure repeated"
+        );
     }
 
     #[test]
@@ -2024,8 +2279,16 @@ mod tests {
     #[test]
     fn candidate_ranking_picks_highest_score() {
         let candidates = vec![
-            DecisionCandidate { decision: RuntimeDecision::cache_hit("grep", 1, 100), score: 0.5, evidence: vec!["low confidence".into()] },
-            DecisionCandidate { decision: RuntimeDecision::cache_hit("grep", 2, 500), score: 0.9, evidence: vec!["high confidence".into()] },
+            DecisionCandidate {
+                decision: RuntimeDecision::cache_hit("grep", 1, 100),
+                score: 0.5,
+                evidence: vec!["low confidence".into()],
+            },
+            DecisionCandidate {
+                decision: RuntimeDecision::cache_hit("grep", 2, 500),
+                score: 0.9,
+                evidence: vec!["high confidence".into()],
+            },
         ];
         let winner = RuntimePolicy::rank_candidates(candidates);
         assert_eq!(winner.decision.estimated_token_saving, 500);
@@ -2035,8 +2298,16 @@ mod tests {
     #[test]
     fn candidate_ranking_ties_use_insertion_order() {
         let candidates = vec![
-            DecisionCandidate { decision: RuntimeDecision::cache_hit("first", 1, 100), score: 0.5, evidence: vec![] },
-            DecisionCandidate { decision: RuntimeDecision::cache_hit("second", 2, 200), score: 0.5, evidence: vec![] },
+            DecisionCandidate {
+                decision: RuntimeDecision::cache_hit("first", 1, 100),
+                score: 0.5,
+                evidence: vec![],
+            },
+            DecisionCandidate {
+                decision: RuntimeDecision::cache_hit("second", 2, 200),
+                score: 0.5,
+                evidence: vec![],
+            },
         ];
         let winner = RuntimePolicy::rank_candidates(candidates);
         // Should contain "first" because stable sort preserves order
@@ -2054,13 +2325,22 @@ mod tests {
         // Only plan hint set — should trigger ContinuePlan (score ~0.7)
         let state = RuntimeState {
             plan_hint: Some(PlanHint {
-                plan_id: 1, goal: "refactor".into(), pending_step_count: 3, assumptions: vec![],
+                plan_id: 1,
+                goal: "refactor".into(),
+                pending_step_count: 3,
+                assumptions: vec![],
             }),
             ..make_state(RuntimeProfile::Efficient, None, None, None)
         };
         let d = RuntimePolicy::decide(&state);
-        assert!(matches!(d.action, RuntimeAction::ContinuePlan { .. }), "should pick ContinuePlan from candidates");
-        assert!(!d.evidence.is_empty(), "should carry evidence from winning stage");
+        assert!(
+            matches!(d.action, RuntimeAction::ContinuePlan { .. }),
+            "should pick ContinuePlan from candidates"
+        );
+        assert!(
+            !d.evidence.is_empty(),
+            "should carry evidence from winning stage"
+        );
     }
 
     #[test]
@@ -2074,7 +2354,9 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let conv_id = db.create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}])).unwrap();
+        let conv_id = db
+            .create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}]))
+            .unwrap();
         let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
         let result = evaluate_failure_context(&db, conv_id, &cycle);
         assert!(result.is_none(), "no patterns → no context");
@@ -2091,16 +2373,35 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let conv_id = db.create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}])).unwrap();
-        let _id = db.store_failure_pattern(
-            conv_id, "Error: ENOENT", "check file exists first", "file was deleted mid-run", &[], &[], None,
-        ).unwrap();
+        let conv_id = db
+            .create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}]))
+            .unwrap();
+        let _id = db
+            .store_failure_pattern(
+                conv_id,
+                "Error: ENOENT",
+                "check file exists first",
+                "file was deleted mid-run",
+                &[],
+                &[],
+                None,
+            )
+            .unwrap();
         let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
         let result = evaluate_failure_context(&db, conv_id, &cycle);
-        assert!(result.is_some(), "should return context with fix suggestion");
+        assert!(
+            result.is_some(),
+            "should return context with fix suggestion"
+        );
         let ctx = result.unwrap();
-        assert!(ctx.contains("ENOENT"), "context should mention the error signature");
-        assert!(ctx.contains("check file exists first"), "context should mention the suggested fix");
+        assert!(
+            ctx.contains("ENOENT"),
+            "context should mention the error signature"
+        );
+        assert!(
+            ctx.contains("check file exists first"),
+            "context should mention the suggested fix"
+        );
     }
 
     #[test]
@@ -2114,7 +2415,9 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let conv_id = db.create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}])).unwrap();
+        let conv_id = db
+            .create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}]))
+            .unwrap();
         let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
         let result = evaluate_plan_context(&db, conv_id, &cycle, &[]);
         assert!(result.is_none(), "no active plan → no context");
@@ -2131,15 +2434,25 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let conv_id = db.create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}])).unwrap();
+        let conv_id = db
+            .create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}]))
+            .unwrap();
         let steps = vec!["add tests".to_string(), "refactor".to_string()];
-        let _plan_id = db.store_plan_state(conv_id, "improve quality", &steps, &[]).unwrap();
+        let _plan_id = db
+            .store_plan_state(conv_id, "improve quality", &steps, &[])
+            .unwrap();
         let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
         let result = evaluate_plan_context(&db, conv_id, &cycle, &[]);
         assert!(result.is_some(), "should return context with next step");
         let ctx = result.unwrap();
-        assert!(ctx.contains("improve quality"), "context should mention goal");
-        assert!(ctx.contains("Next step"), "context should mention next step");
+        assert!(
+            ctx.contains("improve quality"),
+            "context should mention goal"
+        );
+        assert!(
+            ctx.contains("Next step"),
+            "context should mention next step"
+        );
     }
 
     #[test]
@@ -2153,17 +2466,27 @@ mod tests {
                 .await
                 .unwrap()
         });
-        let conv_id = db.create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}])).unwrap();
+        let conv_id = db
+            .create_and_store("test", &serde_json::json!([{"role":"user","content":"hi"}]))
+            .unwrap();
         let steps = vec!["add tests".to_string()];
         let assumptions = vec!["src/lib.rs".to_string()];
-        let _plan_id = db.store_plan_state(conv_id, "improve quality", &steps, &assumptions).unwrap();
+        let _plan_id = db
+            .store_plan_state(conv_id, "improve quality", &steps, &assumptions)
+            .unwrap();
         let cycle = ExecutionCycle::new(RuntimeProfile::Efficient);
         // Pass a context_delta that includes the assumption file — triggers Replan
         let result = evaluate_plan_context(&db, conv_id, &cycle, &["src/lib.rs".to_string()]);
         assert!(result.is_some(), "should return replan context");
         let ctx = result.unwrap();
-        assert!(ctx.contains("replanning"), "should indicate replan is needed");
-        assert!(ctx.contains("src/lib.rs"), "should mention invalidated assumption");
+        assert!(
+            ctx.contains("replanning"),
+            "should indicate replan is needed"
+        );
+        assert!(
+            ctx.contains("src/lib.rs"),
+            "should mention invalidated assumption"
+        );
     }
 
     // ── Online Evaluation ─────────────────────────────────────────────
@@ -2171,8 +2494,8 @@ mod tests {
     #[test]
     fn online_evaluator_adjusts_score_by_success_rate() {
         let history = vec![
-            ("ReuseToolCache".to_string(), 8u64, 10u64),  // 80% success
-            ("RetryWithFix".to_string(), 1u64, 5u64),      // 20% success
+            ("ReuseToolCache".to_string(), 8u64, 10u64), // 80% success
+            ("RetryWithFix".to_string(), 1u64, 5u64),    // 20% success
         ];
         let eval = OnlineEvaluator { history };
 
@@ -2197,16 +2520,21 @@ mod tests {
         };
         eval.adjust_score(&mut candidate, "retry_rule");
         // factor = 0.5 + 0.5 * 0.2 = 0.6
-        assert!((candidate.score - 0.6).abs() < 0.01, "adjusted score should be 0.6");
-        assert!(candidate.evidence.iter().any(|e| e.contains("online_eval")),
-            "should include online_eval evidence");
+        assert!(
+            (candidate.score - 0.6).abs() < 0.01,
+            "adjusted score should be 0.6"
+        );
+        assert!(
+            candidate.evidence.iter().any(|e| e.contains("online_eval")),
+            "should include online_eval evidence"
+        );
     }
 
     #[test]
     fn rule_engine_with_evaluator_applies_online_eval() {
         let history = vec![
-            ("ReuseToolCache".to_string(), 9u64, 10u64),  // 90% success
-            ("RetryWithFix".to_string(), 0u64, 5u64),       // 0% success
+            ("ReuseToolCache".to_string(), 9u64, 10u64), // 90% success
+            ("RetryWithFix".to_string(), 0u64, 5u64),    // 0% success
         ];
         let eval = OnlineEvaluator { history };
 
@@ -2217,7 +2545,9 @@ mod tests {
             profile: RuntimeProfile::Efficient,
             metrics: RuntimeMetrics::default(),
             cache_hit: Some(CacheHit {
-                tool_name: "grep".into(), cache_id: 1, estimated_token_saving: 500,
+                tool_name: "grep".into(),
+                cache_id: 1,
+                estimated_token_saving: 500,
             }),
             failure_hint: None,
             plan_hint: None,
@@ -2225,8 +2555,13 @@ mod tests {
         };
         let decision = engine.decide(&state);
         // CacheReuseRule should fire (90% success → factor=0.95, score=confidence)
-        assert!(matches!(decision.action, RuntimeAction::ReuseToolCache { .. }));
-        assert!(decision.evidence.iter().any(|e| e.contains("online_eval")),
-            "evidence should contain online_eval");
+        assert!(matches!(
+            decision.action,
+            RuntimeAction::ReuseToolCache { .. }
+        ));
+        assert!(
+            decision.evidence.iter().any(|e| e.contains("online_eval")),
+            "evidence should contain online_eval"
+        );
     }
 }

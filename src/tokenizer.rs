@@ -111,22 +111,24 @@ fn count_content_inner(value: &serde_json::Value, enc: &str) -> usize {
         serde_json::Value::Array(arr) => {
             // Content array blocks: count strings directly, or whitelist
             // "text"/"content"/"arguments"/"input" fields from objects.
-            arr.iter().map(|item| {
-                if item.is_string() {
-                    bpe.count(item.as_str().unwrap_or_default())
-                } else if let Some(obj) = item.as_object() {
-                    let mut total = 0;
-                    if let Some(v) = obj.get("text").or_else(|| obj.get("content")) {
-                        total += count_content_inner(v, enc);
+            arr.iter()
+                .map(|item| {
+                    if item.is_string() {
+                        bpe.count(item.as_str().unwrap_or_default())
+                    } else if let Some(obj) = item.as_object() {
+                        let mut total = 0;
+                        if let Some(v) = obj.get("text").or_else(|| obj.get("content")) {
+                            total += count_content_inner(v, enc);
+                        }
+                        if let Some(v) = obj.get("arguments").or_else(|| obj.get("input")) {
+                            total += count_content_inner(v, enc);
+                        }
+                        total
+                    } else {
+                        0
                     }
-                    if let Some(v) = obj.get("arguments").or_else(|| obj.get("input")) {
-                        total += count_content_inner(v, enc);
-                    }
-                    total
-                } else {
-                    0
-                }
-            }).sum()
+                })
+                .sum()
         }
         serde_json::Value::Object(obj) => {
             // Only count known content fields; skip metadata keys
@@ -150,7 +152,11 @@ pub fn count_message(value: &serde_json::Value, overhead: usize) -> usize {
     let role = value["role"].as_str().unwrap_or("unknown");
     let role_tokens = count(role);
     let content_tokens = count_content(value);
-    let tool_token = if value.get("tool_call_id").is_some() { 5 } else { 0 };
+    let tool_token = if value.get("tool_call_id").is_some() {
+        5
+    } else {
+        0
+    };
     let tool_calls_tokens = if let Some(arr) = value["tool_calls"].as_array() {
         arr.iter().map(count_content).sum::<usize>()
     } else {
@@ -162,8 +168,15 @@ pub fn count_message(value: &serde_json::Value, overhead: usize) -> usize {
 /// Count tokens for a full messages array, accounting for chat framing.
 /// Each message includes the per-message overhead, plus a global preamble
 /// overhead for the request structure.
-pub fn count_messages(messages: &[serde_json::Value], overhead_per_msg: usize, overhead_global: usize) -> usize {
-    let total: usize = messages.iter().map(|m| count_message(m, overhead_per_msg)).sum();
+pub fn count_messages(
+    messages: &[serde_json::Value],
+    overhead_per_msg: usize,
+    overhead_global: usize,
+) -> usize {
+    let total: usize = messages
+        .iter()
+        .map(|m| count_message(m, overhead_per_msg))
+        .sum();
     total + overhead_global
 }
 
@@ -260,8 +273,10 @@ mod tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let n = count_messages(&msgs, 12, 5);
-        assert!(n >= count_content(&msgs[0]) + count_content(&msgs[1]),
-            "message count should be >= sum of content counts");
+        assert!(
+            n >= count_content(&msgs[0]) + count_content(&msgs[1]),
+            "message count should be >= sum of content counts"
+        );
     }
 
     #[test]
@@ -288,6 +303,9 @@ mod tests {
     #[test]
     fn get_encoding_falls_back_to_cl100k() {
         let bpe = get_encoding("nonexistent_encoding_xyz");
-        assert!(bpe.count("hello") > 0, "fallback should produce valid tokens");
+        assert!(
+            bpe.count("hello") > 0,
+            "fallback should produce valid tokens"
+        );
     }
 }

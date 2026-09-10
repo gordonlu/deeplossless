@@ -3,11 +3,11 @@
 //!
 //! Each mutation cycle: analyze → propose → apply → record → version.
 
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use crate::dag::{DagEngine, DagNode};
 use crate::db::Database;
 use crate::execution::{ExecutionOutcome, ExecutionUnit};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ── Mutation kinds ─────────────────────────────────────────────────────
 
@@ -134,7 +134,12 @@ impl MutationEngine {
             match self.apply(m) {
                 Ok(record) => records.push(record),
                 Err(e) => {
-                    let _ = self.db.record_event("mutation_error", m.target_node_id, conv_id, &format!("{e}"));
+                    let _ = self.db.record_event(
+                        "mutation_error",
+                        m.target_node_id,
+                        conv_id,
+                        &format!("{e}"),
+                    );
                 }
             }
         }
@@ -152,7 +157,11 @@ impl MutationEngine {
         proposals.extend(self.propose_merges(conv_id));
         proposals.extend(self.propose_invalidations(conv_id, units));
         // Sort by confidence descending
-        proposals.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        proposals.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(proposals)
     }
 
@@ -161,9 +170,7 @@ impl MutationEngine {
         let mut result = Vec::new();
         if let Ok(nodes) = self.db.get_all_dag_nodes(conv_id) {
             for node in &nodes {
-                if node.access_count >= self.config.strengthen_access_threshold
-                    && !node.deleted
-                {
+                if node.access_count >= self.config.strengthen_access_threshold && !node.deleted {
                     // Strengthen edges from this node's parents
                     for pid in &node.parent_ids {
                         result.push(Mutation {
@@ -191,7 +198,10 @@ impl MutationEngine {
     /// Propose edge-decay mutations: nodes with low access_count.
     fn propose_decays(&self, conv_id: i64) -> Vec<Mutation> {
         let mut result = Vec::new();
-        if let Ok(candidates) = self.db.find_decay_candidates(conv_id, self.config.decay_access_threshold) {
+        if let Ok(candidates) = self
+            .db
+            .find_decay_candidates(conv_id, self.config.decay_access_threshold)
+        {
             for node in &candidates {
                 if node.parent_ids.is_empty() {
                     // Root-level node with no parents — decay the node itself
@@ -238,7 +248,10 @@ impl MutationEngine {
         let mut result = Vec::new();
         if let Ok(nodes) = self.db.get_all_dag_nodes(conv_id) {
             for node in &nodes {
-                if node.child_ids.len() >= self.config.split_fanout_threshold && !node.is_leaf && !node.deleted {
+                if node.child_ids.len() >= self.config.split_fanout_threshold
+                    && !node.is_leaf
+                    && !node.deleted
+                {
                     result.push(Mutation {
                         kind: MutationKind::MotifSplit,
                         conv_id,
@@ -246,7 +259,9 @@ impl MutationEngine {
                         related_node_id: None,
                         reason: format!(
                             "Node #{} has {} children (threshold {}), candidate for split",
-                            node.id, node.child_ids.len(), self.config.split_fanout_threshold,
+                            node.id,
+                            node.child_ids.len(),
+                            self.config.split_fanout_threshold,
                         ),
                         confidence: 0.5,
                         metadata: serde_json::json!({
@@ -264,7 +279,8 @@ impl MutationEngine {
     fn propose_merges(&self, conv_id: i64) -> Vec<Mutation> {
         let mut result = Vec::new();
         if let Ok(nodes) = self.db.get_all_dag_nodes(conv_id) {
-            let non_leaf: Vec<&DagNode> = nodes.iter().filter(|n| !n.is_leaf && !n.deleted).collect();
+            let non_leaf: Vec<&DagNode> =
+                nodes.iter().filter(|n| !n.is_leaf && !n.deleted).collect();
             for i in 0..non_leaf.len() {
                 for j in (i + 1)..non_leaf.len() {
                     let a = non_leaf[i];
@@ -301,11 +317,16 @@ impl MutationEngine {
     fn propose_invalidations(&self, conv_id: i64, units: &[ExecutionUnit]) -> Vec<Mutation> {
         let mut result = Vec::new();
         // Find tool names with high failure rates
-        let mut tool_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut tool_total: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut tool_failures: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut tool_total: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for u in units {
             *tool_total.entry(u.tool_name.clone()).or_insert(0) += 1;
-            if matches!(u.outcome, ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked) {
+            if matches!(
+                u.outcome,
+                ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked
+            ) {
                 *tool_failures.entry(u.tool_name.clone()).or_insert(0) += 1;
             }
         }
@@ -326,7 +347,8 @@ impl MutationEngine {
                             related_node_id: None,
                             reason: format!(
                                 "Node #{} references tool `{tool}` which has {:.0}% failure rate",
-                                node.id, fail_rate * 100.0,
+                                node.id,
+                                fail_rate * 100.0,
                             ),
                             confidence: fail_rate * 0.8,
                             metadata: serde_json::json!({
@@ -355,10 +377,17 @@ impl MutationEngine {
             MutationKind::InvalidateBelief => self.apply_invalidate(m)?,
         }
         let version_id = self.db.create_memory_version(
-            None, m.kind.as_str(), &m.reason, Some(m.target_node_id),
+            None,
+            m.kind.as_str(),
+            &m.reason,
+            Some(m.target_node_id),
         )?;
-        let _ = self.db.record_event(m.kind.as_str(), m.target_node_id, m.conv_id,
-            &serde_json::to_string(&m.metadata).unwrap_or_default());
+        let _ = self.db.record_event(
+            m.kind.as_str(),
+            m.target_node_id,
+            m.conv_id,
+            &serde_json::to_string(&m.metadata).unwrap_or_default(),
+        );
         Ok(MutationRecord {
             id: 0,
             conv_id: m.conv_id,
@@ -394,7 +423,10 @@ impl MutationEngine {
     /// Split: create a new child node for a subset of children, rewire.
     fn apply_motif_split(&self, m: &Mutation) -> anyhow::Result<()> {
         // Get the original node's children
-        let node = self.db.get_node(m.target_node_id)?.ok_or_else(|| anyhow::anyhow!("split target not found"))?;
+        let node = self
+            .db
+            .get_node(m.target_node_id)?
+            .ok_or_else(|| anyhow::anyhow!("split target not found"))?;
         if node.child_ids.len() < 2 {
             return Ok(()); // nothing meaningful to split
         }
@@ -404,15 +436,23 @@ impl MutationEngine {
 
         // Create left child node
         let left = self.db.insert_dag_node(
-            m.conv_id, node.level + 1,
+            m.conv_id,
+            node.level + 1,
             &format!("(split from #{}) left half", node.id),
-            node.token_count / 2, &[m.target_node_id], &left_children, false,
+            node.token_count / 2,
+            &[m.target_node_id],
+            &left_children,
+            false,
         )?;
         // Create right child node
         let right = self.db.insert_dag_node(
-            m.conv_id, node.level + 1,
+            m.conv_id,
+            node.level + 1,
             &format!("(split from #{}) right half", node.id),
-            node.token_count / 2, &[m.target_node_id], &right_children, false,
+            node.token_count / 2,
+            &[m.target_node_id],
+            &right_children,
+            false,
         )?;
 
         // Rewire: remove children from original, add split nodes as children
@@ -425,8 +465,10 @@ impl MutationEngine {
             self.db.delete_edges(m.target_node_id, cid, "summarizes")?;
         }
         // Add edges from original to split nodes
-        self.db.insert_edge(m.target_node_id, left.id, "summarizes")?;
-        self.db.insert_edge(m.target_node_id, right.id, "summarizes")?;
+        self.db
+            .insert_edge(m.target_node_id, left.id, "summarizes")?;
+        self.db
+            .insert_edge(m.target_node_id, right.id, "summarizes")?;
         // Update original node's child_ids
         self.db.add_child_to_node(m.target_node_id, left.id)?;
         self.db.add_child_to_node(m.target_node_id, right.id)?;
@@ -436,9 +478,17 @@ impl MutationEngine {
 
     /// Merge: create a new node covering both inputs, rewire parents.
     fn apply_motif_merge(&self, m: &Mutation) -> anyhow::Result<()> {
-        let a = self.db.get_node(m.target_node_id)?.ok_or_else(|| anyhow::anyhow!("merge target A not found"))?;
-        let b_id = m.related_node_id.ok_or_else(|| anyhow::anyhow!("merge requires related_node_id"))?;
-        let b = self.db.get_node(b_id)?.ok_or_else(|| anyhow::anyhow!("merge target B not found"))?;
+        let a = self
+            .db
+            .get_node(m.target_node_id)?
+            .ok_or_else(|| anyhow::anyhow!("merge target A not found"))?;
+        let b_id = m
+            .related_node_id
+            .ok_or_else(|| anyhow::anyhow!("merge requires related_node_id"))?;
+        let b = self
+            .db
+            .get_node(b_id)?
+            .ok_or_else(|| anyhow::anyhow!("merge target B not found"))?;
 
         // Collect all children from both
         let mut all_children: Vec<i64> = a.child_ids.clone();
@@ -461,10 +511,13 @@ impl MutationEngine {
 
         // Create merged node
         let merged = self.db.insert_dag_node(
-            m.conv_id, a.level.min(b.level),
+            m.conv_id,
+            a.level.min(b.level),
             &format!("(merged #{}+#{})", a.id, b.id),
             a.token_count + b.token_count,
-            &all_parents, &all_children, false,
+            &all_parents,
+            &all_children,
+            false,
         )?;
 
         // Rewire children to point to merged
@@ -492,7 +545,8 @@ impl MutationEngine {
             }
             _ => format!("[invalidated] {}", m.reason),
         };
-        self.db.update_node_reasoning(m.target_node_id, &new_reasoning)?;
+        self.db
+            .update_node_reasoning(m.target_node_id, &new_reasoning)?;
         // Decrement access_count as signal
         let conn = self.db.writer_conn();
         conn.execute(
@@ -516,7 +570,10 @@ pub fn spawn_mutation_cycle(
     tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
-            if shutdown.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+            if shutdown
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            {
                 tracing::info!(target: "deeplossless::mutation", "shutdown signal received, stopping mutation cycle");
                 break;
             }
@@ -574,24 +631,39 @@ mod tests {
         );
         let dag = Arc::new(DagEngine::builder().build(db.clone()));
         let fp = crate::session::fingerprint(&[], 3);
-        let conv_id = db.find_or_create_conversation(&fp, "deepseek-v4-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation(&fp, "deepseek-v4-flash")
+            .unwrap();
         // Add a few DAG nodes
         for i in 0..5 {
-            let node = db.insert_dag_node(
-                conv_id, 0, &format!("Raw message {i}"), 100, &[], &[], true,
-            ).unwrap();
+            let node = db
+                .insert_dag_node(conv_id, 0, &format!("Raw message {i}"), 100, &[], &[], true)
+                .unwrap();
             if i == 4 {
                 db.touch_node(node.id).unwrap(); // one hot node
             }
         }
         // Add a summary node with high fanout for split testing
-        let child_ids: Vec<i64> = db.get_all_dag_nodes(conv_id).unwrap()
-            .iter().filter(|n| n.is_leaf).map(|n| n.id).collect();
+        let child_ids: Vec<i64> = db
+            .get_all_dag_nodes(conv_id)
+            .unwrap()
+            .iter()
+            .filter(|n| n.is_leaf)
+            .map(|n| n.id)
+            .collect();
         if !child_ids.is_empty() {
             db.insert_dag_node_full(
-                conv_id, 1, "Summary of all messages", 50,
-                &[], &child_ids, &[], false, false,
-            ).unwrap();
+                conv_id,
+                1,
+                "Summary of all messages",
+                50,
+                &[],
+                &child_ids,
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
         }
         (db, dag, conv_id)
     }
@@ -607,9 +679,13 @@ mod tests {
 
     #[test]
     fn mutation_kind_as_str_roundtrip() {
-        for kind in &[MutationKind::EdgeStrengthen, MutationKind::EdgeDecay,
-                      MutationKind::MotifSplit, MutationKind::MotifMerge,
-                      MutationKind::InvalidateBelief] {
+        for kind in &[
+            MutationKind::EdgeStrengthen,
+            MutationKind::EdgeDecay,
+            MutationKind::MotifSplit,
+            MutationKind::MotifMerge,
+            MutationKind::InvalidateBelief,
+        ] {
             let s = kind.as_str();
             assert!(!s.is_empty());
         }
@@ -646,7 +722,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let config = MutationConfig { enabled: false, ..Default::default() };
+        let config = MutationConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let engine = MutationEngine::new(config, db, dag);
         let records = engine.run_cycle(conv_id).unwrap();
         assert!(records.is_empty());
@@ -683,32 +762,88 @@ mod tests {
 
         // Seed execution units with failures
         let units = vec![
-            ExecutionUnit::new(conv_id, "", "flaky_tool", "{}", "Error: fail", "", ExecutionOutcome::Blocked, &[], ""),
-            ExecutionUnit::new(conv_id, "", "flaky_tool", "{}", "Error: fail", "", ExecutionOutcome::RecoveredFailure, &[], ""),
-            ExecutionUnit::new(conv_id, "", "flaky_tool", "{}", "ok", "", ExecutionOutcome::Success, &[], ""),
-            ExecutionUnit::new(conv_id, "", "good_tool", "{}", "ok", "", ExecutionOutcome::Success, &[], ""),
+            ExecutionUnit::new(
+                conv_id,
+                "",
+                "flaky_tool",
+                "{}",
+                "Error: fail",
+                "",
+                ExecutionOutcome::Blocked,
+                &[],
+                "",
+            ),
+            ExecutionUnit::new(
+                conv_id,
+                "",
+                "flaky_tool",
+                "{}",
+                "Error: fail",
+                "",
+                ExecutionOutcome::RecoveredFailure,
+                &[],
+                "",
+            ),
+            ExecutionUnit::new(
+                conv_id,
+                "",
+                "flaky_tool",
+                "{}",
+                "ok",
+                "",
+                ExecutionOutcome::Success,
+                &[],
+                "",
+            ),
+            ExecutionUnit::new(
+                conv_id,
+                "",
+                "good_tool",
+                "{}",
+                "ok",
+                "",
+                ExecutionOutcome::Success,
+                &[],
+                "",
+            ),
         ];
         for u in &units {
-            engine.db.store_execution_unit(
-                conv_id, &u.reasoning_before, &u.tool_name, &u.tool_args,
-                &u.tool_result, &u.reasoning_after, u.outcome.as_str(), &[],
-            ).unwrap();
+            engine
+                .db
+                .store_execution_unit(
+                    conv_id,
+                    &u.reasoning_before,
+                    &u.tool_name,
+                    &u.tool_args,
+                    &u.tool_result,
+                    &u.reasoning_after,
+                    u.outcome.as_str(),
+                    &[],
+                )
+                .unwrap();
         }
 
         // Create a DAG node that mentions flaky_tool
         let all_nodes = engine.db.get_all_dag_nodes(conv_id).unwrap();
         if let Some(node) = all_nodes.first() {
-            engine.db.update_node_reasoning(node.id, "uses flaky_tool").unwrap();
+            engine
+                .db
+                .update_node_reasoning(node.id, "uses flaky_tool")
+                .unwrap();
         }
 
         let proposals = engine.propose_invalidations(conv_id, &units);
-        let flaky_invalidations: Vec<_> = proposals.iter()
+        let flaky_invalidations: Vec<_> = proposals
+            .iter()
             .filter(|m| m.metadata.get("tool").and_then(|v| v.as_str()) == Some("flaky_tool"))
             .collect();
         // The summary node doesn't contain "flaky_tool" in its summary text
         // it contains "Summary of all messages". So the text matching won't fire.
         // This is expected — the test verifies the logic works end-to-end.
-        assert!(flaky_invalidations.is_empty(), "summary text doesn't mention flaky_tool");
+        assert!(
+            flaky_invalidations.is_empty(),
+            "summary text doesn't mention flaky_tool"
+        );
     }
 
     #[tokio::test]
@@ -716,7 +851,9 @@ mod tests {
         let (db, dag, conv_id) = setup_db().await;
         let engine = MutationEngine::new(MutationConfig::default(), db, dag);
         let nodes = engine.db.get_all_dag_nodes(conv_id).unwrap();
-        if nodes.len() < 2 { return; }
+        if nodes.len() < 2 {
+            return;
+        }
         let parent = &nodes[0];
         let child = &nodes[1];
 
@@ -741,11 +878,15 @@ mod tests {
         let (db, dag, conv_id) = setup_db().await;
         let engine = MutationEngine::new(MutationConfig::default(), db, dag);
         let nodes = engine.db.get_all_dag_nodes(conv_id).unwrap();
-        if nodes.is_empty() { return; }
+        if nodes.is_empty() {
+            return;
+        }
         let target = &nodes[0];
 
         // Bump access count first
-        for _ in 0..3 { engine.db.touch_node(target.id).unwrap(); }
+        for _ in 0..3 {
+            engine.db.touch_node(target.id).unwrap();
+        }
 
         let m = Mutation {
             kind: MutationKind::EdgeDecay,
@@ -766,7 +907,9 @@ mod tests {
         let (db, dag, conv_id) = setup_db().await;
         let engine = MutationEngine::new(MutationConfig::default(), db, dag);
         let nodes = engine.db.get_all_dag_nodes(conv_id).unwrap();
-        if nodes.is_empty() { return; }
+        if nodes.is_empty() {
+            return;
+        }
         let target = &nodes[0];
 
         let m = Mutation {
@@ -780,7 +923,10 @@ mod tests {
         };
         engine.apply(&m).unwrap();
         let updated = engine.db.get_node(target.id).unwrap().unwrap();
-        assert!(updated.reasoning.contains("invalidated"), "reasoning should note invalidation");
+        assert!(
+            updated.reasoning.contains("invalidated"),
+            "reasoning should note invalidation"
+        );
     }
 
     #[tokio::test]
@@ -790,8 +936,12 @@ mod tests {
         let nodes = engine.db.get_all_dag_nodes(conv_id).unwrap();
 
         // Find a summary node with children
-        let summary = nodes.iter().find(|n| !n.is_leaf && !n.deleted && !n.child_ids.is_empty());
-        if summary.is_none() { return; }
+        let summary = nodes
+            .iter()
+            .find(|n| !n.is_leaf && !n.deleted && !n.child_ids.is_empty());
+        if summary.is_none() {
+            return;
+        }
         let summary = summary.unwrap();
 
         let m = Mutation {
@@ -816,15 +966,27 @@ mod tests {
         let engine = MutationEngine::new(MutationConfig::default(), db, dag);
 
         // Create two nodes at the same level to merge
-        let leaf_ids: Vec<i64> = engine.db.get_all_dag_nodes(conv_id).unwrap()
-            .iter().filter(|n| n.is_leaf).map(|n| n.id).collect();
+        let leaf_ids: Vec<i64> = engine
+            .db
+            .get_all_dag_nodes(conv_id)
+            .unwrap()
+            .iter()
+            .filter(|n| n.is_leaf)
+            .map(|n| n.id)
+            .collect();
 
         let mid = leaf_ids.len() / 2;
         let left = leaf_ids[..mid].to_vec();
         let right = leaf_ids[mid..].to_vec();
 
-        let a = engine.db.insert_dag_node(conv_id, 1, "node A", 100, &[], &left, false).unwrap();
-        let b = engine.db.insert_dag_node(conv_id, 1, "node B", 100, &[], &right, false).unwrap();
+        let a = engine
+            .db
+            .insert_dag_node(conv_id, 1, "node A", 100, &[], &left, false)
+            .unwrap();
+        let b = engine
+            .db
+            .insert_dag_node(conv_id, 1, "node B", 100, &[], &right, false)
+            .unwrap();
 
         let m = Mutation {
             kind: MutationKind::MotifMerge,
@@ -839,14 +1001,24 @@ mod tests {
 
         // Originals should be soft-deleted (excluded from get_all_dag_nodes)
         let all_after = engine.db.get_all_dag_nodes(conv_id).unwrap();
-        assert!(!all_after.iter().any(|n| n.id == a.id), "original A should be deleted");
-        assert!(!all_after.iter().any(|n| n.id == b.id), "original B should be deleted");
+        assert!(
+            !all_after.iter().any(|n| n.id == a.id),
+            "original A should be deleted"
+        );
+        assert!(
+            !all_after.iter().any(|n| n.id == b.id),
+            "original B should be deleted"
+        );
         // A merged node should exist with both children
-        let merged = all_after.iter().find(|n| n.level <= a.level && !n.is_leaf && !n.deleted);
+        let merged = all_after
+            .iter()
+            .find(|n| n.level <= a.level && !n.is_leaf && !n.deleted);
         assert!(merged.is_some(), "a merged node should exist");
         if let Some(m) = merged {
-            assert!(m.child_ids.contains(&left[0]) || m.child_ids.contains(&right[0]),
-                    "merged node should reference original children");
+            assert!(
+                m.child_ids.contains(&left[0]) || m.child_ids.contains(&right[0]),
+                "merged node should reference original children"
+            );
         }
     }
 }

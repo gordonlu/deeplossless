@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -54,12 +54,24 @@ pub struct ScenarioWeights {
     pub tool_strategy: f64,
 }
 
-fn default_exploration() -> f64 { 15.0 }
-fn default_reuse() -> f64 { 15.0 }
-fn default_verification() -> f64 { 20.0 }
-fn default_efficiency() -> f64 { 15.0 }
-fn default_correctness() -> f64 { 15.0 }
-fn default_tool_strategy() -> f64 { 20.0 }
+fn default_exploration() -> f64 {
+    15.0
+}
+fn default_reuse() -> f64 {
+    15.0
+}
+fn default_verification() -> f64 {
+    20.0
+}
+fn default_efficiency() -> f64 {
+    15.0
+}
+fn default_correctness() -> f64 {
+    15.0
+}
+fn default_tool_strategy() -> f64 {
+    20.0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualFS {
@@ -127,16 +139,39 @@ pub struct FileEdit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Transition {
-    OnTool { tool: String, next: String },
-    OnRead { pattern: String, next: String },
-    OnEdit { pattern: String, next: String },
-    OnTest { result: String, next: String },
-    OnTask { next: String },
-    OnDone { next: String },
+    OnTool {
+        tool: String,
+        next: String,
+    },
+    OnRead {
+        pattern: String,
+        next: String,
+    },
+    OnEdit {
+        pattern: String,
+        next: String,
+    },
+    OnTest {
+        result: String,
+        next: String,
+    },
+    OnTask {
+        next: String,
+    },
+    OnDone {
+        next: String,
+    },
     #[serde(rename_all = "snake_case")]
-    OnEditResult { pattern: String, result_contains: String, next: String },
+    OnEditResult {
+        pattern: String,
+        result_contains: String,
+        next: String,
+    },
     #[serde(rename_all = "snake_case")]
-    OnTestResult { result_contains: String, next: String },
+    OnTestResult {
+        result_contains: String,
+        next: String,
+    },
     /// File-content check: reads the VFS file and matches if the file's
     /// current text contains `contains`. Evaluated by the mock on every
     /// request, independent of agent tool calls. Useful when the agent's
@@ -145,7 +180,11 @@ pub enum Transition {
     /// include `${VFS}` — the mock resolves it against the scenario's
     /// VFS root before reading.
     #[serde(rename_all = "snake_case")]
-    OnFileContains { file_path: String, contains: String, next: String },
+    OnFileContains {
+        file_path: String,
+        contains: String,
+        next: String,
+    },
 }
 
 // ── Agent event trace ──────────────────────────────────────────────
@@ -166,17 +205,27 @@ pub enum AgentEvent {
 impl AgentEvent {
     pub fn args(&self) -> &str {
         match self {
-            AgentEvent::Search(a, _) | AgentEvent::Read(a, _) | AgentEvent::Edit(a, _)
-            | AgentEvent::Test(a, _) | AgentEvent::Task(a, _) | AgentEvent::Ask(a, _)
-            | AgentEvent::Write(a, _) | AgentEvent::Other(a, _) => a,
+            AgentEvent::Search(a, _)
+            | AgentEvent::Read(a, _)
+            | AgentEvent::Edit(a, _)
+            | AgentEvent::Test(a, _)
+            | AgentEvent::Task(a, _)
+            | AgentEvent::Ask(a, _)
+            | AgentEvent::Write(a, _)
+            | AgentEvent::Other(a, _) => a,
             AgentEvent::Done => "",
         }
     }
     pub fn result(&self) -> &str {
         match self {
-            AgentEvent::Search(_, r) | AgentEvent::Read(_, r) | AgentEvent::Edit(_, r)
-            | AgentEvent::Test(_, r) | AgentEvent::Task(_, r) | AgentEvent::Ask(_, r)
-            | AgentEvent::Write(_, r) | AgentEvent::Other(_, r) => r,
+            AgentEvent::Search(_, r)
+            | AgentEvent::Read(_, r)
+            | AgentEvent::Edit(_, r)
+            | AgentEvent::Test(_, r)
+            | AgentEvent::Task(_, r)
+            | AgentEvent::Ask(_, r)
+            | AgentEvent::Write(_, r)
+            | AgentEvent::Other(_, r) => r,
             AgentEvent::Done => "",
         }
     }
@@ -258,7 +307,9 @@ impl Scenario {
     pub fn list() -> anyhow::Result<Vec<String>> {
         let mut scenarios = Vec::new();
         let dir = std::path::Path::new("scenarios");
-        if !dir.exists() { return Ok(scenarios); }
+        if !dir.exists() {
+            return Ok(scenarios);
+        }
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -361,17 +412,24 @@ impl StateMachine {
     }
 
     pub fn current_prompt(&self) -> Option<&str> {
-        self.scenario.states.get(&self.current_state).map(|s| s.assistant.as_str())
+        self.scenario
+            .states
+            .get(&self.current_state)
+            .map(|s| s.assistant.as_str())
     }
 
     pub fn current_tool_calls(&self) -> Vec<&str> {
-        self.scenario.states.get(&self.current_state)
+        self.scenario
+            .states
+            .get(&self.current_state)
             .map(|s| s.tool_calls.iter().map(|t| t.as_str()).collect())
             .unwrap_or_default()
     }
 
     pub fn current_tool_args(&self, tool: &str) -> Option<serde_json::Value> {
-        self.scenario.states.get(&self.current_state)
+        self.scenario
+            .states
+            .get(&self.current_state)
             .and_then(|s| s.args.get(tool).cloned())
     }
 
@@ -379,7 +437,11 @@ impl StateMachine {
     /// state has an `args_per_agent[format][tool]` entry, that wins
     /// (full replacement, no field-level merge). Otherwise falls back to
     /// the default `args[tool]`. Returns `None` if neither is set.
-    pub fn current_tool_args_for(&self, tool: &str, agent_format: &str) -> Option<serde_json::Value> {
+    pub fn current_tool_args_for(
+        &self,
+        tool: &str,
+        agent_format: &str,
+    ) -> Option<serde_json::Value> {
         let state = self.scenario.states.get(&self.current_state)?;
         if let Some(per_agent) = state.args_per_agent.get(agent_format) {
             if let Some(args) = per_agent.get(tool) {
@@ -390,13 +452,17 @@ impl StateMachine {
     }
 
     pub fn is_terminal(&self) -> bool {
-        self.scenario.states.get(&self.current_state)
+        self.scenario
+            .states
+            .get(&self.current_state)
             .map(|s| s.finish || s.fail)
             .unwrap_or(false)
     }
 
     pub fn is_success(&self) -> bool {
-        self.scenario.states.get(&self.current_state)
+        self.scenario
+            .states
+            .get(&self.current_state)
             .map(|s| s.finish)
             .unwrap_or(false)
     }
@@ -424,19 +490,47 @@ impl StateMachine {
 
 fn matches(event: &AgentEvent, transition: &Transition) -> bool {
     match (event, transition) {
-        (AgentEvent::Search(s, _), Transition::OnTool { tool, .. }) => tool.is_empty() || s.contains(tool),
-        (AgentEvent::Read(p, _), Transition::OnTool { tool, .. }) => tool.is_empty() || p.contains(tool),
-        (AgentEvent::Edit(p, _), Transition::OnTool { tool, .. }) => tool.is_empty() || p.contains(tool),
-        (AgentEvent::Test(t, _), Transition::OnTool { tool, .. }) => tool.is_empty() || t.contains(tool),
-        (AgentEvent::Task(t, _), Transition::OnTool { tool, .. }) => tool.is_empty() || t.contains(tool),
-        (AgentEvent::Ask(a, _), Transition::OnTool { tool, .. }) => tool.is_empty() || a.contains(tool),
-        (AgentEvent::Write(w, _), Transition::OnTool { tool, .. }) => tool.is_empty() || w.contains(tool),
-        (AgentEvent::Other(o, _), Transition::OnTool { tool, .. }) => tool.is_empty() || o.contains(tool),
+        (AgentEvent::Search(s, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || s.contains(tool)
+        }
+        (AgentEvent::Read(p, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || p.contains(tool)
+        }
+        (AgentEvent::Edit(p, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || p.contains(tool)
+        }
+        (AgentEvent::Test(t, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || t.contains(tool)
+        }
+        (AgentEvent::Task(t, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || t.contains(tool)
+        }
+        (AgentEvent::Ask(a, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || a.contains(tool)
+        }
+        (AgentEvent::Write(w, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || w.contains(tool)
+        }
+        (AgentEvent::Other(o, _), Transition::OnTool { tool, .. }) => {
+            tool.is_empty() || o.contains(tool)
+        }
         (AgentEvent::Read(p, _), Transition::OnRead { pattern, .. }) => p.contains(pattern),
         (AgentEvent::Edit(p, _), Transition::OnEdit { pattern, .. }) => p.contains(pattern),
-        (AgentEvent::Edit(p, r), Transition::OnEditResult { pattern, result_contains, .. }) => p.contains(pattern) && r.contains(result_contains),
+        (
+            AgentEvent::Edit(p, r),
+            Transition::OnEditResult {
+                pattern,
+                result_contains,
+                ..
+            },
+        ) => p.contains(pattern) && r.contains(result_contains),
         (AgentEvent::Test(t, _), Transition::OnTest { result, .. }) => t.contains(result),
-        (AgentEvent::Test(_, r), Transition::OnTestResult { result_contains, .. }) => r.contains(result_contains),
+        (
+            AgentEvent::Test(_, r),
+            Transition::OnTestResult {
+                result_contains, ..
+            },
+        ) => r.contains(result_contains),
         (AgentEvent::Task(_, _), Transition::OnTask { .. }) => true,
         (AgentEvent::Done, Transition::OnDone { .. }) => true,
         _ => false,
@@ -549,7 +643,9 @@ fn parse_search_result_files(result: &str) -> Option<usize> {
 ///   narrowing a search from "timeout" to "request_timeout" with a
 ///   different file set counts as novel exploration, not redundancy.
 pub fn compute_search_efficiency(events: &[AgentEvent], expected: bool) -> f64 {
-    let searches: Vec<(usize, &AgentEvent)> = events.iter().enumerate()
+    let searches: Vec<(usize, &AgentEvent)> = events
+        .iter()
+        .enumerate()
         .filter(|(_, e)| matches!(e, AgentEvent::Search(_, _)))
         .collect();
 
@@ -558,19 +654,30 @@ pub fn compute_search_efficiency(events: &[AgentEvent], expected: bool) -> f64 {
     }
 
     // 1. search_to_read
-    let to_read_count = searches.iter().filter(|(i, _)| {
-        let start = i + 1;
-        let end = (start + SEARCH_READ_WINDOW).min(events.len());
-        events[start..end].iter().any(|e| matches!(e, AgentEvent::Read(_, _)))
-    }).count();
+    let to_read_count = searches
+        .iter()
+        .filter(|(i, _)| {
+            let start = i + 1;
+            let end = (start + SEARCH_READ_WINDOW).min(events.len());
+            events[start..end]
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Read(_, _)))
+        })
+        .count();
     let search_to_read = to_read_count as f64 / searches.len() as f64;
 
     // 2. search_targeting
-    let targeting_avg: f64 = searches.iter().map(|(_, e)| {
-        if let AgentEvent::Search(_, result) = e {
-            targeting_score(parse_search_result_files(result))
-        } else { 0.5 }
-    }).sum::<f64>() / searches.len() as f64;
+    let targeting_avg: f64 = searches
+        .iter()
+        .map(|(_, e)| {
+            if let AgentEvent::Search(_, result) = e {
+                targeting_score(parse_search_result_files(result))
+            } else {
+                0.5
+            }
+        })
+        .sum::<f64>()
+        / searches.len() as f64;
 
     // 3. search_novelty
     let mut seen_sets: Vec<std::collections::HashSet<String>> = Vec::new();
@@ -609,7 +716,9 @@ pub fn compute_search_efficiency(events: &[AgentEvent], expected: bool) -> f64 {
 ///   2. There's an Edit or Test on the same file between the two
 ///      reads (justifies re-loading the new state).
 pub fn compute_context_efficiency(events: &[AgentEvent], expected: bool) -> f64 {
-    let reads: Vec<(usize, &AgentEvent)> = events.iter().enumerate()
+    let reads: Vec<(usize, &AgentEvent)> = events
+        .iter()
+        .enumerate()
         .filter(|(_, e)| matches!(e, AgentEvent::Read(_, _)))
         .collect();
 
@@ -618,20 +727,38 @@ pub fn compute_context_efficiency(events: &[AgentEvent], expected: bool) -> f64 
     }
 
     // 1. read_to_action
-    let to_action_count = reads.iter().filter(|(i, _)| {
-        let start = i + 1;
-        let end = (start + READ_ACTION_WINDOW).min(events.len());
-        events[start..end].iter().any(|e|
-            matches!(e, AgentEvent::Edit(_, _) | AgentEvent::Test(_, _)))
-    }).count();
+    let to_action_count = reads
+        .iter()
+        .filter(|(i, _)| {
+            let start = i + 1;
+            let end = (start + READ_ACTION_WINDOW).min(events.len());
+            events[start..end]
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Edit(_, _) | AgentEvent::Test(_, _)))
+        })
+        .count();
     let read_to_action = to_action_count as f64 / reads.len() as f64;
 
     // 2. read_precision
-    let files_read: std::collections::HashSet<&str> = reads.iter()
-        .filter_map(|(_, e)| if let AgentEvent::Read(p, _) = e { Some(p.as_str()) } else { None })
+    let files_read: std::collections::HashSet<&str> = reads
+        .iter()
+        .filter_map(|(_, e)| {
+            if let AgentEvent::Read(p, _) = e {
+                Some(p.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
-    let files_edited: std::collections::HashSet<&str> = events.iter()
-        .filter_map(|e| if let AgentEvent::Edit(p, _) = e { Some(p.as_str()) } else { None })
+    let files_edited: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| {
+            if let AgentEvent::Edit(p, _) = e {
+                Some(p.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
     let precision = if files_read.is_empty() {
         0.0
@@ -640,7 +767,8 @@ pub fn compute_context_efficiency(events: &[AgentEvent], expected: bool) -> f64 
     };
 
     // 3. reread_penalty
-    let mut last_read_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut last_read_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut re_reads = 0usize;
     for (i, e) in events.iter().enumerate() {
         if let AgentEvent::Read(p, _) = e {
@@ -666,73 +794,137 @@ pub fn score_run(run: &ScenarioRun) -> ScoreResult {
     let events = &run.events;
     let is_success = run.terminal_state.as_deref() == Some("verify");
 
-    let edit_count = events.iter().filter(|e| matches!(e, AgentEvent::Edit(_, _))).count();
-    let test_count = events.iter().filter(|e| matches!(e, AgentEvent::Test(_, _))).count();
-    let search_count = events.iter().filter(|e| matches!(e, AgentEvent::Search(_, _))).count();
-    let read_count = events.iter().filter(|e| matches!(e, AgentEvent::Read(_, _))).count();
+    let edit_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Edit(_, _)))
+        .count();
+    let test_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Test(_, _)))
+        .count();
+    let search_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Search(_, _)))
+        .count();
+    let read_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Read(_, _)))
+        .count();
 
-    let first_edit = events.iter().position(|e| matches!(e, AgentEvent::Edit(_, _))).unwrap_or(usize::MAX);
-    let last_edit = events.iter().rposition(|e| matches!(e, AgentEvent::Edit(_, _))).unwrap_or(0);
+    let first_edit = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Edit(_, _)))
+        .unwrap_or(usize::MAX);
+    let last_edit = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::Edit(_, _)))
+        .unwrap_or(0);
 
-    let searches_before = events[..first_edit.min(events.len())].iter()
-        .filter(|e| matches!(e, AgentEvent::Search(_, _))).count();
-    let reads_before_set: std::collections::HashSet<&str> = events[..first_edit.min(events.len())].iter()
-        .filter_map(|e| if let AgentEvent::Read(p, _) = e { Some(p.as_str()) } else { None })
+    let searches_before = events[..first_edit.min(events.len())]
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Search(_, _)))
+        .count();
+    let reads_before_set: std::collections::HashSet<&str> = events[..first_edit.min(events.len())]
+        .iter()
+        .filter_map(|e| {
+            if let AgentEvent::Read(p, _) = e {
+                Some(p.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
-    let unique_tests_after: std::collections::HashSet<&str> = events[last_edit..].iter()
-        .filter_map(|e| if let AgentEvent::Test(t, _) = e { Some(t.as_str()) } else { None })
+    let unique_tests_after: std::collections::HashSet<&str> = events[last_edit..]
+        .iter()
+        .filter_map(|e| {
+            if let AgentEvent::Test(t, _) = e {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
 
     // ── Reuse (20): Search→Read(10) + ReadResultUse(10) ──
     // Did the agent load files that informed its decisions, and did
     // it use the search results it got back?
     let discovery_reuse: f64 = {
-        let read_after_search = events.iter()
+        let read_after_search = events
+            .iter()
             .scan(false, |searched, e| {
-                if let AgentEvent::Search(_, _) = e { *searched = true; }
+                if let AgentEvent::Search(_, _) = e {
+                    *searched = true;
+                }
                 Some(matches!(e, AgentEvent::Read(_, _)) && *searched)
             })
-            .filter(|&b| b).count();
+            .filter(|&b| b)
+            .count();
         (read_after_search as f64 * 2.5).min(10.0)
     };
     let result_reuse: f64 = {
-        if search_count > 0 && read_count >= search_count { 10.0 }
-        else if search_count > 0 && read_count > 0 { 5.0 }
-        else if read_count > 0 { 3.0 }
-        else { 0.0 }
+        if search_count > 0 && read_count >= search_count {
+            10.0
+        } else if search_count > 0 && read_count > 0 {
+            5.0
+        } else if read_count > 0 {
+            3.0
+        } else {
+            0.0
+        }
     };
     let reuse: f64 = (discovery_reuse + result_reuse).clamp(0.0, 20.0);
 
     // ── Verification (20): Attempt(5) + Relevant(10) + Recovery(5) ──
-    let val_attempt: f64 = {
-        if test_count > 0 { 5.0 } else { 0.0 }
-    };
+    let val_attempt: f64 = { if test_count > 0 { 5.0 } else { 0.0 } };
     let relevant_val: f64 = {
-        if unique_tests_after.is_empty() { 0.0 }
-        else if read_count > 0 { 10.0 }
-        else { 5.0 }
+        if unique_tests_after.is_empty() {
+            0.0
+        } else if read_count > 0 {
+            10.0
+        } else {
+            5.0
+        }
     };
     let failure_recovery: f64 = {
-        if test_count >= 3 { 5.0 }
-        else if test_count >= 2 { 3.0 }
-        else if test_count >= 1 { 1.0 }
-        else { 0.0 }
+        if test_count >= 3 {
+            5.0
+        } else if test_count >= 2 {
+            3.0
+        } else if test_count >= 1 {
+            1.0
+        } else {
+            0.0
+        }
     };
     let verification: f64 = (val_attempt + relevant_val + failure_recovery).clamp(0.0, 20.0);
 
     // ── Correctness (20): Goal(15) + RootCause(2) + Quality(3) ──
     let goal_completion: f64 = {
-        if is_success { 15.0 } else if run.terminal_state.is_some() { 5.0 } else { 0.0 }
+        if is_success {
+            15.0
+        } else if run.terminal_state.is_some() {
+            5.0
+        } else {
+            0.0
+        }
     };
     let root_cause_fixed: f64 = {
-        if searches_before >= 2 && reads_before_set.len() >= 2 { 2.0 }
-        else if searches_before >= 1 { 1.0 }
-        else { 0.0 }
+        if searches_before >= 2 && reads_before_set.len() >= 2 {
+            2.0
+        } else if searches_before >= 1 {
+            1.0
+        } else {
+            0.0
+        }
     };
     let solution_quality: f64 = {
-        if is_success && searches_before >= 1 && !reads_before_set.is_empty() { 3.0 }
-        else if is_success { 1.0 }
-        else { 0.0 }
+        if is_success && searches_before >= 1 && !reads_before_set.is_empty() {
+            3.0
+        } else if is_success {
+            1.0
+        } else {
+            0.0
+        }
     };
     let correctness: f64 = (goal_completion + root_cause_fixed + solution_quality).clamp(0.0, 20.0);
 
@@ -741,11 +933,17 @@ pub fn score_run(run: &ScenarioRun) -> ScoreResult {
         let has_search = search_count > 0;
         let has_read = read_count > 0;
         let has_test = test_count > 0;
-        if has_search && has_read && has_test { 10.0 }
-        else if has_search && has_read { 7.0 }
-        else if has_search { 5.0 }
-        else if has_read { 3.0 }
-        else { 1.0 }
+        if has_search && has_read && has_test {
+            10.0
+        } else if has_search && has_read {
+            7.0
+        } else if has_search {
+            5.0
+        } else if has_read {
+            3.0
+        } else {
+            1.0
+        }
     };
     let tool_sequencing: f64 = {
         if edit_count == 0 {
@@ -753,12 +951,20 @@ pub fn score_run(run: &ScenarioRun) -> ScoreResult {
         } else {
             let search_before = searches_before > 0;
             let read_before = !reads_before_set.is_empty();
-            let test_after = events[last_edit..].iter().any(|e| matches!(e, AgentEvent::Test(_, _)));
-            if search_before && read_before && test_after { 10.0 }
-            else if search_before && test_after { 7.0 }
-            else if search_before && read_before { 5.0 }
-            else if search_before { 3.0 }
-            else { 1.0 }
+            let test_after = events[last_edit..]
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Test(_, _)));
+            if search_before && read_before && test_after {
+                10.0
+            } else if search_before && test_after {
+                7.0
+            } else if search_before && read_before {
+                5.0
+            } else if search_before {
+                3.0
+            } else {
+                1.0
+            }
         }
     };
     let tool_strategy: f64 = (tool_selection + tool_sequencing).clamp(0.0, 20.0);
@@ -790,23 +996,51 @@ pub fn score_run(run: &ScenarioRun) -> ScoreResult {
 
 /// Returns (prep_score, verify_score) on a 0-10 scale for 2D profiling.
 pub fn agent_profile(events: &[AgentEvent]) -> (f64, f64) {
-    let first_edit = events.iter().position(|e| matches!(e, AgentEvent::Edit(_, _))).unwrap_or(usize::MAX);
-    let last_edit = events.iter().rposition(|e| matches!(e, AgentEvent::Edit(_, _))).unwrap_or(0);
+    let first_edit = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Edit(_, _)))
+        .unwrap_or(usize::MAX);
+    let last_edit = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::Edit(_, _)))
+        .unwrap_or(0);
 
-    let searches_before = events[..first_edit.min(events.len())].iter()
-        .filter(|e| matches!(e, AgentEvent::Search(_, _))).count();
-    let reads_before: std::collections::HashSet<&str> = events[..first_edit.min(events.len())].iter()
-        .filter_map(|e| if let AgentEvent::Read(p, _) = e { Some(p.as_str()) } else { None })
+    let searches_before = events[..first_edit.min(events.len())]
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Search(_, _)))
+        .count();
+    let reads_before: std::collections::HashSet<&str> = events[..first_edit.min(events.len())]
+        .iter()
+        .filter_map(|e| {
+            if let AgentEvent::Read(p, _) = e {
+                Some(p.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
 
-    let tests_after = events[last_edit..].iter()
-        .filter(|e| matches!(e, AgentEvent::Test(_, _))).count();
-    let unique_reads: std::collections::HashSet<&str> = events.iter()
-        .filter_map(|e| if let AgentEvent::Read(p, _) = e { Some(p.as_str()) } else { None })
+    let tests_after = events[last_edit..]
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Test(_, _)))
+        .count();
+    let unique_reads: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| {
+            if let AgentEvent::Read(p, _) = e {
+                Some(p.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
 
-    let prep: f64 = ((searches_before as f64 * 2.5).min(5.0) + (reads_before.len() as f64 * 2.5).min(5.0)).min(10.0);
-    let verify: f64 = ((tests_after as f64 * 3.0).min(6.0) + (unique_reads.len() as f64 * 1.5).min(4.0)).min(10.0);
+    let prep: f64 = ((searches_before as f64 * 2.5).min(5.0)
+        + (reads_before.len() as f64 * 2.5).min(5.0))
+    .min(10.0);
+    let verify: f64 = ((tests_after as f64 * 3.0).min(6.0)
+        + (unique_reads.len() as f64 * 1.5).min(4.0))
+    .min(10.0);
 
     (prep, verify)
 }
@@ -850,7 +1084,10 @@ pub fn extract_events_from_request(body: &serde_json::Value) -> Vec<AgentEvent> 
 
     let last = &msgs[start_idx];
     if let Some(tcs) = last["tool_calls"].as_array() {
-        let names: Vec<&str> = tcs.iter().map(|tc| tc["function"]["name"].as_str().unwrap_or("?")).collect();
+        let names: Vec<&str> = tcs
+            .iter()
+            .map(|tc| tc["function"]["name"].as_str().unwrap_or("?"))
+            .collect();
         eprintln!("[aces] last assistant tool_calls: {:?}", names);
     }
 
@@ -870,14 +1107,19 @@ pub fn extract_events_from_request(body: &serde_json::Value) -> Vec<AgentEvent> 
                         let id = tc["id"].as_str().unwrap_or("");
                         let result = result_map.get(id).copied().unwrap_or("");
                         match name {
-                            "grep" | "Grep" | "rg" | "search" | "search_file" | "find_in_files" | "glob" | "Glob" => {
-                                events.push(AgentEvent::Search(args.to_string(), result.to_string()));
+                            "grep" | "Grep" | "rg" | "search" | "search_file" | "find_in_files"
+                            | "glob" | "Glob" => {
+                                events
+                                    .push(AgentEvent::Search(args.to_string(), result.to_string()));
                             }
                             "read" | "Read" | "read_file" | "view" | "cat" => {
-                                events.push(AgentEvent::Read(extract_path(args), result.to_string()));
+                                events
+                                    .push(AgentEvent::Read(extract_path(args), result.to_string()));
                             }
-                            "edit" | "Edit" | "edit_file" | "replace" | "write" | "Write" | "write_to_file" | "apply_patch" => {
-                                events.push(AgentEvent::Edit(extract_path(args), result.to_string()));
+                            "edit" | "Edit" | "edit_file" | "replace" | "write" | "Write"
+                            | "write_to_file" | "apply_patch" => {
+                                events
+                                    .push(AgentEvent::Edit(extract_path(args), result.to_string()));
                             }
                             "test" | "cargo_test" | "run_test" | "pytest" | "npm_test" => {
                                 events.push(AgentEvent::Test(args.to_string(), result.to_string()));
@@ -886,21 +1128,40 @@ pub fn extract_events_from_request(body: &serde_json::Value) -> Vec<AgentEvent> 
                                 if let Some(cat_path) = extract_cat_path(args) {
                                     events.push(AgentEvent::Read(cat_path, result.to_string()));
                                 } else if args.contains("test") || args.contains("check") {
-                                    events.push(AgentEvent::Test(args.to_string(), result.to_string()));
-                                } else if args.contains("grep") || args.contains("rg") || args.contains("search") {
-                                    events.push(AgentEvent::Search(args.to_string(), result.to_string()));
+                                    events.push(AgentEvent::Test(
+                                        args.to_string(),
+                                        result.to_string(),
+                                    ));
+                                } else if args.contains("grep")
+                                    || args.contains("rg")
+                                    || args.contains("search")
+                                {
+                                    events.push(AgentEvent::Search(
+                                        args.to_string(),
+                                        result.to_string(),
+                                    ));
                                 } else {
-                                    events.push(AgentEvent::Task(args.to_string(), result.to_string()));
+                                    events.push(AgentEvent::Task(
+                                        args.to_string(),
+                                        result.to_string(),
+                                    ));
                                 }
                             }
                             "task" | "subagent" | "agent" | "Agent" | "delegate" => {
                                 events.push(AgentEvent::Task(args.to_string(), result.to_string()));
                             }
-                            "ask" | "question" | "ask_user" | "ask_followup_question" | "AskUserQuestion" => {
+                            "ask"
+                            | "question"
+                            | "ask_user"
+                            | "ask_followup_question"
+                            | "AskUserQuestion" => {
                                 events.push(AgentEvent::Ask(args.to_string(), result.to_string()));
                             }
                             _ => {
-                                events.push(AgentEvent::Other(format!("{name}({args})"), result.to_string()));
+                                events.push(AgentEvent::Other(
+                                    format!("{name}({args})"),
+                                    result.to_string(),
+                                ));
                             }
                         }
                     }
@@ -923,12 +1184,24 @@ fn extract_path(args: &str) -> String {
     // Try to parse JSON args and extract path/filePath/file_path
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
         // Codex apply_patch nests the path inside operation
-        if let Some(p) = v["operation"]["path"].as_str() { return p.to_string(); }
-        if let Some(p) = v["path"].as_str() { return p.to_string(); }
-        if let Some(p) = v["file_path"].as_str() { return p.to_string(); }
-        if let Some(p) = v["filePath"].as_str() { return p.to_string(); }
-        if let Some(p) = v["pattern"].as_str() { return p.to_string(); }
-        if let Some(p) = v["command"].as_str() { return p.to_string(); }
+        if let Some(p) = v["operation"]["path"].as_str() {
+            return p.to_string();
+        }
+        if let Some(p) = v["path"].as_str() {
+            return p.to_string();
+        }
+        if let Some(p) = v["file_path"].as_str() {
+            return p.to_string();
+        }
+        if let Some(p) = v["filePath"].as_str() {
+            return p.to_string();
+        }
+        if let Some(p) = v["pattern"].as_str() {
+            return p.to_string();
+        }
+        if let Some(p) = v["command"].as_str() {
+            return p.to_string();
+        }
     }
     args.to_string()
 }

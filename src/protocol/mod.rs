@@ -39,10 +39,10 @@ pub mod responses;
 pub mod streaming;
 
 pub use canonical::{
-    CanonicalRequest, CanonicalResponse, ContentPart, DeepSeekNativeCapabilities,
-    FinishReason, Message, MessageMeta, ProviderCapabilities, ReasoningEffort,
-    ReasoningEffortMode, ReasoningMode, ResponseFormat, ResponseStatus, Role,
-    StreamEvent, StructuredOutputMode, ToolDef, ToolInvocation, ToolStreamingMode, Usage,
+    CanonicalRequest, CanonicalResponse, ContentPart, DeepSeekNativeCapabilities, FinishReason,
+    Message, MessageMeta, ProviderCapabilities, ReasoningEffort, ReasoningEffortMode,
+    ReasoningMode, ResponseFormat, ResponseStatus, Role, StreamEvent, StructuredOutputMode,
+    ToolDef, ToolInvocation, ToolStreamingMode, Usage,
 };
 
 pub use dsml::parse_dsml_tool_calls;
@@ -58,13 +58,23 @@ pub struct ModelRegistry {
 impl Default for ModelRegistry {
     fn default() -> Self {
         Self {
-            overrides: vec![
-                ("gpt-5.5".into(), "deepseek-v4-pro".into()),
-            ],
+            overrides: vec![("gpt-5.5".into(), "deepseek-v4-pro".into())],
             prefixes: vec![
-                ("gpt-".into(), "deepseek-flash".into(), "deepseek-v4-pro".into()),
-                ("o1".into(), "deepseek-flash".into(), "deepseek-v4-pro".into()),
-                ("o3".into(), "deepseek-flash".into(), "deepseek-v4-pro".into()),
+                (
+                    "gpt-".into(),
+                    "deepseek-flash".into(),
+                    "deepseek-v4-pro".into(),
+                ),
+                (
+                    "o1".into(),
+                    "deepseek-flash".into(),
+                    "deepseek-v4-pro".into(),
+                ),
+                (
+                    "o3".into(),
+                    "deepseek-flash".into(),
+                    "deepseek-v4-pro".into(),
+                ),
             ],
             // V4.1 Flash is now the recommended general model and also owns vision.
             default: "deepseek-flash".into(),
@@ -78,15 +88,17 @@ impl ModelRegistry {
         prefixes: Vec<(String, String, String)>,
         default: String,
     ) -> Self {
-        Self { overrides, prefixes, default }
+        Self {
+            overrides,
+            prefixes,
+            default,
+        }
     }
 
     /// Return provider capabilities for a model.
     pub fn capabilities(&self, model: &str) -> ProviderCapabilities {
         let m = model.to_lowercase();
-        if m == "deepseek-flash"
-            || m == "deepseek-v4-flash"
-            || m == "deepseek-v4-flash-vision-exp"
+        if m == "deepseek-flash" || m == "deepseek-v4-flash" || m == "deepseek-v4-flash-vision-exp"
         {
             ProviderCapabilities {
                 tool_streaming: ToolStreamingMode::Parallel,

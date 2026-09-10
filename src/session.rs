@@ -38,8 +38,16 @@ pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
             if let (Some(id), Some(func)) = (tc["id"].as_str(), tc["function"].as_object()) {
                 tool_calls.push(NormalizedToolCall {
                     id: id.to_string(),
-                    name: func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    arguments: func.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    name: func
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    arguments: func
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 });
             }
         }
@@ -73,15 +81,28 @@ pub fn normalize_message(msg: &serde_json::Value) -> NormalizedMessage {
         for part in parts {
             if let Some(fc) = part["functionCall"].as_object() {
                 tool_calls.push(NormalizedToolCall {
-                    id: fc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    name: fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    id: fc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    name: fc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     arguments: fc.get("args").map(|v| v.to_string()).unwrap_or_default(),
                 });
             }
         }
     }
 
-    NormalizedMessage { role, content, tool_calls, tool_call_id }
+    NormalizedMessage {
+        role,
+        content,
+        tool_calls,
+        tool_call_id,
+    }
 }
 
 /// Check if a normalized message represents a tool call.
@@ -93,7 +114,8 @@ pub fn is_tool_call(msg: &NormalizedMessage) -> bool {
 
 /// Check if a normalized message represents a tool result.
 pub fn is_tool_result(msg: &NormalizedMessage) -> bool {
-    msg.role == "tool" || msg.tool_call_id.is_some()
+    msg.role == "tool"
+        || msg.tool_call_id.is_some()
         || msg.role == "function"
         || (msg.role == "user" && msg.content.contains("tool_result"))
 }
@@ -117,8 +139,12 @@ fn strip_dynamic_text(text: &str) -> String {
                 || bytes[i..].starts_with(b"Generated at:")
                 || bytes[i..].starts_with(b"Today's date:");
             if is_volatile {
-                while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
-                if i < bytes.len() && bytes[i] == b'\n' { i += 1; }
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
                 continue;
             }
         }
@@ -126,7 +152,8 @@ fn strip_dynamic_text(text: &str) -> String {
         // ISO date: YYYY-MM-DD
         if i + 10 <= bytes.len()
             && bytes[i].is_ascii_digit()
-            && bytes[i+4] == b'-' && bytes[i+7] == b'-'
+            && bytes[i + 4] == b'-'
+            && bytes[i + 7] == b'-'
         {
             out.push_str("[DATE]");
             i += 10;
@@ -134,28 +161,53 @@ fn strip_dynamic_text(text: &str) -> String {
         }
 
         // Day-of-week date: "Thu May 28 2026"
-        let is_dow = (i == 0 || bytes[i-1] == b'\n' || bytes[i-1] == b' ')
+        let is_dow = (i == 0 || bytes[i - 1] == b'\n' || bytes[i - 1] == b' ')
             && i + 4 <= bytes.len()
-            && ((bytes[i] == b'M' && bytes[i+1] == b'o' && bytes[i+2] == b'n' && bytes[i+3] == b' ')
-             || (bytes[i] == b'T' && bytes[i+1] == b'u' && bytes[i+2] == b'e' && bytes[i+3] == b' ')
-             || (bytes[i] == b'W' && bytes[i+1] == b'e' && bytes[i+2] == b'd' && bytes[i+3] == b' ')
-             || (bytes[i] == b'T' && bytes[i+1] == b'h' && bytes[i+2] == b'u' && bytes[i+3] == b' ')
-             || (bytes[i] == b'F' && bytes[i+1] == b'r' && bytes[i+2] == b'i' && bytes[i+3] == b' ')
-             || (bytes[i] == b'S' && bytes[i+1] == b'a' && bytes[i+2] == b't' && bytes[i+3] == b' ')
-             || (bytes[i] == b'S' && bytes[i+1] == b'u' && bytes[i+2] == b'n' && bytes[i+3] == b' '));
+            && ((bytes[i] == b'M'
+                && bytes[i + 1] == b'o'
+                && bytes[i + 2] == b'n'
+                && bytes[i + 3] == b' ')
+                || (bytes[i] == b'T'
+                    && bytes[i + 1] == b'u'
+                    && bytes[i + 2] == b'e'
+                    && bytes[i + 3] == b' ')
+                || (bytes[i] == b'W'
+                    && bytes[i + 1] == b'e'
+                    && bytes[i + 2] == b'd'
+                    && bytes[i + 3] == b' ')
+                || (bytes[i] == b'T'
+                    && bytes[i + 1] == b'h'
+                    && bytes[i + 2] == b'u'
+                    && bytes[i + 3] == b' ')
+                || (bytes[i] == b'F'
+                    && bytes[i + 1] == b'r'
+                    && bytes[i + 2] == b'i'
+                    && bytes[i + 3] == b' ')
+                || (bytes[i] == b'S'
+                    && bytes[i + 1] == b'a'
+                    && bytes[i + 2] == b't'
+                    && bytes[i + 3] == b' ')
+                || (bytes[i] == b'S'
+                    && bytes[i + 1] == b'u'
+                    && bytes[i + 2] == b'n'
+                    && bytes[i + 3] == b' '));
         if is_dow {
             out.push_str("[DATE]");
             i += 4;
-            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b' ' { i += 1; }
-            if i < bytes.len() && bytes[i] == b' ' { i += 1; } // skip month-day separator
+            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b' ' {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            } // skip month-day separator
             continue;
         }
 
         // Time "HH:MM"
         if i + 5 <= bytes.len()
             && bytes[i].is_ascii_digit()
-            && bytes[i+2] == b':'
-            && bytes[i+3].is_ascii_digit()
+            && bytes[i + 2] == b':'
+            && bytes[i + 3].is_ascii_digit()
         {
             out.push_str("[TIME]");
             i += 5;
@@ -184,11 +236,11 @@ fn extract_project_key(text: &str) -> Option<String> {
         let lower = trimmed.to_lowercase();
         // Known patterns
         if lower.starts_with("working directory:")
-        || lower.starts_with("workspace root folder:")
-        || lower.starts_with("workspace folder:")
-        || lower.starts_with("project directory:")
-        || lower.starts_with("primary working directory:")
-        || lower.contains("working directory") && trimmed.contains('/')
+            || lower.starts_with("workspace root folder:")
+            || lower.starts_with("workspace folder:")
+            || lower.starts_with("project directory:")
+            || lower.starts_with("primary working directory:")
+            || lower.contains("working directory") && trimmed.contains('/')
         {
             return Some(trimmed.to_string());
         }
@@ -222,7 +274,11 @@ pub fn fingerprint(messages: &[serde_json::Value], prefix_count: usize) -> Strin
         hasher.update(role.as_bytes());
         if let Some(content) = msg["content"].as_str() {
             // Normalize system prompt: strip dates so fingerprint is stable across days
-            let cleaned = if role == "system" { strip_dynamic_text(content) } else { content.to_string() };
+            let cleaned = if role == "system" {
+                strip_dynamic_text(content)
+            } else {
+                content.to_string()
+            };
             hasher.update(cleaned.as_bytes());
         } else if let Some(arr) = msg["content"].as_array() {
             for block in arr {
@@ -254,7 +310,9 @@ pub fn model_name(body: &serde_json::Value) -> &str {
 
 /// Check whether a request is streaming.
 pub fn is_streaming(body: &serde_json::Value) -> bool {
-    body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
+    body.get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -275,8 +333,18 @@ mod tests {
 
     #[test]
     fn fingerprint_differs_for_different_content() {
-        let a = fingerprint(json!([{"role": "user", "content": "hello"}]).as_array().unwrap(), 1);
-        let b = fingerprint(json!([{"role": "user", "content": "world"}]).as_array().unwrap(), 1);
+        let a = fingerprint(
+            json!([{"role": "user", "content": "hello"}])
+                .as_array()
+                .unwrap(),
+            1,
+        );
+        let b = fingerprint(
+            json!([{"role": "user", "content": "world"}])
+                .as_array()
+                .unwrap(),
+            1,
+        );
         assert_ne!(a, b, "different content must differ");
     }
 

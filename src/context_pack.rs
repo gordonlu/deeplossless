@@ -4,7 +4,11 @@
 /// execution state re-rank old context as the task changes — the useful part of
 /// AttnCompress — without a proxy-attention/PPL model.
 pub fn knapsack_select(costs: &[u64], values: &[f64], capacity: u64) -> Vec<bool> {
-    debug_assert_eq!(costs.len(), values.len(), "costs and values must have equal length");
+    debug_assert_eq!(
+        costs.len(),
+        values.len(),
+        "costs and values must have equal length"
+    );
     let n = costs.len();
     if n == 0 || capacity == 0 {
         return vec![false; n];
@@ -92,7 +96,11 @@ pub struct ImportanceScore {
 
 impl ImportanceScore {
     fn compute(index: usize, total_count: usize, role: &str, text: &str) -> Self {
-        let recency = if total_count <= 1 { 1.0 } else { index as f64 / (total_count - 1) as f64 };
+        let recency = if total_count <= 1 {
+            1.0
+        } else {
+            index as f64 / (total_count - 1) as f64
+        };
         let role_weight = match role {
             "system" => 0.5,
             "user" => 0.8,
@@ -103,7 +111,13 @@ impl ImportanceScore {
         let token_est = (text.len() as f64 / 4.0).ceil();
         let token_count = (token_est / 4096.0).min(1.0);
         let base = recency * 0.4 + role_weight * 0.4 + token_count * 0.2;
-        Self { recency, role_weight, token_count, dynamic: 0.0, total: base }
+        Self {
+            recency,
+            role_weight,
+            token_count,
+            dynamic: 0.0,
+            total: base,
+        }
     }
 
     fn apply_dynamic(&mut self, signals: DynamicSignals) {
@@ -130,16 +144,20 @@ pub struct ContextPack {
 
 impl ContextPack {
     pub fn new(raw_messages: &[serde_json::Value]) -> Self {
-        let messages = raw_messages.iter().enumerate().map(|(i, msg)| {
-            let role = msg["role"].as_str().unwrap_or("user").to_string();
-            let content = msg["content"].as_str().unwrap_or("");
-            ContextMessage {
-                role: role.clone(),
-                raw: msg.clone(),
-                importance: ImportanceScore::compute(i, raw_messages.len(), &role, content),
-                original_index: i,
-            }
-        }).collect();
+        let messages = raw_messages
+            .iter()
+            .enumerate()
+            .map(|(i, msg)| {
+                let role = msg["role"].as_str().unwrap_or("user").to_string();
+                let content = msg["content"].as_str().unwrap_or("");
+                ContextMessage {
+                    role: role.clone(),
+                    raw: msg.clone(),
+                    importance: ImportanceScore::compute(i, raw_messages.len(), &role, content),
+                    original_index: i,
+                }
+            })
+            .collect();
         Self { messages }
     }
 
@@ -149,19 +167,27 @@ impl ContextPack {
     pub fn rescore_dynamic(&mut self, signals: &std::collections::HashMap<usize, DynamicSignals>) {
         for message in &mut self.messages {
             message.importance.apply_dynamic(
-                signals.get(&message.original_index).copied().unwrap_or_default(),
+                signals
+                    .get(&message.original_index)
+                    .copied()
+                    .unwrap_or_default(),
             );
         }
     }
 
     pub fn knapsack_select(&self, budget: u64) -> Vec<ContextMessage> {
-        let costs: Vec<u64> = self.messages.iter().map(|m| {
-            let text = m.raw["content"].as_str().unwrap_or("");
-            (text.len() as u64 / 4).max(1)
-        }).collect();
+        let costs: Vec<u64> = self
+            .messages
+            .iter()
+            .map(|m| {
+                let text = m.raw["content"].as_str().unwrap_or("");
+                (text.len() as u64 / 4).max(1)
+            })
+            .collect();
         let values: Vec<f64> = self.messages.iter().map(|m| m.importance.total).collect();
         let selected_mask = knapsack_select(&costs, &values, budget);
-        self.messages.iter()
+        self.messages
+            .iter()
             .enumerate()
             .filter(|(i, _)| selected_mask[*i])
             .map(|(_, m)| m.clone())
@@ -174,7 +200,9 @@ impl ContextPack {
             ImportanceOrdering::ReverseChronological => self.messages.reverse(),
             ImportanceOrdering::ByImportance => {
                 self.messages.sort_by(|a, b| {
-                    b.importance.total.partial_cmp(&a.importance.total)
+                    b.importance
+                        .total
+                        .partial_cmp(&a.importance.total)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
@@ -186,8 +214,12 @@ impl ContextPack {
         self.messages.into_iter().map(|m| m.raw).collect()
     }
 
-    pub fn len(&self) -> usize { self.messages.len() }
-    pub fn is_empty(&self) -> bool { self.messages.is_empty() }
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -259,7 +291,9 @@ mod tests {
     #[test]
     fn knapsack_selects_highest_value_within_budget() {
         let selected = knapsack_select(&[10, 20, 15], &[5.0, 10.0, 6.0], 25);
-        let total_val: f64 = selected.iter().enumerate()
+        let total_val: f64 = selected
+            .iter()
+            .enumerate()
             .filter(|(_, selected)| **selected)
             .map(|(i, _)| [5.0, 10.0, 6.0][i])
             .sum();
