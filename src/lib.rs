@@ -97,6 +97,7 @@ pub mod proxy_legacy;
 pub mod proxy;
 pub mod replay;
 pub mod response_store;
+pub mod responses_projection;
 pub mod responses_stream;
 pub mod session_store;
 pub mod runtime_coordinator;
