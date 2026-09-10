@@ -291,7 +291,7 @@ pub fn validate_compaction(
         }
     }
 
-    let mut missing_sources: Vec<_> = required_sources
+    let mut missing_sources: Vec<SourceRef> = required_sources
         .into_iter()
         .filter(|source| !recoverable_after.contains(source))
         .collect();
@@ -310,12 +310,12 @@ pub fn validate_compaction(
         }
     }
 
-    let stale_plan_facts = after
+    let stale_plan_facts: Vec<String> = after
         .stale_required_plan_facts()
         .into_iter()
         .map(|fact| fact.id.clone())
         .collect();
-    let unbacked_plan_facts = after
+    let unbacked_plan_facts: Vec<String> = after
         .unbacked_required_plan_facts()
         .into_iter()
         .map(|fact| fact.id.clone())
