@@ -70,6 +70,7 @@ pub mod db;
 pub mod dependency_kind;
 pub mod dependency_view;
 pub mod diff_events;
+pub mod dynamic_context;
 pub mod embeddings;
 pub mod artifacts;
 pub mod assistant_validation;
@@ -123,7 +124,6 @@ pub struct RuntimeServices {
     pub cycle: Arc<StdMutex<runtime::ExecutionCycle>>,
     pub rate_limiter: Arc<runtime::RateLimiter>,
     /// Shutdown signal — notified when the runtime is stopping.
-    /// Background tasks MUST select on this to avoid orphan mutations.
     pub shutdown_notify: Arc<Notify>,
 }
 
