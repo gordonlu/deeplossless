@@ -197,9 +197,8 @@ pub(crate) struct Cli {
 enum Commands {
     /// Run a local demo (no API key needed)
     Demo,
-    /// Translate a saved Responses API request to Chat Completions format.
-    /// Reads the JSON file, runs the full protocol translation pipeline,
-    /// and pretty-prints the result. No API call is made.
+    /// Legacy compatibility diagnostic: translate a saved Responses request to Chat Completions.
+    /// Native DeepSeek Responses traffic does not use this path.
     Translate {
         /// Path to a JSON file containing a Responses API request body
         file: String,
@@ -318,11 +317,11 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("  Smoke test: database OK, DAG OK, cache OK\n");
     println!("  Features:");
     println!("    Tool Result Cache        — deterministic reuse, partial invalidation");
-    println!("    Failure Memory           — avoids repeated failed fixes");
+    println!("    Failure Memory           — source-backed historical evidence");
     println!("    Plan Persistence         — resumable execution state");
     println!("    Semantic DAG             — embedding dedup, BM25 search");
-    println!("    Protocol translation     — Responses API → Chat Completions");
-    println!("    Runtime Policy           — advisory cache/retry/context decisions\n");
+    println!("    Native Responses         — direct DeepSeek Responses transport");
+    println!("    Runtime Policy           — grounded cache/plan advisory decisions\n");
     println!("  Start the proxy:");
     println!("    deeplossless --api-key sk-...");
     println!("  Then check:");
@@ -333,9 +332,8 @@ async fn run_demo() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Translate a saved Responses API request body to Chat Completions format.
-/// Reads the file, runs the full protocol translation pipeline, and prints
-/// the result. No API call is made — purely offline.
+/// Legacy compatibility diagnostic for the Responses-to-Chat fallback adapter.
+/// Native DeepSeek Responses requests bypass this translation path.
 fn run_translate(file: &str) -> anyhow::Result<()> {
     use serde_json::Value;
 
