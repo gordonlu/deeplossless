@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::compactor::CompactCommand;
 use crate::dynamic_context::{assemble_dynamic_context, DynamicContextHints};
-use crate::ground_truth::{FactStatus, ResourceRef};
+use crate::ground_truth::{FactStatus, PlanFactDependency, ResourceRef};
 use crate::ground_truth_store::GroundTruthStore;
 use crate::pipeline::render_dag_context;
 use crate::typed_fact_producer::AutoFactReport;
@@ -26,9 +26,6 @@ pub struct NativeProjectionOutput {
     pub auto_facts: AutoFactReport,
 }
 
-/// Persist the current turn as a lossless DAG projection, derive conservative
-/// typed facts from exact tool evidence, trigger background compaction, then
-/// assemble the working context for the native request.
 pub async fn project_and_assemble(
     state: &AppState,
     session_id: &str,
@@ -44,7 +41,11 @@ pub async fn project_and_assemble(
         return NativeProjectionOutput::default();
     }
 
-    let conv_id = match state.storage.db.find_or_create_conversation(session_id, model) {
+    let conv_id = match state
+        .storage
+        .db
+        .find_or_create_conversation(session_id, model)
+    {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(target:"deeplossless::responses_projection", %error,
@@ -53,15 +54,18 @@ pub async fn project_and_assemble(
         }
     };
 
-    // Automatic facts are produced before dynamic recall so this same turn can
-    // immediately benefit from newly-observed file/symbol/tool evidence.
-    // The hot session may not exist after restart, so fall back to persisted
-    // native Responses history. The producer also searches current_items.
     let history = state
         .storage
         .session_store
         .get(session_id)
-        .or_else(|| state.storage.db.get_response_session(session_id).ok().flatten())
+        .or_else(|| {
+            state
+                .storage
+                .db
+                .get_response_session(session_id)
+                .ok()
+                .flatten()
+        })
         .unwrap_or_default();
     let auto_facts = match crate::typed_fact_producer::produce_from_responses_items(
         &state.storage.db,
@@ -78,8 +82,6 @@ pub async fn project_and_assemble(
         }
     };
 
-    // Pure projection ingestion. `messages` keeps the complete text derived from
-    // the exact provider item; level-0 DAG leaves are no longer 200-char previews.
     let db = state.storage.db.clone();
     let dag = state.storage.dag.clone();
     let stored_messages = Value::Array(messages.clone());
@@ -122,8 +124,6 @@ pub async fn project_and_assemble(
         }
     }
 
-    // Compaction is background work; current request can assemble from the full
-    // leaves immediately and a later turn sees the validated summary.
     if let Ok(mut compactor) = state.compactor.try_lock() {
         let _ = compactor
             .send_command(CompactCommand::ReviewAndCompact {
@@ -177,9 +177,6 @@ pub async fn project_and_assemble(
     }
 }
 
-/// Build dynamic recall hints from persisted typed state plus live execution
-/// changes and recent failure lineage. These hints affect only Working Context;
-/// they never mutate Ground Truth or the persisted Responses session.
 fn build_dynamic_hints(
     state: &AppState,
     session_id: &str,
@@ -201,7 +198,9 @@ fn build_dynamic_hints(
 
     if let Ok(cycle) = state.runtime.cycle.lock() {
         for path in &cycle.context_delta {
-            semantic.changed_resources.insert(format!("file:{path}"));
+            semantic
+                .changed_resources
+                .insert(format!("file:{path}"));
         }
     }
 
@@ -217,8 +216,6 @@ fn build_dynamic_hints(
     DynamicContextHints::from_execution_state(&semantic)
 }
 
-/// Inject derived context as a developer message immediately before the latest
-/// user message. Persisted session history remains the original provider items.
 pub fn inject_context(body: &mut Value, context: &str) {
     if context.trim().is_empty() {
         return;
@@ -244,7 +241,10 @@ fn project_messages(items: &[Value]) -> Vec<Value> {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
             "message" | "" => {
-                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let role = item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user");
                 let content = content_text(item.get("content"));
                 if !content.is_empty() {
                     messages.push(json!({"role":role,"content":content}));
@@ -267,7 +267,9 @@ fn project_messages(items: &[Value]) -> Vec<Value> {
 }
 
 fn content_text(value: Option<&Value>) -> String {
-    let Some(value) = value else { return String::new(); };
+    let Some(value) = value else {
+        return String::new();
+    };
     if let Some(text) = value.as_str() {
         return text.to_string();
     }
@@ -277,7 +279,9 @@ fn content_text(value: Option<&Value>) -> String {
             blocks
                 .iter()
                 .filter_map(|block| {
-                    block.get("text").and_then(Value::as_str)
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
                         .or_else(|| block.get("output_text").and_then(Value::as_str))
                 })
                 .collect::<Vec<_>>()
@@ -286,23 +290,27 @@ fn content_text(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
-/// Typed Plan dependencies take precedence whenever present. The legacy
-/// Runtime string-assumption rule remains the fallback for unmigrated plans.
+fn dependency_applies_to_step(dependency: &PlanFactDependency, step_index: usize) -> bool {
+    dependency.step_index.is_none() || dependency.step_index == Some(step_index)
+}
+
 fn evaluate_typed_plan(
     state: &AppState,
     session_id: &str,
     conv_id: i64,
 ) -> (Option<String>, bool) {
-    let Some((plan_id, goal, pending_value, _completed, _legacy_assumptions)) =
+    let Some((plan_id, goal, pending_value, completed_value, _legacy_assumptions)) =
         state.storage.db.get_active_plan(conv_id).ok().flatten()
     else {
         return (None, false);
     };
 
     let pending: Vec<String> = serde_json::from_value(pending_value).unwrap_or_default();
+    let completed: Vec<String> = serde_json::from_value(completed_value).unwrap_or_default();
     if pending.is_empty() {
         return (None, false);
     }
+    let current_step_index = completed.len();
 
     let store = GroundTruthStore::new(&state.storage.db);
     let mut semantic = match store.rebuild_execution_state(
@@ -318,7 +326,16 @@ fn evaluate_typed_plan(
             return (None, false);
         }
     };
-    if semantic.plan_dependencies.is_empty() {
+
+    let active_dependencies: Vec<&PlanFactDependency> = semantic
+        .plan_dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency.plan_id == plan_id
+                && dependency_applies_to_step(dependency, current_step_index)
+        })
+        .collect();
+    if active_dependencies.is_empty() {
         return (None, false);
     }
 
@@ -340,10 +357,9 @@ fn evaluate_typed_plan(
         }
     }
 
-    let required_fact_ids: Vec<String> = semantic
-        .plan_dependencies
+    let required_fact_ids: Vec<String> = active_dependencies
         .iter()
-        .filter(|dependency| dependency.plan_id == plan_id && dependency.required)
+        .filter(|dependency| dependency.required)
         .map(|dependency| dependency.fact_id.clone())
         .collect();
     let missing: Vec<String> = required_fact_ids
@@ -351,30 +367,41 @@ fn evaluate_typed_plan(
         .filter(|id| !semantic.facts.contains_key(*id))
         .cloned()
         .collect();
-    let stale: Vec<String> = semantic
-        .stale_required_plan_facts()
-        .into_iter()
-        .map(|fact| fact.id.clone())
-        .collect();
-    let unbacked: Vec<String> = semantic
-        .unbacked_required_plan_facts()
-        .into_iter()
-        .map(|fact| fact.id.clone())
-        .collect();
-    let unrecoverable: Vec<String> = semantic
-        .plan_dependencies
+    let stale: Vec<String> = required_fact_ids
         .iter()
-        .filter(|dependency| dependency.plan_id == plan_id && dependency.required)
-        .filter_map(|dependency| semantic.facts.get(&dependency.fact_id))
-        .filter(|fact| fact.evidence.iter().any(|source| !store.is_recoverable(source)))
+        .filter_map(|id| semantic.facts.get(id))
+        .filter(|fact| fact.status != FactStatus::Valid)
+        .map(|fact| fact.id.clone())
+        .collect();
+    let unbacked: Vec<String> = required_fact_ids
+        .iter()
+        .filter_map(|id| semantic.facts.get(id))
+        .filter(|fact| fact.evidence.is_empty())
+        .map(|fact| fact.id.clone())
+        .collect();
+    let unrecoverable: Vec<String> = required_fact_ids
+        .iter()
+        .filter_map(|id| semantic.facts.get(id))
+        .filter(|fact| {
+            fact.evidence
+                .iter()
+                .any(|source| !store.is_recoverable(source))
+        })
         .map(|fact| fact.id.clone())
         .collect();
 
-    if !missing.is_empty() || !stale.is_empty() || !unbacked.is_empty() || !unrecoverable.is_empty() {
+    if !missing.is_empty()
+        || !stale.is_empty()
+        || !unbacked.is_empty()
+        || !unrecoverable.is_empty()
+    {
         let reason = format!(
             "typed plan dependencies invalid: missing={missing:?}, stale={stale:?}, unbacked={unbacked:?}, unrecoverable={unrecoverable:?}"
         );
-        let _ = state.storage.db.store_decision_record(conv_id, "Replan", 0.95, &reason, 0);
+        let _ = state
+            .storage
+            .db
+            .store_decision_record(conv_id, "Replan", 0.95, &reason, 0);
         return (
             Some(format!(
                 "[Plan needs replanning: {goal}]\n[Reason: {reason}]\n[Pending steps: {}]",
@@ -389,7 +416,7 @@ fn evaluate_typed_plan(
         conv_id,
         "ContinuePlan",
         0.95,
-        "all required typed facts are valid, source-backed, and recoverable",
+        "all current-step required typed facts are valid, source-backed, and recoverable",
         500,
     );
     (
@@ -431,5 +458,30 @@ mod tests {
         assert_eq!(input.len(), 3);
         assert_eq!(input[1]["role"], "developer");
         assert_eq!(input[2]["role"], "user");
+    }
+
+    #[test]
+    fn completed_step_dependencies_do_not_apply_to_current_step() {
+        let old = PlanFactDependency {
+            plan_id: 1,
+            step_index: Some(0),
+            fact_id: "old".into(),
+            required: true,
+        };
+        let current = PlanFactDependency {
+            plan_id: 1,
+            step_index: Some(1),
+            fact_id: "current".into(),
+            required: true,
+        };
+        let global = PlanFactDependency {
+            plan_id: 1,
+            step_index: None,
+            fact_id: "global".into(),
+            required: true,
+        };
+        assert!(!dependency_applies_to_step(&old, 1));
+        assert!(dependency_applies_to_step(&current, 1));
+        assert!(dependency_applies_to_step(&global, 1));
     }
 }
