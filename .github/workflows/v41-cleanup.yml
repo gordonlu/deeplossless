@@ -28,7 +28,7 @@ jobs:
             README.md docs/tech-reference.md \
             src/execution.rs src/lib.rs src/main.rs src/runtime.rs \
             src/summarizer.rs src/tool_cache.rs src/prefix_stability.rs
-          git apply /tmp/v41-semantic.patch
+          git apply --ignore-space-change --ignore-whitespace /tmp/v41-semantic.patch
       - name: Verify clean patch
         run: |
           cargo fmt --check
