@@ -43,13 +43,11 @@ pub struct ValidationResult {
 /// `reasoning_content` is checked but treated as advisory — missing it
 /// does NOT make the message invalid.
 pub fn validate_assistant_message(msg: &Value) -> ValidationResult {
-    let has_tool_calls = msg
-        .get("tool_calls")
+    let has_tool_calls = msg.get("tool_calls")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    let has_reasoning = msg
-        .get("reasoning_content")
+    let has_reasoning = msg.get("reasoning_content")
         .and_then(|v| v.as_str())
         .map(|s| !s.is_empty())
         .unwrap_or(false);
@@ -78,15 +76,11 @@ pub fn validate_assistant_message(msg: &Value) -> ValidationResult {
 /// Per-message at debug (avoid log flood), aggregate at warn.
 /// Returns the number of messages with truly critical issues (not advisory).
 pub fn validate_request_messages(body: &Value) -> usize {
-    let Some(messages) = body["messages"].as_array() else {
-        return 0;
-    };
+    let Some(messages) = body["messages"].as_array() else { return 0 };
     let mut invalid = 0;
     let mut advisory_only = 0u32;
     for msg in messages {
-        if msg["role"].as_str() != Some("assistant") {
-            continue;
-        }
+        if msg["role"].as_str() != Some("assistant") { continue; }
         let result = validate_assistant_message(msg);
         if !result.valid {
             invalid += 1;

@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::db::Database;
 use crate::event_store::{EventFilter, EventType, ProxyEvent};
@@ -93,10 +93,7 @@ impl<'a> GroundTruthStore<'a> {
             .find(|event| event.id == Some(expected_id))
             .ok_or_else(|| anyhow::anyhow!("ground-truth source row {expected_id} not found"))?;
 
-        if event
-            .metadata
-            .get("deeplossless_kind")
-            .and_then(Value::as_str)
+        if event.metadata.get("deeplossless_kind").and_then(Value::as_str)
             != Some(KIND_EXACT_SOURCE)
         {
             anyhow::bail!("row {expected_id} is not an exact-source record");
@@ -147,7 +144,10 @@ impl<'a> GroundTruthStore<'a> {
     }
 
     /// Load the newest value for every fact id from the append-only sidecar.
-    pub fn load_execution_facts(&self, session_id: &str) -> anyhow::Result<Vec<ExecutionFact>> {
+    pub fn load_execution_facts(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<ExecutionFact>> {
         let events = self.db.query_proxy_events(&EventFilter {
             session_id: Some(session_id.to_string()),
             ..Default::default()
@@ -156,10 +156,7 @@ impl<'a> GroundTruthStore<'a> {
         let mut out = Vec::new();
         // query_proxy_events is newest-first, so first row wins for each fact id.
         for event in events {
-            if event
-                .metadata
-                .get("deeplossless_kind")
-                .and_then(Value::as_str)
+            if event.metadata.get("deeplossless_kind").and_then(Value::as_str)
                 != Some(KIND_EXECUTION_FACT)
             {
                 continue;
@@ -215,10 +212,7 @@ impl<'a> GroundTruthStore<'a> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for event in events {
-            if event
-                .metadata
-                .get("deeplossless_kind")
-                .and_then(Value::as_str)
+            if event.metadata.get("deeplossless_kind").and_then(Value::as_str)
                 != Some(KIND_PLAN_DEPENDENCY)
                 || event.metadata.get("plan_id").and_then(Value::as_i64) != Some(plan_id)
             {
@@ -228,12 +222,7 @@ impl<'a> GroundTruthStore<'a> {
                 Ok(dep) => dep,
                 Err(_) => continue,
             };
-            let key = (
-                dep.plan_id,
-                dep.step_index,
-                dep.fact_id.clone(),
-                dep.required,
-            );
+            let key = (dep.plan_id, dep.step_index, dep.fact_id.clone(), dep.required);
             if seen.insert(key) {
                 out.push(dep);
             }
@@ -294,12 +283,7 @@ mod tests {
             .unwrap();
         let store = GroundTruthStore::new(&db);
         let src = store
-            .put_text(
-                TruthStream::ToolPayloads,
-                "s1",
-                "full tool output",
-                "tool-result",
-            )
+            .put_text(TruthStream::ToolPayloads, "s1", "full tool output", "tool-result")
             .unwrap();
         assert!(src.seq_no > 0);
         assert_eq!(store.materialize_text(&src).unwrap(), "full tool output");
@@ -316,12 +300,7 @@ mod tests {
             .unwrap();
         let store = GroundTruthStore::new(&db);
         let source = store
-            .put_text(
-                TruthStream::FileObservations,
-                "s1",
-                "enabled=true",
-                "config",
-            )
+            .put_text(TruthStream::FileObservations, "s1", "enabled=true", "config")
             .unwrap();
         let mut fact = ExecutionFact::new("config-enabled", "feature is enabled");
         fact.evidence.push(source);

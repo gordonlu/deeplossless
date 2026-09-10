@@ -180,7 +180,10 @@ pub enum ContentPart {
 
     /// Tool execution result — first-class runtime object, not "assistant message".
     #[serde(rename = "tool_result")]
-    ToolResult { call_id: String, content: String },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
 }
 
 /// Reasoning/thinking trace — NOT a ContentPart.
@@ -357,28 +360,16 @@ pub struct Usage {
 #[serde(tag = "type")]
 pub enum StreamEvent {
     #[serde(rename = "message_start")]
-    MessageStart {
-        role: String,
-        #[serde(default)]
-        message_id: Option<String>,
-    },
+    MessageStart { role: String, #[serde(default)] message_id: Option<String> },
 
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
 
     #[serde(rename = "tool_call_start")]
-    ToolCallStart {
-        index: usize,
-        id: String,
-        name: String,
-    },
+    ToolCallStart { index: usize, id: String, name: String },
 
     #[serde(rename = "tool_call_args_delta")]
-    ToolCallArgsDelta {
-        index: usize,
-        arguments_delta: String,
-        call_id: String,
-    },
+    ToolCallArgsDelta { index: usize, arguments_delta: String, call_id: String },
 
     #[serde(rename = "tool_call_end")]
     ToolCallEnd { index: usize },
@@ -395,34 +386,15 @@ pub enum StreamEvent {
 
     /// An output item is complete.
     #[serde(rename = "output_item_done")]
-    OutputItemDone {
-        index: usize,
-        item_id: String,
-        item_type: String,
-        name: String,
-        arguments: String,
-    },
+    OutputItemDone { index: usize, item_id: String, item_type: String, name: String, arguments: String },
 
     /// Function call arguments are complete.
     #[serde(rename = "function_call_arguments_done")]
-    FunctionCallArgumentsDone {
-        call_id: String,
-        name: String,
-        arguments: String,
-        output_index: usize,
-    },
+    FunctionCallArgumentsDone { call_id: String, name: String, arguments: String, output_index: usize },
 
     #[serde(rename = "done")]
-    Done {
-        usage: Usage,
-        finish_reason: String,
-        incomplete: bool,
-        error_reason: Option<String>,
-    },
+    Done { usage: Usage, finish_reason: String, incomplete: bool, error_reason: Option<String> },
 
     #[serde(rename = "error")]
-    Error {
-        message: String,
-        code: Option<String>,
-    },
+    Error { message: String, code: Option<String> },
 }

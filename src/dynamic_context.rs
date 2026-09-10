@@ -47,9 +47,7 @@ impl DynamicContextHints {
                             ResourceRef::File { path, .. } => {
                                 plan_terms.push(path.clone());
                             }
-                            ResourceRef::Symbol {
-                                file_path, symbol, ..
-                            } => {
+                            ResourceRef::Symbol { file_path, symbol, .. } => {
                                 plan_terms.push(file_path.clone());
                                 plan_terms.push(symbol.clone());
                             }
@@ -431,12 +429,10 @@ mod tests {
     #[test]
     fn execution_signal_detection_ignores_empty_hints() {
         assert!(!DynamicContextHints::default().has_execution_signal());
-        assert!(
-            DynamicContextHints {
-                plan_terms: vec!["src/lib.rs".into()],
-                ..Default::default()
-            }
-            .has_execution_signal()
-        );
+        assert!(DynamicContextHints {
+            plan_terms: vec!["src/lib.rs".into()],
+            ..Default::default()
+        }
+        .has_execution_signal());
     }
 }

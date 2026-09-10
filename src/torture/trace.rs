@@ -2,14 +2,9 @@
 struct SimpleRng(u64);
 
 impl SimpleRng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
+    fn new(seed: u64) -> Self { Self(seed) }
     fn next_f64(&mut self) -> f64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (self.0 >> 11) as f64 / (1u64 << 53) as f64
     }
 }
@@ -71,11 +66,7 @@ pub fn gen_cache_stress(name: &str, total: usize, hit_rate: f64) -> ScenarioTrac
         let is_hit = (i as f64) < (total as f64 * hit_rate);
         turns.push(Turn {
             prompt: format!("search query {i}"),
-            completion: if is_hit {
-                format!("(cached) result {i}")
-            } else {
-                format!("result {i}")
-            },
+            completion: if is_hit { format!("(cached) result {i}") } else { format!("result {i}") },
             tokens: if is_hit { 0 } else { 100 },
             tool_calls: vec![format!("search_{i}")],
         });
@@ -106,11 +97,7 @@ pub fn gen_chaos(name: &str, tools: &[&str], failure_rate: f64) -> ScenarioTrace
     }
     ScenarioTrace {
         name: format!("chaos_{name}_{}t", tools.len()),
-        description: format!(
-            "{:.0}% failure rate across {} tools",
-            failure_rate * 100.0,
-            tools.len()
-        ),
+        description: format!("{:.0}% failure rate across {} tools", failure_rate * 100.0, tools.len()),
         turns,
     }
 }

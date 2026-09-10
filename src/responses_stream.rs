@@ -84,11 +84,7 @@ impl ResponsesStreamProcessor {
         Self {
             phase: StreamPhase::Preamble,
             assembler: StreamAssembler::new(),
-            ds4_normalizer: if use_normalizer {
-                Some(DeepSeekNormalizer::new())
-            } else {
-                None
-            },
+            ds4_normalizer: if use_normalizer { Some(DeepSeekNormalizer::new()) } else { None },
             tx,
             db,
             cycle,
@@ -101,17 +97,11 @@ impl ResponsesStreamProcessor {
         }
     }
 
-    pub fn phase(&self) -> &StreamPhase {
-        &self.phase
-    }
+    pub fn phase(&self) -> &StreamPhase { &self.phase }
 
     fn transition_to(&mut self, next: StreamPhase) {
-        debug_assert!(
-            self.phase.can_transition_to(&next),
-            "invalid phase transition: {:?} → {:?}",
-            self.phase,
-            next
-        );
+        debug_assert!(self.phase.can_transition_to(&next),
+            "invalid phase transition: {:?} → {:?}", self.phase, next);
         self.phase = next;
     }
 
@@ -133,8 +123,7 @@ impl ResponsesStreamProcessor {
         }
 
         for event in crate::protocol::streaming::from_chat_completions_sse(
-            data_line,
-            self.usage_buf.as_ref(),
+            data_line, self.usage_buf.as_ref(),
         ) {
             let enriched = self.enrich_event(&event);
             for ev in enriched {
@@ -158,8 +147,7 @@ impl ResponsesStreamProcessor {
         }
         if !data_line.trim().is_empty() {
             for event in crate::protocol::streaming::from_chat_completions_sse(
-                data_line,
-                self.usage_buf.as_ref(),
+                data_line, self.usage_buf.as_ref(),
             ) {
                 if !matches!(event, StreamEvent::Done { .. }) {
                     let enriched = self.enrich_event(&event);
@@ -206,10 +194,7 @@ impl ResponsesStreamProcessor {
                 match ev {
                     StreamEvent::ToolCallStart { index, .. }
                     | StreamEvent::ToolCallArgsDelta { index, .. }
-                    | StreamEvent::FunctionCallArgumentsDone {
-                        output_index: index,
-                        ..
-                    }
+                    | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
                     | StreamEvent::OutputItemDone { index, .. } => {
                         *index = tc_idx;
                     }
@@ -223,16 +208,10 @@ impl ResponsesStreamProcessor {
         }
         self.transition_to(StreamPhase::Completed);
 
-        let input_tokens = self
-            .usage_buf
-            .as_ref()
-            .and_then(|v| v["usage"]["prompt_tokens"].as_u64())
-            .unwrap_or(0);
-        let output_tokens = self
-            .usage_buf
-            .as_ref()
-            .and_then(|v| v["usage"]["completion_tokens"].as_u64())
-            .unwrap_or(0);
+        let input_tokens = self.usage_buf.as_ref()
+            .and_then(|v| v["usage"]["prompt_tokens"].as_u64()).unwrap_or(0);
+        let output_tokens = self.usage_buf.as_ref()
+            .and_then(|v| v["usage"]["completion_tokens"].as_u64()).unwrap_or(0);
 
         AssembledOutput {
             text: content.text,
@@ -272,10 +251,7 @@ impl ResponsesStreamProcessor {
             match ev {
                 StreamEvent::ToolCallStart { index, .. }
                 | StreamEvent::ToolCallArgsDelta { index, .. }
-                | StreamEvent::FunctionCallArgumentsDone {
-                    output_index: index,
-                    ..
-                }
+                | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
                 | StreamEvent::OutputItemDone { index, .. } => {
                     *index = tc_idx;
                 }
@@ -287,15 +263,8 @@ impl ResponsesStreamProcessor {
         }
         // Collect function calls
         for ev in &events {
-            if let StreamEvent::FunctionCallArgumentsDone {
-                call_id,
-                name,
-                arguments,
-                ..
-            } = ev
-            {
-                self.flushed_tool_calls
-                    .push((call_id.clone(), name.clone(), arguments.clone()));
+            if let StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments, .. } = ev {
+                self.flushed_tool_calls.push((call_id.clone(), name.clone(), arguments.clone()));
             }
         }
         self.send_events(events)
@@ -342,24 +311,25 @@ mod tests {
     fn make_db() -> Arc<Database> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            Arc::new(
-                crate::db::Database::builder()
-                    .path(":memory:".to_string())
-                    .build()
-                    .await
-                    .unwrap(),
-            )
+            Arc::new(crate::db::Database::builder()
+                .path(":memory:".to_string())
+                .build()
+                .await
+                .unwrap())
         })
     }
 
-    fn make_processor() -> (
-        ResponsesStreamProcessor,
-        mpsc::Receiver<Result<axum::body::Bytes, std::convert::Infallible>>,
-    ) {
+    fn make_processor() -> (ResponsesStreamProcessor, mpsc::Receiver<Result<axum::body::Bytes, std::convert::Infallible>>) {
         let (tx, rx) = mpsc::channel(128);
         let db = make_db();
-        let cycle = Arc::new(StdMutex::new(ExecutionCycle::new(RuntimeProfile::Minimal)));
-        let proc = ResponsesStreamProcessor::new(tx, db, cycle, 1, 0, "test_replay".into(), false);
+        let cycle = Arc::new(StdMutex::new(
+            ExecutionCycle::new(RuntimeProfile::Minimal),
+        ));
+        let proc = ResponsesStreamProcessor::new(
+            tx, db, cycle, 1, 0,
+            "test_replay".into(),
+            false,
+        );
         (proc, rx)
     }
 
@@ -434,8 +404,7 @@ mod tests {
         let (mut proc, _rx) = make_processor();
         assert_eq!(*proc.phase(), StreamPhase::Preamble);
 
-        proc.feed_sse_line(r#"{"choices":[{"delta":{"content":"hello"},"index":0}]}"#)
-            .unwrap();
+        proc.feed_sse_line(r#"{"choices":[{"delta":{"content":"hello"},"index":0}]}"#).unwrap();
         assert_eq!(*proc.phase(), StreamPhase::Active);
 
         proc.feed_sse_line("[DONE]").unwrap();

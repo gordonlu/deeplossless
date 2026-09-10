@@ -29,10 +29,7 @@ impl SessionStore {
     }
 
     pub fn get(&self, session_id: &str) -> Option<Vec<serde_json::Value>> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|g| g.map.get(session_id).cloned())
+        self.inner.lock().ok().and_then(|g| g.map.get(session_id).cloned())
     }
 
     pub fn append(&self, session_id: &str, messages: Vec<serde_json::Value>) {
@@ -71,9 +68,7 @@ impl SessionStoreInner {
 }
 
 impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]

@@ -42,11 +42,7 @@ pub enum ReplayError {
     IntegrityMismatch { expected: String, actual: String },
 
     #[error("snapshot boundary mismatch at seq_no {seq_no}: expected {expected}, got {actual}")]
-    BoundaryMismatch {
-        seq_no: i64,
-        expected: String,
-        actual: String,
-    },
+    BoundaryMismatch { seq_no: i64, expected: String, actual: String },
 
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(i64),
@@ -76,24 +72,26 @@ pub fn replay_execution(
     for (_id, kind, payload, seq_no, _ts) in &rows {
         // Try parsing as StreamEvent first (new format: has "type" field).
         // Fall back to injecting type from event_kind (old format: detail-only payload).
-        let stream_event = serde_json::from_str::<StreamEvent>(payload).or_else(|_| {
-            // Old format: payload is a detail object without "type".
-            // Inject the event_kind as the type field and re-parse.
-            let mut val: serde_json::Value =
-                serde_json::from_str(payload).map_err(|e| ReplayError::ParseError {
-                    seq_no: *seq_no,
-                    detail: format!("payload is not valid JSON: {e}"),
-                })?;
-            if let Some(obj) = val.as_object_mut()
-                && !obj.contains_key("type")
-            {
-                obj.insert("type".to_string(), serde_json::Value::String(kind.clone()));
-            }
-            serde_json::from_value::<StreamEvent>(val).map_err(|e| ReplayError::ParseError {
-                seq_no: *seq_no,
-                detail: format!("{e} — payload: {:.200}", payload),
-            })
-        })?;
+        let stream_event = serde_json::from_str::<StreamEvent>(payload)
+            .or_else(|_| {
+                // Old format: payload is a detail object without "type".
+                // Inject the event_kind as the type field and re-parse.
+                let mut val: serde_json::Value = serde_json::from_str(payload)
+                    .map_err(|e| ReplayError::ParseError {
+                        seq_no: *seq_no,
+                        detail: format!("payload is not valid JSON: {e}"),
+                    })?;
+                if let Some(obj) = val.as_object_mut()
+                    && !obj.contains_key("type")
+                {
+                    obj.insert("type".to_string(), serde_json::Value::String(kind.clone()));
+                }
+                serde_json::from_value::<StreamEvent>(val)
+                    .map_err(|e| ReplayError::ParseError {
+                        seq_no: *seq_no,
+                        detail: format!("{e} — payload: {:.200}", payload),
+                    })
+            })?;
         events.push(ReplayEventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
             seq_no: *seq_no,
@@ -109,17 +107,11 @@ pub fn replay_execution(
             return Err(ReplayError::DuplicateSeqNo { seq_no: a });
         }
         if a + 1 != b {
-            return Err(ReplayError::SeqDiscontinuity {
-                expected: a + 1,
-                got: b,
-            });
+            return Err(ReplayError::SeqDiscontinuity { expected: a + 1, got: b });
         }
     }
 
-    Ok(ReplayResult {
-        events,
-        corrupt_count,
-    })
+    Ok(ReplayResult { events, corrupt_count })
 }
 
 /// Replay from a snapshot point, verifying continuity via boundary_hash.
@@ -128,8 +120,7 @@ pub fn replay_from_snapshot(
     snapshot_id: i64,
     execution_id: i64,
 ) -> Result<ReplayResult, ReplayError> {
-    let snap = db
-        .restore_snapshot(snapshot_id)?
+    let snap = db.restore_snapshot(snapshot_id)?
         .ok_or(ReplayError::SnapshotNotFound(snapshot_id))?;
     if snap.execution_id != execution_id {
         return Err(ReplayError::Other(anyhow::anyhow!(
@@ -143,8 +134,7 @@ pub fn replay_from_snapshot(
 
     // Load tail events after the snapshot boundary
     let rows = db.get_execution_events(execution_id)?;
-    let tail: Vec<(i64, String)> = rows
-        .iter()
+    let tail: Vec<(i64, String)> = rows.iter()
         .filter(|(_id, _kind, _payload, seq_no, _ts)| *seq_no > last_snap_seq)
         .map(|(_id, _kind, payload, seq_no, _ts)| (*seq_no, payload.clone()))
         .collect();
@@ -153,10 +143,7 @@ pub fn replay_from_snapshot(
     let mut events: Vec<ReplayEventEnvelope> = Vec::new();
     if let Some(payload) = snap.payload()? {
         match payload {
-            snapshot::SnapshotPayload::Ephemeral {
-                last_seq_no,
-                event_count,
-            } => {
+            snapshot::SnapshotPayload::Ephemeral { last_seq_no, event_count } => {
                 if last_seq_no != snap.last_event_seq_no {
                     return Err(ReplayError::BoundaryMismatch {
                         seq_no: last_seq_no,
@@ -198,23 +185,18 @@ pub fn replay_from_snapshot(
                     });
                 }
             }
-            snapshot::SnapshotPayload::Structural {
-                events: snap_events,
-            }
-            | snapshot::SnapshotPayload::Full {
-                events: snap_events,
-            }
-            | snapshot::SnapshotPayload::Frozen {
-                events: snap_events,
-            } => {
+            snapshot::SnapshotPayload::Structural { events: snap_events }
+            | snapshot::SnapshotPayload::Full { events: snap_events }
+            | snapshot::SnapshotPayload::Frozen { events: snap_events } => {
                 let mut serialized = Vec::with_capacity(snap_events.len());
                 for (seq_no, val) in &snap_events {
                     serialized.push((
                         *seq_no,
-                        serde_json::to_string(val).map_err(|e| ReplayError::ParseError {
-                            seq_no: *seq_no,
-                            detail: format!("snapshot event serialize: {e}"),
-                        })?,
+                        serde_json::to_string(val)
+                            .map_err(|e| ReplayError::ParseError {
+                                seq_no: *seq_no,
+                                detail: format!("snapshot event serialize: {e}"),
+                            })?,
                     ));
                 }
                 let serialized_refs: Vec<(i64, &str)> = serialized
@@ -247,12 +229,11 @@ pub fn replay_from_snapshot(
                     });
                 }
                 for (seq_no, val) in &snap_events {
-                    let event: StreamEvent = serde_json::from_value(val.clone()).map_err(|e| {
-                        ReplayError::ParseError {
+                    let event: StreamEvent = serde_json::from_value(val.clone())
+                        .map_err(|e| ReplayError::ParseError {
                             seq_no: *seq_no,
                             detail: format!("snapshot event parse: {e}"),
-                        }
-                    })?;
+                        })?;
                     events.push(ReplayEventEnvelope {
                         schema_version: snap.schema_version,
                         seq_no: *seq_no,
@@ -274,8 +255,8 @@ pub fn replay_from_snapshot(
 
     // Parse and append tail events
     for (seq_no, payload) in &tail {
-        let event =
-            serde_json::from_str::<StreamEvent>(payload).map_err(|e| ReplayError::ParseError {
+        let event = serde_json::from_str::<StreamEvent>(payload)
+            .map_err(|e| ReplayError::ParseError {
                 seq_no: *seq_no,
                 detail: format!("{e} — payload: {:.200}", payload),
             })?;
@@ -297,17 +278,11 @@ pub fn replay_from_snapshot(
             return Err(ReplayError::DuplicateSeqNo { seq_no: a });
         }
         if a + 1 != b {
-            return Err(ReplayError::SeqDiscontinuity {
-                expected: a + 1,
-                got: b,
-            });
+            return Err(ReplayError::SeqDiscontinuity { expected: a + 1, got: b });
         }
     }
 
-    Ok(ReplayResult {
-        events,
-        corrupt_count: 0,
-    })
+    Ok(ReplayResult { events, corrupt_count: 0 })
 }
 
 #[cfg(test)]
@@ -319,18 +294,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("replay_test.db");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let db = rt
-            .block_on(crate::db::Database::builder().path(&path).build())
-            .unwrap();
+        let db = rt.block_on(
+            crate::db::Database::builder().path(&path).build()
+        ).unwrap();
         (dir, db)
     }
 
-    fn insert_stream_event(
-        db: &crate::db::Database,
-        execution_id: i64,
-        seq_no: i64,
-        payload: &str,
-    ) {
+    fn insert_stream_event(db: &crate::db::Database, execution_id: i64, seq_no: i64, payload: &str) {
         let conn = db.writer_lock().lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO execution_events (execution_id, event_kind, event_payload, seq_no) VALUES (?1, ?2, ?3, ?4)",
@@ -345,12 +315,7 @@ mod tests {
     ) -> i64 {
         let payload_events: Vec<(i64, serde_json::Value)> = events
             .iter()
-            .map(|(seq_no, payload)| {
-                (
-                    *seq_no,
-                    serde_json::from_str::<serde_json::Value>(payload).unwrap(),
-                )
-            })
+            .map(|(seq_no, payload)| (*seq_no, serde_json::from_str::<serde_json::Value>(payload).unwrap()))
             .collect();
         let canonical_events: Vec<(i64, String)> = payload_events
             .iter()
@@ -383,9 +348,7 @@ mod tests {
 
     #[test]
     fn round_trips_text_event() {
-        let ev = StreamEvent::TextDelta {
-            text: "hello world".into(),
-        };
+        let ev = StreamEvent::TextDelta { text: "hello world".into() };
         let json = serde_json::to_string(&ev).unwrap();
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
@@ -394,9 +357,7 @@ mod tests {
     #[test]
     fn round_trips_tool_call_event() {
         let ev = StreamEvent::ToolCallStart {
-            index: 0,
-            id: "call_1".into(),
-            name: "grep".into(),
+            index: 0, id: "call_1".into(), name: "grep".into(),
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
@@ -410,9 +371,7 @@ mod tests {
     fn round_trips_done_with_incomplete() {
         let ev = StreamEvent::Done {
             usage: crate::protocol::canonical::Usage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
+                prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
             },
             finish_reason: "length".into(),
             incomplete: true,
@@ -428,9 +387,7 @@ mod tests {
 
     #[test]
     fn envelope_schema_version() {
-        let ev = StreamEvent::TextDelta {
-            text: "test".into(),
-        };
+        let ev = StreamEvent::TextDelta { text: "test".into() };
         let envelope = ReplayEventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION,
             seq_no: 1,
@@ -516,10 +473,7 @@ mod tests {
         let events = [
             (0, r#"{"type":"text_delta","text":"a"}"#),
             (1, r#"{"type":"text_delta","text":"b"}"#),
-            (
-                2,
-                r#"{"type":"done","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop","incomplete":false,"error_reason":null}"#,
-            ),
+            (2, r#"{"type":"done","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop","incomplete":false,"error_reason":null}"#),
         ];
         for (seq_no, payload) in events {
             insert_stream_event(&db, 1, seq_no, payload);
@@ -595,34 +549,19 @@ pub fn replay_session(
     db: &crate::db::Database,
     session_id: &str,
 ) -> Result<ReplayResult, ReplayError> {
-    let rows = db
-        .get_execution_events_by_session(session_id)
+    let rows = db.get_execution_events_by_session(session_id)
         .map_err(ReplayError::Other)?;
     if rows.is_empty() {
-        return Ok(ReplayResult {
-            events: vec![],
-            corrupt_count: 0,
-        });
+        return Ok(ReplayResult { events: vec![], corrupt_count: 0 });
     }
 
     // Stream event kinds that are valid for replay
-    let is_stream_kind = |k: &str| {
-        matches!(
-            k,
-            "TextDelta"
-                | "ToolCallStart"
-                | "ToolCallArgsDelta"
-                | "ToolCallEnd"
-                | "ReasoningDelta"
-                | "MessageStart"
-                | "MessageEnd"
-                | "OutputItemAdded"
-                | "OutputItemDone"
-                | "FunctionCallArgumentsDone"
-                | "Done"
-                | "Error"
-        )
-    };
+    let is_stream_kind = |k: &str| matches!(k,
+        "TextDelta" | "ToolCallStart" | "ToolCallArgsDelta" | "ToolCallEnd"
+        | "ReasoningDelta" | "MessageStart" | "MessageEnd"
+        | "OutputItemAdded" | "OutputItemDone" | "FunctionCallArgumentsDone"
+        | "Done" | "Error"
+    );
 
     let mut events = Vec::with_capacity(rows.len());
     let mut skipped = 0usize;
@@ -645,7 +584,10 @@ pub fn replay_session(
             }
             Err(_) => {
                 // Fallback: inject event_kind as the "type" field (old format)
-                let injected = format!(r#"{{"type":"{kind}",{}"#, &payload[1.min(payload.len())..]);
+                let injected = format!(
+                    r#"{{"type":"{kind}",{}"#,
+                    &payload[1.min(payload.len())..]
+                );
                 match serde_json::from_str::<StreamEvent>(&injected) {
                     Ok(ev) => {
                         events.push(ReplayEventEnvelope {
@@ -669,10 +611,7 @@ pub fn replay_session(
             "skipped {skipped} non-stream events during session replay");
     }
 
-    Ok(ReplayResult {
-        events,
-        corrupt_count: 0,
-    })
+    Ok(ReplayResult { events, corrupt_count: 0 })
 }
 
 /// Replay protocol assertion — verifies that a replayed event sequence
@@ -692,14 +631,8 @@ pub fn assert_replay_valid(
             StreamEvent::ToolCallStart { name, .. } if name.is_empty() => {
                 errors.push(format!("seq {seq}: ToolCallStart with empty name"));
             }
-            StreamEvent::Done {
-                incomplete: true,
-                error_reason: None,
-                ..
-            } => {
-                errors.push(format!(
-                    "seq {seq}: Done marked incomplete but no error_reason"
-                ));
+            StreamEvent::Done { incomplete: true, error_reason: None, .. } => {
+                errors.push(format!("seq {seq}: Done marked incomplete but no error_reason"));
             }
             StreamEvent::Done { .. } => {}
             _ => {}
@@ -708,9 +641,7 @@ pub fn assert_replay_valid(
 
     // Verify reasoning presence requirement
     if requires_reasoning {
-        let has_reasoning = events
-            .iter()
-            .any(|(_, ev)| matches!(ev, StreamEvent::ReasoningDelta { .. }));
+        let has_reasoning = events.iter().any(|(_, ev)| matches!(ev, StreamEvent::ReasoningDelta { .. }));
         if !has_reasoning {
             // Not an error — some responses don't use reasoning
         }
@@ -736,15 +667,12 @@ mod assertion_tests {
     #[test]
     fn done_incomplete_without_reason_fails() {
         let caps = ProviderCapabilities::default();
-        let events = vec![(
-            0,
-            StreamEvent::Done {
-                usage: Usage::default(),
-                finish_reason: "stop".into(),
-                incomplete: true,
-                error_reason: None,
-            },
-        )];
+        let events = vec![(0, StreamEvent::Done {
+            usage: Usage::default(),
+            finish_reason: "stop".into(),
+            incomplete: true,
+            error_reason: None,
+        })];
         assert!(assert_replay_valid(&events, &caps).is_err());
     }
 

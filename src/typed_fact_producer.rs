@@ -11,12 +11,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::db::Database;
-use crate::file_observation::{FileObservation, observe_file};
-use crate::ground_truth::{
-    ExecutionFact, FactStatus, PlanFactDependency, ResourceRef, TruthStream,
-};
+use crate::file_observation::{observe_file, FileObservation};
+use crate::ground_truth::{ExecutionFact, FactStatus, PlanFactDependency, ResourceRef, TruthStream};
 use crate::ground_truth_store::GroundTruthStore;
-use crate::tool_cache::{ToolKind, extract_dependent_files};
+use crate::tool_cache::{extract_dependent_files, ToolKind};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutoFactReport {
@@ -222,7 +220,9 @@ pub fn produce_from_responses_items(
                     if exit_code == 0 {
                         format!("Validation command {display} succeeded with exit code 0.")
                     } else {
-                        format!("Validation command {display} failed with exit code {exit_code}.")
+                        format!(
+                            "Validation command {display} failed with exit code {exit_code}."
+                        )
                     },
                 );
                 if exit_code != 0 {
@@ -270,15 +270,15 @@ pub fn produce_from_responses_items(
 
         if matches!(
             kind,
-            ToolKind::Grep | ToolKind::ListFiles | ToolKind::SymbolSearch | ToolKind::Diagnostics
+            ToolKind::Grep
+                | ToolKind::ListFiles
+                | ToolKind::SymbolSearch
+                | ToolKind::Diagnostics
         ) && !paths.is_empty()
         {
             let mut fact = ExecutionFact::new(
                 format!("tool-result:{call_id}"),
-                format!(
-                    "Tool {name} returned exact evidence for {}.",
-                    paths.join(", ")
-                ),
+                format!("Tool {name} returned exact evidence for {}.", paths.join(", ")),
             );
             fact.evidence.push(source.clone());
             fact.resources.push(ResourceRef::ToolResult {
@@ -338,12 +338,7 @@ fn persist_dependency_if_new(
     dep: PlanFactDependency,
     report: &mut AutoFactReport,
 ) -> anyhow::Result<()> {
-    let key = (
-        dep.plan_id,
-        dep.step_index,
-        dep.fact_id.clone(),
-        dep.required,
-    );
+    let key = (dep.plan_id, dep.step_index, dep.fact_id.clone(), dep.required);
     if !existing.insert(key) {
         return Ok(());
     }
@@ -471,7 +466,10 @@ fn validation_step_matches_command(step: &str, command: &str) -> bool {
         "create ",
         "refactor ",
     ];
-    if MUTATION_TERMS.iter().any(|term| step_lower.contains(term)) {
+    if MUTATION_TERMS
+        .iter()
+        .any(|term| step_lower.contains(term))
+    {
         return false;
     }
     const VALIDATION_TERMS: &[&str] = &[
@@ -668,11 +666,9 @@ mod tests {
         let truth = GroundTruthStore::new(&db);
         let facts = truth.load_execution_facts("s1").unwrap();
         assert!(facts.iter().any(|fact| fact.id == "file:src/config.rs"));
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.id == "symbol:src/config.rs::ConfigLoader")
-        );
+        assert!(facts
+            .iter()
+            .any(|fact| fact.id == "symbol:src/config.rs::ConfigLoader"));
         let deps = truth.load_plan_dependencies("s1", plan_id).unwrap();
         assert!(deps.iter().any(|dep| dep.fact_id == "file:src/config.rs"
             && dep.required
@@ -711,8 +707,7 @@ mod tests {
         .unwrap();
 
         let read_call = json!({"type":"function_call","call_id":"r1","name":"read_file","arguments":"{\"path\":\"src/config.rs\"}"});
-        let read_out =
-            json!({"type":"function_call_output","call_id":"r1","output":"pub struct Config;"});
+        let read_out = json!({"type":"function_call_output","call_id":"r1","output":"pub struct Config;"});
         produce_from_responses_items(
             &db,
             "s1",
@@ -792,8 +787,7 @@ mod tests {
             .find_or_create_conversation("s1", "deepseek-flash")
             .unwrap();
         let call = json!({"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
-        let vague =
-            json!({"type":"function_call_output","call_id":"c1","output":"tests look successful"});
+        let vague = json!({"type":"function_call_output","call_id":"c1","output":"tests look successful"});
         let report = produce_from_responses_items(
             &db,
             "s1",
@@ -858,10 +852,9 @@ mod tests {
         let deps = GroundTruthStore::new(&db)
             .load_plan_dependencies("s1", plan_id)
             .unwrap();
-        assert!(
-            deps.iter()
-                .any(|dep| dep.fact_id == validation.id && dep.required)
-        );
+        assert!(deps
+            .iter()
+            .any(|dep| dep.fact_id == validation.id && dep.required));
 
         let call2 = json!({"type":"function_call","call_id":"c2","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
         let pass = json!({"type":"function_call_output","call_id":"c2","output":"Process exited with code 0"});

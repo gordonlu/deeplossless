@@ -9,18 +9,13 @@ pub use super::canonical::StreamEvent;
 /// Convert a Chat Completions SSE data line into canonical `StreamEvent`s.
 /// Returns empty Vec if the line contains no meaningful event.
 /// The first chunk of a tool call may return both ToolCallStart + ToolCallArgsDelta.
-pub fn from_chat_completions_sse(
-    data: &str,
-    usage_buffer: Option<&serde_json::Value>,
-) -> Vec<StreamEvent> {
+pub fn from_chat_completions_sse(data: &str, usage_buffer: Option<&serde_json::Value>) -> Vec<StreamEvent> {
     if data == "[DONE]" {
-        let usage = usage_buffer
-            .map(|v| super::canonical::Usage {
-                prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                total_tokens: v["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32,
-            })
-            .unwrap_or_default();
+        let usage = usage_buffer.map(|v| super::canonical::Usage {
+            prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            total_tokens: v["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32,
+        }).unwrap_or_default();
 
         return vec![StreamEvent::Done {
             usage,
@@ -45,11 +40,7 @@ pub struct PartialLineBuffer {
 }
 
 impl PartialLineBuffer {
-    pub fn new() -> Self {
-        Self {
-            buffer: String::new(),
-        }
-    }
+    pub fn new() -> Self { Self { buffer: String::new() } }
 
     /// Push a network chunk. Returns complete lines (without trailing \n).
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
@@ -70,11 +61,7 @@ impl PartialLineBuffer {
         } else {
             let remaining = self.buffer.trim().to_string();
             self.buffer.clear();
-            if remaining.is_empty() {
-                None
-            } else {
-                Some(remaining)
-            }
+            if remaining.is_empty() { None } else { Some(remaining) }
         }
     }
 }
@@ -94,11 +81,7 @@ pub struct SseEventParser {
 }
 
 impl SseEventParser {
-    pub fn new() -> Self {
-        Self {
-            current_event_type: None,
-        }
-    }
+    pub fn new() -> Self { Self { current_event_type: None } }
 
     /// Feed a single line (without trailing \n). Returns Some(SseEvent) when
     /// a complete data line is received, or None for non-data lines.
@@ -153,41 +136,24 @@ pub fn to_chat_completions_sse(event: &StreamEvent) -> String {
             "choices": [{"delta": {"tool_calls": [{"index": index, "id": id, "function": {"name": name, "arguments": ""}, "type": "function"}]}, "index": 0}],
             "object": "chat.completion.chunk",
         }),
-        StreamEvent::ToolCallArgsDelta {
-            index,
-            arguments_delta,
-            ..
-        } => json!({
+        StreamEvent::ToolCallArgsDelta { index, arguments_delta, .. } => json!({
             "choices": [{"delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments_delta}}]}, "index": 0}],
             "object": "chat.completion.chunk",
         }),
-        StreamEvent::ToolCallEnd { .. } => {
-            json!({"choices": [{"delta": {}, "index": 0}], "object": "chat.completion.chunk"})
-        }
-        StreamEvent::Done {
-            usage,
-            finish_reason,
-            incomplete,
-            error_reason: _,
-        } => {
-            let reason = if *incomplete {
-                "length"
-            } else {
-                finish_reason.as_str()
-            };
+        StreamEvent::ToolCallEnd { .. } => json!({"choices": [{"delta": {}, "index": 0}], "object": "chat.completion.chunk"}),
+        StreamEvent::Done { usage, finish_reason, incomplete, error_reason: _ } => {
+            let reason = if *incomplete { "length" } else { finish_reason.as_str() };
             json!({
                 "choices": [{"delta": {}, "index": 0, "finish_reason": reason}],
                 "usage": {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens},
                 "object": "chat.completion.chunk",
             })
-        }
+        },
         StreamEvent::ReasoningDelta { text } => json!({
             "choices": [{"delta": {"reasoning_content": text}, "index": 0}],
             "object": "chat.completion.chunk",
         }),
-        StreamEvent::Error { message, code } => {
-            json!({"error": {"message": message, "code": code}})
-        }
+        StreamEvent::Error { message, code } => json!({"error": {"message": message, "code": code}}),
         _ => json!({"choices": [{"delta": {}, "index": 0}]}),
     };
 
@@ -218,10 +184,7 @@ impl DeepSeekNormalizer {
 
     /// Feed text content through think-tag and DSML parsers.
     /// Returns enriched events (TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgsDelta, ToolCallEnd).
-    pub fn feed_text(
-        &mut self,
-        text: &str,
-    ) -> Result<Vec<StreamEvent>, crate::model_error::ModelError> {
+    pub fn feed_text(&mut self, text: &str) -> Result<Vec<StreamEvent>, crate::model_error::ModelError> {
         if text.is_empty() {
             return Ok(vec![]);
         }
@@ -242,8 +205,7 @@ impl DeepSeekNormalizer {
                                     id: inv.id.clone(),
                                     name: inv.name.clone(),
                                 });
-                                let args_str =
-                                    serde_json::to_string(&inv.arguments).unwrap_or_default();
+                                let args_str = serde_json::to_string(&inv.arguments).unwrap_or_default();
                                 enriched.push(StreamEvent::ToolCallArgsDelta {
                                     index: self.tool_index,
                                     arguments_delta: args_str,
@@ -282,9 +244,7 @@ impl DeepSeekNormalizer {
         // Flush any pending text from think tag parser
         if !think_result.reasoning_text.is_empty() && !think_result.complete {
             // Unclosed think tag — emit remaining reasoning
-            events.push(StreamEvent::ReasoningDelta {
-                text: think_result.reasoning_text,
-            });
+            events.push(StreamEvent::ReasoningDelta { text: think_result.reasoning_text });
         }
 
         let dsml_err = match self.dsml_parser.finish() {
@@ -380,11 +340,7 @@ pub struct StreamAssembler {
 
 impl StreamAssembler {
     pub fn new() -> Self {
-        Self {
-            partial_tools: HashMap::new(),
-            full_text: String::new(),
-            full_reasoning: String::new(),
-        }
+        Self { partial_tools: HashMap::new(), full_text: String::new(), full_reasoning: String::new() }
     }
 
     /// Feed a raw SSE event into the assembler.
@@ -404,47 +360,23 @@ impl StreamAssembler {
             StreamEvent::ToolCallStart { index, id, name } => {
                 // Tolerant assembly: name/id may arrive in later chunk.
                 // Merge with existing entry rather than overwriting.
-                let entry = self.partial_tools.entry(index).or_insert(PartialToolCall {
-                    id: String::new(),
-                    name: String::new(),
-                    arguments: String::new(),
-                });
-                if !id.is_empty() {
-                    entry.id = id;
-                }
-                if !name.is_empty() {
-                    entry.name = name;
-                }
+                let entry = self.partial_tools.entry(index).or_insert(PartialToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+                if !id.is_empty() { entry.id = id; }
+                if !name.is_empty() { entry.name = name; }
                 vec![]
             }
-            StreamEvent::ToolCallArgsDelta {
-                index,
-                arguments_delta,
-                ..
-            } => {
+            StreamEvent::ToolCallArgsDelta { index, arguments_delta, .. } => {
                 // Tolerant assembly: args delta may arrive before ToolCallStart.
                 // Create partial entry on first args delta even without start.
-                let ptc = self.partial_tools.entry(index).or_insert(PartialToolCall {
-                    id: String::new(),
-                    name: String::new(),
-                    arguments: String::new(),
-                });
+                let ptc = self.partial_tools.entry(index).or_insert(PartialToolCall { id: String::new(), name: String::new(), arguments: String::new() });
                 ptc.arguments.push_str(&arguments_delta);
                 vec![]
             }
             StreamEvent::ToolCallEnd { index } => {
                 let mut events = Vec::new();
                 if let Some(ptc) = self.partial_tools.remove(&index) {
-                    events.push(StreamEvent::ToolCallStart {
-                        index,
-                        id: ptc.id.clone(),
-                        name: ptc.name.clone(),
-                    });
-                    events.push(StreamEvent::ToolCallArgsDelta {
-                        index,
-                        arguments_delta: ptc.arguments.clone(),
-                        call_id: ptc.id.clone(),
-                    });
+                    events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
+                    events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments.clone(), call_id: ptc.id.clone() });
                 }
                 events.push(StreamEvent::ToolCallEnd { index });
                 events
@@ -469,13 +401,10 @@ impl StreamAssembler {
     /// Unlike flush(), this consumes state (takes text/reasoning).
     pub fn finish(&mut self) -> (AssembledContent, Vec<StreamEvent>) {
         let events = self.flush();
-        (
-            AssembledContent {
-                text: std::mem::take(&mut self.full_text),
-                reasoning: std::mem::take(&mut self.full_reasoning),
-            },
-            events,
-        )
+        (AssembledContent {
+            text: std::mem::take(&mut self.full_text),
+            reasoning: std::mem::take(&mut self.full_reasoning),
+        }, events)
     }
 
     /// Graceful flush — completes any partially assembled tool calls and
@@ -488,29 +417,15 @@ impl StreamAssembler {
         indices.sort();
         for &index in &indices {
             if let Some(ptc) = self.partial_tools.remove(&index) {
-                events.push(StreamEvent::ToolCallStart {
-                    index,
-                    id: ptc.id.clone(),
-                    name: ptc.name.clone(),
-                });
-                events.push(StreamEvent::ToolCallArgsDelta {
-                    index,
-                    arguments_delta: ptc.arguments.clone(),
-                    call_id: ptc.id.clone(),
-                });
+                events.push(StreamEvent::ToolCallStart { index, id: ptc.id.clone(), name: ptc.name.clone() });
+                events.push(StreamEvent::ToolCallArgsDelta { index, arguments_delta: ptc.arguments.clone(), call_id: ptc.id.clone() });
                 events.push(StreamEvent::FunctionCallArgumentsDone {
                     call_id: ptc.id.clone(),
                     name: ptc.name.clone(),
                     arguments: ptc.arguments.clone(),
                     output_index: index,
                 });
-                events.push(StreamEvent::OutputItemDone {
-                    index,
-                    item_id: ptc.id.clone(),
-                    item_type: "function_call".into(),
-                    name: ptc.name.clone(),
-                    arguments: ptc.arguments.clone(),
-                });
+                events.push(StreamEvent::OutputItemDone { index, item_id: ptc.id.clone(), item_type: "function_call".into(), name: ptc.name.clone(), arguments: ptc.arguments.clone() });
             }
         }
         events
@@ -530,9 +445,7 @@ pub struct AssembledContent {
 }
 
 impl Default for StreamAssembler {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]
@@ -565,8 +478,7 @@ mod normalizer_tests {
 
     #[test]
     fn test_strip_dsml_only_markup() {
-        let text =
-            "<|DSML|tool_calls|><|DSML|invoke| name=\"t\"></|DSML|invoke|></|DSML|tool_calls|>";
+        let text = "<|DSML|tool_calls|><|DSML|invoke| name=\"t\"></|DSML|invoke|></|DSML|tool_calls|>";
         assert_eq!(strip_dsml_on(text), "");
     }
 
@@ -583,14 +495,10 @@ mod normalizer_tests {
     #[test]
     fn normalizer_extracts_think_tag() {
         let mut norm = DeepSeekNormalizer::new();
-        let events = norm
-            .feed_text("before<think>deep thought</think> after")
-            .unwrap();
+        let events = norm.feed_text("before<think>deep thought</think> after").unwrap();
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], StreamEvent::TextDelta { ref text } if text == "before"));
-        assert!(
-            matches!(events[1], StreamEvent::ReasoningDelta { ref text } if text == "deep thought")
-        );
+        assert!(matches!(events[1], StreamEvent::ReasoningDelta { ref text } if text == "deep thought"));
         assert!(matches!(events[2], StreamEvent::TextDelta { ref text } if text == " after"));
     }
 
@@ -599,16 +507,8 @@ mod normalizer_tests {
         let mut norm = DeepSeekNormalizer::new();
         let text = "use tool <|DSML|tool_calls|><|DSML|invoke| name=\"read\"><|DSML|parameter| name=\"path\" string=\"true\">/x</|DSML|parameter|></|DSML|invoke|></|DSML|tool_calls|>";
         let events = norm.feed_text(text).unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { .. }))
-        );
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { .. })));
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { .. })));
     }
 
     #[test]
@@ -622,19 +522,10 @@ mod normalizer_tests {
     fn normalizer_multiple_chunks() {
         let mut norm = DeepSeekNormalizer::new();
         let e1 = norm.feed_text("hello<think>deep").unwrap();
-        assert!(
-            e1.iter()
-                .any(|e| matches!(e, StreamEvent::ReasoningDelta { .. }))
-        );
+        assert!(e1.iter().any(|e| matches!(e, StreamEvent::ReasoningDelta { .. })));
         let e2 = norm.feed_text(" thought</think>done").unwrap();
-        assert!(
-            e2.iter()
-                .any(|e| matches!(e, StreamEvent::ReasoningDelta { text } if text == " thought"))
-        );
-        assert!(
-            e2.iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "done"))
-        );
+        assert!(e2.iter().any(|e| matches!(e, StreamEvent::ReasoningDelta { text } if text == " thought")));
+        assert!(e2.iter().any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "done")));
     }
 }
 
@@ -680,10 +571,7 @@ mod normalizer_partial_tests {
     #[test]
     fn test_sse_parser_data_line() {
         let mut parser = SseEventParser::new();
-        let event = parser
-            .feed_line("data: {\"key\":\"val\"}")
-            .unwrap()
-            .unwrap();
+        let event = parser.feed_line("data: {\"key\":\"val\"}").unwrap().unwrap();
         assert!(!event.is_done);
         assert_eq!(event.data, "{\"key\":\"val\"}");
     }
@@ -699,10 +587,7 @@ mod normalizer_partial_tests {
     fn test_sse_parser_event_type() {
         let mut parser = SseEventParser::new();
         parser.feed_line("event: response.text.delta").unwrap();
-        let event = parser
-            .feed_line("data: {\"delta\":\"hello\"}")
-            .unwrap()
-            .unwrap();
+        let event = parser.feed_line("data: {\"delta\":\"hello\"}").unwrap().unwrap();
         assert_eq!(event.event_type.as_deref(), Some("response.text.delta"));
     }
 
@@ -716,42 +601,17 @@ mod normalizer_partial_tests {
 
 #[cfg(test)]
 mod assembler_tests {
-    use super::super::canonical::Usage;
     use super::*;
+    use super::super::canonical::Usage;
 
     #[test]
     fn assembles_tool_call_from_deltas() {
         let mut asm = StreamAssembler::new();
-        assert!(
-            asm.feed(StreamEvent::ToolCallStart {
-                index: 0,
-                id: "tc1".into(),
-                name: "grep".into()
-            })
-            .is_empty()
-        );
-        assert!(
-            asm.feed(StreamEvent::ToolCallArgsDelta {
-                index: 0,
-                arguments_delta: r#"{"pa"#.into(),
-                call_id: "tc1".into()
-            })
-            .is_empty()
-        );
-        assert!(
-            asm.feed(StreamEvent::ToolCallArgsDelta {
-                index: 0,
-                arguments_delta: r#"ttern":"foo"}"#.into(),
-                call_id: "tc1".into()
-            })
-            .is_empty()
-        );
+        assert!(asm.feed(StreamEvent::ToolCallStart { index: 0, id: "tc1".into(), name: "grep".into() }).is_empty());
+        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into(), call_id: "tc1".into() }).is_empty());
+        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"ttern":"foo"}"#.into(), call_id: "tc1".into() }).is_empty());
         let events = asm.feed(StreamEvent::ToolCallEnd { index: 0 });
-        assert_eq!(
-            events.len(),
-            3,
-            "should emit ToolCallStart + complete ToolCallArgsDelta + ToolCallEnd"
-        );
+        assert_eq!(events.len(), 3, "should emit ToolCallStart + complete ToolCallArgsDelta + ToolCallEnd");
         assert!(matches!(events[0], StreamEvent::ToolCallStart { .. }));
         assert!(matches!(events[1], StreamEvent::ToolCallArgsDelta { .. }));
         assert!(matches!(events[2], StreamEvent::ToolCallEnd { index: 0 }));
@@ -760,80 +620,34 @@ mod assembler_tests {
     #[test]
     fn text_passes_through_immediately() {
         let mut asm = StreamAssembler::new();
-        let events = asm.feed(StreamEvent::TextDelta {
-            text: "hello ".into(),
-        });
+        let events = asm.feed(StreamEvent::TextDelta { text: "hello ".into() });
         assert_eq!(events.len(), 1, "text should pass through immediately");
-        let events = asm.feed(StreamEvent::TextDelta {
-            text: "world".into(),
-        });
+        let events = asm.feed(StreamEvent::TextDelta { text: "world".into() });
         assert_eq!(events.len(), 1, "text should pass through immediately");
     }
 
     #[test]
     fn incomplete_tool_recovered_on_finish() {
         let mut asm = StreamAssembler::new();
-        assert!(
-            asm.feed(StreamEvent::ToolCallStart {
-                index: 0,
-                id: "tc1".into(),
-                name: "grep".into()
-            })
-            .is_empty()
-        );
-        assert!(
-            asm.feed(StreamEvent::ToolCallArgsDelta {
-                index: 0,
-                arguments_delta: r#"{"pa"#.into(),
-                call_id: "tc1".into()
-            })
-            .is_empty()
-        );
+        assert!(asm.feed(StreamEvent::ToolCallStart { index: 0, id: "tc1".into(), name: "grep".into() }).is_empty());
+        assert!(asm.feed(StreamEvent::ToolCallArgsDelta { index: 0, arguments_delta: r#"{"pa"#.into(), call_id: "tc1".into() }).is_empty());
         // Done arrives before ToolCallEnd — partial tool should survive in assembler
-        let done_events = asm.feed(StreamEvent::Done {
-            usage: Usage::default(),
-            finish_reason: "stop".into(),
-            incomplete: false,
-            error_reason: None,
-        });
-        assert!(
-            done_events.is_empty(),
-            "Done passes through without clearing"
-        );
+        let done_events = asm.feed(StreamEvent::Done { usage: Usage::default(), finish_reason: "stop".into(), incomplete: false, error_reason: None });
+        assert!(done_events.is_empty(), "Done passes through without clearing");
         // finish()/flush() should recover the partial tool
         let (_content, events) = asm.finish();
-        assert_eq!(
-            events.len(),
-            4,
-            "flush emits ToolCallStart + ToolCallArgsDelta + FunctionCallArgumentsDone + OutputItemDone"
-        );
-        assert!(matches!(
-            events[0],
-            StreamEvent::ToolCallStart { index: 0, .. }
-        ));
-        assert!(matches!(
-            events[1],
-            StreamEvent::ToolCallArgsDelta { index: 0, .. }
-        ));
-        assert!(matches!(
-            events[2],
-            StreamEvent::FunctionCallArgumentsDone { .. }
-        ));
+        assert_eq!(events.len(), 4, "flush emits ToolCallStart + ToolCallArgsDelta + FunctionCallArgumentsDone + OutputItemDone");
+        assert!(matches!(events[0], StreamEvent::ToolCallStart { index: 0, .. }));
+        assert!(matches!(events[1], StreamEvent::ToolCallArgsDelta { index: 0, .. }));
+        assert!(matches!(events[2], StreamEvent::FunctionCallArgumentsDone { .. }));
         assert!(matches!(events[3], StreamEvent::OutputItemDone { .. }));
     }
 
     #[test]
     fn error_clears_state() {
         let mut asm = StreamAssembler::new();
-        asm.feed(StreamEvent::ToolCallStart {
-            index: 0,
-            id: "tc1".into(),
-            name: "grep".into(),
-        });
-        let events = asm.feed(StreamEvent::Error {
-            message: "timeout".into(),
-            code: None,
-        });
+        asm.feed(StreamEvent::ToolCallStart { index: 0, id: "tc1".into(), name: "grep".into() });
+        let events = asm.feed(StreamEvent::Error { message: "timeout".into(), code: None });
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], StreamEvent::Error { .. }));
     }

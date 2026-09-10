@@ -107,9 +107,7 @@ impl ResourceRef {
     pub fn identity(&self) -> String {
         match self {
             Self::File { path, .. } => format!("file:{path}"),
-            Self::Symbol {
-                file_path, symbol, ..
-            } => format!("symbol:{file_path}::{symbol}"),
+            Self::Symbol { file_path, symbol, .. } => format!("symbol:{file_path}::{symbol}"),
             Self::ToolResult { call_id, .. } => format!("tool:{call_id}"),
             Self::Artifact { artifact_id, .. } => format!("artifact:{artifact_id}"),
             Self::Environment { key, .. } => format!("env:{key}"),

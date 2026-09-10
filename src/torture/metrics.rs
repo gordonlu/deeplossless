@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Runtime metrics collected during protocol compatibility testing.
 /// Shared between proxy operations (writers) and mock server (reader at completion).

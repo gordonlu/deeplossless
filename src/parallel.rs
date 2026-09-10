@@ -77,6 +77,7 @@ impl SpanMode {
             Self::Join => "join",
         }
     }
+
 }
 
 impl FromStr for SpanMode {
@@ -246,9 +247,7 @@ impl ForkJoinTracker {
             .iter()
             .filter(|tc| seen_ids.insert(&tc.call_id))
             .map(|tc| {
-                let span = parent_span
-                    .child(SpanMode::Parallel)
-                    .with_group(gid.clone());
+                let span = parent_span.child(SpanMode::Parallel).with_group(gid.clone());
                 ParallelBranch {
                     span_id: span.span_id,
                     tool_name: tc.name.clone(),
@@ -294,12 +293,7 @@ impl ForkJoinTracker {
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
             || self.is_expired()
-            || self.branches.iter().all(|b| {
-                matches!(
-                    b.status,
-                    BranchStatus::Completed | BranchStatus::Failed | BranchStatus::TimedOut
-                )
-            })
+            || self.branches.iter().all(|b| matches!(b.status, BranchStatus::Completed | BranchStatus::Failed | BranchStatus::TimedOut))
     }
 
     /// Check if governance says we should proceed despite incomplete state.
@@ -307,12 +301,7 @@ impl ForkJoinTracker {
         let terminal = self
             .branches
             .iter()
-            .filter(|b| {
-                matches!(
-                    b.status,
-                    BranchStatus::Completed | BranchStatus::Failed | BranchStatus::TimedOut
-                )
-            })
+            .filter(|b| matches!(b.status, BranchStatus::Completed | BranchStatus::Failed | BranchStatus::TimedOut))
             .count();
         if terminal == 0 && !self.is_expired() {
             return false;
@@ -324,10 +313,7 @@ impl ForkJoinTracker {
             return true;
         }
         if self.governance.fail_fast
-            && self
-                .branches
-                .iter()
-                .any(|b| matches!(b.status, BranchStatus::Failed | BranchStatus::TimedOut))
+            && self.branches.iter().any(|b| matches!(b.status, BranchStatus::Failed | BranchStatus::TimedOut))
         {
             return true;
         }
@@ -342,10 +328,7 @@ impl ForkJoinTracker {
         exec_unit_id: i64,
         outcome: &crate::execution::ExecutionOutcome,
     ) -> anyhow::Result<()> {
-        let branch = self
-            .branches
-            .iter_mut()
-            .find(|b| b.tool_call_id == tool_call_id)
+        let branch = self.branches.iter_mut().find(|b| b.tool_call_id == tool_call_id)
             .ok_or_else(|| anyhow::anyhow!("unknown tool_call_id: {tool_call_id}"))?;
         let new_status = match outcome {
             crate::execution::ExecutionOutcome::Success
@@ -357,12 +340,8 @@ impl ForkJoinTracker {
         };
         // Validate state transition: only Pending/Running can transition to terminal
         match (branch.status, new_status) {
-            (BranchStatus::Pending, _) | (BranchStatus::Running, _) => {}
-            _ => anyhow::bail!(
-                "invalid branch transition: {:?} -> {:?}",
-                branch.status,
-                new_status
-            ),
+            (BranchStatus::Pending, _) | (BranchStatus::Running, _) => {},
+            _ => anyhow::bail!("invalid branch transition: {:?} -> {:?}", branch.status, new_status),
         }
         branch.execution_unit_id = Some(exec_unit_id);
         branch.status = new_status;
@@ -375,13 +354,10 @@ impl ForkJoinTracker {
     /// Mark a branch as failed due to timeout.
     /// Returns an error if `tool_call_id` is unknown or the branch is already terminal.
     pub fn timeout_branch(&mut self, tool_call_id: &str) -> anyhow::Result<()> {
-        let branch = self
-            .branches
-            .iter_mut()
-            .find(|b| b.tool_call_id == tool_call_id)
+        let branch = self.branches.iter_mut().find(|b| b.tool_call_id == tool_call_id)
             .ok_or_else(|| anyhow::anyhow!("unknown tool_call_id: {tool_call_id}"))?;
         match branch.status {
-            BranchStatus::Pending | BranchStatus::Running => {}
+            BranchStatus::Pending | BranchStatus::Running => {},
             _ => anyhow::bail!("cannot timeout branch in state {:?}", branch.status),
         }
         branch.status = BranchStatus::TimedOut;
@@ -483,18 +459,9 @@ mod tests {
     fn fork_creates_one_branch_per_tool() {
         let parent = ExecutionSpan::root_span();
         let tools = vec![
-            ToolCallInfo {
-                name: "grep".into(),
-                call_id: "call_1".into(),
-            },
-            ToolCallInfo {
-                name: "read_file".into(),
-                call_id: "call_2".into(),
-            },
-            ToolCallInfo {
-                name: "list_files".into(),
-                call_id: "call_3".into(),
-            },
+            ToolCallInfo { name: "grep".into(), call_id: "call_1".into() },
+            ToolCallInfo { name: "read_file".into(), call_id: "call_2".into() },
+            ToolCallInfo { name: "list_files".into(), call_id: "call_3".into() },
         ];
         let tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
         assert_eq!(tracker.branch_count(), 3);
@@ -542,27 +509,16 @@ mod tests {
     fn tracker_completion_all_success() {
         let parent = ExecutionSpan::root_span();
         let tools = vec![
-            ToolCallInfo {
-                name: "grep".into(),
-                call_id: "c1".into(),
-            },
-            ToolCallInfo {
-                name: "read".into(),
-                call_id: "c2".into(),
-            },
+            ToolCallInfo { name: "grep".into(), call_id: "c1".into() },
+            ToolCallInfo { name: "read".into(), call_id: "c2".into() },
         ];
-        let mut tracker =
-            ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
+        let mut tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
         assert!(!tracker.is_completed());
 
-        tracker
-            .record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success)
-            .unwrap();
+        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success).unwrap();
         assert!(!tracker.is_completed());
 
-        tracker
-            .record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success)
-            .unwrap();
+        tracker.record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success).unwrap();
         assert!(tracker.is_completed());
     }
 
@@ -570,24 +526,11 @@ mod tests {
     fn tracker_fail_fast_completes_on_failure() {
         let parent = ExecutionSpan::root_span();
         let tools = vec![
-            ToolCallInfo {
-                name: "grep".into(),
-                call_id: "c1".into(),
-            },
-            ToolCallInfo {
-                name: "read".into(),
-                call_id: "c2".into(),
-            },
+            ToolCallInfo { name: "grep".into(), call_id: "c1".into() },
+            ToolCallInfo { name: "read".into(), call_id: "c2".into() },
         ];
-        let mut tracker =
-            ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
-        tracker
-            .record_branch_result(
-                "c1",
-                10,
-                &crate::execution::ExecutionOutcome::RecoveredFailure,
-            )
-            .unwrap();
+        let mut tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
+        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::RecoveredFailure).unwrap();
 
         // With fail_fast=true, should_force_join returns true
         assert!(tracker.should_force_join());
@@ -597,23 +540,12 @@ mod tests {
     fn tracker_happens_before_edges_correct() {
         let parent = ExecutionSpan::root_span();
         let tools = vec![
-            ToolCallInfo {
-                name: "grep".into(),
-                call_id: "c1".into(),
-            },
-            ToolCallInfo {
-                name: "read".into(),
-                call_id: "c2".into(),
-            },
+            ToolCallInfo { name: "grep".into(), call_id: "c1".into() },
+            ToolCallInfo { name: "read".into(), call_id: "c2".into() },
         ];
-        let mut tracker =
-            ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
-        tracker
-            .record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success)
-            .unwrap();
-        tracker
-            .record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success)
-            .unwrap();
+        let mut tracker = ForkJoinTracker::fork(1, 0, &parent, &tools, ParallelGovernance::default());
+        tracker.record_branch_result("c1", 10, &crate::execution::ExecutionOutcome::Success).unwrap();
+        tracker.record_branch_result("c2", 11, &crate::execution::ExecutionOutcome::Success).unwrap();
 
         let edges = tracker.complete(42).unwrap();
         // Both branches happen-before the join node
@@ -635,10 +567,7 @@ mod tests {
 
     #[test]
     fn span_mode_roundtrip() {
-        assert_eq!(
-            SpanMode::from_str("sequential").unwrap(),
-            SpanMode::Sequential
-        );
+        assert_eq!(SpanMode::from_str("sequential").unwrap(), SpanMode::Sequential);
         assert_eq!(SpanMode::from_str("parallel").unwrap(), SpanMode::Parallel);
         assert_eq!(SpanMode::from_str("join").unwrap(), SpanMode::Join);
         assert!(SpanMode::from_str("unknown").is_err());

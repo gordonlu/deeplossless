@@ -13,19 +13,9 @@ use crate::summarizer::{Summarizer, SummarizerConfig};
 
 /// Commands sent from the main thread to the compaction worker.
 pub enum CompactCommand {
-    CompressGroup {
-        conv_id: i64,
-        node_ids: Vec<i64>,
-    },
-    ReviewAndCompact {
-        conv_id: i64,
-        context_window: usize,
-    },
-    SlideAndCompact {
-        conv_id: i64,
-        window_size: usize,
-        context_window: usize,
-    },
+    CompressGroup { conv_id: i64, node_ids: Vec<i64> },
+    ReviewAndCompact { conv_id: i64, context_window: usize },
+    SlideAndCompact { conv_id: i64, window_size: usize, context_window: usize },
     Ping,
     Shutdown,
 }
@@ -48,14 +38,8 @@ pub enum CompactEvent {
         latency_ms: u64,
         failures: u32,
     },
-    BelowThreshold {
-        conv_id: i64,
-        reason: &'static str,
-    },
-    Error {
-        message: String,
-        conv_id: Option<i64>,
-    },
+    BelowThreshold { conv_id: i64, reason: &'static str },
+    Error { message: String, conv_id: Option<i64> },
     Pong,
 }
 
@@ -157,9 +141,7 @@ pub struct CompactionPlan {
 impl CompactionPlan {
     pub fn should_compact(&self) -> bool {
         self.budget.is_critical(self.total_tokens)
-            || self
-                .budget
-                .is_advisory(self.total_tokens, self.leaves.len())
+            || self.budget.is_advisory(self.total_tokens, self.leaves.len())
     }
 }
 
@@ -189,7 +171,8 @@ impl CompactionPlanner {
         let leaves = dag.get_leaves(conv_id)?;
         let leaf_count = leaves.len();
         if leaf_count < 2
-            || (!budget.is_critical(total_tokens) && !budget.is_advisory(total_tokens, leaf_count))
+            || (!budget.is_critical(total_tokens)
+                && !budget.is_advisory(total_tokens, leaf_count))
         {
             return Ok(CompactionPlan {
                 conv_id,
@@ -200,13 +183,7 @@ impl CompactionPlanner {
             });
         }
         let groups = self.build_groups(&leaves, &budget);
-        Ok(CompactionPlan {
-            conv_id,
-            budget,
-            groups,
-            leaves,
-            total_tokens,
-        })
+        Ok(CompactionPlan { conv_id, budget, groups, leaves, total_tokens })
     }
 
     pub fn is_dirty(
@@ -226,10 +203,7 @@ impl CompactionPlanner {
             .iter()
             .enumerate()
             .map(|(position, node)| {
-                (
-                    node.id,
-                    self.score_leaf(node, position, leaves.len(), novelty),
-                )
+                (node.id, self.score_leaf(node, position, leaves.len(), novelty))
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -367,11 +341,7 @@ impl Compactor {
         if let Some(tasks) = tasks {
             tasks.register_handle(worker);
         }
-        Self {
-            cmd_tx,
-            event_rx,
-            config,
-        }
+        Self { cmd_tx, event_rx, config }
     }
 
     pub async fn command(&mut self, cmd: CompactCommand) -> Option<CompactEvent> {
@@ -436,11 +406,7 @@ fn novelty_score(texts: &[&str]) -> f64 {
             }
         }
     }
-    if pairs == 0 {
-        1.0
-    } else {
-        total / pairs as f64
-    }
+    if pairs == 0 { 1.0 } else { total / pairs as f64 }
 }
 
 fn compress_code_blocks(text: &str) -> String {
@@ -546,14 +512,8 @@ async fn compact_worker(
             CompactCommand::Ping => {
                 let _ = event_tx.send(CompactEvent::Pong).await;
             }
-            CompactCommand::ReviewAndCompact {
-                conv_id,
-                context_window,
-            } => {
-                if last_compacted
-                    .get(&conv_id)
-                    .is_some_and(|t| t.elapsed() < COOLDOWN)
-                {
+            CompactCommand::ReviewAndCompact { conv_id, context_window } => {
+                if last_compacted.get(&conv_id).is_some_and(|t| t.elapsed() < COOLDOWN) {
                     continue;
                 }
                 last_compacted.insert(conv_id, std::time::Instant::now());
@@ -566,38 +526,24 @@ async fn compact_worker(
                     &event_tx,
                     &mut last_leaf_counts,
                 );
-                if tokio::time::timeout(Duration::from_secs(120), future)
-                    .await
-                    .is_err()
-                {
-                    let _ = event_tx
-                        .send(CompactEvent::Error {
-                            message: "review_and_compact timed out after 120s".into(),
-                            conv_id: Some(conv_id),
-                        })
-                        .await;
+                if tokio::time::timeout(Duration::from_secs(120), future).await.is_err() {
+                    let _ = event_tx.send(CompactEvent::Error {
+                        message: "review_and_compact timed out after 120s".into(),
+                        conv_id: Some(conv_id),
+                    }).await;
                 }
             }
             CompactCommand::CompressGroup { conv_id, node_ids } => {
                 last_leaf_counts.remove(&conv_id);
                 let future = compress_group(conv_id, node_ids, &dag, &summarizer, &event_tx);
-                if tokio::time::timeout(Duration::from_secs(120), future)
-                    .await
-                    .is_err()
-                {
-                    let _ = event_tx
-                        .send(CompactEvent::Error {
-                            message: "compress_group timed out after 120s".into(),
-                            conv_id: Some(conv_id),
-                        })
-                        .await;
+                if tokio::time::timeout(Duration::from_secs(120), future).await.is_err() {
+                    let _ = event_tx.send(CompactEvent::Error {
+                        message: "compress_group timed out after 120s".into(),
+                        conv_id: Some(conv_id),
+                    }).await;
                 }
             }
-            CompactCommand::SlideAndCompact {
-                conv_id,
-                window_size,
-                context_window,
-            } => {
+            CompactCommand::SlideAndCompact { conv_id, window_size, context_window } => {
                 let future = slide_and_compact(
                     conv_id,
                     window_size,
@@ -608,16 +554,11 @@ async fn compact_worker(
                     &event_tx,
                     &mut last_leaf_counts,
                 );
-                if tokio::time::timeout(Duration::from_secs(120), future)
-                    .await
-                    .is_err()
-                {
-                    let _ = event_tx
-                        .send(CompactEvent::Error {
-                            message: "slide_and_compact timed out after 120s".into(),
-                            conv_id: Some(conv_id),
-                        })
-                        .await;
+                if tokio::time::timeout(Duration::from_secs(120), future).await.is_err() {
+                    let _ = event_tx.send(CompactEvent::Error {
+                        message: "slide_and_compact timed out after 120s".into(),
+                        conv_id: Some(conv_id),
+                    }).await;
                 }
             }
         }
@@ -636,18 +577,14 @@ async fn review_and_compact(
     let prev = last_leaf_counts.get(&conv_id).copied().unwrap_or(0);
     match planner.is_dirty(dag, conv_id, prev) {
         Ok(false) => {
-            let _ = event_tx
-                .send(CompactEvent::below(conv_id, "dirty_skip"))
-                .await;
+            let _ = event_tx.send(CompactEvent::below(conv_id, "dirty_skip")).await;
             return;
         }
         Err(error) => {
-            let _ = event_tx
-                .send(CompactEvent::Error {
-                    message: format!("planner: {error}"),
-                    conv_id: Some(conv_id),
-                })
-                .await;
+            let _ = event_tx.send(CompactEvent::Error {
+                message: format!("planner: {error}"),
+                conv_id: Some(conv_id),
+            }).await;
             return;
         }
         Ok(true) => {}
@@ -655,20 +592,16 @@ async fn review_and_compact(
     let plan = match planner.plan(dag, conv_id, context_window) {
         Ok(plan) => plan,
         Err(error) => {
-            let _ = event_tx
-                .send(CompactEvent::Error {
-                    message: format!("plan: {error}"),
-                    conv_id: Some(conv_id),
-                })
-                .await;
+            let _ = event_tx.send(CompactEvent::Error {
+                message: format!("plan: {error}"),
+                conv_id: Some(conv_id),
+            }).await;
             return;
         }
     };
     last_leaf_counts.insert(conv_id, plan.leaves.len());
     if !plan.should_compact() {
-        let _ = event_tx
-            .send(CompactEvent::below(conv_id, "budget_ok"))
-            .await;
+        let _ = event_tx.send(CompactEvent::below(conv_id, "budget_ok")).await;
         return;
     }
     let start = std::time::Instant::now();
@@ -681,11 +614,7 @@ async fn review_and_compact(
             .iter()
             .filter(|leaf| group.node_ids.contains(&leaf.id))
             .collect();
-        let text = selected
-            .iter()
-            .map(|n| n.summary.as_str())
-            .collect::<Vec<_>>()
-            .join("\n---\n");
+        let text = selected.iter().map(|n| n.summary.as_str()).collect::<Vec<_>>().join("\n---\n");
         let old_tc = selected.iter().map(|n| n.token_count).sum();
         if text.is_empty() {
             continue;
@@ -694,37 +623,31 @@ async fn review_and_compact(
             Ok((saved, node_id, level, summarizer_level, latency_ms)) => {
                 groups += 1;
                 tokens_saved += saved;
-                let _ = event_tx
-                    .send(CompactEvent::GroupCompressed {
-                        conv_id,
-                        new_node_id: node_id,
-                        level,
-                        tokens_saved: saved,
-                        latency_ms,
-                        summarizer_level,
-                    })
-                    .await;
+                let _ = event_tx.send(CompactEvent::GroupCompressed {
+                    conv_id,
+                    new_node_id: node_id,
+                    level,
+                    tokens_saved: saved,
+                    latency_ms,
+                    summarizer_level,
+                }).await;
             }
             Err(error) => {
                 failures += 1;
-                let _ = event_tx
-                    .send(CompactEvent::Error {
-                        message: error.to_string(),
-                        conv_id: Some(conv_id),
-                    })
-                    .await;
+                let _ = event_tx.send(CompactEvent::Error {
+                    message: error.to_string(),
+                    conv_id: Some(conv_id),
+                }).await;
             }
         }
     }
-    let _ = event_tx
-        .send(CompactEvent::CompactionCompleted {
-            conv_id,
-            groups,
-            tokens_saved,
-            latency_ms: start.elapsed().as_millis() as u64,
-            failures,
-        })
-        .await;
+    let _ = event_tx.send(CompactEvent::CompactionCompleted {
+        conv_id,
+        groups,
+        tokens_saved,
+        latency_ms: start.elapsed().as_millis() as u64,
+        failures,
+    }).await;
 }
 
 async fn compress_group(
@@ -737,34 +660,25 @@ async fn compress_group(
     let leaves = match dag.get_leaves(conv_id) {
         Ok(leaves) => leaves,
         Err(error) => {
-            let _ = event_tx
-                .send(CompactEvent::Error {
-                    message: format!("get_leaves: {error}"),
-                    conv_id: Some(conv_id),
-                })
-                .await;
+            let _ = event_tx.send(CompactEvent::Error {
+                message: format!("get_leaves: {error}"),
+                conv_id: Some(conv_id),
+            }).await;
             return;
         }
     };
     let selected: Vec<&DagNode> = leaves.iter().filter(|n| node_ids.contains(&n.id)).collect();
     if selected.len() < 2 {
-        let _ = event_tx
-            .send(CompactEvent::below(conv_id, "too_few_nodes"))
-            .await;
+        let _ = event_tx.send(CompactEvent::below(conv_id, "too_few_nodes")).await;
         return;
     }
-    let text = selected
-        .iter()
-        .map(|n| n.summary.as_str())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
+    let text = selected.iter().map(|n| n.summary.as_str()).collect::<Vec<_>>().join("\n---\n");
     let old_tc = selected.iter().map(|n| n.token_count).sum();
     emit_compression_result(
         conv_id,
         do_compress_inner(conv_id, &node_ids, &text, old_tc, dag, summarizer).await,
         event_tx,
-    )
-    .await;
+    ).await;
 }
 
 async fn slide_and_compact(
@@ -780,32 +694,26 @@ async fn slide_and_compact(
     let plan = match planner.plan_slide_window(dag, conv_id, window_size, context_window) {
         Ok(plan) => plan,
         Err(error) => {
-            let _ = event_tx
-                .send(CompactEvent::Error {
-                    message: format!("plan: {error}"),
-                    conv_id: Some(conv_id),
-                })
-                .await;
+            let _ = event_tx.send(CompactEvent::Error {
+                message: format!("plan: {error}"),
+                conv_id: Some(conv_id),
+            }).await;
             return;
         }
     };
     last_leaf_counts.insert(conv_id, plan.leaves.len());
     if !plan.should_compact() {
-        let _ = event_tx
-            .send(CompactEvent::below(conv_id, "windowsize_ok"))
-            .await;
+        let _ = event_tx.send(CompactEvent::below(conv_id, "windowsize_ok")).await;
         return;
     }
     for group in &plan.groups {
         let leaves = match dag.get_leaves(conv_id) {
             Ok(leaves) => leaves,
             Err(error) => {
-                let _ = event_tx
-                    .send(CompactEvent::Error {
-                        message: format!("get_leaves: {error}"),
-                        conv_id: Some(conv_id),
-                    })
-                    .await;
+                let _ = event_tx.send(CompactEvent::Error {
+                    message: format!("get_leaves: {error}"),
+                    conv_id: Some(conv_id),
+                }).await;
                 continue;
             }
         };
@@ -813,18 +721,13 @@ async fn slide_and_compact(
             .iter()
             .filter(|leaf| group.node_ids.contains(&leaf.id))
             .collect();
-        let text = selected
-            .iter()
-            .map(|n| n.summary.as_str())
-            .collect::<Vec<_>>()
-            .join("\n---\n");
+        let text = selected.iter().map(|n| n.summary.as_str()).collect::<Vec<_>>().join("\n---\n");
         let old_tc = selected.iter().map(|n| n.token_count).sum();
         emit_compression_result(
             conv_id,
             do_compress_inner(conv_id, &group.node_ids, &text, old_tc, dag, summarizer).await,
             event_tx,
-        )
-        .await;
+        ).await;
     }
 }
 
@@ -835,24 +738,20 @@ async fn emit_compression_result(
 ) {
     match result {
         Ok((tokens_saved, new_node_id, level, summarizer_level, latency_ms)) => {
-            let _ = event_tx
-                .send(CompactEvent::GroupCompressed {
-                    conv_id,
-                    new_node_id,
-                    level,
-                    tokens_saved,
-                    latency_ms,
-                    summarizer_level,
-                })
-                .await;
+            let _ = event_tx.send(CompactEvent::GroupCompressed {
+                conv_id,
+                new_node_id,
+                level,
+                tokens_saved,
+                latency_ms,
+                summarizer_level,
+            }).await;
         }
         Err(error) => {
-            let _ = event_tx
-                .send(CompactEvent::Error {
-                    message: error.to_string(),
-                    conv_id: Some(conv_id),
-                })
-                .await;
+            let _ = event_tx.send(CompactEvent::Error {
+                message: error.to_string(),
+                conv_id: Some(conv_id),
+            }).await;
         }
     }
 }
@@ -904,9 +803,14 @@ async fn do_compress_inner(
         &snippets,
     )?;
 
-    if let Err(error) =
-        validate_committed_compaction(dag, node_ids, &source_hashes, &node, text, &exact_source)
-    {
+    if let Err(error) = validate_committed_compaction(
+        dag,
+        node_ids,
+        &source_hashes,
+        &node,
+        text,
+        &exact_source,
+    ) {
         let _ = dag.db().purge_dag_node(node.id);
         return Err(error);
     }
@@ -919,8 +823,7 @@ async fn do_compress_inner(
         "exact_source": exact_source,
         "closed_loop_validated": true,
     });
-    dag.db()
-        .update_node_reasoning(node.id, &reasoning.to_string())?;
+    dag.db().update_node_reasoning(node.id, &reasoning.to_string())?;
 
     Ok((
         old_tc - tc,
@@ -948,9 +851,11 @@ fn validate_committed_compaction(
     }
 
     for (source_id, expected_hash) in source_hashes {
-        let source = dag.get_node(*source_id)?.ok_or_else(|| {
-            anyhow::anyhow!("closed-loop compaction rejected: source node {source_id} disappeared")
-        })?;
+        let source = dag
+            .get_node(*source_id)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "closed-loop compaction rejected: source node {source_id} disappeared"
+            ))?;
         if source.semantic_hash != *expected_hash {
             anyhow::bail!(
                 "closed-loop compaction rejected: source node {source_id} changed during compaction"
@@ -981,10 +886,11 @@ async fn compactor_supervisor(
     summarizer: Summarizer,
     config: CompactorConfig,
 ) {
-    let result =
-        std::panic::AssertUnwindSafe(compact_worker(cmd_rx, event_tx, dag, summarizer, config))
-            .catch_unwind()
-            .await;
+    let result = std::panic::AssertUnwindSafe(compact_worker(
+        cmd_rx, event_tx, dag, summarizer, config,
+    ))
+    .catch_unwind()
+    .await;
     if let Err(error) = result {
         tracing::error!(target:"deeplossless::compactor", ?error, "compactor worker panicked");
     }
@@ -1027,16 +933,8 @@ mod tests {
 
     #[test]
     fn novelty_detects_redundant_vs_unique() {
-        let redundant = [
-            "hello world foo bar",
-            "hello world foo baz",
-            "hello world bar baz",
-        ];
-        let unique = [
-            "quantum computing advances",
-            "my cat ate breakfast",
-            "RFC 9457 error format",
-        ];
+        let redundant = ["hello world foo bar", "hello world foo baz", "hello world bar baz"];
+        let unique = ["quantum computing advances", "my cat ate breakfast", "RFC 9457 error format"];
         assert!(novelty_score(&unique) > novelty_score(&redundant));
     }
 
@@ -1057,9 +955,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let conv_id = db
-            .find_or_create_conversation("compaction:test", "test")
-            .unwrap();
+        let conv_id = db.find_or_create_conversation("compaction:test", "test").unwrap();
         let dag = DagEngine::builder().max_level(3).build(db.clone());
         let a = dag.insert_leaf(conv_id, "alpha exact", 10).unwrap();
         let b = dag.insert_leaf(conv_id, "beta exact", 10).unwrap();
@@ -1073,13 +969,24 @@ mod tests {
             )
             .unwrap();
         let summary = dag
-            .compress_group_with_snippets(conv_id, &[a.id, b.id], "alpha beta", 2, 1, &[])
+            .compress_group_with_snippets(
+                conv_id,
+                &[a.id, b.id],
+                "alpha beta",
+                2,
+                1,
+                &[],
+            )
             .unwrap();
-        let hashes = vec![
-            (a.id, a.semantic_hash.clone()),
-            (b.id, b.semantic_hash.clone()),
-        ];
-        validate_committed_compaction(&dag, &[a.id, b.id], &hashes, &summary, text, &source)
-            .unwrap();
+        let hashes = vec![(a.id, a.semantic_hash.clone()), (b.id, b.semantic_hash.clone())];
+        validate_committed_compaction(
+            &dag,
+            &[a.id, b.id],
+            &hashes,
+            &summary,
+            text,
+            &source,
+        )
+        .unwrap();
     }
 }

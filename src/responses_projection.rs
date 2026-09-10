@@ -6,15 +6,15 @@
 //! creating level-0 leaves. Loss is allowed only after a recoverable source has
 //! been established.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::AppState;
 use crate::compactor::CompactCommand;
-use crate::dynamic_context::{DynamicContextHints, assemble_dynamic_context};
+use crate::dynamic_context::{assemble_dynamic_context, DynamicContextHints};
 use crate::ground_truth::{FactStatus, PlanFactDependency, ResourceRef};
 use crate::ground_truth_store::GroundTruthStore;
 use crate::pipeline::render_dag_context;
 use crate::typed_fact_producer::AutoFactReport;
+use crate::AppState;
 
 const CONTEXT_WINDOW: usize = 1_000_000;
 
@@ -93,14 +93,18 @@ pub async fn project_and_assemble(
                 if !matches!(role, "user" | "assistant" | "tool") {
                     continue;
                 }
-                let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+                let content = message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if content.is_empty() {
                     continue;
                 }
                 let raw_tokens = crate::tokenizer::count(content) + dag.config().token_overhead;
-                let token_count =
-                    crate::tokenizer::correct(raw_tokens, dag.config().token_correction_factor)
-                        as i64;
+                let token_count = crate::tokenizer::correct(
+                    raw_tokens,
+                    dag.config().token_correction_factor,
+                ) as i64;
                 dag.insert_leaf(conv_id, content, token_count)?;
             }
         }
@@ -173,7 +177,11 @@ pub async fn project_and_assemble(
     }
 }
 
-fn build_dynamic_hints(state: &AppState, session_id: &str, conv_id: i64) -> DynamicContextHints {
+fn build_dynamic_hints(
+    state: &AppState,
+    session_id: &str,
+    conv_id: i64,
+) -> DynamicContextHints {
     let active = state.storage.db.get_active_plan(conv_id).ok().flatten();
     let (plan_id, goal, current_step) = match active {
         Some((plan_id, goal, pending, _completed, _assumptions)) => {
@@ -190,7 +198,9 @@ fn build_dynamic_hints(state: &AppState, session_id: &str, conv_id: i64) -> Dyna
 
     if let Ok(cycle) = state.runtime.cycle.lock() {
         for path in &cycle.context_delta {
-            semantic.changed_resources.insert(format!("file:{path}"));
+            semantic
+                .changed_resources
+                .insert(format!("file:{path}"));
         }
     }
 
@@ -231,7 +241,10 @@ fn project_messages(items: &[Value]) -> Vec<Value> {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
             "message" | "" => {
-                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let role = item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user");
                 let content = content_text(item.get("content"));
                 if !content.is_empty() {
                     messages.push(json!({"role":role,"content":content}));
@@ -281,7 +294,11 @@ fn dependency_applies_to_step(dependency: &PlanFactDependency, step_index: usize
     dependency.step_index.is_none() || dependency.step_index == Some(step_index)
 }
 
-fn evaluate_typed_plan(state: &AppState, session_id: &str, conv_id: i64) -> (Option<String>, bool) {
+fn evaluate_typed_plan(
+    state: &AppState,
+    session_id: &str,
+    conv_id: i64,
+) -> (Option<String>, bool) {
     let Some((plan_id, goal, pending_value, completed_value, _legacy_assumptions)) =
         state.storage.db.get_active_plan(conv_id).ok().flatten()
     else {
@@ -373,7 +390,10 @@ fn evaluate_typed_plan(state: &AppState, session_id: &str, conv_id: i64) -> (Opt
         .map(|fact| fact.id.clone())
         .collect();
 
-    if !missing.is_empty() || !stale.is_empty() || !unbacked.is_empty() || !unrecoverable.is_empty()
+    if !missing.is_empty()
+        || !stale.is_empty()
+        || !unbacked.is_empty()
+        || !unrecoverable.is_empty()
     {
         let reason = format!(
             "typed plan dependencies invalid: missing={missing:?}, stale={stale:?}, unbacked={unbacked:?}, unrecoverable={unrecoverable:?}"

@@ -53,11 +53,7 @@ impl RuntimeStateProjection {
     /// Call events in logical_seq order for correct results.
     pub fn apply(&mut self, event: &RuntimeEvent) {
         match event {
-            RuntimeEvent::ToolCallCompleted {
-                tokens_spent,
-                cache_hit,
-                ..
-            } => {
+            RuntimeEvent::ToolCallCompleted { tokens_spent, cache_hit, .. } => {
                 self.tokens_spent += tokens_spent;
                 self.completions += 1;
                 if *cache_hit {
@@ -66,9 +62,7 @@ impl RuntimeStateProjection {
                 // Success resets the failure streak
                 self.failure_streak = 0;
             }
-            RuntimeEvent::ToolCallFailed {
-                error_signature, ..
-            } => {
+            RuntimeEvent::ToolCallFailed { error_signature, .. } => {
                 self.failures += 1;
                 self.failure_streak = self.failure_streak.saturating_add(1);
                 self.last_failure_signature = Some(error_signature.clone());
@@ -119,9 +113,7 @@ impl RuntimeStateView {
     pub fn retry_count(events: &[RuntimeEvent], conv_id: i64) -> usize {
         events
             .iter()
-            .filter(
-                |e| matches!(e, RuntimeEvent::RetryScheduled { conv_id: c, .. } if *c == conv_id),
-            )
+            .filter(|e| matches!(e, RuntimeEvent::RetryScheduled { conv_id: c, .. } if *c == conv_id))
             .count()
     }
 
@@ -139,17 +131,8 @@ impl RuntimeStateView {
         events
             .iter()
             .filter_map(|e| {
-                if let RuntimeEvent::ToolCallCompleted {
-                    conv_id: c,
-                    tokens_spent,
-                    ..
-                } = e
-                {
-                    if *c == conv_id {
-                        Some(*tokens_spent)
-                    } else {
-                        None
-                    }
+                if let RuntimeEvent::ToolCallCompleted { conv_id: c, tokens_spent, .. } = e {
+                    if *c == conv_id { Some(*tokens_spent) } else { None }
                 } else {
                     None
                 }
@@ -179,9 +162,7 @@ impl RuntimeStateView {
     pub fn failure_count(events: &[RuntimeEvent], conv_id: i64) -> usize {
         events
             .iter()
-            .filter(
-                |e| matches!(e, RuntimeEvent::ToolCallFailed { conv_id: c, .. } if *c == conv_id),
-            )
+            .filter(|e| matches!(e, RuntimeEvent::ToolCallFailed { conv_id: c, .. } if *c == conv_id))
             .count()
     }
 
@@ -199,21 +180,9 @@ impl RuntimeStateView {
         events
             .iter()
             .filter_map(|e| match e {
-                RuntimeEvent::ToolCallScheduled {
-                    tool_call_id: tcid,
-                    attempt,
-                    ..
-                } if tcid == tool_call_id => Some(*attempt),
-                RuntimeEvent::ToolCallCompleted {
-                    tool_call_id: tcid,
-                    attempt,
-                    ..
-                } if tcid == tool_call_id => Some(*attempt),
-                RuntimeEvent::ToolCallFailed {
-                    tool_call_id: tcid,
-                    attempt,
-                    ..
-                } if tcid == tool_call_id => Some(*attempt),
+                RuntimeEvent::ToolCallScheduled { tool_call_id: tcid, attempt, .. } if tcid == tool_call_id => Some(*attempt),
+                RuntimeEvent::ToolCallCompleted { tool_call_id: tcid, attempt, .. } if tcid == tool_call_id => Some(*attempt),
+                RuntimeEvent::ToolCallFailed { tool_call_id: tcid, attempt, .. } if tcid == tool_call_id => Some(*attempt),
                 _ => None,
             })
             .max()
@@ -256,8 +225,10 @@ impl RuntimeStateView {
     /// Extract execution ordering: events sorted by logical_seq for a conversation.
     /// Useful for replay reconstruction and ordering validation.
     pub fn ordered_by_seq(events: &[RuntimeEvent], conv_id: i64) -> Vec<&RuntimeEvent> {
-        let mut filtered: Vec<&RuntimeEvent> =
-            events.iter().filter(|e| e.conv_id() == conv_id).collect();
+        let mut filtered: Vec<&RuntimeEvent> = events
+            .iter()
+            .filter(|e| e.conv_id() == conv_id)
+            .collect();
         filtered.sort_by_key(|e| e.logical_seq());
         filtered
     }
@@ -278,7 +249,9 @@ impl RuntimeStateView {
 
         let et = Self::total_tokens(events, conv_id);
         if et != expected_tokens {
-            diffs.push(format!("tokens: events={et}, projection={expected_tokens}"));
+            diffs.push(format!(
+                "tokens: events={et}, projection={expected_tokens}"
+            ));
         }
 
         let ec = Self::cache_hit_count(events, conv_id);
@@ -310,18 +283,8 @@ impl RuntimeStateView {
         events
             .iter()
             .filter_map(|e| {
-                if let RuntimeEvent::ToolCallCompleted {
-                    conv_id: c,
-                    cache_hit: true,
-                    tool_name,
-                    ..
-                } = e
-                {
-                    if *c == conv_id {
-                        Some(tool_name.clone())
-                    } else {
-                        None
-                    }
+                if let RuntimeEvent::ToolCallCompleted { conv_id: c, cache_hit: true, tool_name, .. } = e {
+                    if *c == conv_id { Some(tool_name.clone()) } else { None }
                 } else {
                     None
                 }
@@ -355,14 +318,10 @@ impl RuntimeStateView {
         ));
 
         let pending = Self::is_cancellation_pending(events, conv_id);
-        out.push_str(&format!(
-            "Cancellation: {}\n",
-            if pending { "PENDING" } else { "resolved" }
-        ));
+        out.push_str(&format!("Cancellation: {}\n", if pending { "PENDING" } else { "resolved" }));
 
         // Invariant violations
-        let cancel_issues =
-            crate::runtime_invariants::check_cancellation_well_formed(events, conv_id);
+        let cancel_issues = crate::runtime_invariants::check_cancellation_well_formed(events, conv_id);
         if !cancel_issues.is_empty() {
             out.push_str("\n── INVARIANT VIOLATIONS ──\n");
             for issue in &cancel_issues {
@@ -379,9 +338,7 @@ impl RuntimeStateView {
             }
         }
         if seq_violations > 0 {
-            out.push_str(&format!(
-                "  ✗ {seq_violations} logical_seq ordering violations\n"
-            ));
+            out.push_str(&format!("  ✗ {seq_violations} logical_seq ordering violations\n"));
         }
 
         // Timeline
@@ -390,8 +347,7 @@ impl RuntimeStateView {
 
         // Retry details
         out.push_str("\n── Retry Summary ──\n");
-        let retry_targets: std::collections::HashSet<String> = events
-            .iter()
+        let retry_targets: std::collections::HashSet<String> = events.iter()
             .filter_map(|e| match e {
                 RuntimeEvent::RetryScheduled { tool_call_id, .. } => Some(tool_call_id.clone()),
                 _ => None,
@@ -436,8 +392,7 @@ impl RuntimeStateView {
     pub fn explain(events: &[RuntimeEvent]) -> String {
         let mut out = String::new();
         // Collect tool calls by tcid for grouping
-        let mut tool_calls: std::collections::BTreeMap<String, Vec<&RuntimeEvent>> =
-            std::collections::BTreeMap::new();
+        let mut tool_calls: std::collections::BTreeMap<String, Vec<&RuntimeEvent>> = std::collections::BTreeMap::new();
         let mut meta_events: Vec<&RuntimeEvent> = Vec::new();
 
         for e in events {
@@ -462,20 +417,14 @@ impl RuntimeStateView {
         // Print execution headers
         for e in &meta_events {
             match e {
-                RuntimeEvent::ExecutionStarted {
-                    conv_id, profile, ..
-                } => {
+                RuntimeEvent::ExecutionStarted { conv_id, profile, .. } => {
                     out.push_str(&format!("Execution conv={conv_id} profile={profile}\n"));
                 }
                 RuntimeEvent::CancellationRequested { source, .. } => {
                     out.push_str(&format!("  ⚡ CANCEL {source:?}\n"));
                 }
                 RuntimeEvent::CancellationCompleted { clean, .. } => {
-                    let label = if *clean {
-                        "clean shutdown"
-                    } else {
-                        "FORCED shutdown"
-                    };
+                    let label = if *clean { "clean shutdown" } else { "FORCED shutdown" };
                     out.push_str(&format!("    • {label}\n"));
                 }
                 _ => {}
@@ -487,9 +436,7 @@ impl RuntimeStateView {
             let mut prev_attempt: u32 = 0;
             for e in evs {
                 match e {
-                    RuntimeEvent::ToolCallScheduled {
-                        tool_name, attempt, ..
-                    } => {
+                    RuntimeEvent::ToolCallScheduled { tool_name, attempt, .. } => {
                         if *attempt > prev_attempt {
                             out.push_str(&format!("    → retry [attempt={attempt}]"));
                         } else {
@@ -497,37 +444,19 @@ impl RuntimeStateView {
                         }
                         prev_attempt = *attempt;
                     }
-                    RuntimeEvent::ToolCallCompleted {
-                        tokens_spent,
-                        cache_hit,
-                        ..
-                    } => {
+                    RuntimeEvent::ToolCallCompleted { tokens_spent, cache_hit, .. } => {
                         let ch = if *cache_hit { ", cache" } else { "" };
                         out.push_str(&format!(" ✓ ({tokens_spent} tokens{ch})\n"));
                     }
-                    RuntimeEvent::ToolCallFailed {
-                        error_signature,
-                        retryable,
-                        ..
-                    } => {
-                        let re = if *retryable {
-                            " (retryable)"
-                        } else {
-                            " (fatal)"
-                        };
+                    RuntimeEvent::ToolCallFailed { error_signature, retryable, .. } => {
+                        let re = if *retryable { " (retryable)" } else { " (fatal)" };
                         out.push_str(&format!(" ✗ {error_signature}{re}\n"));
                     }
                     RuntimeEvent::RetryScheduled { suggested_fix, .. } => {
                         out.push_str(&format!(" fix=\"{suggested_fix}\"\n"));
                     }
-                    RuntimeEvent::RetryAborted {
-                        total_attempts,
-                        reason,
-                        ..
-                    } => {
-                        out.push_str(&format!(
-                            "    → ABORTED after {total_attempts} attempts: {reason}\n"
-                        ));
+                    RuntimeEvent::RetryAborted { total_attempts, reason, .. } => {
+                        out.push_str(&format!("    → ABORTED after {total_attempts} attempts: {reason}\n"));
                     }
                     RuntimeEvent::CancellationAcknowledged { span_id, .. } => {
                         out.push_str(&format!("    • {tcid} acknowledged ({span_id})\n"));
@@ -544,87 +473,31 @@ impl RuntimeStateView {
         use std::fmt::Write;
         let mut s = String::new();
         match e {
-            RuntimeEvent::ExecutionStarted {
-                conv_id,
-                logical_seq,
-                profile,
-            } => {
-                write!(
-                    s,
-                    "ExecutionStarted conv={conv_id} seq={logical_seq} profile={profile}"
-                )
-                .unwrap();
+            RuntimeEvent::ExecutionStarted { conv_id, logical_seq, profile } => {
+                write!(s, "ExecutionStarted conv={conv_id} seq={logical_seq} profile={profile}").unwrap();
             }
-            RuntimeEvent::ToolCallScheduled {
-                conv_id,
-                tool_name,
-                tool_call_id,
-                span_id,
-                attempt,
-                ..
-            } => {
+            RuntimeEvent::ToolCallScheduled { conv_id, tool_name, tool_call_id, span_id, attempt, .. } => {
                 write!(s, "ToolCallScheduled conv={conv_id} tool={tool_name} tcid={tool_call_id} span={span_id} attempt={attempt}").unwrap();
             }
-            RuntimeEvent::ToolCallCompleted {
-                conv_id,
-                tool_name,
-                tool_call_id,
-                attempt,
-                tokens_spent,
-                cache_hit,
-                execution_unit_id,
-                ..
-            } => {
+            RuntimeEvent::ToolCallCompleted { conv_id, tool_name, tool_call_id, attempt, tokens_spent, cache_hit, execution_unit_id, .. } => {
                 let ch = if *cache_hit { " (cache)" } else { "" };
                 write!(s, "ToolCallCompleted conv={conv_id} tool={tool_name} tcid={tool_call_id} attempt={attempt} tokens={tokens_spent} unit={execution_unit_id}{ch}").unwrap();
             }
-            RuntimeEvent::ToolCallFailed {
-                conv_id,
-                tool_name,
-                tool_call_id,
-                attempt,
-                error_signature,
-                retryable,
-                execution_unit_id,
-                ..
-            } => {
+            RuntimeEvent::ToolCallFailed { conv_id, tool_name, tool_call_id, attempt, error_signature, retryable, execution_unit_id, .. } => {
                 let re = if *retryable { " retryable" } else { "" };
                 write!(s, "ToolCallFailed conv={conv_id} tool={tool_name} tcid={tool_call_id} attempt={attempt} error={error_signature} unit={execution_unit_id}{re}").unwrap();
             }
-            RuntimeEvent::RetryScheduled {
-                conv_id,
-                tool_call_id,
-                attempt,
-                suggested_fix,
-                ..
-            } => {
+            RuntimeEvent::RetryScheduled { conv_id, tool_call_id, attempt, suggested_fix, .. } => {
                 write!(s, "RetryScheduled conv={conv_id} tcid={tool_call_id} attempt={attempt} fix=\"{suggested_fix}\"").unwrap();
             }
-            RuntimeEvent::RetryAborted {
-                conv_id,
-                tool_call_id,
-                total_attempts,
-                reason,
-                ..
-            } => {
+            RuntimeEvent::RetryAborted { conv_id, tool_call_id, total_attempts, reason, .. } => {
                 write!(s, "RetryAborted conv={conv_id} tcid={tool_call_id} attempts={total_attempts} reason=\"{reason}\"").unwrap();
             }
-            RuntimeEvent::CancellationRequested {
-                conv_id, source, ..
-            } => {
+            RuntimeEvent::CancellationRequested { conv_id, source, .. } => {
                 write!(s, "CancellationRequested conv={conv_id} source={source:?}").unwrap();
             }
-            RuntimeEvent::CancellationAcknowledged {
-                conv_id,
-                tool_call_id,
-                span_id,
-                ..
-            } => {
-                write!(
-                    s,
-                    "CancellationAcknowledged conv={conv_id} tcid={tool_call_id} span={span_id}"
-                )
-                .unwrap();
+            RuntimeEvent::CancellationAcknowledged { conv_id, tool_call_id, span_id, .. } => {
+                write!(s, "CancellationAcknowledged conv={conv_id} tcid={tool_call_id} span={span_id}").unwrap();
             }
             RuntimeEvent::CancellationCompleted { conv_id, clean, .. } => {
                 let cl = if *clean { " clean" } else { " FORCED" };
@@ -641,96 +514,18 @@ mod tests {
 
     fn make_events() -> Vec<RuntimeEvent> {
         vec![
-            RuntimeEvent::ExecutionStarted {
-                conv_id: 1,
-                logical_seq: 1,
-                profile: "efficient".into(),
-            },
-            RuntimeEvent::ToolCallScheduled {
-                conv_id: 1,
-                logical_seq: 2,
-                tool_name: "grep".into(),
-                tool_call_id: "tc_1".into(),
-                span_id: "sp_1".into(),
-                attempt: 1,
-            },
-            RuntimeEvent::ToolCallCompleted {
-                conv_id: 1,
-                logical_seq: 3,
-                tool_name: "grep".into(),
-                tool_call_id: "tc_1".into(),
-                span_id: "sp_1".into(),
-                attempt: 1,
-                tokens_spent: 100,
-                cache_hit: false,
-                execution_unit_id: 10,
-            },
-            RuntimeEvent::ExecutionStarted {
-                conv_id: 2,
-                logical_seq: 4,
-                profile: "efficient".into(),
-            },
-            RuntimeEvent::ToolCallScheduled {
-                conv_id: 2,
-                logical_seq: 5,
-                tool_name: "read_file".into(),
-                tool_call_id: "tc_2".into(),
-                span_id: "sp_2".into(),
-                attempt: 1,
-            },
-            RuntimeEvent::ToolCallFailed {
-                conv_id: 2,
-                logical_seq: 6,
-                tool_name: "read_file".into(),
-                tool_call_id: "tc_2".into(),
-                span_id: "sp_2".into(),
-                attempt: 1,
-                error_signature: "ENOENT".into(),
-                retryable: true,
-                execution_unit_id: 0,
-            },
-            RuntimeEvent::RetryScheduled {
-                conv_id: 2,
-                logical_seq: 7,
-                tool_call_id: "tc_2".into(),
-                attempt: 2,
-                suggested_fix: "check path".into(),
-            },
-            RuntimeEvent::ToolCallScheduled {
-                conv_id: 2,
-                logical_seq: 8,
-                tool_name: "read_file".into(),
-                tool_call_id: "tc_2".into(),
-                span_id: "sp_3".into(),
-                attempt: 2,
-            },
-            RuntimeEvent::ToolCallCompleted {
-                conv_id: 2,
-                logical_seq: 9,
-                tool_name: "read_file".into(),
-                tool_call_id: "tc_2".into(),
-                span_id: "sp_3".into(),
-                attempt: 2,
-                tokens_spent: 50,
-                cache_hit: true,
-                execution_unit_id: 11,
-            },
-            RuntimeEvent::CancellationRequested {
-                conv_id: 2,
-                logical_seq: 10,
-                source: crate::runtime_events::CancellationSource::Shutdown,
-            },
-            RuntimeEvent::CancellationAcknowledged {
-                conv_id: 2,
-                logical_seq: 11,
-                tool_call_id: "tc_pending".into(),
-                span_id: "sp_4".into(),
-            },
-            RuntimeEvent::CancellationCompleted {
-                conv_id: 2,
-                logical_seq: 12,
-                clean: true,
-            },
+            RuntimeEvent::ExecutionStarted { conv_id: 1, logical_seq: 1, profile: "efficient".into() },
+            RuntimeEvent::ToolCallScheduled { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "tc_1".into(), span_id: "sp_1".into(), attempt: 1 },
+            RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "tc_1".into(), span_id: "sp_1".into(), attempt: 1, tokens_spent: 100, cache_hit: false, execution_unit_id: 10 },
+            RuntimeEvent::ExecutionStarted { conv_id: 2, logical_seq: 4, profile: "efficient".into() },
+            RuntimeEvent::ToolCallScheduled { conv_id: 2, logical_seq: 5, tool_name: "read_file".into(), tool_call_id: "tc_2".into(), span_id: "sp_2".into(), attempt: 1 },
+            RuntimeEvent::ToolCallFailed { conv_id: 2, logical_seq: 6, tool_name: "read_file".into(), tool_call_id: "tc_2".into(), span_id: "sp_2".into(), attempt: 1, error_signature: "ENOENT".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::RetryScheduled { conv_id: 2, logical_seq: 7, tool_call_id: "tc_2".into(), attempt: 2, suggested_fix: "check path".into() },
+            RuntimeEvent::ToolCallScheduled { conv_id: 2, logical_seq: 8, tool_name: "read_file".into(), tool_call_id: "tc_2".into(), span_id: "sp_3".into(), attempt: 2 },
+            RuntimeEvent::ToolCallCompleted { conv_id: 2, logical_seq: 9, tool_name: "read_file".into(), tool_call_id: "tc_2".into(), span_id: "sp_3".into(), attempt: 2, tokens_spent: 50, cache_hit: true, execution_unit_id: 11 },
+            RuntimeEvent::CancellationRequested { conv_id: 2, logical_seq: 10, source: crate::runtime_events::CancellationSource::Shutdown },
+            RuntimeEvent::CancellationAcknowledged { conv_id: 2, logical_seq: 11, tool_call_id: "tc_pending".into(), span_id: "sp_4".into() },
+            RuntimeEvent::CancellationCompleted { conv_id: 2, logical_seq: 12, clean: true },
         ]
     }
 
@@ -762,39 +557,9 @@ mod tests {
     fn projection_failure_streak_resets_on_success() {
         // Two failures followed by a success → streak = 0
         let events = vec![
-            RuntimeEvent::ToolCallFailed {
-                conv_id: 1,
-                logical_seq: 1,
-                tool_name: "grep".into(),
-                tool_call_id: "t1".into(),
-                span_id: "s1".into(),
-                attempt: 1,
-                error_signature: "E1".into(),
-                retryable: true,
-                execution_unit_id: 0,
-            },
-            RuntimeEvent::ToolCallFailed {
-                conv_id: 1,
-                logical_seq: 2,
-                tool_name: "grep".into(),
-                tool_call_id: "t2".into(),
-                span_id: "s2".into(),
-                attempt: 1,
-                error_signature: "E2".into(),
-                retryable: true,
-                execution_unit_id: 0,
-            },
-            RuntimeEvent::ToolCallCompleted {
-                conv_id: 1,
-                logical_seq: 3,
-                tool_name: "grep".into(),
-                tool_call_id: "t3".into(),
-                span_id: "s3".into(),
-                attempt: 1,
-                tokens_spent: 10,
-                cache_hit: false,
-                execution_unit_id: 0,
-            },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, error_signature: "E2".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "t3".into(), span_id: "s3".into(), attempt: 1, tokens_spent: 10, cache_hit: false, execution_unit_id: 0 },
         ];
         let proj = RuntimeStateProjection::from_events(&events);
         assert_eq!(proj.failures, 2);
@@ -805,39 +570,9 @@ mod tests {
     #[test]
     fn projection_failure_streak_increments_on_consecutive_failures() {
         let events = vec![
-            RuntimeEvent::ToolCallFailed {
-                conv_id: 1,
-                logical_seq: 1,
-                tool_name: "grep".into(),
-                tool_call_id: "t1".into(),
-                span_id: "s1".into(),
-                attempt: 1,
-                error_signature: "E1".into(),
-                retryable: true,
-                execution_unit_id: 0,
-            },
-            RuntimeEvent::ToolCallFailed {
-                conv_id: 1,
-                logical_seq: 2,
-                tool_name: "grep".into(),
-                tool_call_id: "t2".into(),
-                span_id: "s2".into(),
-                attempt: 1,
-                error_signature: "E2".into(),
-                retryable: true,
-                execution_unit_id: 0,
-            },
-            RuntimeEvent::ToolCallFailed {
-                conv_id: 1,
-                logical_seq: 3,
-                tool_name: "grep".into(),
-                tool_call_id: "t3".into(),
-                span_id: "s3".into(),
-                attempt: 1,
-                error_signature: "E3".into(),
-                retryable: true,
-                execution_unit_id: 0,
-            },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, error_signature: "E2".into(), retryable: true, execution_unit_id: 0 },
+            RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "t3".into(), span_id: "s3".into(), attempt: 1, error_signature: "E3".into(), retryable: true, execution_unit_id: 0 },
         ];
         let proj = RuntimeStateProjection::from_events(&events);
         assert_eq!(proj.failures, 3);
@@ -849,46 +584,16 @@ mod tests {
         let mut proj = RuntimeStateProjection::new();
         assert_eq!(proj.tokens_spent, 0);
 
-        proj.apply(&RuntimeEvent::ToolCallCompleted {
-            conv_id: 1,
-            logical_seq: 1,
-            tool_name: "grep".into(),
-            tool_call_id: "t1".into(),
-            span_id: "s1".into(),
-            attempt: 1,
-            tokens_spent: 50,
-            cache_hit: false,
-            execution_unit_id: 0,
-        });
+        proj.apply(&RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, tokens_spent: 50, cache_hit: false, execution_unit_id: 0 });
         assert_eq!(proj.tokens_spent, 50);
         assert_eq!(proj.completions, 1);
 
-        proj.apply(&RuntimeEvent::ToolCallCompleted {
-            conv_id: 1,
-            logical_seq: 2,
-            tool_name: "grep".into(),
-            tool_call_id: "t2".into(),
-            span_id: "s2".into(),
-            attempt: 1,
-            tokens_spent: 25,
-            cache_hit: true,
-            execution_unit_id: 0,
-        });
+        proj.apply(&RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, tokens_spent: 25, cache_hit: true, execution_unit_id: 0 });
         assert_eq!(proj.tokens_spent, 75);
         assert_eq!(proj.cache_hits, 1);
         assert_eq!(proj.completions, 2);
 
-        proj.apply(&RuntimeEvent::ToolCallFailed {
-            conv_id: 1,
-            logical_seq: 3,
-            tool_name: "grep".into(),
-            tool_call_id: "t3".into(),
-            span_id: "s3".into(),
-            attempt: 1,
-            error_signature: "E1".into(),
-            retryable: true,
-            execution_unit_id: 0,
-        });
+        proj.apply(&RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 3, tool_name: "grep".into(), tool_call_id: "t3".into(), span_id: "s3".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 });
         assert_eq!(proj.failures, 1);
         assert_eq!(proj.failure_streak, 1);
     }
@@ -896,28 +601,8 @@ mod tests {
     #[test]
     fn projection_to_metrics_maps_correctly() {
         let mut proj = RuntimeStateProjection::new();
-        proj.apply(&RuntimeEvent::ToolCallCompleted {
-            conv_id: 1,
-            logical_seq: 1,
-            tool_name: "grep".into(),
-            tool_call_id: "t1".into(),
-            span_id: "s1".into(),
-            attempt: 1,
-            tokens_spent: 100,
-            cache_hit: true,
-            execution_unit_id: 0,
-        });
-        proj.apply(&RuntimeEvent::ToolCallFailed {
-            conv_id: 1,
-            logical_seq: 2,
-            tool_name: "grep".into(),
-            tool_call_id: "t2".into(),
-            span_id: "s2".into(),
-            attempt: 1,
-            error_signature: "E1".into(),
-            retryable: true,
-            execution_unit_id: 0,
-        });
+        proj.apply(&RuntimeEvent::ToolCallCompleted { conv_id: 1, logical_seq: 1, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1, tokens_spent: 100, cache_hit: true, execution_unit_id: 0 });
+        proj.apply(&RuntimeEvent::ToolCallFailed { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t2".into(), span_id: "s2".into(), attempt: 1, error_signature: "E1".into(), retryable: true, execution_unit_id: 0 });
 
         let m = proj.to_metrics();
         assert_eq!(m.tokens_spent, 100);
@@ -933,31 +618,10 @@ mod tests {
     #[test]
     fn projection_irrelevant_events_ignored() {
         let events = vec![
-            RuntimeEvent::ExecutionStarted {
-                conv_id: 1,
-                logical_seq: 1,
-                profile: "minimal".into(),
-            },
-            RuntimeEvent::ToolCallScheduled {
-                conv_id: 1,
-                logical_seq: 2,
-                tool_name: "grep".into(),
-                tool_call_id: "t1".into(),
-                span_id: "s1".into(),
-                attempt: 1,
-            },
-            RuntimeEvent::RetryScheduled {
-                conv_id: 1,
-                logical_seq: 3,
-                tool_call_id: "t1".into(),
-                attempt: 2,
-                suggested_fix: "fix".into(),
-            },
-            RuntimeEvent::CancellationRequested {
-                conv_id: 1,
-                logical_seq: 4,
-                source: crate::runtime_events::CancellationSource::Shutdown,
-            },
+            RuntimeEvent::ExecutionStarted { conv_id: 1, logical_seq: 1, profile: "minimal".into() },
+            RuntimeEvent::ToolCallScheduled { conv_id: 1, logical_seq: 2, tool_name: "grep".into(), tool_call_id: "t1".into(), span_id: "s1".into(), attempt: 1 },
+            RuntimeEvent::RetryScheduled { conv_id: 1, logical_seq: 3, tool_call_id: "t1".into(), attempt: 2, suggested_fix: "fix".into() },
+            RuntimeEvent::CancellationRequested { conv_id: 1, logical_seq: 4, source: crate::runtime_events::CancellationSource::Shutdown },
         ];
         let proj = RuntimeStateProjection::from_events(&events);
         assert_eq!(proj.tokens_spent, 0);
@@ -1026,11 +690,9 @@ mod tests {
 
     #[test]
     fn cancellation_pending_without_completion() {
-        let events = vec![RuntimeEvent::CancellationRequested {
-            conv_id: 1,
-            logical_seq: 1,
-            source: crate::runtime_events::CancellationSource::Shutdown,
-        }];
+        let events = vec![
+            RuntimeEvent::CancellationRequested { conv_id: 1, logical_seq: 1, source: crate::runtime_events::CancellationSource::Shutdown },
+        ];
         assert!(RuntimeStateView::is_cancellation_pending(&events, 1));
     }
 
@@ -1049,7 +711,8 @@ mod tests {
     fn projection_parity_check_passes() {
         let events = make_events();
         let diffs = RuntimeStateView::projection_parity_check(
-            &events, 1, 100, // expected_tokens
+            &events, 1,
+            100, // expected_tokens
             0,   // expected_cache_hits
             0,   // expected_failures
             1,   // expected_completions
@@ -1061,7 +724,8 @@ mod tests {
     fn projection_parity_check_detects_mismatch() {
         let events = make_events();
         let diffs = RuntimeStateView::projection_parity_check(
-            &events, 2, 999, // wrong tokens
+            &events, 2,
+            999, // wrong tokens
             0,   // wrong cache_hits
             0,   // wrong failures
             0,   // wrong completions
@@ -1074,10 +738,7 @@ mod tests {
         let events = make_events();
         let failure = RuntimeStateView::last_failure(&events, 2);
         assert!(failure.is_some());
-        if let Some(RuntimeEvent::ToolCallFailed {
-            error_signature, ..
-        }) = failure
-        {
+        if let Some(RuntimeEvent::ToolCallFailed { error_signature, .. }) = failure {
             assert_eq!(error_signature, "ENOENT");
         } else {
             panic!("expected ToolCallFailed");

@@ -116,7 +116,9 @@ pub struct ObservationDiff {
 /// Normalizes backslash→forward slash, removes trailing separators,
 /// and collapses redundant components.
 pub fn canonicalize_path(path: &str) -> String {
-    path.replace('\\', "/").trim_end_matches('/').to_string()
+    path.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// Guess language from file path extension.
@@ -155,38 +157,10 @@ pub fn extract_ast(path: &str, content: &str) -> FileAst {
     let mut declaration_count = 0;
 
     match lang.as_deref() {
-        Some("rust") => extract_rust_ast(
-            content,
-            &mut functions,
-            &mut types,
-            &mut imports,
-            &mut exports,
-            &mut declaration_count,
-        ),
-        Some("python") => extract_python_ast(
-            content,
-            &mut functions,
-            &mut types,
-            &mut imports,
-            &mut exports,
-            &mut declaration_count,
-        ),
-        Some("go") => extract_go_ast(
-            content,
-            &mut functions,
-            &mut types,
-            &mut imports,
-            &mut exports,
-            &mut declaration_count,
-        ),
-        _ => extract_generic_ast(
-            content,
-            &mut functions,
-            &mut types,
-            &mut imports,
-            &mut exports,
-            &mut declaration_count,
-        ),
+        Some("rust") => extract_rust_ast(content, &mut functions, &mut types, &mut imports, &mut exports, &mut declaration_count),
+        Some("python") => extract_python_ast(content, &mut functions, &mut types, &mut imports, &mut exports, &mut declaration_count),
+        Some("go") => extract_go_ast(content, &mut functions, &mut types, &mut imports, &mut exports, &mut declaration_count),
+        _ => extract_generic_ast(content, &mut functions, &mut types, &mut imports, &mut exports, &mut declaration_count),
     }
 
     // Dedup
@@ -195,24 +169,14 @@ pub fn extract_ast(path: &str, content: &str) -> FileAst {
     exports.sort();
     exports.dedup();
 
-    FileAst {
-        language: lang,
-        imports,
-        exports,
-        functions,
-        types,
-        declaration_count,
-    }
+    FileAst { language: lang, imports, exports, functions, types, declaration_count }
 }
 
 /// Rust-specific AST extraction.
 fn extract_rust_ast(
-    content: &str,
-    functions: &mut Vec<FunctionDef>,
-    types: &mut Vec<TypeDef>,
-    imports: &mut Vec<String>,
-    exports: &mut Vec<String>,
-    decl_count: &mut usize,
+    content: &str, functions: &mut Vec<FunctionDef>,
+    types: &mut Vec<TypeDef>, imports: &mut Vec<String>,
+    exports: &mut Vec<String>, decl_count: &mut usize,
 ) {
     let lines: Vec<&str> = content.lines().collect();
     let mut in_block_comment = false;
@@ -244,10 +208,7 @@ fn extract_rust_ast(
         }
 
         // Imports
-        if trimmed.starts_with("use ")
-            || trimmed.starts_with("pub use ")
-            || trimmed.starts_with("pub(crate) use ")
-        {
+        if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") || trimmed.starts_with("pub(crate) use ") {
             let imp = trimmed.trim_end_matches(';').to_string();
             imports.push(imp.clone());
             if imp.starts_with("pub ") {
@@ -259,32 +220,15 @@ fn extract_rust_ast(
         }
 
         // Functions
-        let fn_vis = [
-            "fn ",
-            "pub fn ",
-            "pub async fn ",
-            "async fn ",
-            "pub(crate) fn ",
-            "pub(super) fn ",
-            "unsafe fn ",
-            "pub unsafe fn ",
-            "pub async unsafe fn ",
-            "pub(super) async fn ",
-            "pub(crate) async fn ",
-            "const fn ",
-            "pub const fn ",
-        ];
+        let fn_vis = ["fn ", "pub fn ", "pub async fn ", "async fn ", "pub(crate) fn ", "pub(super) fn ",
+                      "unsafe fn ", "pub unsafe fn ", "pub async unsafe fn ",
+                      "pub(super) async fn ", "pub(crate) async fn ", "const fn ", "pub const fn "];
         if let Some(sig) = fn_vis.iter().find_map(|p| trimmed.strip_prefix(p)) {
             let name = sig.split(['(', '<', ' ']).next().unwrap_or("").to_string();
             if !name.is_empty() && !name.starts_with('_') {
                 let line_start = i + 1;
                 let line_end = find_block_end(&lines[i..]) + i;
-                functions.push(FunctionDef {
-                    name: name.clone(),
-                    signature: trimmed.to_string(),
-                    line_start,
-                    line_end,
-                });
+                functions.push(FunctionDef { name: name.clone(), signature: trimmed.to_string(), line_start, line_end });
                 if trimmed.starts_with("pub ") {
                     exports.push(name);
                 }
@@ -295,48 +239,19 @@ fn extract_rust_ast(
         }
 
         // Types
-        let type_vis = [
-            "struct ",
-            "pub struct ",
-            "enum ",
-            "pub enum ",
-            "trait ",
-            "pub trait ",
-            "union ",
-            "pub union ",
-            "type ",
-            "pub type ",
-        ];
+        let type_vis = ["struct ", "pub struct ", "enum ", "pub enum ", "trait ", "pub trait ",
+                       "union ", "pub union ", "type ", "pub type "];
         if let Some(sig) = type_vis.iter().find_map(|p| trimmed.strip_prefix(p)) {
-            let name = sig
-                .split([' ', '<', ';', '('])
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let name = sig.split([' ', '<', ';', '(']).next().unwrap_or("").to_string();
             if !name.is_empty() {
-                let kind = if trimmed.contains("struct") {
-                    "struct"
-                } else if trimmed.contains("enum") {
-                    "enum"
-                } else if trimmed.contains("trait") {
-                    "trait"
-                } else if trimmed.contains("union") {
-                    "union"
-                } else {
-                    "type_alias"
-                };
+                let kind = if trimmed.contains("struct") { "struct" }
+                    else if trimmed.contains("enum") { "enum" }
+                    else if trimmed.contains("trait") { "trait" }
+                    else if trimmed.contains("union") { "union" }
+                    else { "type_alias" };
                 let line_start = i + 1;
-                let line_end = if trimmed.contains(';') {
-                    i + 1
-                } else {
-                    find_block_end(&lines[i..]) + i
-                };
-                types.push(TypeDef {
-                    name: name.clone(),
-                    kind: kind.to_string(),
-                    line_start,
-                    line_end,
-                });
+                let line_end = if trimmed.contains(';') { i + 1 } else { find_block_end(&lines[i..]) + i };
+                types.push(TypeDef { name: name.clone(), kind: kind.to_string(), line_start, line_end });
                 if trimmed.starts_with("pub ") {
                     exports.push(name);
                 }
@@ -347,20 +262,14 @@ fn extract_rust_ast(
         }
 
         // Mod declarations
-        if let Some(mod_name) = trimmed
-            .strip_prefix("mod ")
-            .and_then(|s| s.strip_suffix(';'))
-        {
+        if let Some(mod_name) = trimmed.strip_prefix("mod ").and_then(|s| s.strip_suffix(';')) {
             exports.push(mod_name.trim().to_string());
             *decl_count += 1;
         }
 
         // Const/static
-        if trimmed.starts_with("const ")
-            || trimmed.starts_with("pub const ")
-            || trimmed.starts_with("static ")
-            || trimmed.starts_with("pub static ")
-        {
+        if trimmed.starts_with("const ") || trimmed.starts_with("pub const ")
+            || trimmed.starts_with("static ") || trimmed.starts_with("pub static ") {
             *decl_count += 1;
         }
 
@@ -370,12 +279,9 @@ fn extract_rust_ast(
 
 /// Python-specific AST extraction.
 fn extract_python_ast(
-    content: &str,
-    functions: &mut Vec<FunctionDef>,
-    types: &mut Vec<TypeDef>,
-    imports: &mut Vec<String>,
-    _exports: &mut Vec<String>,
-    decl_count: &mut usize,
+    content: &str, functions: &mut Vec<FunctionDef>,
+    types: &mut Vec<TypeDef>, imports: &mut Vec<String>,
+    _exports: &mut Vec<String>, decl_count: &mut usize,
 ) {
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
@@ -396,20 +302,14 @@ fn extract_python_ast(
         }
 
         // Functions (def)
-        if let Some(sig) = trimmed
-            .strip_prefix("def ")
+        if let Some(sig) = trimmed.strip_prefix("def ")
             .or_else(|| trimmed.strip_prefix("async def "))
         {
             let name = sig.split(['(', ' ']).next().unwrap_or("").to_string();
             if !name.is_empty() && !name.starts_with('_') {
                 let line_start = i + 1;
                 let line_end = find_python_block_end(&lines[i..]) + i;
-                functions.push(FunctionDef {
-                    name,
-                    signature: trimmed.to_string(),
-                    line_start,
-                    line_end,
-                });
+                functions.push(FunctionDef { name, signature: trimmed.to_string(), line_start, line_end });
                 *decl_count += 1;
             }
             i += 1;
@@ -422,12 +322,7 @@ fn extract_python_ast(
             if !name.is_empty() {
                 let line_start = i + 1;
                 let line_end = find_python_block_end(&lines[i..]) + i;
-                types.push(TypeDef {
-                    name,
-                    kind: "class".into(),
-                    line_start,
-                    line_end,
-                });
+                types.push(TypeDef { name, kind: "class".into(), line_start, line_end });
                 *decl_count += 1;
             }
             i += 1;
@@ -440,12 +335,9 @@ fn extract_python_ast(
 
 /// Go-specific AST extraction.
 fn extract_go_ast(
-    content: &str,
-    functions: &mut Vec<FunctionDef>,
-    types: &mut Vec<TypeDef>,
-    imports: &mut Vec<String>,
-    exports: &mut Vec<String>,
-    decl_count: &mut usize,
+    content: &str, functions: &mut Vec<FunctionDef>,
+    types: &mut Vec<TypeDef>, imports: &mut Vec<String>,
+    exports: &mut Vec<String>, decl_count: &mut usize,
 ) {
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
@@ -469,15 +361,8 @@ fn extract_go_ast(
             let is_exported = name.starts_with(char::is_uppercase);
             let line_start = i + 1;
             let line_end = find_block_end(&lines[i..]) + i;
-            functions.push(FunctionDef {
-                name: name.clone(),
-                signature: trimmed.to_string(),
-                line_start,
-                line_end,
-            });
-            if is_exported {
-                exports.push(name);
-            }
+            functions.push(FunctionDef { name: name.clone(), signature: trimmed.to_string(), line_start, line_end });
+            if is_exported { exports.push(name); }
             *decl_count += 1;
             i += 1;
             continue;
@@ -487,17 +372,8 @@ fn extract_go_ast(
             let name = sig.split([' ', '<']).next().unwrap_or("").to_string();
             let kind = sig.split(' ').nth(1).unwrap_or("type").to_string();
             let line_start = i + 1;
-            let line_end = if trimmed.contains(';') {
-                i + 1
-            } else {
-                find_block_end(&lines[i..]) + i
-            };
-            types.push(TypeDef {
-                name,
-                kind,
-                line_start,
-                line_end,
-            });
+            let line_end = if trimmed.contains(';') { i + 1 } else { find_block_end(&lines[i..]) + i };
+            types.push(TypeDef { name, kind, line_start, line_end });
             *decl_count += 1;
         }
 
@@ -507,43 +383,27 @@ fn extract_go_ast(
 
 /// Generic fallback: detect top-level declarations by indentation heuristics.
 fn extract_generic_ast(
-    content: &str,
-    functions: &mut Vec<FunctionDef>,
-    types: &mut Vec<TypeDef>,
-    imports: &mut Vec<String>,
-    _exports: &mut Vec<String>,
-    decl_count: &mut usize,
+    content: &str, functions: &mut Vec<FunctionDef>,
+    types: &mut Vec<TypeDef>, imports: &mut Vec<String>,
+    _exports: &mut Vec<String>, decl_count: &mut usize,
 ) {
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("//")
-            || trimmed.starts_with('#')
-            || trimmed.starts_with("/*")
-        {
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
             i += 1;
             continue;
         }
 
         // Generic function detection
         if trimmed.contains("function ") || trimmed.starts_with("fn ") {
-            let name = trimmed
-                .split(['(', ' ', '{'])
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+            let name = trimmed.split(['(', ' ', '{']).nth(1).unwrap_or("").to_string();
             if !name.is_empty() {
                 let line_start = i + 1;
                 let line_end = find_block_end(&lines[i..]) + i;
-                functions.push(FunctionDef {
-                    name,
-                    signature: trimmed.to_string(),
-                    line_start,
-                    line_end,
-                });
+                functions.push(FunctionDef { name, signature: trimmed.to_string(), line_start, line_end });
                 *decl_count += 1;
             }
             i += 1;
@@ -551,10 +411,7 @@ fn extract_generic_ast(
         }
 
         // Generic import detection
-        if trimmed.starts_with("import ")
-            || trimmed.starts_with("using ")
-            || trimmed.starts_with("#include")
-        {
+        if trimmed.starts_with("import ") || trimmed.starts_with("using ") || trimmed.starts_with("#include") {
             imports.push(trimmed.to_string());
             *decl_count += 1;
         }
@@ -562,18 +419,9 @@ fn extract_generic_ast(
         // Generic class/struct/interface detection
         for keyword in &["class ", "struct ", "interface ", "enum ", "trait "] {
             if trimmed.starts_with(keyword) {
-                let name = trimmed
-                    .split([' ', '{', ':', '<', '('])
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
+                let name = trimmed.split([' ', '{', ':', '<', '(']).nth(1).unwrap_or("").to_string();
                 if !name.is_empty() {
-                    types.push(TypeDef {
-                        name,
-                        kind: keyword.trim().to_string(),
-                        line_start: i + 1,
-                        line_end: i + 1,
-                    });
+                    types.push(TypeDef { name, kind: keyword.trim().to_string(), line_start: i + 1, line_end: i + 1 });
                     *decl_count += 1;
                 }
                 break;
@@ -591,13 +439,8 @@ fn find_block_end(lines: &[&str]) -> usize {
     for (i, line) in lines.iter().enumerate() {
         for ch in line.chars() {
             match ch {
-                '{' => {
-                    depth += 1;
-                    started = true;
-                }
-                '}' => {
-                    depth -= 1;
-                }
+                '{' => { depth += 1; started = true; }
+                '}' => { depth -= 1; }
                 _ => {}
             }
         }
@@ -610,18 +453,11 @@ fn find_block_end(lines: &[&str]) -> usize {
 
 /// Find the end of a Python indentation-based block.
 fn find_python_block_end(lines: &[&str]) -> usize {
-    if lines.len() <= 1 {
-        return 0;
-    }
+    if lines.len() <= 1 { return 0; }
     // The first line (def/class) ends with ':'
-    let base_indent = lines
-        .get(1)
-        .map(|l| l.len() - l.trim_start().len())
-        .unwrap_or(0);
+    let base_indent = lines.get(1).map(|l| l.len() - l.trim_start().len()).unwrap_or(0);
     for (i, line) in lines.iter().enumerate().skip(2) {
-        if line.trim().is_empty() {
-            continue;
-        }
+        if line.trim().is_empty() { continue; }
         let indent = line.len() - line.trim_start().len();
         if indent <= base_indent && !lines[i].trim().starts_with('#') {
             return i.saturating_sub(1);
@@ -698,67 +534,28 @@ pub fn observe_file(path: &str, content: &str) -> FileObservation {
 pub fn compare_observations(before: &FileObservation, after: &FileObservation) -> ObservationDiff {
     let semantic_hash_changed = before.semantic_hash != after.semantic_hash;
     let content_changed = before.content_hash != after.content_hash;
-    let mut diff = ObservationDiff {
-        changed: content_changed,
-        semantic_hash_changed,
-        ..Default::default()
-    };
+    let mut diff = ObservationDiff { changed: content_changed, semantic_hash_changed, ..Default::default() };
 
     // Compare functions
-    let before_fns: std::collections::HashSet<&str> = before
-        .ast
-        .functions
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
-    let after_fns: std::collections::HashSet<&str> = after
-        .ast
-        .functions
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
-    diff.functions_added = after_fns
-        .difference(&before_fns)
-        .map(|s| s.to_string())
-        .collect();
-    diff.functions_removed = before_fns
-        .difference(&after_fns)
-        .map(|s| s.to_string())
-        .collect();
+    let before_fns: std::collections::HashSet<&str> = before.ast.functions.iter().map(|f| f.name.as_str()).collect();
+    let after_fns: std::collections::HashSet<&str> = after.ast.functions.iter().map(|f| f.name.as_str()).collect();
+    diff.functions_added = after_fns.difference(&before_fns).map(|s| s.to_string()).collect();
+    diff.functions_removed = before_fns.difference(&after_fns).map(|s| s.to_string()).collect();
 
     // Compare types
-    let before_types: std::collections::HashSet<&str> =
-        before.ast.types.iter().map(|t| t.name.as_str()).collect();
-    let after_types: std::collections::HashSet<&str> =
-        after.ast.types.iter().map(|t| t.name.as_str()).collect();
-    diff.types_added = after_types
-        .difference(&before_types)
-        .map(|s| s.to_string())
-        .collect();
-    diff.types_removed = before_types
-        .difference(&after_types)
-        .map(|s| s.to_string())
-        .collect();
+    let before_types: std::collections::HashSet<&str> = before.ast.types.iter().map(|t| t.name.as_str()).collect();
+    let after_types: std::collections::HashSet<&str> = after.ast.types.iter().map(|t| t.name.as_str()).collect();
+    diff.types_added = after_types.difference(&before_types).map(|s| s.to_string()).collect();
+    diff.types_removed = before_types.difference(&after_types).map(|s| s.to_string()).collect();
 
     // Compare imports
-    let before_imports: std::collections::HashSet<&str> =
-        before.ast.imports.iter().map(|i| i.as_str()).collect();
-    let after_imports: std::collections::HashSet<&str> =
-        after.ast.imports.iter().map(|i| i.as_str()).collect();
-    diff.imports_added = after_imports
-        .difference(&before_imports)
-        .map(|s| s.to_string())
-        .collect();
-    diff.imports_removed = before_imports
-        .difference(&after_imports)
-        .map(|s| s.to_string())
-        .collect();
+    let before_imports: std::collections::HashSet<&str> = before.ast.imports.iter().map(|i| i.as_str()).collect();
+    let after_imports: std::collections::HashSet<&str> = after.ast.imports.iter().map(|i| i.as_str()).collect();
+    diff.imports_added = after_imports.difference(&before_imports).map(|s| s.to_string()).collect();
+    diff.imports_removed = before_imports.difference(&after_imports).map(|s| s.to_string()).collect();
 
-    diff.changed = content_changed
-        || !diff.functions_added.is_empty()
-        || !diff.functions_removed.is_empty()
-        || !diff.types_added.is_empty()
-        || !diff.types_removed.is_empty();
+    diff.changed = content_changed || !diff.functions_added.is_empty() || !diff.functions_removed.is_empty()
+        || !diff.types_added.is_empty() || !diff.types_removed.is_empty();
 
     diff
 }
@@ -836,21 +633,9 @@ pub trait Handler {
 "#;
         let ast = extract_ast("src/lib.rs", content);
         assert_eq!(ast.types.len(), 3);
-        assert!(
-            ast.types
-                .iter()
-                .any(|t| t.name == "Config" && t.kind == "struct")
-        );
-        assert!(
-            ast.types
-                .iter()
-                .any(|t| t.name == "Status" && t.kind == "enum")
-        );
-        assert!(
-            ast.types
-                .iter()
-                .any(|t| t.name == "Handler" && t.kind == "trait")
-        );
+        assert!(ast.types.iter().any(|t| t.name == "Config" && t.kind == "struct"));
+        assert!(ast.types.iter().any(|t| t.name == "Status" && t.kind == "enum"));
+        assert!(ast.types.iter().any(|t| t.name == "Handler" && t.kind == "trait"));
     }
 
     #[test]
@@ -879,14 +664,8 @@ class DataProcessor:
         let content2 = "fn main() {\nprintln!(\"hello\");\n}";
         let obs1 = observe_file("src/main.rs", content1);
         let obs2 = observe_file("src/main.rs", content2);
-        assert_eq!(
-            obs1.semantic_hash, obs2.semantic_hash,
-            "whitespace should not affect semantic hash"
-        );
-        assert_ne!(
-            obs1.content_hash, obs2.content_hash,
-            "content hash should differ"
-        );
+        assert_eq!(obs1.semantic_hash, obs2.semantic_hash, "whitespace should not affect semantic hash");
+        assert_ne!(obs1.content_hash, obs2.content_hash, "content hash should differ");
     }
 
     #[test]
@@ -931,10 +710,7 @@ class DataProcessor:
         let content2 = "// different comment\nfn main() {}";
         let obs1 = observe_file("src/lib.rs", content1);
         let obs2 = observe_file("src/lib.rs", content2);
-        assert_eq!(
-            obs1.semantic_hash, obs2.semantic_hash,
-            "comments should not affect semantic hash"
-        );
+        assert_eq!(obs1.semantic_hash, obs2.semantic_hash, "comments should not affect semantic hash");
     }
 
     #[test]

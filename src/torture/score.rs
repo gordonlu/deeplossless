@@ -10,11 +10,7 @@ pub fn print_report(run: &ScenarioRun) {
     eprintln!("  pre_apply_used: {}", run.pre_apply_used);
     eprintln!();
 
-    let score = run
-        .score
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| score_run(run));
+    let score = run.score.as_ref().cloned().unwrap_or_else(|| score_run(run));
     eprintln!("  ── Scores (all 0-20, higher = better) ──");
     eprintln!("  Correctness         {:>5.1}", score.correctness);
     eprintln!("  Verification        {:>5.1}", score.verification);
@@ -34,10 +30,8 @@ pub fn print_report(run: &ScenarioRun) {
     let prep_i = prep.round() as usize;
     let verify_i = verify.round() as usize;
     eprintln!("  ── Agent Profile ──");
-    eprintln!(
-        "  Prep (search+read before edit): {:>2}/10  Verify (tests+reads after edit): {:>2}/10",
-        prep_i, verify_i
-    );
+    eprintln!("  Prep (search+read before edit): {:>2}/10  Verify (tests+reads after edit): {:>2}/10",
+        prep_i, verify_i);
     eprintln!("  Quadrant: {}", classify_agent(&run.events));
     eprintln!();
 }

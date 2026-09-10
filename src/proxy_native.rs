@@ -8,31 +8,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    Json, Router,
     body::Body,
     extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 
-use crate::AppState;
 use crate::event_store::EventType;
 use crate::ground_truth::TruthStream;
 use crate::ground_truth_store::GroundTruthStore;
 use crate::protocol::{ReasoningEffort, ReasoningEffortMode};
+use crate::AppState;
 
 const LOCAL_SESSION_FIELD: &str = "_deeplossless_session_id";
 const STREAM_CHANNEL_CAPACITY: usize = 32;
 static NEXT_EPHEMERAL_SESSION: AtomicU64 = AtomicU64::new(1);
 type SseChunk = Result<axum::body::Bytes, std::convert::Infallible>;
 
-pub(crate) use crate::proxy_legacy::process_events;
 pub use crate::proxy_legacy::upstream_chat_url;
+pub(crate) use crate::proxy_legacy::process_events;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -93,11 +93,7 @@ pub fn upstream_responses_url(upstream: &str) -> String {
 }
 
 fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({"error":{"code":code,"message":message.into()}})),
-    )
-        .into_response()
+    (status, Json(json!({"error":{"code":code,"message":message.into()}}))).into_response()
 }
 
 fn cached_api_key(state: &AppState) -> String {
@@ -323,11 +319,7 @@ fn store_response_and_session(
         .storage
         .session_store
         .replace(session_id, session.clone());
-    if let Err(error) = state
-        .storage
-        .db
-        .store_response_session(session_id, &session)
-    {
+    if let Err(error) = state.storage.db.store_response_session(session_id, &session) {
         tracing::warn!(target:"deeplossless::responses", %session_id, %error, "failed to persist response session");
     }
 }
@@ -462,7 +454,9 @@ fn terminal_response_from_frame(frame: &str) -> Option<Value> {
 /// forwarded to the client.
 fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n");
     let (position, delimiter_len) = match (lf, crlf) {
         (Some(a), Some(b)) if a <= b => (a, 2),
         (Some(_), Some(b)) => (b, 4),
@@ -478,7 +472,9 @@ fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
 async fn responses(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     let request: Value = match serde_json::from_str(&body) {
         Ok(value) => value,
-        Err(error) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", error.to_string()),
+        Err(error) => {
+            return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", error.to_string())
+        }
     };
 
     remember_api_key(&state, &headers);
@@ -552,10 +548,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         .runtime
         .client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", cached_api_key(&state)),
-        )
+        .header("Authorization", format!("Bearer {}", cached_api_key(&state)))
         .header("Content-Type", "application/json")
         .json(&upstream_body)
         .send()
@@ -621,7 +614,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
-                return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", error.to_string());
+                return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", error.to_string())
             }
         };
         let response_value: Value = match serde_json::from_slice(&bytes) {
@@ -631,7 +624,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                     StatusCode::BAD_GATEWAY,
                     "UPSTREAM_ERROR",
                     format!("invalid upstream JSON: {error}"),
-                );
+                )
             }
         };
         let output = response_value

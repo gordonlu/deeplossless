@@ -461,10 +461,7 @@ impl ChatPipeline {
         self.inject_reasoning_content(&mut injected);
 
         // DS4-14: ContextPack importance ordering (default Preserve = no-op)
-        if !matches!(
-            self.context_ordering,
-            crate::context_pack::ImportanceOrdering::Preserve
-        ) {
+        if !matches!(self.context_ordering, crate::context_pack::ImportanceOrdering::Preserve) {
             use crate::context_pack::ContextPack;
             if let Some(msgs) = injected["messages"].as_array_mut() {
                 let mut pack = ContextPack::new(msgs);

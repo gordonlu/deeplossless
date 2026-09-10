@@ -1,22 +1,21 @@
 use axum::{
-    Json, Router,
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    Json, Router, routing::{get, post, delete},
 };
-use futures::FutureExt;
-use futures::StreamExt;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use futures::StreamExt;
+use futures::FutureExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
-use crate::AppState;
 use crate::metrics;
 use crate::protocol::canonical::StreamEvent;
+use crate::AppState;
 
 const STREAM_CHANNEL_CAPACITY: usize = 32;
 const REASONING_CACHE_CAPACITY: usize = 1024;
@@ -32,23 +31,18 @@ struct DoneGuard {
 
 impl DoneGuard {
     fn new(tx: tokio::sync::mpsc::Sender<SseChunk>) -> Self {
-        Self {
-            tx: Some(tx),
-            armed: true,
-        }
+        Self { tx: Some(tx), armed: true }
     }
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
+    fn disarm(&mut self) { self.armed = false; }
 }
 
 impl Drop for DoneGuard {
     fn drop(&mut self) {
         if self.armed {
             if let Some(tx) = self.tx.take() {
-                let _ = tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    "data: [DONE]\n\n",
-                )));
+                let _ = tx.try_send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from("data: [DONE]\n\n"),
+                ));
             }
         }
     }
@@ -56,11 +50,7 @@ impl Drop for DoneGuard {
 
 /// Uniform JSON error envelope: `{"error": {"code": "...", "message": "..."}}`
 fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({"error": {"code": code, "message": message.into()}})),
-    )
-        .into_response()
+    (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
 }
 
 /// Build the upstream Chat Completions URL with auto-detection.
@@ -95,10 +85,7 @@ fn response_session_key_from_previous(state: &AppState, response_id: &str) -> Op
     match state.storage.db.get_response_object(response_id) {
         Ok(Some(resp)) => {
             let key = response_session_key_from_object(&resp);
-            state
-                .storage
-                .response_store
-                .insert(response_id.to_string(), resp);
+            state.storage.response_store.insert(response_id.to_string(), resp);
             key
         }
         Ok(None) => None,
@@ -164,9 +151,7 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
     match tokio::time::timeout(
         std::time::Duration::from_secs(3),
         state.runtime.client.head(upstream).send(),
-    )
-    .await
-    {
+    ).await {
         Ok(Ok(resp)) => checks["upstream"] = json!(format!("reachable (http {})", resp.status())),
         Ok(Err(e)) => {
             healthy = false;
@@ -179,18 +164,9 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
     }
 
     // Compactor liveness — ping worker via channel (500ms timeout)
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        state.compactor.lock(),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_millis(500), state.compactor.lock()).await {
         Ok(mut compactor) => {
-            checks["compactor"] = json!(if compactor.health_ping().await {
-                "ok"
-            } else {
-                "worker unresponsive"
-            });
+            checks["compactor"] = json!(if compactor.health_ping().await { "ok" } else { "worker unresponsive" });
         }
         Err(_) => {
             healthy = false;
@@ -198,19 +174,11 @@ async fn lcm_health(State(state): State<AppState>) -> Response {
         }
     }
 
-    let status_code = if healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (
-        status_code,
-        Json(json!({
-            "status": if healthy { "healthy" } else { "unhealthy" },
-            "checks": checks,
-        })),
-    )
-        .into_response()
+    let status_code = if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status_code, Json(json!({
+        "status": if healthy { "healthy" } else { "unhealthy" },
+        "checks": checks,
+    }))).into_response()
 }
 
 /// Check the tool cache for a pair of [ToolCallStart, ToolCallArgsDelta] events.
@@ -224,24 +192,12 @@ fn check_tool_cache(
     cycle: &std::sync::Mutex<crate::runtime::ExecutionCycle>,
     conv_id: i64,
 ) -> (Option<String>, usize) {
-    if offset + 1 >= events.len() {
-        return (None, 0);
-    }
-    if let StreamEvent::ToolCallStart {
-        index: si, name, ..
-    } = &events[offset]
-    {
+    if offset + 1 >= events.len() { return (None, 0); }
+    if let StreamEvent::ToolCallStart { index: si, name, .. } = &events[offset] {
         // Only intercept tools whose results are compact (grep/search/diagnostics).
         // Large results (read_file, list_files) would flood the conversation.
-        if !crate::tool_cache::is_interceptable(name) {
-            return (None, 0);
-        }
-        if let StreamEvent::ToolCallArgsDelta {
-            index: ai,
-            arguments_delta,
-            ..
-        } = &events[offset + 1]
-        {
+        if !crate::tool_cache::is_interceptable(name) { return (None, 0); }
+        if let StreamEvent::ToolCallArgsDelta { index: ai, arguments_delta, .. } = &events[offset + 1] {
             if si == ai {
                 let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments_delta);
                 match db.tool_cache_get(&cname, &args_hash) {
@@ -266,10 +222,7 @@ fn check_tool_cache(
                         // Skip FunctionCallArgumentsDone + OutputItemDone if present (from flush())
                         let mut consumed = 2;
                         if offset + 3 < events.len()
-                            && matches!(
-                                &events[offset + 2],
-                                StreamEvent::FunctionCallArgumentsDone { .. }
-                            )
+                            && matches!(&events[offset + 2], StreamEvent::FunctionCallArgumentsDone { .. })
                             && matches!(&events[offset + 3], StreamEvent::OutputItemDone { .. })
                         {
                             consumed = 4;
@@ -329,34 +282,19 @@ pub(crate) fn process_events(
                 if let Some(asm) = assembler.as_mut() {
                     for ev in asm.feed(text_ev) {
                         let sse_line = crate::protocol::streaming::to_responses_sse(&ev);
-                        if tx
-                            .try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                                sse_line,
-                            )))
-                            .is_err()
-                        {
+                        if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
                             return Ok(false);
                         }
                     }
                 } else {
                     let sse_line = crate::protocol::streaming::to_responses_sse(&text_ev);
-                    if tx
-                        .try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                            sse_line,
-                        )))
-                        .is_err()
-                    {
+                    if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
                         return Ok(false);
                     }
                 }
             } else {
                 let sse_line = crate::protocol::streaming::to_chat_completions_sse(&text_ev);
-                if tx
-                    .try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                        sse_line,
-                    )))
-                    .is_err()
-                {
+                if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
                     return Ok(false);
                 }
             }
@@ -386,12 +324,7 @@ pub(crate) fn process_events(
         } else {
             crate::protocol::streaming::to_chat_completions_sse(ev)
         };
-        if tx
-            .try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                sse_line,
-            )))
-            .is_err()
-        {
+        if tx.try_send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse_line))).is_err() {
             return Ok(false);
         }
         i += 1;
@@ -413,8 +346,7 @@ fn event_kind_name(ev: &StreamEvent) -> String {
         StreamEvent::FunctionCallArgumentsDone { .. } => "FunctionCallArgumentsDone",
         StreamEvent::Done { .. } => "Done",
         StreamEvent::Error { .. } => "Error",
-    }
-    .to_string()
+    }.to_string()
 }
 
 fn event_to_payload(ev: &StreamEvent) -> String {
@@ -449,10 +381,7 @@ fn session_file_path(log_dir: &str) -> &std::path::PathBuf {
     SESSION_FILE.get_or_init(|| {
         let _ = std::fs::create_dir_all(log_dir);
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        std::path::PathBuf::from(format!(
-            "{}/session-{ts}.jsonl",
-            log_dir.trim_end_matches('/')
-        ))
+        std::path::PathBuf::from(format!("{}/session-{ts}.jsonl", log_dir.trim_end_matches('/')))
     })
 }
 
@@ -460,11 +389,7 @@ fn write_log(log_dir: Option<&str>, entry: &LogEntry) {
     let Some(dir) = log_dir else { return };
     let path = session_file_path(dir);
     // Append one line — best-effort, never crash on log failure
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         use std::io::Write;
         if let Ok(line) = serde_json::to_string(entry) {
             let _ = writeln!(f, "{line}");
@@ -485,14 +410,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/lcm/sessions", get(lcm_sessions_list))
         .route("/v1/lcm/sessions/{id}/events", get(lcm_session_events))
         .route("/v1/lcm/sessions/{id}/patches", get(lcm_session_patches))
-        .route(
-            "/v1/lcm/sessions/{id}/system-prompt",
-            get(lcm_session_system_prompt),
-        )
-        .route(
-            "/v1/lcm/sessions/{id}/context-pressure",
-            get(lcm_context_pressure),
-        )
+        .route("/v1/lcm/sessions/{id}/system-prompt", get(lcm_session_system_prompt))
+        .route("/v1/lcm/sessions/{id}/context-pressure", get(lcm_context_pressure))
         .route("/v1/lcm/latency", get(lcm_latency_records))
         .route("/v1/lcm/latency/summary", get(lcm_latency_summary))
         .route("/v1/lcm/cache/stability", get(lcm_cache_stability))
@@ -543,26 +462,19 @@ pub fn routes() -> Router<AppState> {
 
 /// Responses API endpoint — translates to Chat Completions internally.
 /// Codex and other Responses API clients connect here.
-async fn responses(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let req_body: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                format!("invalid JSON: {e}"),
-            );
-        }
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", format!("invalid JSON: {e}")),
     };
 
     // Request diagnostics: log key metrics for token cost tracking
-    let prev_resp = req_body["previous_response_id"]
-        .as_str()
-        .unwrap_or("(none)");
-    let instructions_len = req_body["instructions"]
-        .as_str()
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let prev_resp = req_body["previous_response_id"].as_str().unwrap_or("(none)");
+    let instructions_len = req_body["instructions"].as_str().map(|s| s.len()).unwrap_or(0);
     let tools_count = req_body["tools"].as_array().map(|a| a.len()).unwrap_or(0);
     let store = req_body["store"].as_bool().unwrap_or(true);
     let request_prompt_cache_key = req_body["prompt_cache_key"].as_str().unwrap_or("(none)");
@@ -583,8 +495,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
         if key.is_none()
             && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
-            && let Some(bearer) = auth
-                .strip_prefix("Bearer ")
+            && let Some(bearer) = auth.strip_prefix("Bearer ")
                 .or_else(|| auth.strip_prefix("bearer "))
         {
             *key = Some(bearer.to_string());
@@ -601,10 +512,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     // Map Codex model names to DeepSeek equivalents
     canonical.model = map_model(&canonical.model);
     // Codex sends Accept: text/event-stream — treat as implicit stream request
-    let accept_ss = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let accept_ss = headers.get("accept").and_then(|v| v.to_str().ok()).unwrap_or("");
     let streaming = canonical.stream || accept_ss.contains("text/event-stream");
     if streaming && !canonical.stream {
         canonical.stream = true;
@@ -641,22 +549,15 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                     let item_type = item["type"].as_str().unwrap_or("");
                     if item_type == "function_call_output" {
                         // Deduplicate: skip if this call_id already exists in session
-                        let call_id = item["call_id"]
-                            .as_str()
+                        let call_id = item["call_id"].as_str()
                             .or_else(|| item["id"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if call_id.is_empty() {
-                            continue;
-                        }
-                        let already_in_session = canonical.messages.iter().any(|m| {
+                            .unwrap_or("").to_string();
+                        if call_id.is_empty() { continue; }
+                        let already_in_session = canonical.messages.iter().any(|m|
                             m.role == crate::protocol::canonical::Role::Tool
-                                && m.meta
-                                    .as_ref()
-                                    .and_then(|meta| meta.tool_call_id.as_ref())
-                                    .map(|id| *id == call_id)
-                                    .unwrap_or(false)
-                        });
+                            && m.meta.as_ref().and_then(|meta| meta.tool_call_id.as_ref())
+                                .map(|id| *id == call_id).unwrap_or(false)
+                        );
                         if already_in_session {
                             tracing::debug!(target: "deeplossless", %call_id, "skipping duplicate tool message");
                             continue;
@@ -665,8 +566,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                         append_msgs.push(crate::protocol::canonical::Message {
                             role: crate::protocol::canonical::Role::Tool,
                             parts: vec![crate::protocol::canonical::ContentPart::ToolResult {
-                                call_id,
-                                content: output,
+                                call_id, content: output,
                             }],
                             meta: Some(crate::protocol::canonical::MessageMeta {
                                 tool_call_id: item["call_id"].as_str().map(|s| s.to_string()),
@@ -677,9 +577,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                     }
                 }
                 // Also append the last user message
-                if let Some(last_user) = input_arr
-                    .iter()
-                    .rev()
+                if let Some(last_user) = input_arr.iter().rev()
                     .find(|item| item["role"].as_str() == Some("user"))
                     .and_then(|item| item["content"].as_array())
                     .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
@@ -700,16 +598,12 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             // available yet — remove it to avoid orphaned tool_calls errors from DeepSeek.
             if let Some(msg) = canonical.messages.last() {
                 if msg.role == crate::protocol::canonical::Role::Assistant {
-                    let has_tc = msg
-                        .meta
-                        .as_ref()
-                        .map(|m| !m.tool_calls.is_empty())
-                        .unwrap_or(false);
+                    let has_tc = msg.meta.as_ref()
+                        .map(|m| !m.tool_calls.is_empty()).unwrap_or(false);
                     if has_tc {
                         let last_tc_idx = canonical.messages.len() - 1;
                         // Count tool messages after this assistant
-                        let tool_count = canonical.messages[last_tc_idx + 1..]
-                            .iter()
+                        let tool_count = canonical.messages[last_tc_idx + 1..].iter()
                             .filter(|m| m.role == crate::protocol::canonical::Role::Tool)
                             .count();
                         let tc_count = msg.meta.as_ref().map(|m| m.tool_calls.len()).unwrap_or(0);
@@ -761,19 +655,12 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(".deeplossless");
         let _ = std::fs::create_dir_all(&out_dir);
-        let _ = std::fs::write(
-            out_dir.join("last_request.json"),
-            serde_json::to_string_pretty(&req_body).unwrap_or_default(),
-        );
-        let _ = std::fs::write(
-            out_dir.join("translated.json"),
-            serde_json::to_string_pretty(&injected).unwrap_or_default(),
-        );
+        let _ = std::fs::write(out_dir.join("last_request.json"),
+            serde_json::to_string_pretty(&req_body).unwrap_or_default());
+        let _ = std::fs::write(out_dir.join("translated.json"),
+            serde_json::to_string_pretty(&injected).unwrap_or_default());
 
-        let msgs = injected["messages"]
-            .as_array()
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
+        let msgs = injected["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
         tracing::info!(target: "deeplossless", msg_count=msgs.len(),
             model=%canonical.model, stream=canonical.stream,
             "dry-run: saved to ~/.deeplossless/");
@@ -783,25 +670,14 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         let _ = tx.send(Ok::<_, std::convert::Infallible>(
             axum::body::Bytes::from("data: {\"type\":\"response.output_text.delta\",\"delta\":\"[dry-run] request saved to ~/.deeplossless/translated.json\"}\n\n")
         )).await;
-        let _ = tx
-            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                "data: [DONE]\n\n",
-            )))
-            .await;
+        let _ = tx.send(Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from("data: [DONE]\n\n")
+        )).await;
         let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(
-            "content-type",
-            "text/event-stream; charset=utf-8"
-                .parse()
-                .expect("static header"),
-        );
-        response
-            .headers_mut()
-            .insert("cache-control", "no-cache".parse().expect("static header"));
-        response
-            .headers_mut()
-            .insert("connection", "close".parse().expect("static header"));
+        response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
+        response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header"));
+        response.headers_mut().insert("connection", "close".parse().expect("static header"));
         return response;
     }
 
@@ -829,15 +705,8 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     // 4. Forward to upstream
     let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let api_key = get_cached_key(&state.api_key);
-    let req_stream = injected
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let req_msgs = injected
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let req_stream = injected.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let req_msgs = injected.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
     tracing::info!(target: "deeplossless",
         msg_count=req_msgs, instr_hash,
         system_kb=system_len as f64 / 1024.0,
@@ -854,18 +723,8 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             let role = m["role"].as_str().unwrap_or("?");
             let has_tc = m.get("tool_calls").is_some();
             let tci = m["tool_call_id"].as_str().unwrap_or("-");
-            let rc = m["reasoning_content"]
-                .as_str()
-                .unwrap_or("-")
-                .chars()
-                .take(30)
-                .collect::<String>();
-            let content = m["content"]
-                .as_str()
-                .unwrap_or("")
-                .chars()
-                .take(60)
-                .collect::<String>();
+            let rc = m["reasoning_content"].as_str().unwrap_or("-").chars().take(30).collect::<String>();
+            let content = m["content"].as_str().unwrap_or("").chars().take(60).collect::<String>();
             tracing::debug!(target: "deeplossless", "  msg[{i}] role={role} rc={rc} tc={has_tc} tci={tci} content={content}");
         }
     }
@@ -873,22 +732,14 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
     // The assistant response will be appended after streaming completes.
     let session_input_msgs = injected["messages"].as_array().cloned().unwrap_or_default();
     if !session_input_msgs.is_empty() {
-        state
-            .storage
-            .session_store
-            .replace(&session_key, session_input_msgs.clone());
-        if let Err(e) = state
-            .storage
-            .db
-            .store_response_session(&session_key, &session_input_msgs)
-        {
+        state.storage.session_store.replace(&session_key, session_input_msgs.clone());
+        if let Err(e) = state.storage.db.store_response_session(&session_key, &session_input_msgs) {
             tracing::warn!(target: "deeplossless", session_key, "failed to persist response session input: {e}");
         }
         tracing::debug!(target: "deeplossless", session_key, msg_count=session_input_msgs.len(), "saved session messages");
     }
     let upstream_start = std::time::Instant::now();
-    let resp = match state
-        .runtime
+    let resp = match state.runtime
         .client
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -917,11 +768,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                 &format!("{e}"),
                 serde_json::json!({"source": "responses"}),
             );
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "UPSTREAM_ERROR",
-                format!("upstream error: {e}"),
-            );
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
         }
     };
 
@@ -945,13 +792,9 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        if !content_type
-            .to_ascii_lowercase()
-            .contains("text/event-stream")
-        {
+        if !content_type.to_ascii_lowercase().contains("text/event-stream") {
             let body = resp.text().await.unwrap_or_default();
-            let message =
-                format!("expected upstream text/event-stream, got {content_type}: {body}");
+            let message = format!("expected upstream text/event-stream, got {content_type}: {body}");
             let _ = state.storage.db.insert_event_simple(
                 crate::event_store::EventType::Error,
                 &session_key,
@@ -987,11 +830,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         let reasoning_key = format!("reasoning:{}:{}", canonical.model, session_key);
         let shutdown = state.runtime.shutdown_notify.clone();
         let record_dir = state.record.clone();
-        let record_body = if record_dir.is_some() {
-            Some(body.clone())
-        } else {
-            None
-        };
+        let record_body = if record_dir.is_some() { Some(body.clone()) } else { None };
         if let Some(ref d) = record_dir {
             tracing::info!(target: "deeplossless::record", dir=%d, "response recording enabled");
         }
@@ -1024,15 +863,11 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             let msg_id = format!("msg_{}", crate::protocol::responses::monotonic_id());
             let model = canonical.model.clone();
             let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
             // Helper: build the full response envelope used by created/in_progress/completed
             let response_envelope = |status: &str| -> String {
-                format!(
-                    "\"id\":\"{resp_id}\",\"object\":\"response\",\"created_at\":{now},\"status\":\"{status}\",\"model\":\"{model}\",\"output\":[],\"tools\":[],\"text\":{{\"format\":{{\"type\":\"text\"}}}},\"usage\":null"
-                )
+                format!("\"id\":\"{resp_id}\",\"object\":\"response\",\"created_at\":{now},\"status\":\"{status}\",\"model\":\"{model}\",\"output\":[],\"tools\":[],\"text\":{{\"format\":{{\"type\":\"text\"}}}},\"usage\":null")
             };
 
             // response.created (full envelope, status=in_progress)
@@ -1062,10 +897,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             let mut all_bytes: Vec<u8> = Vec::new();
             let mut assembler = crate::protocol::streaming::StreamAssembler::new();
             let use_normalizer = canonical.deepseek_native.dsml_parse
-                || !matches!(
-                    canonical.deepseek_native.reasoning_effort,
-                    crate::protocol::ReasoningEffortMode::Passthrough
-                );
+                || !matches!(canonical.deepseek_native.reasoning_effort, crate::protocol::ReasoningEffortMode::Passthrough);
             let mut ds4_normalizer = if use_normalizer {
                 Some(crate::protocol::streaming::DeepSeekNormalizer::new())
             } else {
@@ -1089,34 +921,27 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                             buf = buf[pos + 1..].to_string();
                             if let Some(data_line) = line.strip_prefix("data: ") {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
-                                    && v.get("usage").is_some()
-                                {
-                                    usage_buf = Some(v.clone());
-                                }
-                                'event_loop: for event in
-                                    crate::protocol::streaming::from_chat_completions_sse(
-                                        data_line,
-                                        usage_buf.as_ref(),
-                                    )
-                                {
+                                    && v.get("usage").is_some() {
+                                        usage_buf = Some(v.clone());
+                                    }
+                                    'event_loop: for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                                     // Enrich TextDelta events through DS4 normalizer when enabled
-                                    let enriched: Vec<StreamEvent> =
-                                        if let Some(ref mut norm) = ds4_normalizer {
-                                            match &event {
-                                                StreamEvent::TextDelta { text } => {
-                                                    match norm.feed_text(text) {
-                                                        Ok(events) => events,
-                                                        Err(e) => {
-                                                            warn!("DS4 normalizer error: {:?}", e);
-                                                            vec![event.clone()]
-                                                        }
+                                    let enriched: Vec<StreamEvent> = if let Some(ref mut norm) = ds4_normalizer {
+                                        match &event {
+                                            StreamEvent::TextDelta { text } => {
+                                                match norm.feed_text(text) {
+                                                    Ok(events) => events,
+                                                    Err(e) => {
+                                                        warn!("DS4 normalizer error: {:?}", e);
+                                                        vec![event.clone()]
                                                     }
                                                 }
-                                                _ => vec![event.clone()],
                                             }
-                                        } else {
-                                            vec![event]
-                                        };
+                                            _ => vec![event.clone()],
+                                        }
+                                    } else {
+                                        vec![event]
+                                    };
                                     for ev in enriched {
                                         // Done = transport-level EOF, drain remaining buffers
                                         if matches!(ev, StreamEvent::Done { .. }) {
@@ -1135,27 +960,14 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                                                         }
                                                         _ => {}
                                                     }
-                                                    if matches!(
-                                                        ev,
-                                                        StreamEvent::OutputItemDone { .. }
-                                                    ) {
+                                                    if matches!(ev, StreamEvent::OutputItemDone { .. }) {
                                                         tc_idx += 1;
                                                     }
                                                 }
                                             }
                                             for ev in &events {
-                                                if let StreamEvent::FunctionCallArgumentsDone {
-                                                    call_id,
-                                                    name,
-                                                    arguments,
-                                                    ..
-                                                } = ev
-                                                {
-                                                    flushed_tool_calls.push((
-                                                        call_id.clone(),
-                                                        name.clone(),
-                                                        arguments.clone(),
-                                                    ));
+                                                if let StreamEvent::FunctionCallArgumentsDone { call_id, name, arguments, .. } = ev {
+                                                    flushed_tool_calls.push((call_id.clone(), name.clone(), arguments.clone()));
                                                 }
                                             }
                                             match process_events(
@@ -1204,10 +1016,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                             }
                         }
                     }
-                    Err(e) => {
-                        warn!("stream error: {e}");
-                        break;
-                    }
+                    Err(e) => { warn!("stream error: {e}"); break; }
                 }
             }
             if first_chunk {
@@ -1218,25 +1027,22 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             if !buf.trim().is_empty() {
                 let data_line = buf.trim().strip_prefix("data: ").unwrap_or(&buf);
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
-                    && v.get("usage").is_some()
-                {
-                    usage_buf = Some(v.clone());
-                }
-                for event in crate::protocol::streaming::from_chat_completions_sse(
-                    data_line,
-                    usage_buf.as_ref(),
-                ) {
+                    && v.get("usage").is_some() {
+                        usage_buf = Some(v.clone());
+                    }
+                for event in crate::protocol::streaming::from_chat_completions_sse(data_line, usage_buf.as_ref()) {
                     if !matches!(event, StreamEvent::Done { .. }) {
-                        let enriched: Vec<StreamEvent> = if let Some(ref mut norm) = ds4_normalizer
-                        {
+                        let enriched: Vec<StreamEvent> = if let Some(ref mut norm) = ds4_normalizer {
                             match &event {
-                                StreamEvent::TextDelta { text } => match norm.feed_text(text) {
-                                    Ok(events) => events,
-                                    Err(e) => {
-                                        warn!("DS4 normalizer error (trailing buffer): {:?}", e);
-                                        vec![event.clone()]
+                                StreamEvent::TextDelta { text } => {
+                                    match norm.feed_text(text) {
+                                        Ok(events) => events,
+                                        Err(e) => {
+                                            warn!("DS4 normalizer error (trailing buffer): {:?}", e);
+                                            vec![event.clone()]
+                                        }
                                     }
-                                },
+                                }
                                 _ => vec![event.clone()],
                             }
                         } else {
@@ -1267,13 +1073,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                 match norm.finish() {
                     Ok(flush_events) => {
                         for ev in flush_events {
-                            if !matches!(
-                                ev,
-                                StreamEvent::ReasoningDelta { .. }
-                                    | StreamEvent::ToolCallStart { .. }
-                                    | StreamEvent::ToolCallArgsDelta { .. }
-                                    | StreamEvent::ToolCallEnd { .. }
-                            ) {
+                            if !matches!(ev, StreamEvent::ReasoningDelta { .. } | StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallArgsDelta { .. } | StreamEvent::ToolCallEnd { .. }) {
                                 continue;
                             }
                             let events = assembler.feed(ev);
@@ -1304,10 +1104,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                     match ev {
                         StreamEvent::ToolCallStart { index, .. }
                         | StreamEvent::ToolCallArgsDelta { index, .. }
-                        | StreamEvent::FunctionCallArgumentsDone {
-                            output_index: index,
-                            ..
-                        }
+                        | StreamEvent::FunctionCallArgumentsDone { output_index: index, .. }
                         | StreamEvent::OutputItemDone { index, .. } => {
                             *index = tc_idx;
                         }
@@ -1332,12 +1129,10 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                     warn!("execution event store failed: {e}");
                 }
             }
-            let input_tokens = usage_buf
-                .as_ref()
+            let input_tokens = usage_buf.as_ref()
                 .and_then(|v| v["usage"]["prompt_tokens"].as_u64())
                 .unwrap_or(0);
-            let output_tokens = usage_buf
-                .as_ref()
+            let output_tokens = usage_buf.as_ref()
                 .and_then(|v| v["usage"]["completion_tokens"].as_u64())
                 .unwrap_or(0);
             let output_text_len = content.text.len();
@@ -1348,33 +1143,24 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             // Write session log if --log-dir is set
             if log_dir.is_some() {
                 let cache_hits = cycle.lock().ok().map(|c| c.metrics.cache_hits).unwrap_or(0);
-                write_log(
-                    log_dir.as_deref(),
-                    &LogEntry {
-                        ts: chrono::Local::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3f")
-                            .to_string(),
-                        endpoint: "responses",
-                        model: log_model,
-                        request_body_kb: log_request_body_kb,
-                        input_tokens_est: input_tokens as usize,
-                        output_tokens,
-                        output_text_len,
-                        cache_hits,
-                        msg_count: log_msg_count,
-                        tools_count: log_tools_count,
-                        instructions_len: log_instructions_len,
-                        instr_hash: log_instr_hash,
-                        prompt_cache_key: log_prompt_cache_key,
-                        upstream_status,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        error: if upstream_status >= 400 {
-                            Some(format!("HTTP {upstream_status}"))
-                        } else {
-                            None
-                        },
-                    },
-                );
+                write_log(log_dir.as_deref(), &LogEntry {
+                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                    endpoint: "responses",
+                    model: log_model,
+                    request_body_kb: log_request_body_kb,
+                    input_tokens_est: input_tokens as usize,
+                    output_tokens,
+                    output_text_len,
+                    cache_hits,
+                    msg_count: log_msg_count,
+                    tools_count: log_tools_count,
+                    instructions_len: log_instructions_len,
+                    instr_hash: log_instr_hash,
+                    prompt_cache_key: log_prompt_cache_key,
+                    upstream_status,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    error: if upstream_status >= 400 { Some(format!("HTTP {upstream_status}")) } else { None },
+                });
             }
 
             // Store reasoning for multi-turn continuity (DeepSeek thinking mode
@@ -1393,8 +1179,7 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
 
             // Append assistant response to session for conversation continuity.
             // Build in Chat Completions format matching injected["messages"].
-            let mut assistant_msg =
-                serde_json::json!({"role": "assistant", "content": content.text});
+            let mut assistant_msg = serde_json::json!({"role": "assistant", "content": content.text});
             if !content.reasoning.is_empty() {
                 assistant_msg["reasoning_content"] = serde_json::json!(content.reasoning);
             }
@@ -1441,22 +1226,12 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                 "output_index": 0, "content_index": 0,
                 "part": text_part
             });
-            let resp_status = if usage_buf.is_some() {
-                "completed"
-            } else {
-                "incomplete"
-            };
-            let usage_json = usage_buf
-                .map(|v| {
-                    serde_json::json!({
-                        "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                        "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                        "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
-                    })
-                })
-                .unwrap_or(
-                    serde_json::json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}),
-                );
+            let resp_status = if usage_buf.is_some() { "completed" } else { "incomplete" };
+            let usage_json = usage_buf.map(|v| serde_json::json!({
+                "input_tokens": v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                "output_tokens": v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                "total_tokens": v["usage"]["total_tokens"].as_u64().unwrap_or(0),
+            })).unwrap_or(serde_json::json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}));
             // Build response.completed output. Only include the text message item;
             // function_call items were already emitted via SSE during flush().
             // Including them again in response.completed causes Codex to see
@@ -1481,43 +1256,28 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                 "content_index": 0,
                 "text": content.text
             });
-            let _ = tx
-                .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    format!("event: response.output_text.done\ndata: {output_text_done}\n\n"),
-                )))
-                .await;
-            let _ = tx
-                .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    format!("event: response.content_part.done\ndata: {content_part_done}\n\n"),
-                )))
-                .await;
-            let _ = tx
-                .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    format!("event: response.output_item.done\ndata: {output_item_done}\n\n"),
-                )))
-                .await;
-            let _ = tx
-                .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    format!("event: response.completed\ndata: {completed}\n\n"),
-                )))
-                .await;
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.output_text.done\ndata: {output_text_done}\n\n"))
+            )).await;
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.content_part.done\ndata: {content_part_done}\n\n"))
+            )).await;
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.output_item.done\ndata: {output_item_done}\n\n"))
+            )).await;
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from(format!("event: response.completed\ndata: {completed}\n\n"))
+            )).await;
             // Persist the response so GET /v1/responses/{id} returns real data,
             // and Codex's previous_response_id continuity can work incrementally.
             // Reasoning is stored by the reasoning_key block above.
 
             // Always store for previous_response_id continuity.
             // Compute tool calls for storage, filtering out cache-intercepted ones
-            let effective_tool_calls: Vec<_> = flushed_tool_calls
-                .iter()
-                .filter(|(_, name, arguments)| {
-                    let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments);
-                    db.tool_cache_get(&cname, &args_hash)
-                        .ok()
-                        .flatten()
-                        .is_none()
-                })
-                .cloned()
-                .collect();
+            let effective_tool_calls: Vec<_> = flushed_tool_calls.iter().filter(|(_, name, arguments)| {
+                let (cname, args_hash) = crate::tool_cache::cache_key(name, arguments);
+                db.tool_cache_get(&cname, &args_hash).ok().flatten().is_none()
+            }).cloned().collect();
             let mut stored_output: Vec<serde_json::Value> = Vec::new();
             for (call_id, name, arguments) in &effective_tool_calls {
                 stored_output.push(serde_json::json!({
@@ -1546,21 +1306,15 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
             if let Some((ref dir, ts)) = _rec {
                 let rsp_path = format!("{dir}/rsp_{ts}.txt");
                 match std::fs::write(&rsp_path, &all_bytes) {
-                    Ok(()) => {
-                        tracing::debug!(target: "deeplossless::record", path=%rsp_path, len=all_bytes.len(), "recorded response")
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "deeplossless::record", path=%rsp_path, error=%e, "failed to record response")
-                    }
+                    Ok(()) => tracing::debug!(target: "deeplossless::record", path=%rsp_path, len=all_bytes.len(), "recorded response"),
+                    Err(e) => tracing::warn!(target: "deeplossless::record", path=%rsp_path, error=%e, "failed to record response"),
                 }
             }
             // Transport-level EOF marker
             _guard.disarm();
-            let _ = tx
-                .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    "data: [DONE]\n\n",
-                )))
-                .await;
+            let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from("data: [DONE]\n\n")
+            )).await;
             let _ = db.insert_event_simple(
                 crate::event_store::EventType::RequestEnd,
                 &session_key,
@@ -1571,24 +1325,12 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
         });
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(
-            "content-type",
-            "text/event-stream; charset=utf-8"
-                .parse()
-                .expect("static header"),
-        );
-        response
-            .headers_mut()
-            .insert("cache-control", "no-cache".parse().expect("static header"));
-        response
-            .headers_mut()
-            .insert("connection", "close".parse().expect("static header"));
+        response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
+        response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header"));
+        response.headers_mut().insert("connection", "close".parse().expect("static header"));
         response.headers_mut().insert(
             "x-deeplossless-execution-id",
-            stream_execution_id
-                .to_string()
-                .parse()
-                .expect("numeric header"),
+            stream_execution_id.to_string().parse().expect("numeric header"),
         );
         response.headers_mut().insert(
             "x-deeplossless-replay-session-id",
@@ -1602,103 +1344,51 @@ async fn responses(State(state): State<AppState>, headers: HeaderMap, body: Stri
                 // Record raw upstream response
                 if let Some(ref dir) = state.record {
                     let _ = std::fs::create_dir_all(dir);
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
                     let req_path = format!("{dir}/req_{ts}.json");
-                    match std::fs::write(
-                        &req_path,
-                        serde_json::to_string_pretty(
-                            &serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default(),
-                        )
-                        .unwrap_or_default(),
-                    ) {
-                        Ok(()) => {
-                            tracing::info!(target: "deeplossless::record", path=%req_path, "recorded non-streaming request")
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "deeplossless::record", path=%req_path, error=%e, "failed to record non-streaming request")
-                        }
+                    match std::fs::write(&req_path, serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default()).unwrap_or_default()) {
+                        Ok(()) => tracing::info!(target: "deeplossless::record", path=%req_path, "recorded non-streaming request"),
+                        Err(e) => tracing::warn!(target: "deeplossless::record", path=%req_path, error=%e, "failed to record non-streaming request"),
                     }
                     let rsp_path = format!("{dir}/rsp_{ts}.txt");
                     match std::fs::write(&rsp_path, &bytes) {
-                        Ok(()) => {
-                            tracing::debug!(target: "deeplossless::record", path=%rsp_path, len=bytes.len(), "recorded non-streaming response")
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "deeplossless::record", path=%rsp_path, error=%e, "failed to record non-streaming response")
-                        }
+                        Ok(()) => tracing::debug!(target: "deeplossless::record", path=%rsp_path, len=bytes.len(), "recorded non-streaming response"),
+                        Err(e) => tracing::warn!(target: "deeplossless::record", path=%rsp_path, error=%e, "failed to record non-streaming response"),
                     }
                 }
                 let chat_resp: serde_json::Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
-                    Err(e) => {
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            "UPSTREAM_ERROR",
-                            format!("invalid upstream JSON: {e}"),
-                        );
-                    }
+                    Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid upstream JSON: {e}")),
                 };
-                let canonical_resp =
-                    crate::protocol::chat_completions::response_from_chat(&chat_resp);
+                let canonical_resp = crate::protocol::chat_completions::response_from_chat(&chat_resp);
                 if let Some(message) = chat_resp["choices"][0]["message"].as_object() {
                     let mut assistant_msg = Value::Object(message.clone());
                     if assistant_msg.get("role").is_none() {
                         assistant_msg["role"] = json!("assistant");
                     }
-                    let mut session = state
-                        .storage
-                        .session_store
-                        .get(&session_key)
-                        .unwrap_or_default();
+                    let mut session = state.storage.session_store.get(&session_key).unwrap_or_default();
                     session.push(assistant_msg);
-                    state
-                        .storage
-                        .session_store
-                        .replace(&session_key, session.clone());
-                    if let Err(e) = state
-                        .storage
-                        .db
-                        .store_response_session(&session_key, &session)
-                    {
+                    state.storage.session_store.replace(&session_key, session.clone());
+                    if let Err(e) = state.storage.db.store_response_session(&session_key, &session) {
                         tracing::warn!(target: "deeplossless", session_key, "failed to persist non-streaming response session: {e}");
                     }
                 }
-                let mut responses_body =
-                    crate::protocol::responses::response_to_responses(&canonical_resp);
+                let mut responses_body = crate::protocol::responses::response_to_responses(&canonical_resp);
                 responses_body["prompt_cache_key"] = json!(session_key);
                 if let Some(resp_id) = responses_body["id"].as_str() {
-                    state
-                        .storage
-                        .response_store
-                        .insert(resp_id.to_string(), responses_body.clone());
-                    if let Err(e) = state.storage.db.store_response_object(
-                        resp_id,
-                        &session_key,
-                        &responses_body,
-                    ) {
+                    state.storage.response_store.insert(resp_id.to_string(), responses_body.clone());
+                    if let Err(e) = state.storage.db.store_response_object(resp_id, &session_key, &responses_body) {
                         tracing::warn!(target: "deeplossless", resp_id, "failed to persist non-streaming response object: {e}");
                     }
                 }
-                let mut response = Response::new(Body::from(
-                    serde_json::to_string(&responses_body).unwrap_or_default(),
-                ));
+                let mut response = Response::new(Body::from(serde_json::to_string(&responses_body).unwrap_or_default()));
                 *response.status_mut() = StatusCode::OK;
-                response.headers_mut().insert(
-                    "content-type",
-                    "application/json".parse().expect("static header"),
-                );
+                response.headers_mut().insert("content-type", "application/json".parse().expect("static header"));
                 response
             }
             Err(e) => {
                 metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "UPSTREAM_ERROR",
-                    format!("upstream error: {e}"),
-                )
+                json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
             }
         }
     }
@@ -1719,10 +1409,7 @@ async fn responses_retrieve(
     }
     match state.storage.db.get_response_object(&response_id) {
         Ok(Some(resp)) => {
-            state
-                .storage
-                .response_store
-                .insert(response_id.clone(), resp.clone());
+            state.storage.response_store.insert(response_id.clone(), resp.clone());
             tracing::debug!(target: "deeplossless",
                 %response_id, "response retrieve persisted hit");
             return Json(resp).into_response();
@@ -1738,9 +1425,7 @@ async fn responses_retrieve(
     json_error(
         StatusCode::NOT_FOUND,
         "NOT_FOUND",
-        format!(
-            "response '{response_id}' not found; response continuity is ephemeral and may be lost after restart or FIFO eviction"
-        ),
+        format!("response '{response_id}' not found; response continuity is ephemeral and may be lost after restart or FIFO eviction"),
     )
 }
 
@@ -1790,8 +1475,7 @@ async fn list_models() -> Response {
                 }
             }
         ]
-    }))
-    .into_response()
+    })).into_response()
 }
 
 async fn chat_completions(
@@ -1804,8 +1488,7 @@ async fn chat_completions(
         let mut key = state.api_key.lock().unwrap_or_else(|e| e.into_inner());
         if key.is_none()
             && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
-            && let Some(bearer) = auth
-                .strip_prefix("Bearer ")
+            && let Some(bearer) = auth.strip_prefix("Bearer ")
                 .or_else(|| auth.strip_prefix("bearer "))
         {
             *key = Some(bearer.to_string());
@@ -1815,13 +1498,7 @@ async fn chat_completions(
 
     let req_body: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                format!("invalid JSON: {e}"),
-            );
-        }
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", format!("invalid JSON: {e}")),
     };
 
     let model = crate::session::model_name(&req_body);
@@ -1831,18 +1508,11 @@ async fn chat_completions(
     // For isolating protocol bugs — when this works but the full pipeline doesn't.
     if state.passthrough && streaming {
         let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
-        let resp = state
-            .runtime
-            .client
-            .post(&upstream_url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", get_cached_key(&state.api_key)),
-            )
+        let resp = state.runtime.client.post(&upstream_url)
+            .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
             .header("Content-Type", "application/json")
             .body(body.clone())
-            .send()
-            .await;
+            .send().await;
         match resp {
             Ok(r) => {
                 let status = r.status();
@@ -1853,9 +1523,7 @@ async fn chat_completions(
                     let mut stream = byte_stream;
                     while let Some(chunk) = stream.next().await {
                         if let Ok(c) = chunk {
-                            if tx.send(Ok::<_, std::convert::Infallible>(c)).await.is_err() {
-                                break;
-                            }
+                            if tx.send(Ok::<_, std::convert::Infallible>(c)).await.is_err() { break; }
                         }
                     }
                 });
@@ -1889,8 +1557,7 @@ async fn chat_completions(
     };
 
     // LCM context injection (--lcm-context-tokens, default 500)
-    let lcm_budget = req_body
-        .get("lcm_max_tokens")
+    let lcm_budget = req_body.get("lcm_max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(state.lcm_context_tokens)
         .clamp(0, 8000) as usize;
@@ -1899,17 +1566,13 @@ async fn chat_completions(
         let msgs = req_body["messages"].as_array().cloned().unwrap_or_default();
         let fp = crate::session::fingerprint(msgs.as_slice(), 3);
         if let Ok(Some(cid)) = state.storage.db.find_conversation_by_fingerprint(&fp) {
-            let query = msgs
-                .iter()
-                .rev()
-                .find(|m| m["role"] == "user")
+            let query = msgs.iter().rev().find(|m| m["role"] == "user")
                 .and_then(|m| m["content"].as_str());
             if let Ok(nodes) = state.storage.dag.assemble_context(cid, lcm_budget, query) {
                 if !nodes.is_empty() {
                     let ctx_text = crate::pipeline::render_dag_context(&nodes);
                     if let Some(arr) = injected["messages"].as_array_mut() {
-                        if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user")
-                        {
+                        if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
                             let original = last_user["content"].as_str().unwrap_or("").to_string();
                             last_user["content"] = json!(if original.is_empty() {
                                 ctx_text
@@ -1953,17 +1616,9 @@ async fn chat_completions(
 
     // Resolve conversation ID for response header — lightweight fingerprint lookup
     let conv_id: Option<i64> = {
-        let msgs_arr = req_body["messages"]
-            .as_array()
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
+        let msgs_arr = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
         let fp = crate::session::fingerprint(msgs_arr, 3);
-        state
-            .storage
-            .db
-            .find_conversation_by_fingerprint(&fp)
-            .ok()
-            .flatten()
+        state.storage.db.find_conversation_by_fingerprint(&fp).ok().flatten()
     };
 
     if let Some(cid) = conv_id {
@@ -1973,14 +1628,10 @@ async fn chat_completions(
     // Forward to upstream
     let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let upstream_start = std::time::Instant::now();
-    let resp = match state
-        .runtime
+    let resp = match state.runtime
         .client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", get_cached_key(&state.api_key)),
-        )
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
         .json(&injected_body)
         .send()
@@ -1991,11 +1642,7 @@ async fn chat_completions(
             let latency = upstream_start.elapsed().as_millis() as u64;
             metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             metrics::record_latency("chat_completions", 502, None, latency, Some(format!("{e}")));
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "UPSTREAM_ERROR",
-                format!("upstream error: {e}"),
-            );
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
         }
     };
 
@@ -2005,13 +1652,7 @@ async fn chat_completions(
     metrics::record_latency("chat_completions", code, Some(code), latency, None);
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        let fp = crate::session::fingerprint(
-            req_body["messages"]
-                .as_array()
-                .map(|a| a.as_slice())
-                .unwrap_or(&[]),
-            3,
-        );
+        let fp = crate::session::fingerprint(req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3);
         let _ = state.storage.db.insert_event_simple(
             crate::event_store::EventType::Error,
             &fp,
@@ -2031,51 +1672,28 @@ async fn chat_completions(
         let stream = ReceiverStream::new(rx);
         // Protocol recorder — raw bytes, no parsing. Compare with direct DeepSeek.
         let record_dir = state.record.clone();
-        let record_body = if record_dir.is_some() {
-            Some(req_body.clone())
-        } else {
-            None
-        };
+        let record_body = if record_dir.is_some() { Some(req_body.clone()) } else { None };
         // Capture reasoning_content for multi-turn continuity.
         let reasoning_db = state.storage.db.clone();
         let session_fingerprint = {
-            let msgs = req_body["messages"]
-                .as_array()
-                .map(|a| a.as_slice())
-                .unwrap_or(&[]);
+            let msgs = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
             crate::session::fingerprint(msgs, 3)
         };
         let reasoning_key = {
-            let msgs = req_body["messages"]
-                .as_array()
-                .map(|a| a.as_slice())
-                .unwrap_or(&[]);
-            let last_user = msgs
-                .iter()
-                .rev()
-                .find(|m| m["role"] == "user")
-                .and_then(|m| m["content"].as_str())
-                .unwrap_or("");
+            let msgs = req_body["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
+                .and_then(|m| m["content"].as_str()).unwrap_or("");
             let model = req_body["model"].as_str().unwrap_or("");
-            format!(
-                "reasoning:{model}:{}",
-                last_user.chars().take(80).collect::<String>()
-            )
+            format!("reasoning:{model}:{}", last_user.chars().take(80).collect::<String>())
         };
         tokio::spawn(async move {
             let req_start = std::time::Instant::now();
             // Protocol recorder: write raw request/response for diffing
             let _rec = record_dir.as_ref().map(|dir| {
                 let _ = std::fs::create_dir_all(dir);
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
                 if let Some(body) = &record_body {
-                    let _ = std::fs::write(
-                        format!("{dir}/req_{ts}.json"),
-                        serde_json::to_string_pretty(body).unwrap_or_default(),
-                    );
+                    let _ = std::fs::write(format!("{dir}/req_{ts}.json"), serde_json::to_string_pretty(body).unwrap_or_default());
                 }
                 (dir.clone(), ts)
             });
@@ -2090,11 +1708,7 @@ async fn chat_completions(
                 match chunk {
                     Ok(c) => {
                         all_bytes.extend_from_slice(&c);
-                        if tx
-                            .send(Ok::<_, std::convert::Infallible>(c.clone()))
-                            .await
-                            .is_err()
-                        {
+                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).await.is_err() {
                             break;
                         }
                         let s = String::from_utf8_lossy(&c);
@@ -2103,25 +1717,16 @@ async fn chat_completions(
                             let line = buf[..pos].trim().to_string();
                             buf = buf[pos + 1..].to_string();
                             if let Some(data_line) = line.strip_prefix("data: ") {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line)
-                                {
-                                    if let Some(rc) =
-                                        v["choices"][0]["delta"]["reasoning_content"].as_str()
-                                    {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_line) {
+                                    if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
                                         reasoning.push_str(rc);
                                     }
                                     if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
                                         content.push_str(c);
                                     }
                                     if let Some(u) = v["usage"].as_object() {
-                                        prompt_tokens = u
-                                            .get("prompt_tokens")
-                                            .and_then(|t| t.as_u64())
-                                            .unwrap_or(0);
-                                        completion_tokens = u
-                                            .get("completion_tokens")
-                                            .and_then(|t| t.as_u64())
-                                            .unwrap_or(0);
+                                        prompt_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        completion_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                                     }
                                 }
                             }
@@ -2184,25 +1789,14 @@ async fn chat_completions(
         *response.status_mut() = status;
         response.headers_mut().insert("content-type", content_type);
         if let Some(cid) = conv_id {
-            response.headers_mut().insert(
-                "x-deeplossless-conv",
-                cid.to_string().parse().expect("static header"),
-            );
+            response.headers_mut().insert("x-deeplossless-conv", cid.to_string().parse().expect("static header"));
         }
         if cache_normalized {
-            let _ = response
-                .headers_mut()
-                .insert("x-lcm-normalized", "1".parse().expect("static"));
+            let _ = response.headers_mut().insert("x-lcm-normalized", "1".parse().expect("static"));
         }
         if !state.no_header_mod {
-            response.headers_mut().insert(
-                "cache-control",
-                "no-cache".parse().expect("static header parse"),
-            );
-            response.headers_mut().insert(
-                "x-accel-buffering",
-                "no".parse().expect("static header parse"),
-            );
+            response.headers_mut().insert("cache-control", "no-cache".parse().expect("static header parse"));
+            response.headers_mut().insert("x-accel-buffering", "no".parse().expect("static header parse"));
         }
         response
     } else {
@@ -2212,21 +1806,14 @@ async fn chat_completions(
                 *response.status_mut() = status;
                 response.headers_mut().insert("content-type", content_type);
                 if let Some(cid) = conv_id {
-                    response.headers_mut().insert(
-                        "x-deeplossless-conv",
-                        cid.to_string().parse().expect("static header"),
-                    );
+                    response.headers_mut().insert("x-deeplossless-conv", cid.to_string().parse().expect("static header"));
                 }
                 response.headers_mut().insert("x-deeplossless-lcm", "GET /v1/lcm/grep/{conv_id}?query= — search past context; GET /v1/lcm/cache?tool=&args= — check tool cache; GET /v1/lcm/status/{conv_id} — DAG health".parse().expect("static header"));
                 response
             }
             Err(e) => {
                 metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "UPSTREAM_ERROR",
-                    format!("upstream error: {e}"),
-                )
+                json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
             }
         }
     }
@@ -2246,21 +1833,11 @@ async fn lcm_chat_completions(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
 
-    let model = req_body["model"]
-        .as_str()
-        .map(map_model)
-        .unwrap_or_else(|| "deepseek-chat".to_string());
-    let streaming = req_body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let model = req_body["model"].as_str().map(map_model).unwrap_or_else(|| "deepseek-chat".to_string());
+    let streaming = req_body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let msgs = req_body["messages"].as_array().cloned().unwrap_or_default();
     if msgs.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "messages array is empty",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "messages array is empty");
     }
 
     // Run pipeline for storage and context assembly
@@ -2269,16 +1846,9 @@ async fn lcm_chat_completions(
         Ok(out) => {
             // Assemble DAG context for injection
             let dag = state.storage.dag.clone();
-            let token_budget = req_body
-                .get("lcm_max_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(500)
-                .clamp(0, 8000) as usize;
+            let token_budget = req_body.get("lcm_max_tokens").and_then(|v| v.as_u64()).unwrap_or(500).clamp(0, 8000) as usize;
             let (ctx_text, ctx_tokens) = if token_budget > 0 {
-                let query = msgs
-                    .iter()
-                    .rev()
-                    .find(|m| m["role"] == "user")
+                let query = msgs.iter().rev().find(|m| m["role"] == "user")
                     .and_then(|m| m["content"].as_str());
                 match dag.assemble_context(out.conv_id, token_budget, query) {
                     Ok(nodes) if !nodes.is_empty() => {
@@ -2295,36 +1865,19 @@ async fn lcm_chat_completions(
             // Proactively load failure patterns + active plan, run the rule engine,
             // and inject context so the agent knows about past failures and plan state
             let (failure_context, plan_context) = {
-                let guard = state
-                    .runtime
-                    .cycle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let guard = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
                 let db = &state.storage.db;
                 let fc = crate::runtime::evaluate_failure_context(db, out.conv_id, &guard);
-                let pc = crate::runtime::evaluate_plan_context(
-                    db,
-                    out.conv_id,
-                    &guard,
-                    &guard.context_delta,
-                );
+                let pc = crate::runtime::evaluate_plan_context(db, out.conv_id, &guard, &guard.context_delta);
                 (fc, pc)
             };
             let ctx_text = match (failure_context.as_deref(), plan_context.as_deref()) {
                 (Some(fc), Some(pc)) => format!("{ctx_text}\n\n{fc}\n\n{pc}"),
                 (Some(fc), None) => {
-                    if ctx_text.is_empty() {
-                        fc.to_string()
-                    } else {
-                        format!("{ctx_text}\n\n{fc}")
-                    }
+                    if ctx_text.is_empty() { fc.to_string() } else { format!("{ctx_text}\n\n{fc}") }
                 }
                 (None, Some(pc)) => {
-                    if ctx_text.is_empty() {
-                        pc.to_string()
-                    } else {
-                        format!("{ctx_text}\n\n{pc}")
-                    }
+                    if ctx_text.is_empty() { pc.to_string() } else { format!("{ctx_text}\n\n{pc}") }
                 }
                 (None, None) => ctx_text,
             };
@@ -2349,8 +1902,7 @@ async fn lcm_chat_completions(
                 } else {
                     format!("{context_text}\n\n{original}")
                 };
-                context_token_count = crate::tokenizer::count(&merged)
-                    - crate::tokenizer::count(last_user["content"].as_str().unwrap_or(""));
+                context_token_count = crate::tokenizer::count(&merged) - crate::tokenizer::count(last_user["content"].as_str().unwrap_or(""));
                 last_user["content"] = serde_json::json!(merged);
             }
         }
@@ -2359,14 +1911,10 @@ async fn lcm_chat_completions(
     // Forward to upstream
     let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
     let upstream_start = std::time::Instant::now();
-    let resp = match state
-        .runtime
+    let resp = match state.runtime
         .client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", get_cached_key(&state.api_key)),
-        )
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
         .json(&injected_body)
         .send()
@@ -2376,18 +1924,8 @@ async fn lcm_chat_completions(
         Err(e) => {
             let latency = upstream_start.elapsed().as_millis() as u64;
             metrics::UPSTREAM_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            metrics::record_latency(
-                "lcm_chat_completions",
-                502,
-                None,
-                latency,
-                Some(format!("{e}")),
-            );
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "UPSTREAM_ERROR",
-                format!("upstream error: {e}"),
-            );
+            metrics::record_latency("lcm_chat_completions", 502, None, latency, Some(format!("{e}")));
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("upstream error: {e}"))
         }
     };
 
@@ -2411,17 +1949,9 @@ async fn lcm_chat_completions(
         let stream = ReceiverStream::new(rx);
         let reasoning_db = state.storage.db.clone();
         let session_fp = crate::session::fingerprint(&msgs, 3);
-        let last_user = msgs
-            .iter()
-            .rev()
-            .find(|m| m["role"] == "user")
-            .and_then(|m| m["content"].as_str())
-            .unwrap_or("");
-        let reasoning_key = format!(
-            "reasoning:{}:{}",
-            model,
-            last_user.chars().take(80).collect::<String>()
-        );
+        let last_user = msgs.iter().rev().find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str()).unwrap_or("");
+        let reasoning_key = format!("reasoning:{}:{}", model, last_user.chars().take(80).collect::<String>());
         tokio::spawn(async move {
             let req_start = std::time::Instant::now();
             let mut byte_stream = resp.bytes_stream();
@@ -2431,34 +1961,18 @@ async fn lcm_chat_completions(
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(c) => {
-                        if tx
-                            .send(Ok::<_, std::convert::Infallible>(c.clone()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        if tx.send(Ok::<_, std::convert::Infallible>(c.clone())).await.is_err() { break; }
                         let s = String::from_utf8_lossy(&c);
                         for line in s.lines() {
                             if let Some(data) = line.strip_prefix("data: ") {
-                                if data == "[DONE]" {
-                                    break;
-                                }
+                                if data == "[DONE]" { break; }
                                 if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                    if let Some(rc) =
-                                        v["choices"][0]["delta"]["reasoning_content"].as_str()
-                                    {
+                                    if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
                                         reasoning.push_str(rc);
                                     }
                                     if let Some(u) = v["usage"].as_object() {
-                                        prompt_tokens = u
-                                            .get("prompt_tokens")
-                                            .and_then(|t| t.as_u64())
-                                            .unwrap_or(0);
-                                        completion_tokens = u
-                                            .get("completion_tokens")
-                                            .and_then(|t| t.as_u64())
-                                            .unwrap_or(0);
+                                        prompt_tokens = u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        completion_tokens = u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                                     }
                                 }
                             }
@@ -2491,25 +2005,21 @@ async fn lcm_chat_completions(
                 serde_json::json!({"duration_ms": req_start.elapsed().as_millis(), "source": "chat_completions"}),
             );
         });
-        let mut resp = axum::response::Response::new(axum::body::Body::from_stream(stream));
-        resp.headers_mut()
-            .insert("content-type", "text/event-stream".parse().unwrap());
-        resp.headers_mut()
-            .insert("cache-control", "no-cache".parse().unwrap());
-        resp.headers_mut().insert(
-            "x-lcm-context-tokens",
-            context_token_count.to_string().parse().unwrap(),
+        let mut resp = axum::response::Response::new(
+            axum::body::Body::from_stream(stream),
         );
+        resp.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+        resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
+        resp.headers_mut().insert("x-lcm-context-tokens", context_token_count.to_string().parse().unwrap());
         resp
     } else {
         let mut resp = match resp.text().await {
-            Ok(body) => (StatusCode::OK, Json(json!(body))).into_response(),
+            Ok(body) => {
+                (StatusCode::OK, Json(json!(body))).into_response()
+            }
             Err(e) => json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}")),
         };
-        resp.headers_mut().insert(
-            "x-lcm-context-tokens",
-            context_token_count.to_string().parse().unwrap(),
-        );
+        resp.headers_mut().insert("x-lcm-context-tokens", context_token_count.to_string().parse().unwrap());
         resp
     }
 }
@@ -2535,15 +2045,9 @@ fn get_cached_key(key: &std::sync::Mutex<Option<String>>) -> String {
 fn ctx_react_auth_ok(headers: &HeaderMap, state: &AppState) -> bool {
     // Allow localhost access — LCM endpoints are local-only tools.
     // Sandboxed agents (OpenClaw, etc.) can't access host env vars for auth.
-    let is_local = headers
-        .get("host")
+    let is_local = headers.get("host")
         .and_then(|v| v.to_str().ok())
-        .map(|h| {
-            h.starts_with("127.")
-                || h.starts_with("localhost")
-                || h.starts_with("[::1]")
-                || h.starts_with("0.0.0.0")
-        })
+        .map(|h| h.starts_with("127.") || h.starts_with("localhost") || h.starts_with("[::1]") || h.starts_with("0.0.0.0"))
         .unwrap_or(true); // Missing Host header → assume local
     if is_local {
         return true;
@@ -2566,36 +2070,26 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> bool {
     let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    let bearer = auth
-        .strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "));
+    let bearer = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "));
     bearer == Some(expected)
 }
 
 /// Record a system prompt fingerprint for cache stability tracking.
 /// Keeps the last 20 hashes per conversation.
 fn track_cache_stability(state: &AppState, conv_id: i64, body: &serde_json::Value) {
-    let system_content = body["messages"]
-        .as_array()
+    let system_content = body["messages"].as_array()
         .and_then(|arr| arr.first())
         .filter(|m| m["role"].as_str() == Some("system"))
         .and_then(|m| m["content"].as_str());
 
-    let Some(content) = system_content else {
-        return;
-    };
-    if content.is_empty() {
-        return;
-    }
+    let Some(content) = system_content else { return };
+    if content.is_empty() { return }
 
     use sha2::{Digest, Sha256};
     let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
     let short_hash = &hash[..12];
 
-    let mut tracker = state
-        .cache_stability
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut tracker = state.cache_stability.lock().unwrap_or_else(|e| e.into_inner());
     let hashes = tracker.entry(conv_id).or_default();
     hashes.push(short_hash.to_string());
     if hashes.len() > 20 {
@@ -2609,21 +2103,11 @@ fn track_cache_stability(state: &AppState, conv_id: i64, body: &serde_json::Valu
 ///
 /// Only modifies `messages[0]` if its role is "system".
 fn normalize_system_prompt(mut body: serde_json::Value) -> serde_json::Value {
-    let Some(messages) = body["messages"].as_array_mut() else {
-        return body;
-    };
-    if messages.is_empty() {
-        return body;
-    }
-    if messages[0].get("role").and_then(|v| v.as_str()) != Some("system") {
-        return body;
-    }
-    let Some(original) = messages[0].get("content").and_then(|v| v.as_str()) else {
-        return body;
-    };
-    if original.is_empty() {
-        return body;
-    }
+    let Some(messages) = body["messages"].as_array_mut() else { return body };
+    if messages.is_empty() { return body }
+    if messages[0].get("role").and_then(|v| v.as_str()) != Some("system") { return body }
+    let Some(original) = messages[0].get("content").and_then(|v| v.as_str()) else { return body };
+    if original.is_empty() { return body }
 
     let cleaned = original.to_string();
     let mut changes = 0u32;
@@ -2637,11 +2121,9 @@ fn normalize_system_prompt(mut body: serde_json::Value) -> serde_json::Value {
         // Try ISO 8601 timestamp: YYYY-MM-DDTHH:MM:SS...
         if i + 19 <= bytes.len()
             && bytes[i].is_ascii_digit()
-            && bytes[i + 4] == b'-'
-            && bytes[i + 7] == b'-'
-            && (bytes[i + 10] == b'T' || bytes[i + 10] == b' ')
-            && bytes[i + 13] == b':'
-            && bytes[i + 16] == b':'
+            && bytes[i+4] == b'-' && bytes[i+7] == b'-'
+            && (bytes[i+10] == b'T' || bytes[i+10] == b' ')
+            && bytes[i+13] == b':' && bytes[i+16] == b':'
         {
             // Consume the full timestamp
             let start = i;
@@ -2649,17 +2131,13 @@ fn normalize_system_prompt(mut body: serde_json::Value) -> serde_json::Value {
             // Optional fractional seconds
             if i < bytes.len() && bytes[i] == b'.' {
                 i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
+                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
             }
             // Optional timezone
             if i < bytes.len() && (bytes[i] == b'Z' || bytes[i] == b'+' || bytes[i] == b'-') {
                 i += 1;
-                if bytes[i - 1] != b'Z' {
-                    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b':') {
-                        i += 1;
-                    }
+                if bytes[i-1] != b'Z' {
+                    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b':') { i += 1; }
                 }
             }
             out.push_str("[ts]");
@@ -2671,13 +2149,12 @@ fn normalize_system_prompt(mut body: serde_json::Value) -> serde_json::Value {
         // Try UUID: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (36 chars, hex digits + dashes)
         if i + 36 <= bytes.len()
             && bytes[i].is_ascii_hexdigit()
-            && bytes[i + 8] == b'-'
-            && bytes[i + 13] == b'-'
-            && bytes[i + 18] == b'-'
-            && bytes[i + 23] == b'-'
+            && bytes[i+8] == b'-' && bytes[i+13] == b'-'
+            && bytes[i+18] == b'-' && bytes[i+23] == b'-'
         {
-            let is_uuid = (i..i + 36)
-                .all(|j| matches!(bytes[j], b'-' | b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'));
+            let is_uuid = (i..i+36).all(|j| {
+                matches!(bytes[j], b'-' | b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
+            });
             if is_uuid {
                 out.push_str("[uuid]");
                 i += 36;
@@ -2719,10 +2196,7 @@ async fn anthropic_messages(
             if let Some(ak) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
                 *key = Some(ak.to_string());
             } else if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-                if let Some(bearer) = auth
-                    .strip_prefix("Bearer ")
-                    .or_else(|| auth.strip_prefix("bearer "))
-                {
+                if let Some(bearer) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
                     *key = Some(bearer.to_string());
                 }
             }
@@ -2736,8 +2210,7 @@ async fn anthropic_messages(
     if let Some(system) = body.get("system") {
         let system_text = match system {
             Value::String(s) => s.clone(),
-            Value::Array(arr) => arr
-                .iter()
+            Value::Array(arr) => arr.iter()
                 .filter_map(|b| b["text"].as_str().map(|s| s.to_string()))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -2745,11 +2218,9 @@ async fn anthropic_messages(
         };
         if !system_text.is_empty() {
             if let Some(arr) = body["messages"].as_array_mut() {
-                let existing_system = arr
-                    .first()
+                let existing_system = arr.first()
                     .and_then(|m| m.get("role"))
-                    .and_then(|r| r.as_str())
-                    == Some("system");
+                    .and_then(|r| r.as_str()) == Some("system");
                 if !existing_system {
                     arr.insert(0, json!({"role": "system", "content": system_text}));
                 }
@@ -2771,11 +2242,7 @@ async fn anthropic_messages(
     let fp = crate::session::fingerprint_anthropic(state.workspace.as_deref());
     // Synchronously create/find conversation so near-simultaneous requests
     // (e.g. Claude Code's stream+non-stream pair) share the same ID.
-    let conv_id = state
-        .storage
-        .db
-        .find_or_create_conversation(&fp, "claude")
-        .ok();
+    let conv_id = state.storage.db.find_or_create_conversation(&fp, "claude").ok();
     if let Some(cid) = conv_id {
         track_cache_stability(&state, cid, &body);
     }
@@ -2788,10 +2255,7 @@ async fn anthropic_messages(
         let body_clone = body.clone();
         let body_fp = fp.clone();
         tokio::task::spawn(async move {
-            if let Err(e) = pipeline
-                .process_with_fp("claude", &body_clone, 1, Some(&body_fp))
-                .await
-            {
+            if let Err(e) = pipeline.process_with_fp("claude", &body_clone, 1, Some(&body_fp)).await {
                 tracing::warn!(target: "deeplossless::pipeline", "anthropic pipeline failed: {e}");
             }
         });
@@ -2813,8 +2277,7 @@ async fn anthropic_messages(
                 if !nodes.is_empty() {
                     let ctx_text = crate::pipeline::render_dag_context(&nodes);
                     if let Some(arr) = body["messages"].as_array_mut() {
-                        if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user")
-                        {
+                        if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
                             let original = last_user["content"].as_str().unwrap_or("").to_string();
                             last_user["content"] = json!(if original.is_empty() {
                                 ctx_text
@@ -2830,10 +2293,7 @@ async fn anthropic_messages(
 
     // Translate Anthropic → DeepSeek Chat Completions
     let last_reasoning = {
-        let cache = state
-            .reasoning_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = state.reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
         let rc = cache.get(&fp).cloned();
         tracing::debug!(target: "deeplossless::anthropic",
             fp = %fp,
@@ -2842,44 +2302,26 @@ async fn anthropic_messages(
             "reasoning cache lookup");
         rc
     };
-    let deepseek_body =
-        crate::protocol::anthropic::request_to_deepseek(&body, last_reasoning.as_deref());
-    let streaming = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let deepseek_body = crate::protocol::anthropic::request_to_deepseek(&body, last_reasoning.as_deref());
+    let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let overhead_ms = t0.elapsed().as_millis();
 
     // Forward to upstream
     let upstream_url = upstream_chat_url(&state.upstream, &state.upstream_path);
-    let body_kb = serde_json::to_string(&deepseek_body)
-        .unwrap_or_default()
-        .len() as f64
-        / 1024.0;
+    let body_kb = serde_json::to_string(&deepseek_body).unwrap_or_default().len() as f64 / 1024.0;
     let orig_kb = serde_json::to_string(&body).unwrap_or_default().len() as f64 / 1024.0;
     tracing::debug!(target: "deeplossless::anthropic", orig_kb, translated_kb = body_kb, overhead_ms, "request sizes");
     // Record original Anthropic request body for protocol debugging
     if let Some(ref dir) = state.record {
         let _ = std::fs::create_dir_all(dir);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let _ = std::fs::write(
-            format!("{dir}/req_{ts}.json"),
-            serde_json::to_string_pretty(&body).unwrap_or_default(),
-        );
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+        let _ = std::fs::write(format!("{dir}/req_{ts}.json"), serde_json::to_string_pretty(&body).unwrap_or_default());
     }
     let upstream_start = std::time::Instant::now();
-    let resp = match state
-        .runtime
-        .client
+    let resp = match state.runtime.client
         .post(&upstream_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", get_cached_key(&state.api_key)),
-        )
+        .header("Authorization", format!("Bearer {}", get_cached_key(&state.api_key)))
         .header("Content-Type", "application/json")
         .json(&deepseek_body)
         .send()
@@ -2893,19 +2335,13 @@ async fn anthropic_messages(
                 &format!("{e}"),
                 serde_json::json!({"source": "anthropic_messages"}),
             );
-            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}"));
+            return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("{e}"))
         }
     };
 
     let status = resp.status();
     let latency = upstream_start.elapsed().as_millis() as u64;
-    metrics::record_latency(
-        "anthropic",
-        status.as_u16(),
-        Some(status.as_u16()),
-        latency,
-        None,
-    );
+    metrics::record_latency("anthropic", status.as_u16(), Some(status.as_u16()), latency, None);
 
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -2942,17 +2378,9 @@ async fn anthropic_messages(
                             let line = buf[..pos].trim().to_string();
                             buf = buf[pos + 1..].to_string();
                             if let Some(data) = line.strip_prefix("data: ") {
-                                if data == "[DONE]" {
-                                    continue;
-                                }
+                                if data == "[DONE]" { continue; }
                                 for event in sse_state.convert(data) {
-                                    if tx
-                                        .send(Ok::<_, std::convert::Infallible>(
-                                            axum::body::Bytes::from(event),
-                                        ))
-                                        .await
-                                        .is_err()
-                                    {
+                                    if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event))).await.is_err() {
                                         return;
                                     }
                                 }
@@ -2972,11 +2400,9 @@ async fn anthropic_messages(
                 let _ = tx.send(Ok::<_, std::convert::Infallible>(
                     axum::body::Bytes::from("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n")
                 )).await;
-                let _ = tx
-                    .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-                    )))
-                    .await;
+                let _ = tx.send(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                )).await;
             }
             // Cache reasoning_content for the next turn
             if !sse_state.reasoning_content.is_empty() {
@@ -3010,51 +2436,26 @@ async fn anthropic_messages(
 
         let mut response = Response::new(Body::from_stream(stream));
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(
-            "content-type",
-            "text/event-stream; charset=utf-8"
-                .parse()
-                .expect("static header"),
-        );
+        response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().expect("static header"));
         response
     } else {
         match resp.bytes().await {
             Ok(bytes) => {
                 // Record raw DeepSeek response for protocol debugging
                 if let Some(ref dir) = state.record {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let _ = std::fs::write(
-                        format!("{dir}/rsp_{ts}.json"),
-                        serde_json::to_string_pretty(
-                            &serde_json::from_slice::<Value>(&bytes).unwrap_or_default(),
-                        )
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string()),
-                    );
+                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let _ = std::fs::write(format!("{dir}/rsp_{ts}.json"), serde_json::to_string_pretty(&serde_json::from_slice::<Value>(&bytes).unwrap_or_default()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string()));
                 }
                 let deepseek_resp: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
-                    Err(e) => {
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            "UPSTREAM_ERROR",
-                            format!("invalid JSON: {e}"),
-                        );
-                    }
+                    Err(e) => return json_error(StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR", format!("invalid JSON: {e}")),
                 };
                 // Capture reasoning_content for next turn (thinking mode requirement)
                 let rc = deepseek_resp["choices"][0]["message"]["reasoning_content"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                    .as_str().unwrap_or("").to_string();
                 if !rc.is_empty() {
                     let rc_len = rc.len();
-                    let mut cache = state
-                        .reasoning_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut cache = state.reasoning_cache.lock().unwrap_or_else(|e| e.into_inner());
                     if !cache.contains_key(&fp)
                         && cache.len() >= REASONING_CACHE_CAPACITY
                         && let Some(evicted) = cache.keys().next().cloned()
@@ -3067,16 +2468,11 @@ async fn anthropic_messages(
                         fp = %fp, rc_len,
                         "reasoning cached from non-streaming response");
                 }
-                let anthropic_resp =
-                    crate::protocol::anthropic::response_to_anthropic(&deepseek_resp);
+                let anthropic_resp = crate::protocol::anthropic::response_to_anthropic(&deepseek_resp);
                 // Accumulate token usage for non-streaming path
                 if let Some(cid) = conv_id {
-                    let it = deepseek_resp["usage"]["prompt_tokens"]
-                        .as_u64()
-                        .unwrap_or(0);
-                    let ot = deepseek_resp["usage"]["completion_tokens"]
-                        .as_u64()
-                        .unwrap_or(0);
+                    let it = deepseek_resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+                    let ot = deepseek_resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
                     if it > 0 || ot > 0 {
                         let usage_db = state.storage.db.clone();
                         tokio::task::spawn_blocking(move || {
@@ -3103,10 +2499,7 @@ async fn lcm_grep_by_id(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
     match state.storage.db.search_unified(conv_id, query, limit) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
@@ -3115,11 +2508,9 @@ async fn lcm_grep_by_id(
             "matches": results,
         }))
         .into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SEARCH_ERROR",
-            format!("search error: {e}"),
-        ),
+        Err(e) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}"))
+        }
     }
 }
 
@@ -3137,11 +2528,7 @@ async fn lcm_grep_by_fingerprint(
     let fingerprint = params.get("fingerprint").map(|s| s.as_str()).unwrap_or("");
 
     // Resolve fingerprint to internal conversation ID
-    let conv_id = if let Ok(Some(id)) = state
-        .storage
-        .db
-        .find_conversation_by_fingerprint(fingerprint)
-    {
+    let conv_id = if let Ok(Some(id)) = state.storage.db.find_conversation_by_fingerprint(fingerprint) {
         id
     } else if let Ok(id) = fingerprint.parse::<i64>() {
         id
@@ -3149,43 +2536,31 @@ async fn lcm_grep_by_fingerprint(
         return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "conversation not found");
     };
 
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
     match state.storage.db.search_unified(conv_id, query, limit) {
         Ok(results) => Json(json!({
             "conversation_id": conv_id,
             "query": query,
             "total": results.len(),
             "matches": results,
-        }))
-        .into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SEARCH_ERROR",
-            format!("search error: {e}"),
-        ),
+        })).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
     }
 }
 
 /// Return the most recent conversation ID for the current session.
 /// AI agents can use this to discover which conversation to query via LCM endpoints.
-async fn lcm_current_conv(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_current_conv(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     match state.storage.db.last_conversation_id() {
         Ok(Some(id)) => Json(json!({"conversation_id": id})).into_response(),
-        Ok(None) => Json(
-            json!({"conversation_id": null, "hint": "No conversations yet. Make a request first."}),
-        )
-        .into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Ok(None) => Json(json!({"conversation_id": null, "hint": "No conversations yet. Make a request first."})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3198,31 +2573,19 @@ async fn lcm_sessions_list(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
     match state.storage.db.list_sessions(limit) {
         Ok(rows) => {
-            let items: Vec<Value> = rows
-                .iter()
-                .map(|(id, fp, model, count, tokens)| {
-                    json!({
-                        "id": id,
-                        "fingerprint": fp,
-                        "model": model,
-                        "event_count": count,
-                        "total_tokens": tokens,
-                    })
-                })
-                .collect();
+            let items: Vec<Value> = rows.iter().map(|(id, fp, model, count, tokens)| json!({
+                "id": id,
+                "fingerprint": fp,
+                "model": model,
+                "event_count": count,
+                "total_tokens": tokens,
+            })).collect();
             Json(json!({"sessions": items})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3240,45 +2603,31 @@ async fn lcm_search_events(
     }
 
     let filter = EventFilter {
-        event_type: params
-            .get("event_type")
-            .and_then(|s| EventType::from_event_str(s)),
+        event_type: params.get("event_type").and_then(|s| EventType::from_event_str(s)),
         tool_name: params.get("tool").cloned(),
         session_id: params.get("session").cloned(),
         status: params.get("status").cloned(),
         path_pattern: params.get("path").map(|p| format!("%{p}%")),
         content_match: params.get("content").cloned(),
-        limit: params
-            .get("limit")
-            .and_then(|s| s.parse().ok())
-            .or(Some(50)),
+        limit: params.get("limit").and_then(|s| s.parse().ok()).or(Some(50)),
     };
 
     match state.storage.db.query_proxy_events(&filter) {
         Ok(events) => {
-            let items: Vec<Value> = events
-                .iter()
-                .map(|e| {
-                    json!({
-                        "id": e.id,
-                        "event_type": e.event_type.as_str(),
-                        "session_id": e.session_id,
-                        "timestamp": e.timestamp,
-                        "tool_name": e.tool_name,
-                        "path": e.path,
-                        "status": e.status,
-                        "content": &e.content[..e.content.len().min(500)],
-                        "metadata": e.metadata,
-                    })
-                })
-                .collect();
+            let items: Vec<Value> = events.iter().map(|e| json!({
+                "id": e.id,
+                "event_type": e.event_type.as_str(),
+                "session_id": e.session_id,
+                "timestamp": e.timestamp,
+                "tool_name": e.tool_name,
+                "path": e.path,
+                "status": e.status,
+                "content": &e.content[..e.content.len().min(500)],
+                "metadata": e.metadata,
+            })).collect();
             Json(json!({"events": items, "count": items.len()})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3297,10 +2646,7 @@ async fn lcm_diffs_list(
         session_id: params.get("session").cloned(),
         file_path: params.get("file_path").cloned(),
         tool_call_id: params.get("tool_call_id").cloned(),
-        limit: params
-            .get("limit")
-            .and_then(|s| s.parse().ok())
-            .or(Some(50)),
+        limit: params.get("limit").and_then(|s| s.parse().ok()).or(Some(50)),
     };
     match state.storage.db.query_diffs(&q) {
         Ok(diffs) => {
@@ -3313,11 +2659,7 @@ async fn lcm_diffs_list(
             })).collect();
             Json(json!({"diffs": items, "count": items.len()})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3335,23 +2677,11 @@ async fn lcm_diff_reconstruct(
     let file_path = params.get("file_path").cloned().unwrap_or_default();
     let initial = params.get("initial").cloned().unwrap_or_default();
     if session.is_empty() || file_path.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "session and file_path required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session and file_path required");
     }
-    match state
-        .storage
-        .db
-        .reconstruct_file(&session, &file_path, &initial)
-    {
+    match state.storage.db.reconstruct_file(&session, &file_path, &initial) {
         Ok(content) => Json(json!({"content": content, "file_path": file_path})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3376,11 +2706,7 @@ async fn lcm_diff_overlaps(
             })).collect();
             Json(json!({"overlaps": items, "count": items.len()})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3395,36 +2721,20 @@ async fn lcm_session_events(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     if id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "session id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
     }
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2000);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(2000);
     let total = state.storage.db.count_session_events(id).unwrap_or(0);
-    let tool_counts = state
-        .storage
-        .db
-        .get_tool_category_counts(id)
-        .unwrap_or_default();
+    let tool_counts = state.storage.db.get_tool_category_counts(id).unwrap_or_default();
     match state.storage.db.get_session_events(id, limit) {
         Ok(rows) => {
-            let items: Vec<Value> = rows
-                .iter()
-                .map(|(ev_id, kind, payload, seq, ts)| {
-                    json!({
-                        "id": ev_id,
-                        "type": kind,
-                        "payload": payload,
-                        "seq_no": seq,
-                        "timestamp": ts.replacen(' ', "T", 1) + "Z",
-                    })
-                })
-                .collect();
+            let items: Vec<Value> = rows.iter().map(|(ev_id, kind, payload, seq, ts)| json!({
+                "id": ev_id,
+                "type": kind,
+                "payload": payload,
+                "seq_no": seq,
+                "timestamp": ts.replacen(' ', "T", 1) + "Z",
+            })).collect();
             Json(json!({
                 "session_id": id,
                 "events": items,
@@ -3432,11 +2742,7 @@ async fn lcm_session_events(
                 "tool_counts": tool_counts.iter().map(|(k, v)| json!({"tool": k, "count": v})).collect::<Vec<_>>(),
             })).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3447,7 +2753,7 @@ async fn lcm_expand(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    } // Expand a summary node to its children (original messages)
+    }    // Expand a summary node to its children (original messages)
     match state.storage.dag.get_children(node_id) {
         Ok(children) => {
             let node = state.storage.dag.get_node(node_id).ok().flatten();
@@ -3458,11 +2764,9 @@ async fn lcm_expand(
             }))
             .into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "EXPAND_ERROR",
-            format!("expand error: {e}"),
-        ),
+        Err(e) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "EXPAND_ERROR", format!("expand error: {e}"))
+        }
     }
 }
 
@@ -3473,20 +2777,17 @@ async fn lcm_snippets(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }
-    match state.storage.dag.get_node(node_id) {
-        Ok(Some(node)) => Json(serde_json::json!({
-            "node_id": node_id,
-            "snippets": node.snippets,
-            "summary": node.summary,
-        }))
-        .into_response(),
+    }    match state.storage.dag.get_node(node_id) {
+        Ok(Some(node)) => {
+            Json(serde_json::json!({
+                "node_id": node_id,
+                "snippets": node.snippets,
+                "summary": node.summary,
+            }))
+            .into_response()
+        }
         Ok(None) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", "node not found"),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "NODE_ERROR",
-            format!("error: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     }
 }
 
@@ -3500,10 +2801,7 @@ async fn lcm_stream_context(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let budget: usize = params
-        .get("budget")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2000);
+    let budget: usize = params.get("budget").and_then(|s| s.parse().ok()).unwrap_or(2000);
     let q_owned: Option<String> = params.get("q").cloned();
 
     let dag = state.storage.dag.clone();
@@ -3511,12 +2809,9 @@ async fn lcm_stream_context(
     let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
-        if shutdown.notified().now_or_never().is_some() {
-            return;
-        }
+        if shutdown.notified().now_or_never().is_some() { return; }
         let q_ref = q_owned.as_deref();
-        let nodes = dag
-            .assemble_context(conv_id, budget, q_ref)
+        let nodes = dag.assemble_context(conv_id, budget, q_ref)
             .unwrap_or_default();
 
         for (i, node) in nodes.iter().enumerate() {
@@ -3529,28 +2824,17 @@ async fn lcm_stream_context(
                 "tokens": node.token_count,
                 "reasoning": if node.reasoning.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(node.reasoning.clone()) },
             });
-            let payload = format!(
-                "data: {}\n\n",
-                serde_json::to_string(&data).unwrap_or_default()
-            );
-            if tx
-                .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    payload,
-                )))
-                .await
-                .is_err()
-            {
+            let payload = format!("data: {}\n\n", serde_json::to_string(&data).unwrap_or_default());
+            if tx.send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(payload))).await.is_err() {
                 break;
             }
             // Small yield to let the client process incrementally
             tokio::task::yield_now().await;
         }
 
-        let _ = tx
-            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                "data: [DONE]\n\n",
-            )))
-            .await;
+        let _ = tx.send(Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from("data: [DONE]\n\n")
+        )).await;
     });
 
     let stream = ReceiverStream::new(rx);
@@ -3562,11 +2846,7 @@ async fn lcm_stream_context(
         .body(axum::body::Body::from_stream(stream))
     {
         Ok(resp) => resp,
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "STREAM_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "STREAM_ERROR", format!("{e}")),
     }
 }
 
@@ -3579,30 +2859,16 @@ async fn lcm_file_claim(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let agent_id = body
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let agent_id = body.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
     let file_path = body.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-    let operation = body
-        .get("operation")
-        .and_then(|v| v.as_str())
-        .unwrap_or("edit");
+    let operation = body.get("operation").and_then(|v| v.as_str()).unwrap_or("edit");
     let conv_id = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(0);
 
     if file_path.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "file_path is required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "file_path is required");
     }
     if conv_id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "conv_id must be a positive integer",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "conv_id must be a positive integer");
     }
 
     match state.storage.db.claim_file(agent_id, file_path, operation, conv_id) {
@@ -3621,57 +2887,36 @@ async fn lcm_file_release(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let agent_id = body
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let agent_id = body.get("agent_id").and_then(|v| v.as_str()).unwrap_or("unknown");
     let file_path = body.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
 
     if file_path.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "file_path is required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "file_path is required");
     }
 
     match state.storage.db.release_file(agent_id, file_path) {
-        Ok(0) => json_error(
-            StatusCode::NOT_FOUND,
-            "NOT_FOUND",
-            format!("no claim found for '{}' by agent '{}'", file_path, agent_id),
-        ),
+        Ok(0) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("no claim found for '{}' by agent '{}'", file_path, agent_id)),
         Ok(_) => Json(json!({"status": "released", "file_path": file_path})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "RELEASE_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "RELEASE_ERROR", format!("{e}")),
     }
 }
 
 /// List all active file claims (for conflict awareness).
-async fn lcm_file_conflicts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_file_conflicts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     match state.storage.db.list_all_file_claims() {
         Ok(claims) => {
-            let rows: Vec<Value> = claims
-                .iter()
-                .map(|(aid, path, op)| {
-                    json!({
-                        "agent_id": aid, "file_path": path, "operation": op
-                    })
-                })
-                .collect();
+            let rows: Vec<Value> = claims.iter().map(|(aid, path, op)| json!({
+                "agent_id": aid, "file_path": path, "operation": op
+            })).collect();
             Json(json!({"conflicts": rows})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3687,29 +2932,16 @@ async fn lcm_cache_put(
     let tool = body.get("tool").map(|s| s.as_str()).unwrap_or("");
     let args = body.get("args").map(|s| s.as_str()).unwrap_or("");
     let result = body.get("result").map(|s| s.as_str()).unwrap_or("");
-    let files: Vec<String> = body
-        .get("files")
+    let files: Vec<String> = body.get("files")
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
     if tool.is_empty() || args.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "tool and args required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
     }
-    match state
-        .storage
-        .db
-        .store_tool_artifact(tool, args, result, &files)
-    {
+    match state.storage.db.store_tool_artifact(tool, args, result, &files) {
         Ok(_id) => Json(json!({"status": "cached", "tool": tool})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CACHE_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
     }
 }
 
@@ -3727,22 +2959,12 @@ async fn lcm_cache_get(
 
     let (_name, hash) = crate::tool_cache::cache_key(tool, args);
     if tool.is_empty() || hash.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "tool and args required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
     }
     match state.storage.db.tool_cache_get(tool, &hash) {
-        Ok(Some((result, hits))) => {
-            Json(json!({"hit": true, "result": result, "hit_count": hits})).into_response()
-        }
+        Ok(Some((result, hits))) => Json(json!({"hit": true, "result": result, "hit_count": hits})).into_response(),
         Ok(None) => Json(json!({"hit": false})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CACHE_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
     }
 }
 
@@ -3755,21 +2977,20 @@ async fn lcm_latency_records(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
     let records = metrics::get_latency_records(limit);
     Json(json!({
         "count": records.len(),
         "records": records,
         "summary": metrics::get_latency_summary(),
-    }))
-    .into_response()
+    })).into_response()
 }
 
 /// GET /v1/lcm/latency/summary — aggregated latency statistics.
-async fn lcm_latency_summary(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_latency_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
@@ -3789,19 +3010,11 @@ async fn lcm_cache_delete(
     let args = params.get("args").map(|s| s.as_str()).unwrap_or("");
     let (_name, hash) = crate::tool_cache::cache_key(tool, args);
     if tool.is_empty() || hash.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "tool and args required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "tool and args required");
     }
     match state.storage.db.tool_cache_delete(tool, &hash) {
         Ok(()) => Json(json!({"status": "deleted"})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CACHE_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "CACHE_ERROR", format!("{e}")),
     }
 }
 
@@ -3816,34 +3029,18 @@ async fn lcm_session_patches(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     if id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "session id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
     }
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
     match state.storage.db.get_session_patches(id, limit) {
         Ok(rows) => {
-            let items: Vec<Value> = rows
-                .iter()
-                .map(|(role, content)| {
-                    json!({
-                        "role": role,
-                        "content": content,
-                    })
-                })
-                .collect();
+            let items: Vec<Value> = rows.iter().map(|(role, content)| json!({
+                "role": role,
+                "content": content,
+            })).collect();
             Json(json!({"session_id": id, "patches": items})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3858,37 +3055,23 @@ async fn lcm_session_system_prompt(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     if id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "session id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
     }
     match state.storage.db.get_system_prompts_deduped(id) {
         Ok(rows) => {
-            let items: Vec<Value> = rows
-                .iter()
-                .map(|(msg_id, content, tokens, ts)| {
-                    json!({
-                        "id": msg_id,
-                        "content": content,
-                        "token_count": tokens,
-                        "stored_at": ts.replacen(' ', "T", 1) + "Z",
-                    })
-                })
-                .collect();
+            let items: Vec<Value> = rows.iter().map(|(msg_id, content, tokens, ts)| json!({
+                "id": msg_id,
+                "content": content,
+                "token_count": tokens,
+                "stored_at": ts.replacen(' ', "T", 1) + "Z",
+            })).collect();
             Json(json!({
                 "session_id": id,
                 "count": items.len(),
                 "prompts": items,
-            }))
-            .into_response()
+            })).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3904,19 +3087,11 @@ async fn lcm_context_pressure(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     if id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "session id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "session id must be positive");
     }
     match state.storage.db.context_pressure_analysis(id) {
         Ok(data) => Json(data).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DB_ERROR", format!("{e}")),
     }
 }
 
@@ -3944,18 +3119,10 @@ async fn lcm_context_inject(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     if body.conv_id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "conv_id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "conv_id must be positive");
     }
     if body.messages.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "messages array is empty",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "messages array is empty");
     }
 
     let mut messages = body.messages;
@@ -3975,11 +3142,7 @@ async fn lcm_context_inject(
             }
             Ok(_) => {} // no context found — inject nothing
             Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DAG_ERROR",
-                    format!("{e}"),
-                );
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "DAG_ERROR", format!("{e}"));
             }
         }
     }
@@ -3999,8 +3162,7 @@ async fn lcm_context_inject(
         }
     }
 
-    let total_tokens: usize = messages
-        .iter()
+    let total_tokens: usize = messages.iter()
         .map(|m| crate::tokenizer::count(m["content"].as_str().unwrap_or("")))
         .sum();
 
@@ -4023,36 +3185,26 @@ async fn lcm_context_inject(
 
 /// GET /v1/lcm/cache/stability — system prompt cache stability diagnostics.
 /// Returns per-conversation hash history and stability metrics.
-async fn lcm_cache_stability(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_cache_stability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let tracker = state
-        .cache_stability
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let items: Vec<Value> = tracker
-        .iter()
-        .map(|(conv_id, hashes)| {
-            let total = hashes.len();
-            let unique = hashes
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            let cache_hit_rate = if total < 2 {
-                1.0
-            } else {
-                1.0 - (unique as f64 - 1.0) / (total as f64 - 1.0).max(1.0)
-            };
-            json!({
-                "conversation_id": conv_id,
-                "samples": total,
-                "unique_hashes": unique,
-                "stability_pct": (cache_hit_rate * 100.0).round() as u32,
-                "recent": hashes.iter().rev().take(5).collect::<Vec<_>>(),
-            })
+    let tracker = state.cache_stability.lock().unwrap_or_else(|e| e.into_inner());
+    let items: Vec<Value> = tracker.iter().map(|(conv_id, hashes)| {
+        let total = hashes.len();
+        let unique = hashes.iter().collect::<std::collections::HashSet<_>>().len();
+        let cache_hit_rate = if total < 2 { 1.0 } else { 1.0 - (unique as f64 - 1.0) / (total as f64 - 1.0).max(1.0) };
+        json!({
+            "conversation_id": conv_id,
+            "samples": total,
+            "unique_hashes": unique,
+            "stability_pct": (cache_hit_rate * 100.0).round() as u32,
+            "recent": hashes.iter().rev().take(5).collect::<Vec<_>>(),
         })
-        .collect();
+    }).collect();
     Json(json!({"conversations": items})).into_response()
 }
 
@@ -4067,31 +3219,15 @@ async fn lcm_failure_put(
     }
     let conv_id: i64 = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(1);
     let sig = body.get("signature").and_then(|v| v.as_str()).unwrap_or("");
-    let fix = body
-        .get("attempted_fix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let why = body
-        .get("why_failed")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let assumptions: Vec<String> = body
-        .get("assumptions")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let files: Vec<String> = body
-        .get("files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let fix = body.get("attempted_fix").and_then(|v| v.as_str()).unwrap_or("");
+    let why = body.get("why_failed").and_then(|v| v.as_str()).unwrap_or("");
+    let assumptions: Vec<String> = body.get("assumptions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let files: Vec<String> = body.get("files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
 
-    if sig.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "signature required");
-    }
-    match state
-        .storage
-        .db
-        .store_failure_pattern(conv_id, sig, fix, why, &assumptions, &files, None)
-    {
+    if sig.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "signature required"); }
+    match state.storage.db.store_failure_pattern(conv_id, sig, fix, why, &assumptions, &files, None) {
         Ok(id) => {
             // Link to runtime metrics so repeated_failures stays accurate
             if let Ok(mut cycle) = state.runtime.cycle.lock() {
@@ -4103,39 +3239,26 @@ async fn lcm_failure_put(
             } else {
                 format!("failure pattern stored: signature={sig}, attempted_fix={fix}")
             };
-            let _ =
-                state
-                    .storage
-                    .db
-                    .store_decision_record(conv_id, "RetryWithFix", 0.7, &reason, 0);
+            let _ = state.storage.db.store_decision_record(
+                conv_id, "RetryWithFix", 0.7, &reason, 0,
+            );
             // Evaluate any pending cache decisions — the failure may invalidate cache entries
             if let Ok(records) = state.storage.db.query_decision_records(conv_id, 5) {
                 for (rec_id, action, _, accepted, outcome, _, _, _) in &records {
                     if action == "ReuseToolCache" && *accepted != Some(false) && outcome.is_none() {
-                        let _ = state.storage.db.evaluate_decision(
-                            *rec_id,
-                            "cache_invalidated",
-                            Some(0),
-                        );
+                        let _ = state.storage.db.evaluate_decision(*rec_id, "cache_invalidated", Some(0));
                     }
                 }
             }
             // Auto-snapshot on failure for recovery support
-            if let Err(e) =
-                state
-                    .storage
-                    .dag
-                    .auto_snapshot_on_event(conv_id, "failure", &format!("sig={sig}"))
-            {
+            if let Err(e) = state.storage.dag.auto_snapshot_on_event(
+                conv_id, "failure", &format!("sig={sig}"),
+            ) {
                 tracing::warn!(target: "deeplossless::proxy", "auto-snapshot on failure: {e}");
             }
             Json(json!({"status": "stored", "id": id})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "FAILURE_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "FAILURE_ERROR", format!("{e}")),
     }
 }
 
@@ -4150,29 +3273,15 @@ async fn lcm_plan_put(
     }
     let conv_id: i64 = body.get("conv_id").and_then(|v| v.as_i64()).unwrap_or(1);
     let goal = body.get("goal").and_then(|v| v.as_str()).unwrap_or("");
-    let steps: Vec<String> = body
-        .get("steps")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let assumptions: Vec<String> = body
-        .get("assumptions")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let steps: Vec<String> = body.get("steps")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let assumptions: Vec<String> = body.get("assumptions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
 
-    if goal.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "goal required");
-    }
-    match state
-        .storage
-        .db
-        .store_plan_state(conv_id, goal, &steps, &assumptions)
-    {
+    if goal.is_empty() { return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "goal required"); }
+    match state.storage.db.store_plan_state(conv_id, goal, &steps, &assumptions) {
         Ok(id) => Json(json!({"status": "stored", "id": id})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PLAN_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
 }
 
@@ -4191,14 +3300,9 @@ async fn lcm_plan_get(
             "pending_steps": pending,
             "completed_steps": completed,
             "assumptions": assumptions,
-        }))
-        .into_response(),
+        })).into_response(),
         Ok(None) => Json(json!({"active_plan": null})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PLAN_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
 }
 
@@ -4213,57 +3317,32 @@ async fn lcm_plan_delete(
     }
     let id: i64 = params.get("id").and_then(|s| s.parse().ok()).unwrap_or(0);
     if id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "plan id must be a positive integer",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "plan id must be a positive integer");
     }
     match state.storage.db.deactivate_plan(id) {
         Ok(true) => Json(json!({"status": "deleted", "id": id})).into_response(),
-        Ok(false) => json_error(
-            StatusCode::NOT_FOUND,
-            "NOT_FOUND",
-            format!("plan {} not found", id),
-        ),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PLAN_ERROR",
-            format!("{e}"),
-        ),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("plan {} not found", id)),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PLAN_ERROR", format!("{e}")),
     }
 }
 
 /// Debug dump for GitHub issues. Strips user content — only counters, hashes, and structure.
-async fn lcm_debug_dump(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_debug_dump(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let cycle = state
-        .runtime
-        .cycle
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
     let m = &cycle.metrics;
 
     // Cache stats (no content, just key counts)
-    let cache_entry_count = state
-        .storage
-        .db
-        .top_tool_cache_entries(999)
-        .unwrap_or_default()
-        .len();
-    let (total_nodes, total_convs, total_embeddings, active_plan_count, event_count) = state
-        .storage
-        .db
-        .debug_counts()
-        .unwrap_or((-1, -1, -1, -1, -1));
-    let failure_count: i64 = state
-        .storage
-        .db
-        .search_failure_patterns("error", 9999)
-        .map(|r| r.len() as i64)
-        .unwrap_or(-1);
+    let cache_entry_count = state.storage.db.top_tool_cache_entries(999).unwrap_or_default().len();
+    let (total_nodes, total_convs, total_embeddings, active_plan_count, event_count) =
+        state.storage.db.debug_counts().unwrap_or((-1, -1, -1, -1, -1));
+    let failure_count: i64 = state.storage.db.search_failure_patterns("error", 9999)
+        .map(|r| r.len() as i64).unwrap_or(-1);
 
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -4304,21 +3383,13 @@ async fn lcm_runtime_report(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let label = params
-        .get("label")
-        .map(|s| s.as_str())
-        .unwrap_or("coding session");
+    let label = params.get("label").map(|s| s.as_str()).unwrap_or("coding session");
     let conv_id: Option<i64> = params.get("conv_id").and_then(|s| s.parse().ok());
-    let turns: usize = params
-        .get("turns")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let turns: usize = params.get("turns").and_then(|s| s.parse().ok()).unwrap_or(0);
     let fmt = params.get("format").map(|s| s.as_str()).unwrap_or("md");
 
     // Per-conversation data if conv_id provided
-    let (_leaf_count, _summary_count, total_tokens, failure_count) = match conv_id
-        .and_then(|cid| state.storage.db.collect_session_metrics(cid).ok())
-    {
+    let (_leaf_count, _summary_count, total_tokens, failure_count) = match conv_id.and_then(|cid| state.storage.db.collect_session_metrics(cid).ok()) {
         Some(m) => m,
         None => {
             if conv_id.is_some() {
@@ -4328,55 +3399,32 @@ async fn lcm_runtime_report(
         }
     };
 
-    let top_reused = state
-        .storage
-        .db
-        .top_tool_cache_entries(8)
+    let top_reused = state.storage.db.top_tool_cache_entries(8)
         .unwrap_or_default()
         .into_iter()
         .map(|(name, count)| (name, count as u64))
         .collect::<Vec<_>>();
 
-    let duration: u64 = params
-        .get("duration")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut cycle = state
-        .runtime
-        .cycle
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let duration: u64 = params.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     // Override global metrics with per-session data for accurate reporting
     if conv_id.is_some() {
-        cycle.set_session_metrics(
-            total_tokens as u64,
-            failure_count as u64,
-            failure_count.min(1) as u32,
-        );
+        cycle.set_session_metrics(total_tokens as u64, failure_count as u64, failure_count.min(1) as u32);
     }
 
     if fmt == "svg" {
         let svg = crate::runtime::generate_svg_card(&cycle, label, turns, &top_reused);
         let mut response = Response::new(axum::body::Body::from(svg));
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(
-            "content-type",
-            "image/svg+xml".parse().expect("static header"),
-        );
+        response.headers_mut().insert("content-type", "image/svg+xml".parse().expect("static header"));
         return response;
     }
 
     let report = crate::runtime::generate_report(&cycle, label, turns, &top_reused, duration);
     let mut response = Response::new(axum::body::Body::from(report));
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        "content-type",
-        "text/markdown; charset=utf-8"
-            .parse()
-            .expect("static header"),
-    );
+    response.headers_mut().insert("content-type", "text/markdown; charset=utf-8".parse().expect("static header"));
     response
 }
 
@@ -4396,15 +3444,8 @@ async fn lcm_audit_trail(
         ..Default::default()
     };
     match crate::audit::build_audit_trail(&state.storage.db, &query) {
-        Ok(records) => {
-            Json(json!({"conv_id": conv_id, "records": records, "total": records.len()}))
-                .into_response()
-        }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "AUDIT_ERROR",
-            format!("{e}"),
-        ),
+        Ok(records) => Json(json!({"conv_id": conv_id, "records": records, "total": records.len()})).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "AUDIT_ERROR", format!("{e}")),
     }
 }
 
@@ -4419,11 +3460,7 @@ async fn lcm_audit_report(
     }
     match crate::audit::build_audit_report(&state.storage.db, Some(conv_id)) {
         Ok(report) => Json(json!({"conv_id": conv_id, "report": report})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "AUDIT_REPORT_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "AUDIT_REPORT_ERROR", format!("{e}")),
     }
 }
 
@@ -4438,11 +3475,7 @@ async fn lcm_score(
     }
     match state.storage.db.compute_execution_score(conv_id) {
         Ok(score) => Json(score).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SCORE_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SCORE_ERROR", format!("{e}")),
     }
 }
 
@@ -4466,14 +3499,9 @@ async fn lcm_replay(
                 "events": items,
                 "total": items.len(),
                 "corrupt_count": result.corrupt_count,
-            }))
-            .into_response()
+            })).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "REPLAY_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "REPLAY_ERROR", format!("{e}")),
     }
 }
 
@@ -4486,23 +3514,13 @@ async fn lcm_snapshot_take(
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let execution_id = body
-        .get("execution_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let memory_version_id = body
-        .get("memory_version_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let execution_id = body.get("execution_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let memory_version_id = body.get("memory_version_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let tier_raw = body.get("tier").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let ttl = body.get("retention_ttl").and_then(|v| v.as_i64());
 
     if execution_id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "execution_id must be a positive integer",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "execution_id must be a positive integer");
     }
 
     // Validate tier — fail fast on invalid values
@@ -4513,13 +3531,7 @@ async fn lcm_snapshot_take(
 
     let rows = match state.storage.db.get_execution_events(execution_id) {
         Ok(rows) => rows,
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SNAPSHOT_ERROR",
-                format!("{e}"),
-            );
-        }
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
     };
     let last_event_seq_no = rows
         .iter()
@@ -4538,15 +3550,11 @@ async fn lcm_snapshot_take(
             for (_id, _kind, payload, seq_no, _ts) in &rows {
                 let value = match serde_json::from_str::<serde_json::Value>(payload) {
                     Ok(value) => value,
-                    Err(e) => {
-                        return json_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "SNAPSHOT_ERROR",
-                            format!(
-                                "execution event payload is not valid JSON at seq_no {seq_no}: {e}"
-                            ),
-                        );
-                    }
+                    Err(e) => return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "SNAPSHOT_ERROR",
+                        format!("execution event payload is not valid JSON at seq_no {seq_no}: {e}"),
+                    ),
                 };
                 events.push((*seq_no, value));
             }
@@ -4554,9 +3562,7 @@ async fn lcm_snapshot_take(
                 crate::snapshot::SnapshotTier::Structural => {
                     crate::snapshot::SnapshotPayload::Structural { events }
                 }
-                crate::snapshot::SnapshotTier::Full => {
-                    crate::snapshot::SnapshotPayload::Full { events }
-                }
+                crate::snapshot::SnapshotTier::Full => crate::snapshot::SnapshotPayload::Full { events },
                 crate::snapshot::SnapshotTier::Frozen => {
                     crate::snapshot::SnapshotPayload::Frozen { events }
                 }
@@ -4595,70 +3601,50 @@ async fn lcm_snapshot_take(
         .collect();
     let data = match serde_json::to_string(&payload) {
         Ok(data) => data,
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SNAPSHOT_ERROR",
-                format!("{e}"),
-            );
-        }
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
     };
     let size_bytes = data.len() as i64;
-    let boundary_hash =
-        crate::snapshot::compute_boundary_hash(&event_refs, crate::snapshot::BOUNDARY_EVENT_COUNT);
+    let boundary_hash = crate::snapshot::compute_boundary_hash(
+        &event_refs,
+        crate::snapshot::BOUNDARY_EVENT_COUNT,
+    );
     let integrity_hash = crate::snapshot::compute_chain_hash(&event_refs);
 
     match state.storage.db.take_snapshot(
-        execution_id,
-        memory_version_id,
-        tier_raw,
-        &data,
-        size_bytes,
-        ttl,
-        last_event_seq_no,
-        &boundary_hash,
-        &integrity_hash,
+        execution_id, memory_version_id, tier_raw, &data, size_bytes, ttl,
+        last_event_seq_no, &boundary_hash, &integrity_hash,
     ) {
         Ok(id) => {
-            let _ = state
-                .storage
-                .db
-                .enforce_snapshot_budget(&crate::snapshot::SnapshotBudget::default());
+            let _ = state.storage.db.enforce_snapshot_budget(&crate::snapshot::SnapshotBudget::default());
             Json(json!({"status": "stored", "id": id})).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SNAPSHOT_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SNAPSHOT_ERROR", format!("{e}")),
     }
 }
 
 /// List memory version history.
-async fn lcm_versions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     match state.storage.db.list_memory_versions(50) {
         Ok(versions) => Json(json!({"versions": versions})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "VERSION_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "VERSION_ERROR", format!("{e}")),
     }
 }
 
 /// Runtime metrics endpoint — exposes inference-economics counters for diagnostics.
-async fn lcm_runtime_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn lcm_runtime_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    let cycle = state
-        .runtime
-        .cycle
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let cycle = state.runtime.cycle.lock().unwrap_or_else(|e| e.into_inner());
     let m = &cycle.metrics;
     let total_cache = m.cache_hits + m.cache_misses;
     Json(json!({
@@ -4688,23 +3674,12 @@ async fn lcm_execution_search(
     }
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     if query.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "query parameter 'q' is required",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "query parameter 'q' is required");
     }
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.storage.dag.search_execution_memory(query, limit) {
         Ok(refs) => Json(json!({ "results": refs })).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SEARCH_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("{e}")),
     }
 }
 
@@ -4716,32 +3691,19 @@ async fn lcm_global_search(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }
-    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    }    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(10);
     match state.storage.dag.search_cross_session(query, limit) {
         Ok(results) => {
-            let items: Vec<Value> = results
-                .iter()
-                .map(|(nid, cid, summary, excerpt)| {
-                    json!({
-                        "node_id": nid,
-                        "conversation_id": cid,
-                        "summary": summary,
-                        "excerpt": excerpt,
-                    })
-                })
-                .collect();
+            let items: Vec<Value> = results.iter().map(|(nid, cid, summary, excerpt)| json!({
+                "node_id": nid,
+                "conversation_id": cid,
+                "summary": summary,
+                "excerpt": excerpt,
+            })).collect();
             Json(json!({ "results": items })).into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SEARCH_ERROR",
-            format!("search error: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
     }
 }
 
@@ -4754,11 +3716,7 @@ async fn lcm_dag_health(
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
     if conv_id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "conversation_id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "conversation_id must be positive");
     }
     // Verify the conversation exists before running expensive validation
     if !state.storage.db.conversation_exists(conv_id) {
@@ -4774,24 +3732,19 @@ async fn lcm_dag_health(
             }))
             .into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "VALIDATION_ERROR",
-            format!("validation error: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "VALIDATION_ERROR", format!("validation error: {e}")),
     }
 }
 
 /// Return 400 when hash is missing from the path.
-async fn lcm_similar_missing_hash(headers: HeaderMap, State(state): State<AppState>) -> Response {
+async fn lcm_similar_missing_hash(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
     }
-    json_error(
-        StatusCode::BAD_REQUEST,
-        "BAD_REQUEST",
-        "hash is required in path: /v1/lcm/similar/{hash}",
-    )
+    json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "hash is required in path: /v1/lcm/similar/{hash}")
 }
 
 async fn lcm_similar(
@@ -4816,11 +3769,7 @@ async fn lcm_similar(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SEARCH_ERROR",
-            format!("search error: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_ERROR", format!("search error: {e}")),
     }
 }
 
@@ -4831,31 +3780,21 @@ async fn lcm_trace(
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
         return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "unauthorized");
-    }
-    match state.storage.db.get_provenance_with_excerpts(node_id) {
+    }    match state.storage.db.get_provenance_with_excerpts(node_id) {
         Ok(rows) => {
-            let sources: Vec<Value> = rows
-                .iter()
-                .map(|(sid, off, len, excerpt)| {
-                    json!({
-                        "source_node_id": sid,
-                        "offset": off,
-                        "length": len,
-                        "excerpt": excerpt,
-                    })
-                })
-                .collect();
+            let sources: Vec<Value> = rows.iter().map(|(sid, off, len, excerpt)| json!({
+                "source_node_id": sid,
+                "offset": off,
+                "length": len,
+                "excerpt": excerpt,
+            })).collect();
             Json(json!({
                 "summary_node_id": node_id,
                 "sources": sources,
             }))
             .into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "PROVENANCE_ERROR",
-            format!("provenance error: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "PROVENANCE_ERROR", format!("provenance error: {e}")),
     }
 }
 
@@ -4906,58 +3845,41 @@ async fn lcm_compress(
     Json(op): Json<LcmRangeOp>,
 ) -> Response {
     if !ctx_react_auth_ok(&headers, &state) {
-        return json_error(
-            StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
-            "Context-ReAct requires Authorization header",
-        );
+        return json_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "Context-ReAct requires Authorization header");
     }
     // Collect source nodes from DAG leaves in the requested range.
     // Fall back to raw messages only if there are no DAG leaves at all.
-    let (text, source_ids, source_level): (String, Vec<i64>, u8) =
-        match state.storage.dag.get_leaves(op.conv_id) {
-            Ok(leaves) if leaves.len() >= 2 => {
-                let in_range: Vec<&crate::dag::DagNode> = leaves
-                    .iter()
-                    .skip_while(|n| n.id < op.from)
-                    .take_while(|n| n.id <= op.to)
-                    .collect();
-                if in_range.len() < 2 {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        "BAD_REQUEST",
-                        "need at least 2 leaves in range",
-                    );
-                }
-                let ids: Vec<i64> = in_range.iter().map(|n| n.id).collect();
-                // New level = max(source levels) + 1, capped at effective max
-                let max_lvl = in_range.iter().map(|n| n.level).max().unwrap_or(0);
-                let level = (max_lvl + 1).min(3);
-                let text = in_range
-                    .iter()
-                    .map(|n| n.summary.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n---\n");
-                (text, ids, level)
+    let (text, source_ids, source_level): (String, Vec<i64>, u8) = match state.storage.dag.get_leaves(op.conv_id) {
+        Ok(leaves) if leaves.len() >= 2 => {
+            let in_range: Vec<&crate::dag::DagNode> = leaves.iter()
+                .skip_while(|n| n.id < op.from)
+                .take_while(|n| n.id <= op.to)
+                .collect();
+            if in_range.len() < 2 {
+                return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "need at least 2 leaves in range");
             }
-            _ => {
-                let db = state.storage.dag.db();
-                let raw = db.get_messages_in_range(op.conv_id, op.from, op.to);
-                match raw {
-                    Ok(msgs) if msgs.len() >= 2 => {
-                        // Raw messages have no DAG node IDs — produce a level-1 summary
-                        (msgs.join("\n---\n"), vec![], 1u8)
-                    }
-                    _ => {
-                        return json_error(
-                            StatusCode::BAD_REQUEST,
-                            "BAD_REQUEST",
-                            "need at least 2 messages to compress",
-                        );
-                    }
+            let ids: Vec<i64> = in_range.iter().map(|n| n.id).collect();
+            // New level = max(source levels) + 1, capped at effective max
+            let max_lvl = in_range.iter().map(|n| n.level).max().unwrap_or(0);
+            let level = (max_lvl + 1).min(3);
+            let text = in_range.iter()
+                .map(|n| n.summary.as_str())
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            (text, ids, level)
+        }
+        _ => {
+            let db = state.storage.dag.db();
+            let raw = db.get_messages_in_range(op.conv_id, op.from, op.to);
+            match raw {
+                Ok(msgs) if msgs.len() >= 2 => {
+                    // Raw messages have no DAG node IDs — produce a level-1 summary
+                    (msgs.join("\n---\n"), vec![], 1u8)
                 }
+                _ => return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "need at least 2 messages to compress"),
             }
-        };
+        }
+    };
 
     let summarizer = match crate::summarizer::Summarizer::builder()
         .api_key(&get_cached_key(&state.api_key))
@@ -4966,13 +3888,7 @@ async fn lcm_compress(
         .build()
     {
         Ok(s) => s,
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SUMMARIZER_ERROR",
-                format!("summarizer: {e}"),
-            );
-        }
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "SUMMARIZER_ERROR", format!("summarizer: {e}")),
     };
 
     match summarizer.summarize_escalate(&text).await {
@@ -4980,12 +3896,7 @@ async fn lcm_compress(
             let tc = crate::tokenizer::count(&result.text) as i64;
             let snippets = crate::snippet::extract(&text);
             match state.storage.dag.compress_group_with_snippets(
-                op.conv_id,
-                &source_ids,
-                &result.text,
-                tc,
-                source_level,
-                &snippets,
+                op.conv_id, &source_ids, &result.text, tc, source_level, &snippets,
             ) {
                 Ok(node) => Json(json!({
                     "node_id": node.id,
@@ -4994,18 +3905,10 @@ async fn lcm_compress(
                     "snippets": node.snippets,
                 }))
                 .into_response(),
-                Err(e) => json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "COMPRESS_ERROR",
-                    format!("compress: {e}"),
-                ),
+                Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "COMPRESS_ERROR", format!("compress: {e}")),
             }
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "SUMMARIZE_ERROR",
-            format!("summarize: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "SUMMARIZE_ERROR", format!("summarize: {e}")),
     }
 }
 
@@ -5022,11 +3925,7 @@ async fn lcm_delete(
     }
     match state.storage.dag.db().delete_dag_node(op.id) {
         Ok(_) => Json(json!({"deleted": op.id})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DELETE_ERROR",
-            format!("delete: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "DELETE_ERROR", format!("delete: {e}")),
     }
 }
 
@@ -5043,28 +3942,12 @@ async fn lcm_rollback(
     }
     let node_id = if op.id > 0 { op.id } else { op.execution_id };
     if node_id <= 0 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "id or execution_id must be positive",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "id or execution_id must be positive");
     }
     let node = match state.storage.dag.get_node(node_id) {
         Ok(Some(n)) => n,
-        Ok(None) => {
-            return json_error(
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                format!("node {} not found", op.id),
-            );
-        }
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "NODE_ERROR",
-                format!("error: {e}"),
-            );
-        }
+        Ok(None) => return json_error(StatusCode::NOT_FOUND, "NOT_FOUND", format!("node {} not found", op.id)),
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "NODE_ERROR", format!("error: {e}")),
     };
     // Actual DAG rollback: soft-delete all nodes created after target, and their
     // transitive children that depend exclusively on them.
@@ -5084,11 +3967,7 @@ async fn lcm_rollback(
             }))
             .into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ROLLBACK_ERROR",
-            format!("rollback failed: {e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "ROLLBACK_ERROR", format!("rollback failed: {e}")),
     }
 }
 
@@ -5103,11 +3982,7 @@ async fn lcm_motifs(
     }
     match crate::motif::extract_motifs_from_db(&state.storage.db, &[conv_id], None) {
         Ok(motifs) => Json(json!({"conv_id": conv_id, "motifs": motifs})).into_response(),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MOTIF_ERROR",
-            format!("{e}"),
-        ),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "MOTIF_ERROR", format!("{e}")),
     }
 }
 
@@ -5123,11 +3998,7 @@ async fn lcm_observe(
     let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
     if path.is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "missing 'path' field",
-        );
+        return json_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "missing 'path' field");
     }
     let observation = crate::file_observation::observe_file(path, content);
 

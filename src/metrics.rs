@@ -5,8 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 pub static REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -39,13 +39,7 @@ fn start_instant() -> &'static Instant {
 }
 
 /// Record a completed upstream request for latency tracking.
-pub fn record_latency(
-    endpoint: &str,
-    status_code: u16,
-    upstream_status: Option<u16>,
-    latency_ms: u64,
-    error: Option<String>,
-) {
+pub fn record_latency(endpoint: &str, status_code: u16, upstream_status: Option<u16>, latency_ms: u64, error: Option<String>) {
     if let Ok(mut ring) = LATENCY_RING.lock() {
         let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
         ring.push_back(LatencyRecord {
@@ -146,7 +140,10 @@ pub async fn handle_metrics() -> Response {
     (StatusCode::OK, body).into_response()
 }
 
-pub async fn middleware(req: Request, next: Next) -> Response {
+pub async fn middleware(
+    req: Request,
+    next: Next,
+) -> Response {
     REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     REQUESTS_ACTIVE.fetch_add(1, Ordering::Relaxed);
 

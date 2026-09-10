@@ -13,6 +13,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
     // ── Topology dependencies (stored in dag_edges) ──────────────────
+
     /// A summary node covers source nodes. Child → Parent.
     /// Created by: compress_group_with_snippets, insert_leaf.
     Coverage,
@@ -26,6 +27,7 @@ pub enum DependencyKind {
     CrossSessionReuse,
 
     // ── Execution ordering dependencies ──────────────────────────────
+
     /// Unit B was executed after Unit A in sequence.
     /// Stored in: lineage_edges (kind = "depends_on").
     SequentialOrdering,
@@ -35,6 +37,7 @@ pub enum DependencyKind {
     ParallelJoin,
 
     // ── Artifact dependencies ────────────────────────────────────────
+
     /// An execution read from a file. Cache invalidation trigger.
     /// Stored in: tool_cache (dependent_files).
     ReadsFile,
@@ -48,6 +51,7 @@ pub enum DependencyKind {
     SearchesFile,
 
     // ── Lineage dependencies (Phase 2+ candidates) ───────────────────
+
     /// Unit B was derived from (summarized from) Unit A.
     /// Defined but no active producer.
     Derivation,
@@ -81,10 +85,7 @@ impl DependencyKind {
 
     /// Whether this kind represents a topology relationship (dag_edges).
     pub fn is_topology(&self) -> bool {
-        matches!(
-            self,
-            Self::Coverage | Self::Refinement | Self::CrossSessionReuse
-        )
+        matches!(self, Self::Coverage | Self::Refinement | Self::CrossSessionReuse)
     }
 
     /// Whether this kind represents an execution ordering relationship.
@@ -94,10 +95,7 @@ impl DependencyKind {
 
     /// Whether this kind represents a file artifact dependency.
     pub fn is_artifact(&self) -> bool {
-        matches!(
-            self,
-            Self::ReadsFile | Self::ProducesFile | Self::SearchesFile
-        )
+        matches!(self, Self::ReadsFile | Self::ProducesFile | Self::SearchesFile)
     }
 
     /// Whether this kind has an active producer in production code.

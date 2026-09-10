@@ -116,23 +116,14 @@ pub struct DependencyIndex {
 }
 
 impl DependencyIndex {
-    pub fn new() -> Self {
-        Self {
-            edges: HashMap::new(),
-        }
-    }
+    pub fn new() -> Self { Self { edges: HashMap::new() } }
 
     /// Record that an execution depends on an artifact at a specific version.
     pub fn record(&mut self, exec_key: &str, artifact: ArtifactVersion, kind: DependencyKind) {
         self.edges
             .entry(artifact.path.clone())
             .or_default()
-            .push(DependencyEdge {
-                execution_key: exec_key.to_string(),
-                artifact,
-                kind,
-                dirty: false,
-            });
+            .push(DependencyEdge { execution_key: exec_key.to_string(), artifact, kind, dirty: false });
     }
 
     /// Mark dependent executions as dirty when an artifact changes.
@@ -154,9 +145,9 @@ impl DependencyIndex {
     /// Check if an execution key is dirty (stale). Used for lazy validation.
     /// Returns true if any dependency of this execution has changed.
     pub fn is_dirty(&self, exec_key: &str) -> bool {
-        self.edges
-            .values()
-            .any(|edges| edges.iter().any(|e| e.execution_key == exec_key && e.dirty))
+        self.edges.values().any(|edges| {
+            edges.iter().any(|e| e.execution_key == exec_key && e.dirty)
+        })
     }
 
     /// Validate (clean) an execution key — called when the execution is re-run
@@ -190,10 +181,7 @@ impl DependencyIndex {
 
     /// Get all execution keys that depend on a given artifact path.
     pub fn dependencies_of(&self, path: &str) -> Vec<&DependencyEdge> {
-        self.edges
-            .get(path)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default()
+        self.edges.get(path).map(|v| v.iter().collect()).unwrap_or_default()
     }
 
     /// Remove all dependencies for an execution key (when invalidated).
@@ -267,9 +255,7 @@ impl ExecutionArtifact {
     /// Record a dependency edge for each dependent file.
     /// Returns the edges to persist.
     pub fn dependency_edges(&self) -> Vec<(String, ArtifactVersion, DependencyKind)> {
-        self.dependent_files
-            .iter()
-            .zip(self.file_hashes.iter())
+        self.dependent_files.iter().zip(self.file_hashes.iter())
             .map(|(path, hash)| {
                 let av = ArtifactVersion {
                     path: path.clone(),
@@ -347,10 +333,7 @@ mod tests {
 
         let v2 = ArtifactVersion::new("Cargo.toml", "[dependencies]\ntokio = \"1.42\"");
         let invalidated = idx.invalidate(&v2);
-        assert!(
-            !invalidated.is_empty(),
-            "should invalidate on content change"
-        );
+        assert!(!invalidated.is_empty(), "should invalidate on content change");
     }
 
     #[test]
@@ -376,40 +359,24 @@ mod tests {
     #[test]
     fn execution_artifact_creates_dependency_edges() {
         let artifact = ExecutionArtifact::new(
-            "grep:abc123",
-            "grep",
-            "search foo",
-            "abc123",
-            "found 3 results",
+            "grep:abc123", "grep", "search foo",
+            "abc123", "found 3 results",
             vec!["src/main.rs".to_string()],
             vec!["hash1".to_string()],
             "deepseek-chat",
         );
         let edges = artifact.dependency_edges();
-        assert!(
-            !edges.is_empty(),
-            "should create an edge for each dependent file"
-        );
+        assert!(!edges.is_empty(), "should create an edge for each dependent file");
         assert_eq!(edges[0].0, "grep:abc123", "execution_key should match");
-        assert_eq!(
-            edges[0].1.path, "src/main.rs",
-            "should reference the dependent file"
-        );
-        assert_eq!(
-            edges[0].2,
-            DependencyKind::Read,
-            "default kind should be Read"
-        );
+        assert_eq!(edges[0].1.path, "src/main.rs", "should reference the dependent file");
+        assert_eq!(edges[0].2, DependencyKind::Read, "default kind should be Read");
     }
 
     #[test]
     fn execution_artifact_roundtrip_fields() {
         let artifact = ExecutionArtifact::new(
-            "read_file:def456",
-            "read_file",
-            "/path/to/file.txt",
-            "def456",
-            "file contents here",
+            "read_file:def456", "read_file", "/path/to/file.txt",
+            "def456", "file contents here",
             vec!["/path/to/file.txt".to_string()],
             vec!["hash2".to_string()],
             "deepseek-chat",

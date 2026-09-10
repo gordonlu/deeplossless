@@ -39,36 +39,26 @@ pub enum DsmlError {
 impl std::fmt::Display for DsmlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DsmlError::MalformedSyntax { position, detail } => {
-                write!(f, "malformed DSML at position {position}: {detail}")
-            }
+            DsmlError::MalformedSyntax { position, detail } => write!(f, "malformed DSML at position {position}: {detail}"),
             DsmlError::UnclosedTag { tag } => write!(f, "unclosed DSML tag: {tag}"),
-            DsmlError::InvalidParameterType { name, raw } => {
-                write!(f, "invalid parameter type for '{name}': {raw}")
-            }
+            DsmlError::InvalidParameterType { name, raw } => write!(f, "invalid parameter type for '{name}': {raw}"),
             DsmlError::NestedTooDeep => write!(f, "DSML nesting too deep"),
         }
     }
 }
 
 /// Parse a complete DSML tool_calls block from assistant content.
-pub fn parse_dsml_tool_calls(
-    raw: &str,
-    next_id: &mut u64,
-) -> Result<Vec<ToolInvocation>, DsmlError> {
+pub fn parse_dsml_tool_calls(raw: &str, next_id: &mut u64) -> Result<Vec<ToolInvocation>, DsmlError> {
     let start_tag = "<|DSML|tool_calls|>";
     let start = raw.find(start_tag).ok_or(DsmlError::MalformedSyntax {
-        position: 0,
-        detail: "missing <|DSML|tool_calls|>".into(),
+        position: 0, detail: "missing <|DSML|tool_calls|>".into(),
     })?;
     let content_after_start = &raw[start + start_tag.len()..];
 
     let end_tag = "</|DSML|tool_calls|>";
-    let end = content_after_start
-        .find(end_tag)
-        .ok_or(DsmlError::UnclosedTag {
-            tag: "</|DSML|tool_calls|>".into(),
-        })?;
+    let end = content_after_start.find(end_tag).ok_or(DsmlError::UnclosedTag {
+        tag: "</|DSML|tool_calls|>".into(),
+    })?;
     let body = &content_after_start[..end];
 
     let doc = parse_dsml_body(body)?;
@@ -81,11 +71,8 @@ fn parse_dsml_body(body: &str) -> Result<DsmlDocument, DsmlError> {
     while !remaining.is_empty() {
         remaining = remaining.trim();
         if remaining.starts_with("<|DSML|invoke|") {
-            let invoke_end = remaining
-                .find("</|DSML|invoke|>")
-                .ok_or(DsmlError::UnclosedTag {
-                    tag: "</|DSML|invoke|>".into(),
-                })?;
+            let invoke_end = remaining.find("</|DSML|invoke|>")
+                .ok_or(DsmlError::UnclosedTag { tag: "</|DSML|invoke|>".into() })?;
             let invoke_body = &remaining[..invoke_end + "</|DSML|invoke|>".len()];
             let invoke = parse_invoke(invoke_body)?;
             invokes.push(invoke);
@@ -103,18 +90,14 @@ fn parse_dsml_body(body: &str) -> Result<DsmlDocument, DsmlError> {
 
 fn parse_invoke(raw: &str) -> Result<DsmlInvoke, DsmlError> {
     let name = extract_attr(raw, "name").ok_or(DsmlError::MalformedSyntax {
-        position: 0,
-        detail: "invoke missing name attribute".into(),
+        position: 0, detail: "invoke missing name attribute".into(),
     })?;
     let mut parameters = Vec::new();
     let mut remaining = raw;
     while let Some(param_start) = remaining.find("<|DSML|parameter|") {
         remaining = &remaining[param_start + "<|DSML|parameter|".len()..];
-        let param_end = remaining
-            .find("</|DSML|parameter|>")
-            .ok_or(DsmlError::UnclosedTag {
-                tag: "</|DSML|parameter|>".into(),
-            })?;
+        let param_end = remaining.find("</|DSML|parameter|>")
+            .ok_or(DsmlError::UnclosedTag { tag: "</|DSML|parameter|>".into() })?;
         let param_raw = &remaining[..param_end + "</|DSML|parameter|>".len()];
         let param = parse_parameter(param_raw)?;
         parameters.push(param);
@@ -125,16 +108,14 @@ fn parse_invoke(raw: &str) -> Result<DsmlInvoke, DsmlError> {
 
 fn parse_parameter(raw: &str) -> Result<DsmlParameter, DsmlError> {
     let name = extract_attr(raw, "name").ok_or(DsmlError::MalformedSyntax {
-        position: 0,
-        detail: "parameter missing name attribute".into(),
+        position: 0, detail: "parameter missing name attribute".into(),
     })?;
     let is_string = match extract_attr(raw, "string") {
         Some(v) => v == "true",
         None => true,
     };
     let value_start = raw.find('>').ok_or(DsmlError::MalformedSyntax {
-        position: 0,
-        detail: "parameter missing value".into(),
+        position: 0, detail: "parameter missing value".into(),
     })? + 1;
     let value_end = raw.rfind("</|DSML|parameter|>").unwrap_or(raw.len());
     let raw_value = raw[value_start..value_end].trim().to_string();
@@ -143,11 +124,7 @@ fn parse_parameter(raw: &str) -> Result<DsmlParameter, DsmlError> {
     } else {
         parse_json_value(&raw_value)?
     };
-    Ok(DsmlParameter {
-        name,
-        value,
-        raw_string: raw_value,
-    })
+    Ok(DsmlParameter { name, value, raw_string: raw_value })
 }
 
 fn extract_attr(raw: &str, attr: &str) -> Option<String> {
@@ -162,11 +139,9 @@ fn extract_attr(raw: &str, attr: &str) -> Option<String> {
 }
 
 fn parse_json_value(raw: &str) -> Result<DsmlValue, DsmlError> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| DsmlError::MalformedSyntax {
-            position: 0,
-            detail: format!("JSON parse error: {e}"),
-        })?;
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| DsmlError::MalformedSyntax {
+        position: 0, detail: format!("JSON parse error: {e}"),
+    })?;
     Ok(json_to_dsml(v))
 }
 
@@ -176,39 +151,30 @@ fn json_to_dsml(v: serde_json::Value) -> DsmlValue {
         serde_json::Value::Number(n) => DsmlValue::Number(n),
         serde_json::Value::Bool(b) => DsmlValue::Bool(b),
         serde_json::Value::Null => DsmlValue::Null,
-        serde_json::Value::Array(arr) => {
-            DsmlValue::Array(arr.into_iter().map(json_to_dsml).collect())
-        }
-        serde_json::Value::Object(obj) => {
-            DsmlValue::Object(obj.into_iter().map(|(k, v)| (k, json_to_dsml(v))).collect())
-        }
+        serde_json::Value::Array(arr) => DsmlValue::Array(arr.into_iter().map(json_to_dsml).collect()),
+        serde_json::Value::Object(obj) => DsmlValue::Object(obj.into_iter().map(|(k, v)| (k, json_to_dsml(v))).collect()),
     }
 }
 
 impl DsmlDocument {
     fn invocations_to_canonical(&self, next_id: &mut u64) -> Vec<ToolInvocation> {
-        self.invokes
-            .iter()
-            .map(|invoke| {
-                let id = *next_id;
-                *next_id += 1;
-                let args = dsml_params_to_json(&invoke.parameters);
-                ToolInvocation {
-                    id: format!("dsml_{id}"),
-                    name: invoke.name.clone(),
-                    arguments: args,
-                }
-            })
-            .collect()
+        self.invokes.iter().map(|invoke| {
+            let id = *next_id;
+            *next_id += 1;
+            let args = dsml_params_to_json(&invoke.parameters);
+            ToolInvocation {
+                id: format!("dsml_{id}"),
+                name: invoke.name.clone(),
+                arguments: args,
+            }
+        }).collect()
     }
 }
 
 fn dsml_params_to_json(params: &[DsmlParameter]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for p in params {
-        if p.name.is_empty() {
-            continue;
-        }
+        if p.name.is_empty() { continue; }
         map.insert(p.name.clone(), dsml_value_to_json(&p.value));
     }
     serde_json::Value::Object(map)
@@ -220,14 +186,9 @@ fn dsml_value_to_json(v: &DsmlValue) -> serde_json::Value {
         DsmlValue::Number(n) => serde_json::Value::Number(n.clone()),
         DsmlValue::Bool(b) => serde_json::Value::Bool(*b),
         DsmlValue::Null => serde_json::Value::Null,
-        DsmlValue::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(dsml_value_to_json).collect())
-        }
+        DsmlValue::Array(arr) => serde_json::Value::Array(arr.iter().map(dsml_value_to_json).collect()),
         DsmlValue::Object(obj) => {
-            let map: serde_json::Map<_, _> = obj
-                .iter()
-                .map(|(k, v)| (k.clone(), dsml_value_to_json(v)))
-                .collect();
+            let map: serde_json::Map<_, _> = obj.iter().map(|(k, v)| (k.clone(), dsml_value_to_json(v))).collect();
             serde_json::Value::Object(map)
         }
     }
@@ -264,12 +225,7 @@ pub struct StreamingDsmlParser {
 }
 
 impl StreamingDsmlParser {
-    pub fn new() -> Self {
-        Self {
-            buffer: String::new(),
-            next_id: 0,
-        }
-    }
+    pub fn new() -> Self { Self { buffer: String::new(), next_id: 0 } }
 
     /// Feed a text chunk. Returns complete ToolInvocation vectors when full
     /// <|DSML|tool_calls|>...</|DSML|tool_calls|> documents close.
@@ -316,9 +272,7 @@ impl StreamingDsmlParser {
     /// Flush remaining buffer at stream end (may return DsmlIncomplete).
     pub fn finish(&mut self) -> Result<Vec<ToolInvocation>, DsmlError> {
         if self.buffer.contains("<|DSML|") {
-            Err(DsmlError::UnclosedTag {
-                tag: "</|DSML|tool_calls|>".into(),
-            })
+            Err(DsmlError::UnclosedTag { tag: "</|DSML|tool_calls|>".into() })
         } else {
             Ok(vec![])
         }
@@ -412,12 +366,7 @@ mod tests {
     #[test]
     fn test_streaming_partial() {
         let mut parser = StreamingDsmlParser::new();
-        assert!(
-            parser
-                .feed("<|DSML|tool_calls|>\n<|DSML|invoke| name=\"test\">\n")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(parser.feed("<|DSML|tool_calls|>\n<|DSML|invoke| name=\"test\">\n").unwrap().is_empty());
         let results = parser.feed("<|DSML|parameter| name=\"x\" string=\"true\">val</|DSML|parameter|>\n</|DSML|invoke|>\n</|DSML|tool_calls|>").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "test");
@@ -426,9 +375,7 @@ mod tests {
     #[test]
     fn test_streaming_incomplete_at_end() {
         let mut parser = StreamingDsmlParser::new();
-        parser
-            .feed("<|DSML|tool_calls|>\n<|DSML|invoke| name=\"test\">\n")
-            .unwrap();
+        parser.feed("<|DSML|tool_calls|>\n<|DSML|invoke| name=\"test\">\n").unwrap();
         let result = parser.finish();
         assert!(result.is_err());
     }
