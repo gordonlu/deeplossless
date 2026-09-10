@@ -60,10 +60,6 @@ impl Default for ModelRegistry {
         Self {
             overrides: vec![
                 ("gpt-5.5".into(), "deepseek-v4-pro".into()),
-                // V4.1 Flash replaced both legacy Flash endpoints. Keep the aliases
-                // accepted locally, but always send the canonical current model name.
-                ("deepseek-v4-flash".into(), "deepseek-flash".into()),
-                ("deepseek-v4-flash-vision-exp".into(), "deepseek-flash".into()),
             ],
             prefixes: vec![
                 ("gpt-".into(), "deepseek-flash".into(), "deepseek-v4-pro".into()),
@@ -133,6 +129,9 @@ impl ModelRegistry {
                 return (pro_target.clone(), true);
             }
         }
+        // Explicit DeepSeek model names, including deprecated-but-supported
+        // aliases such as deepseek-v4-flash, are preserved verbatim. DeepSeek
+        // owns their server-side routing to the current underlying model.
         (model.to_string(), false)
     }
 
