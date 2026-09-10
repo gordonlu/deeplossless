@@ -1,0 +1,87 @@
+name: V4.1 Simplification Patch
+
+on:
+  push:
+    branches: [v41-runtime-simplification]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v41-runtime-simplification
+      - name: Apply conservative V4.1 simplifications
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              count = s.count(old)
+              assert count == 1, f"{path}: expected exactly one match, got {count}"
+              p.write_text(s.replace(old, new, 1))
+
+          # 1) Cache must preserve tool semantics: exact replay, not preview truncation.
+          p = Path("src/tool_cache.rs")
+          s = p.read_text()
+          start = s.index("/// Transform a cached result before injecting it into the stream.")
+          end = s.index("/// Convenience: compute cache key tuple", start)
+          exact = '''/// Return the exact cached tool result.\n///\n/// Cache reuse is an execution optimization, not a context-compression step.\n/// A cache hit must preserve the observable semantics of executing the tool.\npub fn transform_result(_tool_name: &str, raw_result: &str) -> String {\n    raw_result.to_string()\n}\n\n'''
+          s = s[:start] + exact + s[end:]
+          # Replace transform tests as one bounded section.
+          t0 = s.index("    // ── Transform ─")
+          t1 = s.index("    // ── L2 invalidation ─", t0)
+          tests = '''    // ── Transform / exact replay ───────────────────────────────────────\n\n    #[test]\n    fn transform_read_file_preserves_exact_result() {\n        let raw = "pub fn foo() {\\n    let x = 1;\\n}\\n";\n        assert_eq!(transform_result("read_file", raw), raw);\n    }\n\n    #[test]\n    fn transform_list_files_preserves_all_entries() {\n        let raw = "a\\nb\\nc\\nd\\ne\\nf\\n";\n        assert_eq!(transform_result("list_files", raw), raw);\n    }\n\n    #[test]\n    fn transform_result_never_panics_on_weird_input() {\n        let raw = "\\0\\n\\x01\\n\\x02";\n        assert_eq!(transform_result("read_file", raw), raw);\n        assert_eq!(transform_result("unknown_tool", raw), raw);\n    }\n\n'''
+          p.write_text(s[:t0] + tests + s[t1:])
+
+          # 2) Exit code parsing: exit code 0 is success; non-zero is failure.
+          p = Path("src/execution.rs")
+          s = p.read_text()
+          old = '''                    if tool_result.contains("Error:") || tool_result.contains("error:")\n                        || tool_result.contains("error[") || tool_result.contains("Error[")\n                        || tool_result.contains("\\nerror") || tool_result.starts_with("error")\n                        || lower.contains("failed:") || lower.contains("exit code")\n                        || lower.contains("timed out") || lower.contains("permission denied")\n                        || lower.contains("not found") || lower.starts_with("err:")\n                    {\n                        ExecutionOutcome::RecoveredFailure\n                    } else if tool_result.is_empty() {\n'''
+          new = '''                    let nonzero_exit = parse_exit_code(&lower).is_some_and(|code| code != 0);\n                    if tool_result.contains("Error:") || tool_result.contains("error:")\n                        || tool_result.contains("error[") || tool_result.contains("Error[")\n                        || tool_result.contains("\\nerror") || tool_result.starts_with("error")\n                        || lower.contains("failed:") || nonzero_exit\n                        || lower.contains("timed out") || lower.contains("permission denied")\n                        || lower.contains("not found") || lower.starts_with("err:")\n                    {\n                        ExecutionOutcome::RecoveredFailure\n                    } else if tool_result.is_empty() {\n'''
+          assert s.count(old) == 1, "execution outcome block changed"
+          s = s.replace(old, new, 1)
+          marker = "/// Group normalized messages into execution units."
+          helper = '''fn parse_exit_code(text: &str) -> Option<i32> {\n    for marker in ["exit code", "exit_code", "exit status", "exit_status"] {\n        if let Some(pos) = text.find(marker) {\n            let tail = &text[pos + marker.len()..];\n            let token = tail\n                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '('))\n                .split(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';'))\n                .next()?;\n            if let Ok(code) = token.parse::<i32>() {\n                return Some(code);\n            }\n        }\n    }\n    None\n}\n\n'''
+          assert marker in s
+          s = s.replace(marker, helper + marker, 1)
+
+          # 3) Do not infer semantic reasoning labels merely from execution outcome.
+          old = '''        let reasoning_steps = {\n            let mut steps = Vec::new();\n            if !reasoning_before.is_empty() {\n                let kind = match &outcome {\n                    ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked =>\n                        ReasoningKind::Failure,\n                    ExecutionOutcome::CacheHit | ExecutionOutcome::Replayed =>\n                        ReasoningKind::Validation,\n                    _ => ReasoningKind::Assumption,\n                };\n                steps.push(ReasoningStep {\n                    kind,\n                    content: reasoning_before.chars().take(300).collect(),\n                    execution_unit_id: None,\n                    derived_from: vec![],\n                });\n            }\n            if !reasoning_after.is_empty() {\n                let kind = match &outcome {\n                    ExecutionOutcome::Success => ReasoningKind::Resolution,\n                    ExecutionOutcome::RecoveredFailure | ExecutionOutcome::Blocked =>\n                        ReasoningKind::Hypothesis,\n                    _ => ReasoningKind::Validation,\n                };\n                steps.push(ReasoningStep {\n                    kind,\n                    content: reasoning_after.chars().take(300).collect(),\n                    execution_unit_id: None,\n                    derived_from: vec![],\n                });\n            }\n            steps\n        };\n'''
+          new = '''        // Free-form model reasoning is evidence, not typed execution truth.\n        // Semantic labels (assumption/failure/resolution) require explicit evidence\n        // from the typed fact / validation pipeline rather than outcome heuristics.\n        let reasoning_steps = Vec::new();\n'''
+          assert s.count(old) == 1, "reasoning heuristic block changed"
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # 4) V4.1 model defaults.
+          replace_once("src/summarizer.rs", 'model: "deepseek-v4-flash".to_string(),', 'model: "deepseek-flash".to_string(),')
+          replace_once("src/main.rs", '#[arg(long, default_value = "deepseek-v4-pro", env = "SUMMARIZER_MODEL")]', '#[arg(long, default_value = "deepseek-flash", env = "SUMMARIZER_MODEL")]')
+
+          # 5) README: durable execution state is the product; token compression is secondary.
+          p = Path("README.md")
+          s = p.read_text()
+          s = s.replace('An **inference-aware coding runtime** that reduces repeated work in long AI\ncoding sessions.', 'A **durable execution-state runtime** for long AI coding sessions. It preserves exact\nevidence, avoids repeated execution, and gives agents a rebuildable working state.')
+          s = s.replace('Long context windows are not memory. Repeated inference is waste.', 'Long context windows are useful. Durable execution state is different.')
+          s = s.replace('- **Repeated tool calls** — cached results returned inline, zero API tokens spent\n- **File reads** — structured summaries instead of raw content dumps\n- **Failed fixes** — remembers what didn\'t work and why\n- **Plans** — persists execution state across turns, avoids replanning', '- **Repeated deterministic tool calls** — exact cached results, invalidated when dependencies change\n- **File observations** — versioned evidence instead of stale conversational recollection\n- **Failed attempts** — preserves what failed and why as evidence, without forcing an old fix\n- **Plans** — persists typed execution state and revalidates dependencies\n- **Working context** — recalls and compacts projections while Ground Truth stays exact')
+          s = s.replace('| `--summarizer-model` | `deepseek-v4-pro` | Model for background summarization |', '| `--summarizer-model` | `deepseek-flash` | Model for optional background summarization |')
+          s = s.replace('Protocol translation and tool cache interception work transparently.\nThe proxy translates Codex\'s Responses API requests to DeepSeek Chat Completions,\nand converts streaming responses back to Responses SSE format.', 'DeepSeek Responses requests stay native end-to-end. DeepLossless records exact provider\nitems, derives execution state and working context internally, then forwards native Responses\nJSON/SSE without translating it through Chat Completions.')
+          p.write_text(s)
+
+      - name: Format and test
+        run: |
+          cargo fmt --check
+          cargo test --lib
+          cargo clippy --lib -- -D warnings
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src README.md
+          git commit -m "refactor: simplify runtime assumptions for V4.1 Flash"
+          git push origin HEAD:v41-runtime-simplification
