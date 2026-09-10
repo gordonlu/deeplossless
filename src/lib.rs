@@ -62,6 +62,7 @@
 //! DAG mutations (insert node + back-link to sources) must be atomic.
 //! A database transaction wraps both operations.
 
+#[allow(clippy::result_unit_err)]
 pub mod compactor;
 pub mod dag;
 pub mod db;
