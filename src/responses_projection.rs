@@ -9,6 +9,7 @@
 use serde_json::{json, Value};
 
 use crate::compactor::CompactCommand;
+use crate::dynamic_context::{assemble_dynamic_context, DynamicContextHints};
 use crate::ground_truth::{FactStatus, ResourceRef};
 use crate::ground_truth_store::GroundTruthStore;
 use crate::pipeline::render_dag_context;
@@ -111,14 +112,15 @@ pub async fn project_and_assemble(
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str);
 
+    let hints = build_dynamic_hints(state, session_id, conv_id);
     let budget = state.lcm_context_tokens.clamp(0, 8_000) as usize;
     let dag_context = if state.lcm_context && budget > 0 {
-        match state.storage.dag.assemble_context(conv_id, budget, query) {
+        match assemble_dynamic_context(&state.storage.dag, conv_id, budget, query, &hints) {
             Ok(nodes) if !nodes.is_empty() => render_dag_context(&nodes),
             Ok(_) => String::new(),
             Err(error) => {
                 tracing::warn!(target:"deeplossless::responses_projection", %error,
-                    "native Responses DAG assembly failed");
+                    "native Responses dynamic DAG assembly failed");
                 String::new()
             }
         }
@@ -144,6 +146,46 @@ pub async fn project_and_assemble(
         context,
         typed_plan_used,
     }
+}
+
+/// Build dynamic recall hints from persisted typed state plus live execution
+/// changes and recent failure lineage. These hints affect only Working Context;
+/// they never mutate Ground Truth or the persisted Responses session.
+fn build_dynamic_hints(
+    state: &AppState,
+    session_id: &str,
+    conv_id: i64,
+) -> DynamicContextHints {
+    let active = state.storage.db.get_active_plan(conv_id).ok().flatten();
+    let (plan_id, goal, current_step) = match active {
+        Some((plan_id, goal, pending, _completed, _assumptions)) => {
+            let pending: Vec<String> = serde_json::from_value(pending).unwrap_or_default();
+            (Some(plan_id), Some(goal), pending.first().cloned())
+        }
+        None => (None, None, None),
+    };
+
+    let store = GroundTruthStore::new(&state.storage.db);
+    let mut semantic = store
+        .rebuild_execution_state(session_id, plan_id, goal, current_step)
+        .unwrap_or_default();
+
+    if let Ok(cycle) = state.runtime.cycle.lock() {
+        for path in &cycle.context_delta {
+            semantic.changed_resources.insert(format!("file:{path}"));
+        }
+    }
+
+    if let Ok(patterns) = state.storage.db.get_recent_failure_patterns(conv_id, 3) {
+        for pattern in patterns {
+            semantic.blocked_reasons.push(format!(
+                "{} {} {}",
+                pattern.signature, pattern.why_failed, pattern.attempted_fix
+            ));
+        }
+    }
+
+    DynamicContextHints::from_execution_state(&semantic)
 }
 
 /// Inject derived context as a developer message immediately before the latest
