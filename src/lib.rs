@@ -77,6 +77,7 @@ pub mod event_store;
 pub mod execution;
 pub mod file_observation;
 pub mod ground_truth;
+pub mod ground_truth_store;
 pub mod parallel;
 pub mod provider;
 pub mod runtime;
