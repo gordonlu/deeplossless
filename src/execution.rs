@@ -1030,7 +1030,7 @@ mod scoring_tests {
                 created_at: String::new(),
                 tool_args_json: None,
                 reasoning_steps: vec![],
-                ..Default::default()
+            ..Default::default()
             },
             ExecutionUnit {
                 id: 2,
@@ -1045,7 +1045,7 @@ mod scoring_tests {
                 created_at: String::new(),
                 tool_args_json: None,
                 reasoning_steps: vec![],
-                ..Default::default()
+            ..Default::default()
             },
         ];
         let summary = EventSummary::from_units(&units);
@@ -1063,8 +1063,8 @@ mod scoring_tests {
             tool_name: "grep".into(),
             tool_args: String::new(),
             tool_result: "ok".into(),
-            reasoning_after: String::new(),
-            outcome: ExecutionOutcome::Success,
+                reasoning_after: String::new(),
+                outcome: ExecutionOutcome::Success,
             related_nodes: vec![],
             created_at: String::new(),
             tool_args_json: None,
@@ -1094,7 +1094,7 @@ mod scoring_tests {
                 created_at: String::new(),
                 tool_args_json: None,
                 reasoning_steps: vec![],
-                ..Default::default()
+            ..Default::default()
             },
             ExecutionUnit {
                 id: 2,
@@ -1109,7 +1109,7 @@ mod scoring_tests {
                 created_at: String::new(),
                 tool_args_json: None,
                 reasoning_steps: vec![],
-                ..Default::default()
+            ..Default::default()
             },
         ];
         let dag = DagMetrics::default();
@@ -1139,7 +1139,7 @@ mod scoring_tests {
                 created_at: String::new(),
                 tool_args_json: None,
                 reasoning_steps: vec![],
-                ..Default::default()
+            ..Default::default()
             },
             ExecutionUnit {
                 id: 2,
@@ -1154,7 +1154,7 @@ mod scoring_tests {
                 created_at: String::new(),
                 tool_args_json: None,
                 reasoning_steps: vec![],
-                ..Default::default()
+            ..Default::default()
             },
         ];
         let dag = DagMetrics::default();
@@ -1175,8 +1175,8 @@ mod scoring_tests {
             tool_name: "grep".into(),
             tool_args: String::new(),
             tool_result: "ok".into(),
-            reasoning_after: String::new(),
-            outcome: ExecutionOutcome::Success,
+                reasoning_after: String::new(),
+                outcome: ExecutionOutcome::Success,
             related_nodes: vec![],
             created_at: String::new(),
             tool_args_json: None,
@@ -1190,8 +1190,8 @@ mod scoring_tests {
             tool_name: "grep".into(),
             tool_args: String::new(),
             tool_result: "stale".into(),
-            reasoning_after: String::new(),
-            outcome: ExecutionOutcome::Stale,
+                reasoning_after: String::new(),
+                outcome: ExecutionOutcome::Stale,
             related_nodes: vec![],
             created_at: String::new(),
             tool_args_json: None,
@@ -1216,8 +1216,8 @@ mod scoring_tests {
             tool_name: "grep".into(),
             tool_args: String::new(),
             tool_result: "ok".into(),
-            reasoning_after: String::new(),
-            outcome: ExecutionOutcome::Success,
+                reasoning_after: String::new(),
+                outcome: ExecutionOutcome::Success,
             related_nodes: vec![],
             created_at: String::new(),
             tool_args_json: None,

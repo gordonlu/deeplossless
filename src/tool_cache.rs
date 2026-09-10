@@ -187,11 +187,11 @@ impl L1HotCache {
         map.insert(
             key,
             CacheEntry {
-                result: Arc::from(result.to_string()),
-                dependent_files: dependent_files.to_vec(),
-                file_hashes: file_hashes.to_vec(),
-                hit_count: 1,
-                access_seq: seq,
+            result: Arc::from(result.to_string()),
+            dependent_files: dependent_files.to_vec(),
+            file_hashes: file_hashes.to_vec(),
+            hit_count: 1,
+            access_seq: seq,
             },
         );
     }

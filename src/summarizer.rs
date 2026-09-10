@@ -585,7 +585,7 @@ impl Summarizer {
 
         Err(last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
-                "Level 1 & 2 unavailable after {max_retries} attempts, using Level 3 truncation"
+            "Level 1 & 2 unavailable after {max_retries} attempts, using Level 3 truncation"
             )
         }))
     }

@@ -949,8 +949,8 @@ impl ExecutionCycle {
             crate::runtime_events::RuntimeEvent::CancellationAcknowledged {
                 conv_id,
                 logical_seq: seq,
-                tool_call_id: tool_call_id.to_string(),
-                span_id: span_id.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            span_id: span_id.to_string(),
             },
         );
     }
@@ -1292,7 +1292,7 @@ pub fn default_rules() -> Vec<Box<dyn DecisionRule>> {
 /// Tracks historical decision outcomes and adjusts confidence scores
 /// based on past success rates per action type (Online Evaluation).
 pub struct OnlineEvaluator {
-    history: Vec<(String, u64, u64)>, // (action_type, successes, total)
+    history: Vec<(String, u64, u64)>,  // (action_type, successes, total)
 }
 
 impl OnlineEvaluator {
@@ -1449,11 +1449,11 @@ impl RuntimePolicy {
                 }
             }),
             failure_hint: has_recent_failure.map(|(signature, suggested_fix)| FailureHint {
-                signature: signature.to_string(),
-                suggested_fix: suggested_fix.to_string(),
-                why_failed: String::new(),
-                invalidated_assumptions: vec![],
-                retry_count: 0,
+                    signature: signature.to_string(),
+                    suggested_fix: suggested_fix.to_string(),
+                    why_failed: String::new(),
+                    invalidated_assumptions: vec![],
+                    retry_count: 0,
             }),
             plan_hint: has_active_plan.map(|(plan_id, goal, pending_step_count)| PlanHint {
                 plan_id,
@@ -1482,7 +1482,7 @@ pub fn evaluate_failure_context(
     let mut lines = vec![format!("[Previous failure evidence: {}]", best.signature)];
     if !best.why_failed.is_empty() {
         lines.push(format!("[Observed reason: {}]", best.why_failed));
-    }
+        }
     if !best.attempted_fix.is_empty() {
         lines.push(format!(
             "[Previously attempted fix (historical evidence, not a recommendation): {}]",
@@ -1563,10 +1563,10 @@ pub fn evaluate_plan_context(
             ))
         }
         RuntimeAction::Replan { reason } => Some(format!(
-            "[Plan needs replanning: {goal}]\n\
+                "[Plan needs replanning: {goal}]\n\
                  [Reason: {reason}]\n\
                  [Pending steps: {}]",
-            pending_steps.join(", ")
+                pending_steps.join(", ")
         )),
         _ => None,
     }
@@ -2409,8 +2409,8 @@ mod tests {
     #[test]
     fn online_evaluator_adjusts_score_by_success_rate() {
         let history = vec![
-            ("ReuseToolCache".to_string(), 8u64, 10u64), // 80% success
-            ("RetryWithFix".to_string(), 1u64, 5u64),    // 20% success
+            ("ReuseToolCache".to_string(), 8u64, 10u64),  // 80% success
+            ("RetryWithFix".to_string(), 1u64, 5u64),      // 20% success
         ];
         let eval = OnlineEvaluator { history };
 
@@ -2448,8 +2448,8 @@ mod tests {
     #[test]
     fn rule_engine_with_evaluator_applies_online_eval() {
         let history = vec![
-            ("ReuseToolCache".to_string(), 9u64, 10u64), // 90% success
-            ("RetryWithFix".to_string(), 0u64, 5u64),    // 0% success
+            ("ReuseToolCache".to_string(), 9u64, 10u64),  // 90% success
+            ("RetryWithFix".to_string(), 0u64, 5u64),       // 0% success
         ];
         let eval = OnlineEvaluator { history };
 

@@ -318,7 +318,7 @@ async fn run_demo() -> anyhow::Result<()> {
     let conv_id = db.create_and_store(
         "demo",
         &serde_json::json!([
-            {"role":"user","content":"Hello, deeplossless!"}
+        {"role":"user","content":"Hello, deeplossless!"}
         ]),
     )?;
     db.store_tool_artifact(
@@ -496,7 +496,7 @@ fn run_drive(scenario: &str, format: &str) -> anyhow::Result<()> {
     } else {
         let outcome =
             deeplossless::torture::driver::drive_scenario(scenario, format, &parent, verbose)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if !outcome.success {
             anyhow::bail!(
                 "scenario '{}' failed at state '{}'",
@@ -703,43 +703,43 @@ async fn main() -> anyhow::Result<()> {
     if is_aces || is_torture {
         eprintln!();
         if is_aces {
-            eprintln!("┌────────────────────────────────────────────────┐");
-            eprintln!("│ Torture — Protocol Compatibility Test          │");
-            eprintln!("├────────────────────────────────────────────────┤");
-            let scenario_label = match cli.torture_aces.as_deref() {
-                Some("") | Some("all") => "(suite)",
-                Some(name) => name,
-                None => "(suite)",
-            };
-            eprintln!("│ Scenario: {:<37}", scenario_label);
-            eprintln!("│ Mode:     {mode_str}");
-            eprintln!("│                                                │");
-            eprintln!("│ Point your agent to:                           │");
-            eprintln!("│ http://127.0.0.1:8081/v1/chat/completions      │");
-            eprintln!("│ or HTTPS at 127.0.0.1:8080                     │");
-            eprintln!("│                                                │");
-            eprintln!("│ Scenario guides the interaction. Scores +      │");
-            eprintln!("│ runtime metrics saved on exit.                 │");
-            eprintln!("└────────────────────────────────────────────────┘");
-        } else {
-            eprintln!("═══════════════════════════════════════════════════════════════");
-            eprintln!("  Torture Protocol Test Started");
-            eprintln!("═══════════════════════════════════════════════════════════════");
-            eprintln!("  mock upstream:  http://127.0.0.1:9000/v1/chat/completions");
-            eprintln!("  proxy HTTP:     http://127.0.0.1:8081/v1/chat/completions");
-            eprintln!("  proxy HTTPS:    https://127.0.0.1:8080/v1/chat/completions");
-            eprintln!("  mode:           {mode_str}");
-            eprintln!();
-            if let Some(ref ws) = torture_workspace {
-                eprintln!("  workspace:   {}", ws.display());
-            }
-            eprintln!("  HOW TO TEST");
-            eprintln!("  1. Open an empty directory in your agent");
-            eprintln!("  2. Point your agent to proxy:");
-            eprintln!("     http://127.0.0.1:8081 (HTTP) or https://127.0.0.1:8080 (HTTPS)");
-            eprintln!("  3. Work naturally — traces will generate files and exercise tools");
-            eprintln!("  4. After all turns complete, test finishes and report is saved");
-            eprintln!("═══════════════════════════════════════════════════════════════");
+        eprintln!("┌────────────────────────────────────────────────┐");
+        eprintln!("│ Torture — Protocol Compatibility Test          │");
+        eprintln!("├────────────────────────────────────────────────┤");
+        let scenario_label = match cli.torture_aces.as_deref() {
+            Some("") | Some("all") => "(suite)",
+            Some(name) => name,
+            None => "(suite)",
+        };
+        eprintln!("│ Scenario: {:<37}", scenario_label);
+        eprintln!("│ Mode:     {mode_str}");
+        eprintln!("│                                                │");
+        eprintln!("│ Point your agent to:                           │");
+        eprintln!("│ http://127.0.0.1:8081/v1/chat/completions      │");
+        eprintln!("│ or HTTPS at 127.0.0.1:8080                     │");
+        eprintln!("│                                                │");
+        eprintln!("│ Scenario guides the interaction. Scores +      │");
+        eprintln!("│ runtime metrics saved on exit.                 │");
+        eprintln!("└────────────────────────────────────────────────┘");
+    } else {
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        eprintln!("  Torture Protocol Test Started");
+        eprintln!("═══════════════════════════════════════════════════════════════");
+        eprintln!("  mock upstream:  http://127.0.0.1:9000/v1/chat/completions");
+        eprintln!("  proxy HTTP:     http://127.0.0.1:8081/v1/chat/completions");
+        eprintln!("  proxy HTTPS:    https://127.0.0.1:8080/v1/chat/completions");
+        eprintln!("  mode:           {mode_str}");
+        eprintln!();
+        if let Some(ref ws) = torture_workspace {
+            eprintln!("  workspace:   {}", ws.display());
+        }
+        eprintln!("  HOW TO TEST");
+        eprintln!("  1. Open an empty directory in your agent");
+        eprintln!("  2. Point your agent to proxy:");
+        eprintln!("     http://127.0.0.1:8081 (HTTP) or https://127.0.0.1:8080 (HTTPS)");
+        eprintln!("  3. Work naturally — traces will generate files and exercise tools");
+        eprintln!("  4. After all turns complete, test finishes and report is saved");
+        eprintln!("═══════════════════════════════════════════════════════════════");
         }
     }
 
@@ -851,18 +851,18 @@ async fn main() -> anyhow::Result<()> {
     let (tls_cert_path, tls_key_path) = if let (Some(c), Some(k)) =
         (cli.tls_cert.as_ref(), cli.tls_key.as_ref())
     {
-        (c.clone(), k.clone())
-    } else {
-        // Auto-generate self-signed cert — generated once, reused on restart.
-        if !std::path::Path::new(&default_cert).exists() {
+            (c.clone(), k.clone())
+        } else {
+            // Auto-generate self-signed cert — generated once, reused on restart.
+            if !std::path::Path::new(&default_cert).exists() {
             let cert =
                 rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
-            std::fs::write(&default_cert, cert.cert.pem())?;
-            std::fs::write(&default_key, cert.key_pair.serialize_pem())?;
-            tracing::info!("self-signed cert generated at {tls_dir}/");
-        }
-        (default_cert, default_key)
-    };
+                std::fs::write(&default_cert, cert.cert.pem())?;
+                std::fs::write(&default_key, cert.key_pair.serialize_pem())?;
+                tracing::info!("self-signed cert generated at {tls_dir}/");
+            }
+            (default_cert, default_key)
+        };
 
     let tls_config =
         axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls_cert_path, &tls_key_path).await?;
