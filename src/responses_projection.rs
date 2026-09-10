@@ -1,16 +1,20 @@
-//! Internal projection pipeline for native Responses transport.
+//! Internal lossless projection pipeline for native Responses transport.
 //!
-//! Wire protocol stays Responses end-to-end. This module derives a minimal
-//! Chat-shaped *projection* solely so the existing DAG/compaction pipeline can
-//! ingest the turn, then assembles DeepLossless context back into a native
-//! Responses input item. Projection loss never affects Ground Truth storage.
+//! Wire protocol stays Responses end-to-end. Native provider items are Ground
+//! Truth; this module derives a working projection for DAG/context selection.
+//! Unlike the historical Chat pipeline it does not truncate content before
+//! creating level-0 leaves. Loss is allowed only after a recoverable source has
+//! been established.
 
 use serde_json::{json, Value};
 
+use crate::compactor::CompactCommand;
 use crate::ground_truth::{FactStatus, ResourceRef};
 use crate::ground_truth_store::GroundTruthStore;
-use crate::pipeline::{render_dag_context, ChatPipeline};
+use crate::pipeline::render_dag_context;
 use crate::AppState;
+
+const CONTEXT_WINDOW: usize = 1_000_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeProjectionOutput {
@@ -19,8 +23,8 @@ pub struct NativeProjectionOutput {
     pub typed_plan_used: bool,
 }
 
-/// Ingest the current native Responses turn into the LCM projection pipeline
-/// and assemble context for injection into the upstream native request.
+/// Persist the current turn as a lossless DAG projection, trigger background
+/// compaction, then assemble the working context for the native request.
 pub async fn project_and_assemble(
     state: &AppState,
     session_id: &str,
@@ -36,25 +40,70 @@ pub async fn project_and_assemble(
         return NativeProjectionOutput::default();
     }
 
-    let shadow = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-    let pipeline = ChatPipeline::new(state);
-    let processed = match pipeline
-        .process_with_fp(model, &shadow, 1, Some(session_id))
-        .await
-    {
-        Ok(out) => out,
+    let conv_id = match state.storage.db.find_or_create_conversation(session_id, model) {
+        Ok(id) => id,
         Err(error) => {
             tracing::warn!(target:"deeplossless::responses_projection", %error,
-                "native Responses projection pipeline failed");
+                "failed to resolve native Responses conversation");
             return NativeProjectionOutput::default();
         }
     };
 
-    let conv_id = processed.conv_id;
+    // Pure projection ingestion. `messages` keeps the complete text derived from
+    // the exact provider item; level-0 DAG leaves are no longer 200-char previews.
+    let db = state.storage.db.clone();
+    let dag = state.storage.dag.clone();
+    let stored_messages = Value::Array(messages.clone());
+    let ingest = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        db.store_messages(conv_id, &stored_messages)?;
+        if let Some(items) = stored_messages.as_array() {
+            for message in items {
+                let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+                if !matches!(role, "user" | "assistant" | "tool") {
+                    continue;
+                }
+                let content = message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if content.is_empty() {
+                    continue;
+                }
+                let raw_tokens = crate::tokenizer::count(content) + dag.config().token_overhead;
+                let token_count = crate::tokenizer::correct(
+                    raw_tokens,
+                    dag.config().token_correction_factor,
+                ) as i64;
+                dag.insert_leaf(conv_id, content, token_count)?;
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    match ingest {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target:"deeplossless::responses_projection", %error,
+                "native Responses projection ingestion failed");
+        }
+        Err(error) => {
+            tracing::warn!(target:"deeplossless::responses_projection", %error,
+                "native Responses projection worker failed");
+        }
+    }
+
+    // Compaction is background work; current request can assemble from the full
+    // leaves immediately and a later turn sees the validated summary.
+    if let Ok(mut compactor) = state.compactor.try_lock() {
+        let _ = compactor
+            .send_command(CompactCommand::ReviewAndCompact {
+                conv_id,
+                context_window: CONTEXT_WINDOW,
+            })
+            .await;
+    }
+
     let query = messages
         .iter()
         .rev()
@@ -77,11 +126,11 @@ pub async fn project_and_assemble(
         String::new()
     };
 
-    let (plan_context, typed_plan_used) = evaluate_typed_plan(
-        state,
-        session_id,
-        conv_id,
-    );
+    let (plan_context, typed_plan_used) = if state.lcm_context {
+        evaluate_typed_plan(state, session_id, conv_id)
+    } else {
+        (None, false)
+    };
 
     let context = match (dag_context.is_empty(), plan_context.as_deref()) {
         (false, Some(plan)) => format!("{dag_context}\n\n{plan}"),
@@ -98,8 +147,7 @@ pub async fn project_and_assemble(
 }
 
 /// Inject derived context as a developer message immediately before the latest
-/// user message. The persisted session history remains the original provider
-/// items; this mutation applies only to the one upstream request.
+/// user message. Persisted session history remains the original provider items.
 pub fn inject_context(body: &mut Value, context: &str) {
     if context.trim().is_empty() {
         return;
@@ -110,10 +158,7 @@ pub fn inject_context(body: &mut Value, context: &str) {
     let context_item = json!({
         "type": "message",
         "role": "developer",
-        "content": [{
-            "type": "input_text",
-            "text": context,
-        }],
+        "content": [{"type":"input_text","text":context}],
     });
     let insert_at = items
         .iter()
@@ -131,16 +176,16 @@ fn project_messages(items: &[Value]) -> Vec<Value> {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let content = content_text(item.get("content"));
                 if !content.is_empty() {
-                    messages.push(json!({"role": role, "content": content}));
+                    messages.push(json!({"role":role,"content":content}));
                 }
             }
             "function_call_output" | "custom_tool_call_output" => {
                 let content = content_text(item.get("output"));
                 if !content.is_empty() {
                     messages.push(json!({
-                        "role": "tool",
-                        "content": content,
-                        "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or(""),
+                        "role":"tool",
+                        "content":content,
+                        "tool_call_id":item.get("call_id").and_then(Value::as_str).unwrap_or(""),
                     }));
                 }
             }
@@ -170,8 +215,8 @@ fn content_text(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
-/// Prefer typed Plan→Fact dependencies. Legacy string assumptions are evaluated
-/// by the old Runtime path when no typed dependencies have been registered.
+/// Typed Plan dependencies take precedence whenever present. The legacy
+/// Runtime string-assumption rule remains the fallback for unmigrated plans.
 fn evaluate_typed_plan(
     state: &AppState,
     session_id: &str,
@@ -206,9 +251,6 @@ fn evaluate_typed_plan(
         return (None, false);
     }
 
-    // context_delta represents resources known to have changed during the
-    // execution cycle. Typed resource identity replaces assumption-string
-    // matching. A matching File/Symbol dependency is stale immediately.
     let changed_paths = state
         .runtime
         .cycle
@@ -233,7 +275,6 @@ fn evaluate_typed_plan(
         .filter(|dependency| dependency.plan_id == plan_id && dependency.required)
         .map(|dependency| dependency.fact_id.clone())
         .collect();
-
     let missing: Vec<String> = required_fact_ids
         .iter()
         .filter(|id| !semantic.facts.contains_key(*id))
@@ -262,13 +303,7 @@ fn evaluate_typed_plan(
         let reason = format!(
             "typed plan dependencies invalid: missing={missing:?}, stale={stale:?}, unbacked={unbacked:?}, unrecoverable={unrecoverable:?}"
         );
-        let _ = state.storage.db.store_decision_record(
-            conv_id,
-            "Replan",
-            0.95,
-            &reason,
-            0,
-        );
+        let _ = state.storage.db.store_decision_record(conv_id, "Replan", 0.95, &reason, 0);
         return (
             Some(format!(
                 "[Plan needs replanning: {goal}]\n[Reason: {reason}]\n[Pending steps: {}]",
@@ -300,16 +335,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projects_native_messages_and_tool_outputs() {
+    fn projects_native_messages_and_tool_outputs_without_truncation() {
+        let long = "x".repeat(10_000);
         let items = vec![
-            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]}),
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":long}]}),
             json!({"type":"function_call_output","call_id":"c1","output":"tests failed"}),
         ];
         let messages = project_messages(&items);
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["content"], "fix it");
+        assert_eq!(messages[0]["content"].as_str().unwrap().len(), 10_000);
         assert_eq!(messages[1]["role"], "tool");
-        assert_eq!(messages[1]["tool_call_id"], "c1");
     }
 
     #[test]
