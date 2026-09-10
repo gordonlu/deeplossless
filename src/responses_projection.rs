@@ -124,7 +124,11 @@ pub async fn project_and_assemble(
         }
     }
 
-    if let Ok(mut compactor) = state.compactor.try_lock() {
+    // Native Responses keeps exact level-0 projection data regardless of LCM mode,
+    // but compaction is only useful when the LCM working view is actually consumed.
+    if state.lcm_context
+        && let Ok(mut compactor) = state.compactor.try_lock()
+    {
         let _ = compactor
             .send_command(CompactCommand::ReviewAndCompact {
                 conv_id,
@@ -417,7 +421,7 @@ fn evaluate_typed_plan(
         "ContinuePlan",
         0.95,
         "all current-step required typed facts are valid, source-backed, and recoverable",
-        500,
+        0,
     );
     (
         Some(format!(

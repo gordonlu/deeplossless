@@ -117,6 +117,23 @@ pub fn render_dag_context(nodes: &[DagNode]) -> String {
     out
 }
 
+/// Return the complete level-0 DAG payload for a conversational message.
+///
+/// Level-0 nodes are a projection, not the Ground Truth ledger, but they must not
+/// introduce an additional arbitrary truncation boundary before compaction. String
+/// content is preserved verbatim; structured content is serialized in full.
+fn dag_leaf_content(message: &serde_json::Value) -> Option<String> {
+    let role = message.get("role").and_then(serde_json::Value::as_str)?;
+    if !matches!(role, "user" | "assistant" | "tool") {
+        return None;
+    }
+    match message.get("content") {
+        Some(serde_json::Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(value.to_string()),
+    }
+}
+
 /// ChatPipeline: orchestrates the request processing steps
 /// (fingerprint → store → compact → assemble → inject) without
 /// coupling to HTTP transport.
@@ -181,8 +198,12 @@ impl ChatPipeline {
             None => crate::session::fingerprint(msgs_arr, prefix_count),
         };
         let conv_id = self.db.find_or_create_conversation(&fp, model)?;
+        // The resolved conversation fingerprint is also the authoritative event session
+        // identity. Do not recompute it with a hard-coded prefix inside the worker:
+        // Anthropic/project-key overrides would otherwise split one run across IDs.
+        let event_session_id = fp.clone();
 
-        // Store messages and create DAG leaf nodes (async, non-blocking)
+        // Store messages and create DAG leaf nodes.
         let db = self.db.clone();
         let dag = self.dag.clone();
         let overhead = dag.config().token_overhead;
@@ -206,14 +227,13 @@ impl ChatPipeline {
             // Neither modifies the messages table — pure read from
             // committed state.
             if let Some(arr) = msgs.as_array() {
-                let session_id = crate::session::fingerprint(arr, 3);
                 let conn = db.writer_conn();
-                if let Err(e) = crate::event_store::extract_and_insert(&conn, &session_id, arr) {
+                if let Err(e) = crate::event_store::extract_and_insert(&conn, &event_session_id, arr) {
                     crate::metrics::OBSERVABILITY_WRITE_FAILED
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(target: "deeplossless::pipeline", "failed to extract proxy events: {e}");
                 }
-                if let Err(e) = crate::diff_events::extract_diffs_post_commit(&conn, &session_id, conv_id) {
+                if let Err(e) = crate::diff_events::extract_diffs_post_commit(&conn, &event_session_id, conv_id) {
                     crate::metrics::OBSERVABILITY_WRITE_FAILED
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(target: "deeplossless::pipeline", "failed to extract diff events: {e}");
@@ -221,12 +241,10 @@ impl ChatPipeline {
             }
             if let Some(arr) = msgs.as_array() {
                 for msg in arr {
-                    let role = msg["role"].as_str().unwrap_or("");
-                    if role == "user" || role == "assistant" || role == "tool" {
-                        let summary = msg["content"].to_string().chars().take(200).collect::<String>();
-                        let raw_tokens = crate::tokenizer::count(&summary) + overhead;
+                    if let Some(content) = dag_leaf_content(msg) {
+                        let raw_tokens = crate::tokenizer::count(&content) + overhead;
                         let tc = crate::tokenizer::correct(raw_tokens, correction) as i64;
-                        dag.insert_leaf(conv_id, &summary, tc)
+                        dag.insert_leaf(conv_id, &content, tc)
                             .context("failed to create DAG leaf")?;
                     }
                 }
@@ -398,31 +416,35 @@ impl ChatPipeline {
         .await
         .context("pipeline persistence task failed to join")??;
 
-        // Trigger async compaction review (soft threshold)
-        // Lock held only for send — recv is NOT awaited while holding the lock,
-        // so the compactor Mutex is free during background summarization.
-        let cmd_sent = {
-            let mut compactor = self.compactor.lock().await;
-            compactor
-                .send_command(CompactCommand::ReviewAndCompact {
-                    conv_id,
-                    context_window: CONTEXT_WINDOW,
-                })
-                .await
-        };
-        if cmd_sent.is_ok() {
-            let mut compactor = self.compactor.lock().await;
-            for event in compactor.drain_events() {
-                match event {
-                    CompactEvent::GroupCompressed { tokens_saved, .. } => {
-                        tracing::debug!(target: "deeplossless::pipeline", conv_id, tokens_saved, "compaction completed");
+        // Compaction exists to maintain the LCM working view. When LCM injection is
+        // disabled, keep ingesting exact level-0 leaves for future recall but do not
+        // spend request-path work maintaining a projection that is not being consumed.
+        if self.lcm_context {
+            // Lock held only for send — recv is NOT awaited while holding the lock,
+            // so the compactor Mutex is free during background summarization.
+            let cmd_sent = {
+                let mut compactor = self.compactor.lock().await;
+                compactor
+                    .send_command(CompactCommand::ReviewAndCompact {
+                        conv_id,
+                        context_window: CONTEXT_WINDOW,
+                    })
+                    .await
+            };
+            if cmd_sent.is_ok() {
+                let mut compactor = self.compactor.lock().await;
+                for event in compactor.drain_events() {
+                    match event {
+                        CompactEvent::GroupCompressed { tokens_saved, .. } => {
+                            tracing::debug!(target: "deeplossless::pipeline", conv_id, tokens_saved, "compaction completed");
+                        }
+                        CompactEvent::BelowThreshold { .. } => {}
+                        CompactEvent::Error { message, .. } => {
+                            tracing::warn!(target: "deeplossless::pipeline", conv_id, error = %message, "compaction error");
+                        }
+                        CompactEvent::CompactionCompleted { .. } => {}
+                        CompactEvent::Pong => {}
                     }
-                    CompactEvent::BelowThreshold { .. } => {}
-                    CompactEvent::Error { message, .. } => {
-                        tracing::warn!(target: "deeplossless::pipeline", conv_id, error = %message, "compaction error");
-                    }
-                    CompactEvent::CompactionCompleted { .. } => {}
-                    CompactEvent::Pong => {}
                 }
             }
         }
@@ -552,5 +574,36 @@ impl ChatPipeline {
                 ),
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn level_zero_leaf_preserves_complete_string_content() {
+        let text = "x".repeat(10_000);
+        let message = json!({"role":"tool","content":text});
+        let projected = dag_leaf_content(&message).expect("tool content");
+        assert_eq!(projected.len(), 10_000);
+        assert_eq!(projected, "x".repeat(10_000));
+    }
+
+    #[test]
+    fn level_zero_leaf_serializes_structured_content_without_truncation() {
+        let message = json!({
+            "role":"assistant",
+            "content":[{"type":"text","text":"payload"}, {"meta":{"n":42}}]
+        });
+        let projected = dag_leaf_content(&message).expect("structured content");
+        assert!(projected.contains("payload"));
+        assert!(projected.contains("\"n\":42"));
+    }
+
+    #[test]
+    fn level_zero_leaf_ignores_non_conversational_roles() {
+        assert!(dag_leaf_content(&json!({"role":"system","content":"rules"})).is_none());
     }
 }
