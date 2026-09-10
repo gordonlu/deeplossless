@@ -49,12 +49,18 @@ pub fn produce_from_responses_items(
         .collect();
 
     let active_plan = db.get_active_plan(conv_id)?;
-    let (plan_id, goal, current_step) = match active_plan {
-        Some((id, goal, pending, _completed, _assumptions)) => {
+    let (plan_id, goal, current_step, current_step_index) = match active_plan {
+        Some((id, goal, pending, completed, _assumptions)) => {
             let pending: Vec<String> = serde_json::from_value(pending).unwrap_or_default();
-            (Some(id), goal, pending.first().cloned().unwrap_or_default())
+            let completed: Vec<String> = serde_json::from_value(completed).unwrap_or_default();
+            (
+                Some(id),
+                goal,
+                pending.first().cloned().unwrap_or_default(),
+                completed.len(),
+            )
         }
-        None => (None, String::new(), String::new()),
+        None => (None, String::new(), String::new(), 0),
     };
     let plan_text = format!("{goal}\n{current_step}");
     let mut existing_deps: HashSet<(i64, Option<usize>, String, bool)> = match plan_id {
@@ -68,10 +74,17 @@ pub fn produce_from_responses_items(
 
     for item in current_items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        if !matches!(item_type, "function_call_output" | "custom_tool_call_output") {
+        if !matches!(
+            item_type,
+            "function_call_output" | "custom_tool_call_output"
+        ) {
             continue;
         }
-        let Some(call_id) = item.get("call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        let Some(call_id) = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
         let Some(call) = find_call(history, current_items, call_id) else {
@@ -87,22 +100,20 @@ pub fn produce_from_responses_items(
             continue;
         }
 
-        // Store a dedicated exact tool-payload copy. ProviderItems remains the
-        // transport ledger; ToolPayloads is the semantic evidence stream used
-        // by typed facts. Both are immutable and independently materializable.
         let source = store.put_json(
             TruthStream::ToolPayloads,
             session_id,
             item,
-            if item_type.is_empty() { "tool-output" } else { item_type },
+            if item_type.is_empty() {
+                "tool-output"
+            } else {
+                item_type
+            },
         )?;
 
         let kind = ToolKind::from_name(name);
         let paths = extract_dependent_files(name, &args);
 
-        // A real read-file result is strong enough to establish a versioned
-        // FileObservation. This gives the fact a live-world invalidation key,
-        // rather than treating a historical tool result as timeless truth.
         if kind == ToolKind::ReadFile && paths.len() == 1 {
             let path = paths[0].clone();
             let obs = observe_file(&path, &output);
@@ -135,7 +146,13 @@ pub fn produce_from_responses_items(
             );
             fact.evidence.extend([source.clone(), obs_source.clone()]);
             fact.resources.push(current_resource);
-            persist_fact_if_changed(&store, session_id, &mut existing_facts, fact.clone(), &mut report)?;
+            persist_fact_if_changed(
+                &store,
+                session_id,
+                &mut existing_facts,
+                fact.clone(),
+                &mut report,
+            )?;
 
             if let Some(id) = plan_id {
                 let required = exact_path_mentioned(&current_step, &obs.path);
@@ -147,7 +164,7 @@ pub fn produce_from_responses_items(
                         &mut existing_deps,
                         PlanFactDependency {
                             plan_id: id,
-                            step_index: Some(0),
+                            step_index: Some(current_step_index),
                             fact_id: fact.id.clone(),
                             required,
                         },
@@ -155,9 +172,6 @@ pub fn produce_from_responses_items(
                     )?;
                 }
 
-                // Symbol facts are created only when the active plan actually
-                // names the symbol. This keeps the sidecar compact and avoids
-                // manufacturing thousands of low-value declarations.
                 for symbol in plan_relevant_symbols(&obs, &plan_text).into_iter().take(32) {
                     let mut symbol_fact = ExecutionFact::new(
                         format!("symbol:{}::{symbol}", obs.path),
@@ -185,7 +199,7 @@ pub fn produce_from_responses_items(
                         &mut existing_deps,
                         PlanFactDependency {
                             plan_id: id,
-                            step_index: Some(0),
+                            step_index: Some(current_step_index),
                             fact_id: symbol_fact.id,
                             required: current_step.contains(symbol.as_str()),
                         },
@@ -196,9 +210,6 @@ pub fn produce_from_responses_items(
             continue;
         }
 
-        // Shell results only become authoritative when an explicit exit code is
-        // present. A stable validation fact id lets a later success replace the
-        // earlier failed state without deleting the immutable evidence rows.
         if kind == ToolKind::Bash {
             if let Some(exit_code) = parse_exit_code(&output) {
                 let command = command_text(&args);
@@ -209,11 +220,11 @@ pub fn produce_from_responses_items(
                     if exit_code == 0 {
                         format!("Validation command {display} succeeded with exit code 0.")
                     } else {
-                        format!("Validation command {display} failed with exit code {exit_code}.")
+                        format!(
+                            "Validation command {display} failed with exit code {exit_code}."
+                        )
                     },
                 );
-                // Non-zero validation is known evidence, but not a valid
-                // continuation premise. Required dependencies therefore block.
                 if exit_code != 0 {
                     fact.status = FactStatus::Unknown;
                 }
@@ -239,7 +250,7 @@ pub fn produce_from_responses_items(
                         &mut existing_deps,
                         PlanFactDependency {
                             plan_id: id,
-                            step_index: Some(0),
+                            step_index: Some(current_step_index),
                             fact_id,
                             required: true,
                         },
@@ -257,10 +268,13 @@ pub fn produce_from_responses_items(
             continue;
         }
 
-        // Deterministic search/diagnostic tools can safely establish the
-        // existence of exact evidence without interpreting its semantic meaning.
-        if matches!(kind, ToolKind::Grep | ToolKind::ListFiles | ToolKind::SymbolSearch | ToolKind::Diagnostics)
-            && !paths.is_empty()
+        if matches!(
+            kind,
+            ToolKind::Grep
+                | ToolKind::ListFiles
+                | ToolKind::SymbolSearch
+                | ToolKind::Diagnostics
+        ) && !paths.is_empty()
         {
             let mut fact = ExecutionFact::new(
                 format!("tool-result:{call_id}"),
@@ -271,7 +285,13 @@ pub fn produce_from_responses_items(
                 call_id: call_id.to_string(),
                 content_hash: source.content_hash.clone(),
             });
-            persist_fact_if_changed(&store, session_id, &mut existing_facts, fact.clone(), &mut report)?;
+            persist_fact_if_changed(
+                &store,
+                session_id,
+                &mut existing_facts,
+                fact.clone(),
+                &mut report,
+            )?;
 
             if let Some(id) = plan_id
                 && paths.iter().any(|path| path_mentioned(&plan_text, path))
@@ -282,11 +302,8 @@ pub fn produce_from_responses_items(
                     &mut existing_deps,
                     PlanFactDependency {
                         plan_id: id,
-                        step_index: Some(0),
+                        step_index: Some(current_step_index),
                         fact_id: fact.id,
-                        // Search evidence is useful for recall, but is not a
-                        // hard continuation gate because the searched file can
-                        // change after the historical result was produced.
                         required: false,
                     },
                     &mut report,
@@ -357,7 +374,9 @@ fn call_arguments(call: &Value) -> String {
 }
 
 fn output_text(value: Option<&Value>) -> String {
-    let Some(value) = value else { return String::new(); };
+    let Some(value) = value else {
+        return String::new();
+    };
     match value {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
@@ -383,7 +402,9 @@ fn parse_exit_code(text: &str) -> Option<i32> {
         "\"exit_code\":",
     ];
     for marker in MARKERS {
-        let Some(pos) = text.find(marker) else { continue; };
+        let Some(pos) = text.find(marker) else {
+            continue;
+        };
         let tail = text[pos + marker.len()..].trim_start();
         let token: String = tail
             .chars()
@@ -420,13 +441,15 @@ fn command_preview(args: &str) -> String {
 }
 
 fn validation_fact_id(command: &str) -> String {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     let digest = Sha256::digest(normalized.as_bytes());
     format!("validation:{}", hex::encode(&digest[..8]))
 }
 
-/// Only simple validation-only steps can evolve automatically. Compound or
-/// mutating steps stay under agent control even when a test command succeeds.
 fn validation_step_matches_command(step: &str, command: &str) -> bool {
     if step.trim().is_empty() || command.trim().is_empty() {
         return false;
@@ -434,15 +457,28 @@ fn validation_step_matches_command(step: &str, command: &str) -> bool {
     let step_lower = step.to_lowercase();
     let command_lower = command.to_lowercase();
     const MUTATION_TERMS: &[&str] = &[
-        "fix ", "edit ", "implement ", "change ", "update ", "write ", "create ", "refactor ",
+        "fix ",
+        "edit ",
+        "implement ",
+        "change ",
+        "update ",
+        "write ",
+        "create ",
+        "refactor ",
     ];
-    if MUTATION_TERMS.iter().any(|term| step_lower.contains(term)) {
+    if MUTATION_TERMS
+        .iter()
+        .any(|term| step_lower.contains(term))
+    {
         return false;
     }
     const VALIDATION_TERMS: &[&str] = &[
         "test", "check", "build", "lint", "verify", "validate", "clippy", "pytest",
     ];
-    if !VALIDATION_TERMS.iter().any(|term| step_lower.contains(term)) {
+    if !VALIDATION_TERMS
+        .iter()
+        .any(|term| step_lower.contains(term))
+    {
         return false;
     }
     if step_lower.contains(&command_lower) {
@@ -456,21 +492,24 @@ fn validation_step_matches_command(step: &str, command: &str) -> bool {
     !command_terms.is_empty() && command_terms.iter().all(|term| step_lower.contains(term))
 }
 
-/// Atomically evolve only the current validation step. Failure adds a blocker
-/// while keeping the step pending; success removes the blocker and moves that
-/// exact first pending step to completed.
 fn evolve_validation_step(
     db: &Database,
     plan_id: i64,
     step: &str,
     success: bool,
 ) -> anyhow::Result<bool> {
-    let mut conn = db.writer_conn();
+    let conn = db.writer_conn();
     let tx = conn.unchecked_transaction()?;
     let row = tx.query_row(
         "SELECT pending_steps, completed_steps, blocked_steps FROM plan_states WHERE id = ?1 AND is_active = 1",
         rusqlite::params![plan_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     );
     let (pending_json, completed_json, blocked_json) = match row {
         Ok(row) => row,
@@ -554,17 +593,32 @@ mod tests {
 
     #[test]
     fn parses_codex_exit_code_without_guessing_from_prose() {
-        assert_eq!(parse_exit_code("Process exited with code 0\nFinal output:\nok"), Some(0));
+        assert_eq!(
+            parse_exit_code("Process exited with code 0\nFinal output:\nok"),
+            Some(0)
+        );
         assert_eq!(parse_exit_code("exit_code=101"), Some(101));
         assert_eq!(parse_exit_code("tests look successful"), None);
     }
 
     #[test]
     fn validation_step_matching_rejects_compound_work() {
-        assert!(validation_step_matches_command("run cargo test", "cargo test --lib"));
-        assert!(validation_step_matches_command("check with cargo check", "cargo check"));
-        assert!(!validation_step_matches_command("fix parser and run cargo test", "cargo test"));
-        assert!(!validation_step_matches_command("implement parser", "cargo test"));
+        assert!(validation_step_matches_command(
+            "run cargo test",
+            "cargo test --lib"
+        ));
+        assert!(validation_step_matches_command(
+            "check with cargo check",
+            "cargo check"
+        ));
+        assert!(!validation_step_matches_command(
+            "fix parser and run cargo test",
+            "cargo test"
+        ));
+        assert!(!validation_step_matches_command(
+            "implement parser",
+            "cargo test"
+        ));
     }
 
     #[tokio::test]
@@ -575,7 +629,9 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("s1", "deepseek-flash")
+            .unwrap();
         let plan_id = db
             .store_plan_state(
                 conv_id,
@@ -605,15 +661,68 @@ mod tests {
         )
         .unwrap();
 
-        assert!(report.facts_created >= 2, "file + plan-relevant symbol fact");
+        assert!(report.facts_created >= 2);
         assert_eq!(report.file_observations_created, 1);
         let truth = GroundTruthStore::new(&db);
         let facts = truth.load_execution_facts("s1").unwrap();
         assert!(facts.iter().any(|fact| fact.id == "file:src/config.rs"));
-        assert!(facts.iter().any(|fact| fact.id == "symbol:src/config.rs::ConfigLoader"));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.id == "symbol:src/config.rs::ConfigLoader"));
         let deps = truth.load_plan_dependencies("s1", plan_id).unwrap();
-        assert!(deps.iter().any(|dep| dep.fact_id == "file:src/config.rs" && dep.required));
-        assert!(deps.iter().any(|dep| dep.fact_id == "symbol:src/config.rs::ConfigLoader" && dep.required));
+        assert!(deps.iter().any(|dep| dep.fact_id == "file:src/config.rs"
+            && dep.required
+            && dep.step_index == Some(0)));
+    }
+
+    #[tokio::test]
+    async fn dependency_uses_absolute_current_step_index() {
+        let dir = tempdir().unwrap();
+        let db = Database::builder()
+            .path(dir.path().join("step-index.db"))
+            .build()
+            .await
+            .unwrap();
+        let conv_id = db
+            .find_or_create_conversation("s1", "deepseek-flash")
+            .unwrap();
+        let plan_id = db
+            .store_plan_state(
+                conv_id,
+                "ship config",
+                &["run cargo test".into(), "inspect src/config.rs".into()],
+                &[],
+            )
+            .unwrap();
+
+        let test_call = json!({"type":"function_call","call_id":"t1","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
+        let test_out = json!({"type":"function_call_output","call_id":"t1","output":"Process exited with code 0"});
+        produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[test_call, test_out.clone()],
+            std::slice::from_ref(&test_out),
+        )
+        .unwrap();
+
+        let read_call = json!({"type":"function_call","call_id":"r1","name":"read_file","arguments":"{\"path\":\"src/config.rs\"}"});
+        let read_out = json!({"type":"function_call_output","call_id":"r1","output":"pub struct Config;"});
+        produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[read_call, read_out.clone()],
+            std::slice::from_ref(&read_out),
+        )
+        .unwrap();
+
+        let deps = GroundTruthStore::new(&db)
+            .load_plan_dependencies("s1", plan_id)
+            .unwrap();
+        assert!(deps.iter().any(|dep| dep.fact_id == "file:src/config.rs"
+            && dep.required
+            && dep.step_index == Some(1)));
     }
 
     #[tokio::test]
@@ -624,7 +733,9 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("s1", "deepseek-flash")
+            .unwrap();
         db.store_plan_state(
             conv_id,
             "fix loader",
@@ -657,7 +768,10 @@ mod tests {
         assert!(report.facts_invalidated >= 1);
         let truth = GroundTruthStore::new(&db);
         let facts = truth.load_execution_facts("s1").unwrap();
-        let file_fact = facts.iter().find(|fact| fact.id == "file:src/config.rs").unwrap();
+        let file_fact = facts
+            .iter()
+            .find(|fact| fact.id == "file:src/config.rs")
+            .unwrap();
         assert_eq!(file_fact.status, FactStatus::Valid);
     }
 
@@ -669,14 +783,30 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("s1", "deepseek-flash")
+            .unwrap();
         let call = json!({"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
         let vague = json!({"type":"function_call_output","call_id":"c1","output":"tests look successful"});
-        let report = produce_from_responses_items(&db, "s1", conv_id, &[call.clone(), vague.clone()], std::slice::from_ref(&vague)).unwrap();
+        let report = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call.clone(), vague.clone()],
+            std::slice::from_ref(&vague),
+        )
+        .unwrap();
         assert_eq!(report.facts_created, 0);
 
         let exact = json!({"type":"function_call_output","call_id":"c1","output":"Process exited with code 0\nFinal output:\nok"});
-        let report = produce_from_responses_items(&db, "s1", conv_id, &[call, exact.clone()], std::slice::from_ref(&exact)).unwrap();
+        let report = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call, exact.clone()],
+            std::slice::from_ref(&exact),
+        )
+        .unwrap();
         assert_eq!(report.facts_created, 1);
     }
 
@@ -688,27 +818,54 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
-        let plan_id = db.store_plan_state(
-            conv_id,
-            "ship parser",
-            &["run cargo test".into(), "implement docs".into()],
-            &[],
-        ).unwrap();
+        let conv_id = db
+            .find_or_create_conversation("s1", "deepseek-flash")
+            .unwrap();
+        let plan_id = db
+            .store_plan_state(
+                conv_id,
+                "ship parser",
+                &["run cargo test".into(), "implement docs".into()],
+                &[],
+            )
+            .unwrap();
 
         let call1 = json!({"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
         let fail = json!({"type":"function_call_output","call_id":"c1","output":"Process exited with code 101"});
-        let failed = produce_from_responses_items(&db, "s1", conv_id, &[call1, fail.clone()], std::slice::from_ref(&fail)).unwrap();
+        let failed = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call1, fail.clone()],
+            std::slice::from_ref(&fail),
+        )
+        .unwrap();
         assert_eq!(failed.validation_steps_blocked, 1);
-        let facts = GroundTruthStore::new(&db).load_execution_facts("s1").unwrap();
-        let validation = facts.iter().find(|fact| fact.id.starts_with("validation:")).unwrap();
+        let facts = GroundTruthStore::new(&db)
+            .load_execution_facts("s1")
+            .unwrap();
+        let validation = facts
+            .iter()
+            .find(|fact| fact.id.starts_with("validation:"))
+            .unwrap();
         assert_eq!(validation.status, FactStatus::Unknown);
-        let deps = GroundTruthStore::new(&db).load_plan_dependencies("s1", plan_id).unwrap();
-        assert!(deps.iter().any(|dep| dep.fact_id == validation.id && dep.required));
+        let deps = GroundTruthStore::new(&db)
+            .load_plan_dependencies("s1", plan_id)
+            .unwrap();
+        assert!(deps
+            .iter()
+            .any(|dep| dep.fact_id == validation.id && dep.required));
 
         let call2 = json!({"type":"function_call","call_id":"c2","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
         let pass = json!({"type":"function_call_output","call_id":"c2","output":"Process exited with code 0"});
-        let passed = produce_from_responses_items(&db, "s1", conv_id, &[call2, pass.clone()], std::slice::from_ref(&pass)).unwrap();
+        let passed = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call2, pass.clone()],
+            std::slice::from_ref(&pass),
+        )
+        .unwrap();
         assert_eq!(passed.validation_steps_completed, 1);
 
         let active = db.get_active_plan(conv_id).unwrap().unwrap();
@@ -716,8 +873,13 @@ mod tests {
         let completed: Vec<String> = serde_json::from_value(active.3).unwrap();
         assert_eq!(pending, vec!["implement docs"]);
         assert_eq!(completed, vec!["run cargo test"]);
-        let facts = GroundTruthStore::new(&db).load_execution_facts("s1").unwrap();
-        let validation = facts.iter().find(|fact| fact.id.starts_with("validation:")).unwrap();
+        let facts = GroundTruthStore::new(&db)
+            .load_execution_facts("s1")
+            .unwrap();
+        let validation = facts
+            .iter()
+            .find(|fact| fact.id.starts_with("validation:"))
+            .unwrap();
         assert_eq!(validation.status, FactStatus::Valid);
     }
 
@@ -729,16 +891,26 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db.find_or_create_conversation("s1", "deepseek-flash").unwrap();
+        let conv_id = db
+            .find_or_create_conversation("s1", "deepseek-flash")
+            .unwrap();
         db.store_plan_state(
             conv_id,
             "fix parser",
             &["fix parser and run cargo test".into()],
             &[],
-        ).unwrap();
+        )
+        .unwrap();
         let call = json!({"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\":\"cargo test\"}"});
         let pass = json!({"type":"function_call_output","call_id":"c1","output":"Process exited with code 0"});
-        let report = produce_from_responses_items(&db, "s1", conv_id, &[call, pass.clone()], std::slice::from_ref(&pass)).unwrap();
+        let report = produce_from_responses_items(
+            &db,
+            "s1",
+            conv_id,
+            &[call, pass.clone()],
+            std::slice::from_ref(&pass),
+        )
+        .unwrap();
         assert_eq!(report.validation_steps_completed, 0);
         let active = db.get_active_plan(conv_id).unwrap().unwrap();
         let pending: Vec<String> = serde_json::from_value(active.2).unwrap();
