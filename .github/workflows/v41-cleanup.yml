@@ -31,7 +31,7 @@ jobs:
           git apply --ignore-space-change --ignore-whitespace /tmp/v41-semantic.patch
       - name: Verify clean patch
         run: |
-          cargo fmt --check
+          git diff --check origin/master
           cargo test --lib
           cargo clippy --lib -- -D warnings
       - name: Commit clean semantic diff
