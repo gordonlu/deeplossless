@@ -1,0 +1,85 @@
+name: V41 Fix Execution Idempotency Final
+
+on:
+  push:
+    branches: [v41-fix-execution-idempotency]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v41-fix-execution-idempotency
+          fetch-depth: 0
+      - name: Apply and validate focused fix
+        run: |
+          python3 - <<'PY'
+          import subprocess, textwrap
+          from pathlib import Path
+
+          workflow = subprocess.check_output([
+              'git', 'show',
+              '287a36fd854b7a1b3af13c61003fd11785749ab9:.github/workflows/v41-fix-execution-idempotency.yml'
+          ], text=True)
+          marker = "          python3 - <<'PY'\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n          PY", start)
+          code = textwrap.dedent(workflow[start:end])
+          exec(compile(code, '<execution-idempotency-patch>', 'exec'))
+
+          p = Path('src/db.rs')
+          s = p.read_text()
+          old = (
+              "        if let Some(id) = conn\n"
+              "            .query_row(\n"
+              "                \"SELECT id FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3 LIMIT 1\",\n"
+              "                rusqlite::params![from_id, to_id, kind],\n"
+              "                |row| row.get::<_, i64>(0),\n"
+              "            )\n"
+              "            .ok()\n"
+              "        {"
+          )
+          new = (
+              "        if let Ok(id) = conn.query_row(\n"
+              "            \"SELECT id FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3 LIMIT 1\",\n"
+              "            rusqlite::params![from_id, to_id, kind],\n"
+              "            |row| row.get::<_, i64>(0),\n"
+              "        ) {"
+          )
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('tests/proxy_integration.rs')
+          s = p.read_text()
+          old = '''    assert_eq!(
+        id2, 0,
+        "second insert with same tool_call_id must return 0 (dedup'd)"
+    );
+'''
+          new = '''    assert_eq!(
+        id2, id1,
+        "second insert with same tool_call_id must return the durable existing id"
+    );
+'''
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          cargo fmt
+          git diff --check
+          cargo test --lib
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+          cargo build --release
+      - name: Commit focused fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/db.rs src/execution.rs src/pipeline.rs tests/execution_idempotency.rs tests/proxy_integration.rs
+          git commit -m "fix: make execution replay side effects idempotent"
+          git push origin HEAD:v41-fix-execution-idempotency
