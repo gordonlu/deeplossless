@@ -3494,8 +3494,8 @@ async fn execution_unit_dedup_same_tool_call_id() {
         .unwrap();
     assert!(id1 > 0, "first insert must succeed");
     assert_eq!(
-        id2, 0,
-        "second insert with same tool_call_id must return 0 (dedup'd)"
+        id2, id1,
+        "second insert with same tool_call_id must return the durable existing id"
     );
 }
 

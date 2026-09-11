@@ -262,6 +262,7 @@ impl ChatPipeline {
                 // parallel group. Match units to groups by tool_call_id.
                 let root_span = crate::parallel::ExecutionSpan::root_span();
                 let mut active_trackers: Vec<crate::parallel::ForkJoinTracker> = Vec::new();
+                let mut newly_inserted_parallel_groups = std::collections::HashSet::new();
                 // Stores the final HappensBefore edges for DB insertion
                 let mut pending_hb_edges: Vec<crate::parallel::HappensBeforeEdge> = Vec::new();
                 let mut next_turn_index: usize = 0;
@@ -312,7 +313,7 @@ impl ChatPipeline {
                             (String::new(), String::new(), String::new(), String::new())
                         };
 
-                    let exec_id = db.store_execution_unit_with_span(
+                    let (exec_id, inserted) = db.store_execution_unit_with_span_once(
                         conv_id,
                         &unit.reasoning_before,
                         &unit.tool_name,
@@ -330,23 +331,31 @@ impl ChatPipeline {
                     )
                     .context("failed to store execution unit")?;
 
-                    // Record DependsOn lineage edge: consecutive units in a conversation
-                    // form a dependency chain (unit N depends on unit N-1's output).
-                    if let Some(prev_id) = last_exec_id {
-                        if let Err(e) = db.insert_lineage_edge(prev_id, exec_id, "depends_on") {
-                            tracing::warn!(target: "deeplossless::pipeline",
-                                "failed to insert DependsOn edge: {e}");
+                    // Historical units still seed ordering and transient parallel state so a
+                    // newly appended unit can depend on the real previous execution id.
+                    if inserted {
+                        if let Some(prev_id) = last_exec_id {
+                            if let Err(e) = db.insert_lineage_edge(prev_id, exec_id, "depends_on") {
+                                tracing::warn!(target: "deeplossless::pipeline",
+                                    "failed to insert DependsOn edge: {e}");
+                            }
+                        }
+                        if !parallel_group.is_empty() {
+                            newly_inserted_parallel_groups.insert(parallel_group.clone());
                         }
                     }
                     last_exec_id = Some(exec_id);
 
-                    // Update tracker with result
                     if !unit.tool_call_id.is_empty() {
                         for tracker in &mut active_trackers {
                             if let Err(e) = tracker.record_branch_result(&unit.tool_call_id, exec_id, &unit.outcome) {
                                 tracing::debug!(target: "deeplossless::pipeline", "record_branch_result: {e}");
                             }
                         }
+                    }
+
+                    if !inserted {
+                        continue;
                     }
 
                     // Auto-populate execution artifact store from message history.
@@ -388,7 +397,9 @@ impl ChatPipeline {
                 // Complete any finished parallel trackers and record HappensBefore edges.
                 // For groups that should force-join, insert a join DAG node.
                 for tracker in &active_trackers {
-                    if !tracker.should_force_join() {
+                    if !tracker.should_force_join()
+                        || !newly_inserted_parallel_groups.contains(&tracker.group_id)
+                    {
                         continue;
                     }
                     // Insert a join DAG node

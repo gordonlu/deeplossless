@@ -1598,6 +1598,11 @@ impl Database {
     /// Store an execution unit with full span/parallel metadata and replay session.
     /// Always writes an append-only event to execution_events with epoch_ms.
     /// `replay_session_id` groups related executions for replay lineage.
+    /// Store an execution unit and return its durable ID.
+    ///
+    /// Compatibility wrapper for callers that do not need to distinguish a fresh
+    /// insert from cumulative-history replay. Duplicate calls return the existing
+    /// execution id rather than the old sentinel value 0.
     pub fn store_execution_unit_with_span(
         &self,
         conv_id: i64,
@@ -1615,17 +1620,54 @@ impl Database {
         tool_call_id: &str,
         replay_session_id: &str,
     ) -> anyhow::Result<i64> {
+        self.store_execution_unit_with_span_once(
+            conv_id,
+            reasoning_before,
+            tool_name,
+            tool_args,
+            tool_result,
+            reasoning_after,
+            outcome,
+            related_nodes,
+            span_id,
+            parent_span_id,
+            span_mode,
+            parallel_group,
+            tool_call_id,
+            replay_session_id,
+        )
+        .map(|(id, _inserted)| id)
+    }
+
+    pub fn store_execution_unit_with_span_once(
+        &self,
+        conv_id: i64,
+        reasoning_before: &str,
+        tool_name: &str,
+        tool_args: &str,
+        tool_result: &str,
+        reasoning_after: &str,
+        outcome: &str,
+        related_nodes: &[i64],
+        span_id: &str,
+        parent_span_id: &str,
+        span_mode: &str,
+        parallel_group: &str,
+        tool_call_id: &str,
+        replay_session_id: &str,
+    ) -> anyhow::Result<(i64, bool)> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        // Dedup: skip if we already stored this tool execution.
-        // Prevents re-processing conversation history as execution events.
+        // Full-history clients resend old tool calls. Return the durable row id
+        // without replaying persistent side effects. Use the actual schema column
+        // and the same identity as idx_execution_dedup.
         if !tool_call_id.is_empty() {
-            let exists: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM execution_units WHERE conv_id = ?1 AND tool_call_id = ?2 AND tool_name = ?3",
-                rusqlite::params![conv_id, tool_call_id, tool_name],
-                |row| row.get(0),
-            ).unwrap_or(false);
-            if exists {
-                return Ok(0); // already stored — skip
+            let existing_id = conn.query_row(
+                "SELECT id FROM execution_units WHERE conversation_id = ?1 AND tool_call_id = ?2 LIMIT 1",
+                rusqlite::params![conv_id, tool_call_id],
+                |row| row.get::<_, i64>(0),
+            ).ok();
+            if let Some(id) = existing_id {
+                return Ok((id, false));
             }
         }
         let related_json = serde_json::to_string(related_nodes)?;
@@ -1643,7 +1685,14 @@ impl Database {
                 tool_call_id, epoch_ms, replay_session_id,
             ],
         )?;
-        if conn.changes() == 0 { return Ok(0); } // duplicate, skipped
+        if conn.changes() == 0 {
+            let id = conn.query_row(
+                "SELECT id FROM execution_units WHERE conversation_id = ?1 AND tool_call_id = ?2 LIMIT 1",
+                rusqlite::params![conv_id, tool_call_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            return Ok((id, false));
+        }
         let exec_id = conn.last_insert_rowid();
 
         // Conditional append-only event log (authoritative audit source)
@@ -1701,7 +1750,7 @@ impl Database {
             }
         }
 
-        Ok(exec_id)
+        Ok((exec_id, true))
     }
 
     /// Get execution units for a conversation, newest first.
@@ -2958,8 +3007,15 @@ impl Database {
     /// Returns the edge ID.
     pub fn insert_lineage_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(id) = conn.query_row(
+            "SELECT id FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3 LIMIT 1",
+            rusqlite::params![from_id, to_id, kind],
+            |row| row.get::<_, i64>(0),
+        ) {
+            return Ok(id);
+        }
         conn.execute(
-            "INSERT OR IGNORE INTO lineage_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
+            "INSERT INTO lineage_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",
             rusqlite::params![from_id, to_id, kind],
         )?;
         Ok(conn.last_insert_rowid())

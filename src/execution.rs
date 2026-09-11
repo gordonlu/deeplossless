@@ -67,7 +67,11 @@ pub const LINEAGE_MIGRATION: &str = "
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_lineage_from ON lineage_edges(from_id);
-    CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_id);";
+    CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_id);
+    DELETE FROM lineage_edges
+      WHERE id NOT IN (
+        SELECT MIN(id) FROM lineage_edges GROUP BY from_id, to_id, kind
+      );";
 
 // ── Structured Reasoning ──────────────────────────────────────────────
 
