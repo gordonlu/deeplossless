@@ -53,6 +53,23 @@ jobs:
           )
           assert s.count(old) == 1, s.count(old)
           p.write_text(s.replace(old, new, 1))
+
+          p = Path('tests/proxy_integration.rs')
+          s = p.read_text()
+          old = (
+              '    assert_eq!(\n'
+              '        id2, 0,\n'
+              '        "second insert with same tool_call_id must return 0 (dedup\'d)"\n'
+              '    );\n'
+          )
+          new = (
+              '    assert_eq!(\n'
+              '        id2, id1,\n'
+              '        "second insert with same tool_call_id must return the durable existing id"\n'
+              '    );\n'
+          )
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
           PY
 
           cargo fmt
@@ -65,6 +82,6 @@ jobs:
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/db.rs src/execution.rs src/pipeline.rs tests/execution_idempotency.rs
+          git add src/db.rs src/execution.rs src/pipeline.rs tests/execution_idempotency.rs tests/proxy_integration.rs
           git commit -m "fix: make execution replay side effects idempotent"
           git push origin HEAD:v41-fix-execution-idempotency
