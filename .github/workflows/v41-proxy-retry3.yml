@@ -13,7 +13,7 @@ jobs:
         with:
           ref: v41-incremental-proxy-events
           fetch-depth: 0
-      - name: Apply patch
+      - name: Apply and validate patch
         run: |
           python3 - <<'PY'
           import subprocess, textwrap
@@ -34,6 +34,14 @@ jobs:
           tail += "p.write_text(s)\n"
           code = code[:cut] + tail
           exec(compile(code, '<proxy-event-patch>', 'exec'))
+
+          p = Path('src/event_store.rs')
+          lines = p.read_text().splitlines()
+          for i, line in enumerate(lines):
+              if '"id":"c1"' in line and '"arguments"' in line:
+                  indent = line[:len(line) - len(line.lstrip())]
+                  lines[i] = indent + r'{"id":"c1","function":{"name":"read_file","arguments":"{}"}}'
+          p.write_text('\n'.join(lines) + '\n')
           PY
           cargo fmt
           git diff --check
