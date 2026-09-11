@@ -3,10 +3,17 @@ on:
   push:
     branches:
       - v41-incremental-proxy-events
+
+concurrency:
+  group: v41-incremental-proxy-events-patch
+  cancel-in-progress: true
+
 permissions:
   contents: write
+
 jobs:
   patch:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +33,7 @@ jobs:
           exec(compile(code, '<proxy-event-patch>', 'exec'))
 
           p = Path('src/event_store.rs')
-          s = p.read_text()
-          lines = s.splitlines()
+          lines = p.read_text().splitlines()
           for i, line in enumerate(lines):
               if '"id":"c1"' in line and '"arguments"' in line:
                   indent = line[:len(line) - len(line.lstrip())]
@@ -40,10 +46,12 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test --all-targets
           cargo build --release
-      - name: Commit
+      - name: Commit and push
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add src/event_store.rs src/pipeline.rs
           git commit -m "refactor: make proxy-event projection incremental"
+          git fetch origin v41-incremental-proxy-events
+          git rebase origin/v41-incremental-proxy-events
           git push origin HEAD:v41-incremental-proxy-events
