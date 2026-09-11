@@ -16,18 +16,67 @@ jobs:
         with:
           ref: v41-fix-execution-idempotency
           fetch-depth: 0
-      - name: Rebuild clean semantic diff
+      - name: Rebuild focused patch from master
         run: |
           git fetch origin master
           cp tests/execution_idempotency.rs /tmp/execution_idempotency.rs
-          git diff -w origin/master HEAD -- \
-            src/db.rs src/execution.rs src/pipeline.rs tests/proxy_integration.rs \
-            > /tmp/idempotency-semantic.patch
-          git checkout origin/master -- \
-            src/db.rs src/execution.rs src/pipeline.rs tests/proxy_integration.rs
-          git apply --ignore-space-change --ignore-whitespace /tmp/idempotency-semantic.patch
-          cp /tmp/execution_idempotency.rs tests/execution_idempotency.rs
+          git checkout origin/master -- src/db.rs src/execution.rs src/pipeline.rs tests/proxy_integration.rs
 
+          python3 - <<'PY'
+          import subprocess, textwrap
+          from pathlib import Path
+
+          workflow = subprocess.check_output([
+              'git', 'show',
+              '287a36fd854b7a1b3af13c61003fd11785749ab9:.github/workflows/v41-fix-execution-idempotency.yml'
+          ], text=True)
+          marker = "          python3 - <<'PY'\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n          PY", start)
+          code = textwrap.dedent(workflow[start:end])
+          exec(compile(code, '<execution-idempotency-patch>', 'exec'))
+
+          p = Path('src/db.rs')
+          s = p.read_text()
+          old = (
+              "        if let Some(id) = conn\n"
+              "            .query_row(\n"
+              "                \"SELECT id FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3 LIMIT 1\",\n"
+              "                rusqlite::params![from_id, to_id, kind],\n"
+              "                |row| row.get::<_, i64>(0),\n"
+              "            )\n"
+              "            .ok()\n"
+              "        {"
+          )
+          new = (
+              "        if let Ok(id) = conn.query_row(\n"
+              "            \"SELECT id FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3 LIMIT 1\",\n"
+              "            rusqlite::params![from_id, to_id, kind],\n"
+              "            |row| row.get::<_, i64>(0),\n"
+              "        ) {"
+          )
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('tests/proxy_integration.rs')
+          s = p.read_text()
+          old = (
+              '    assert_eq!(\n'
+              '        id2, 0,\n'
+              '        "second insert with same tool_call_id must return 0 (dedup\'d)"\n'
+              '    );\n'
+          )
+          new = (
+              '    assert_eq!(\n'
+              '        id2, id1,\n'
+              '        "second insert with same tool_call_id must return the durable existing id"\n'
+              '    );\n'
+          )
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          cp /tmp/execution_idempotency.rs tests/execution_idempotency.rs
           git diff --check origin/master
           cargo test --lib
           cargo clippy --all-targets -- -D warnings
