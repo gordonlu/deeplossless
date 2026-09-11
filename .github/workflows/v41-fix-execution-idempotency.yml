@@ -21,7 +21,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # 1) Execution replay: return the real durable id and whether this call inserted it.
           p = Path('src/db.rs')
           s = p.read_text()
           start = s.index('    pub fn store_execution_unit_with_span(\n')
@@ -50,71 +49,10 @@ jobs:
           wrapper = '''    /// Store an execution unit and return its durable ID.\n    ///\n    /// Compatibility wrapper for callers that do not need to distinguish a fresh\n    /// insert from cumulative-history replay. Duplicate calls return the existing\n    /// execution id rather than the old sentinel value 0.\n    pub fn store_execution_unit_with_span(\n        &self,\n        conv_id: i64,\n        reasoning_before: &str,\n        tool_name: &str,\n        tool_args: &str,\n        tool_result: &str,\n        reasoning_after: &str,\n        outcome: &str,\n        related_nodes: &[i64],\n        span_id: &str,\n        parent_span_id: &str,\n        span_mode: &str,\n        parallel_group: &str,\n        tool_call_id: &str,\n        replay_session_id: &str,\n    ) -> anyhow::Result<i64> {\n        self.store_execution_unit_with_span_once(\n            conv_id,\n            reasoning_before,\n            tool_name,\n            tool_args,\n            tool_result,\n            reasoning_after,\n            outcome,\n            related_nodes,\n            span_id,\n            parent_span_id,\n            span_mode,\n            parallel_group,\n            tool_call_id,\n            replay_session_id,\n        )\n        .map(|(id, _inserted)| id)\n    }\n\n'''
           s = s[:start] + wrapper + once + s[end:]
 
-          # 2) Lineage: clean historical duplicates without adding another SQLite index page,
-          # then make the writer-lock-protected insert explicitly idempotent.
           fn_start = s.index('    pub fn insert_lineage_edge(')
           fn_end = s.index('\n    ///', fn_start)
-          old_lineage_fn = s[fn_start:fn_end]
           new_lineage_fn = '''    pub fn insert_lineage_edge(&self, from_id: i64, to_id: i64, kind: &str) -> anyhow::Result<i64> {\n        let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());\n        if let Some(id) = conn\n            .query_row(\n                "SELECT id FROM lineage_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3 LIMIT 1",\n                rusqlite::params![from_id, to_id, kind],\n                |row| row.get::<_, i64>(0),\n            )\n            .ok()\n        {\n            return Ok(id);\n        }\n        conn.execute(\n            "INSERT INTO lineage_edges (from_id, to_id, kind) VALUES (?1, ?2, ?3)",\n            rusqlite::params![from_id, to_id, kind],\n        )?;\n        Ok(conn.last_insert_rowid())\n    }\n'''
           s = s[:fn_start] + new_lineage_fn + s[fn_end:]
-
-          # Focused regression tests for both durable-id replay and lineage idempotency.
-          insert_at = s.rfind('\n}')
-          tests = r'''
-
-    #[tokio::test]
-    async fn execution_unit_replay_returns_existing_id_without_reinsert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::builder()
-            .path(dir.path().join("exec-replay-idempotent.db"))
-            .build()
-            .await
-            .unwrap();
-        let conv_id = db.find_or_create_conversation("exec-replay", "test").unwrap();
-
-        let first = db.store_execution_unit_with_span_once(
-            conv_id, "before", "read_file", "{}", "ok", "after", "success", &[],
-            "", "", "", "", "call-1", "replay-1",
-        ).unwrap();
-        let second = db.store_execution_unit_with_span_once(
-            conv_id, "before", "read_file", "{}", "ok", "after", "success", &[],
-            "", "", "", "", "call-1", "replay-2",
-        ).unwrap();
-
-        assert!(first.1);
-        assert!(!second.1);
-        assert_eq!(first.0, second.0);
-        assert_ne!(second.0, 0);
-        let conn = db.read_conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM execution_units WHERE conversation_id = ?1 AND tool_call_id = 'call-1'",
-            rusqlite::params![conv_id],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    async fn lineage_insert_is_idempotent_under_writer_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::builder()
-            .path(dir.path().join("lineage-idempotent.db"))
-            .build()
-            .await
-            .unwrap();
-        let first = db.insert_lineage_edge(10, 20, "depends_on").unwrap();
-        let second = db.insert_lineage_edge(10, 20, "depends_on").unwrap();
-        assert_eq!(first, second);
-        let conn = db.read_conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM lineage_edges WHERE from_id = 10 AND to_id = 20 AND kind = 'depends_on'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 1);
-    }
-'''
-          s = s[:insert_at] + tests + s[insert_at:]
           p.write_text(s)
 
           p = Path('src/execution.rs')
@@ -125,8 +63,6 @@ jobs:
           s = s.replace(old, new, 1)
           p.write_text(s)
 
-          # 3) Pipeline: historical executions seed transient ordering/tracker state,
-          # but only fresh execution rows may produce persistent derived side effects.
           p = Path('src/pipeline.rs')
           s = p.read_text()
           s = s.replace(
@@ -160,6 +96,6 @@ jobs:
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/db.rs src/execution.rs src/pipeline.rs
+          git add src/db.rs src/execution.rs src/pipeline.rs tests/execution_idempotency.rs
           git commit -m "fix: make execution replay side effects idempotent"
           git push origin HEAD:v41-fix-execution-idempotency
