@@ -1,8 +1,8 @@
 use rusqlite::Connection;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::dag::DagNode;
 
@@ -114,13 +114,7 @@ pub struct Database {
 /// Run a WAL checkpoint every N writes to limit WAL file growth.
 const CHECKPOINT_INTERVAL: u64 = 100;
 
-pub type ActivePlan = (
-    i64,
-    String,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-);
+pub type ActivePlan = (i64, String, serde_json::Value, serde_json::Value, serde_json::Value);
 
 impl Database {
     pub fn builder() -> DatabaseBuilder {
@@ -131,10 +125,7 @@ impl Database {
         Self::open_with_config(path, &crate::runtime::RuntimePolicyConfig::default()).await
     }
 
-    async fn open_with_config(
-        path: &Path,
-        config: &crate::runtime::RuntimePolicyConfig,
-    ) -> anyhow::Result<Self> {
+    async fn open_with_config(path: &Path, config: &crate::runtime::RuntimePolicyConfig) -> anyhow::Result<Self> {
         let expanded = shellexpand::full(&path.to_string_lossy())
             .map(|c| c.to_string())
             .unwrap_or_else(|_| path.to_string_lossy().to_string());
@@ -181,32 +172,20 @@ impl Database {
     /// Round-robin dispatch to the next read connection.
     fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         let idx = self.write_count.load(Ordering::Relaxed) as usize % self.read_pool.len();
-        self.read_pool[idx]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.read_pool[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get the current audit mode from policy config.
     fn audit_mode(&self) -> crate::runtime::AuditMode {
-        self.policy_config
-            .read()
+        self.policy_config.read()
             .map(|c| c.audit_mode)
             .unwrap_or(crate::runtime::AuditMode::Full)
     }
 
     /// Buffer a pending audit event for OnError mode.
-    fn buffer_audit_event(
-        &self,
-        event_kind: &str,
-        event_payload: &str,
-        seq_no: i64,
-        conv_id: Option<i64>,
-        epoch_ms: i64,
-    ) {
+    fn buffer_audit_event(&self, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64) {
         if let Ok(mut buf) = self.onerror_buffer.lock() {
-            let max = self
-                .policy_config
-                .read()
+            let max = self.policy_config.read()
                 .map(|c| c.onerror_ring_size)
                 .unwrap_or(50);
             if buf.len() >= max {
@@ -300,20 +279,14 @@ impl Database {
 
     /// Insert a proxy event into the structured event index. Writes
     /// to `proxy_events` + `proxy_events_fts` in the same transaction.
-    pub fn insert_proxy_event(
-        &self,
-        event: &crate::event_store::ProxyEvent,
-    ) -> anyhow::Result<i64> {
+    pub fn insert_proxy_event(&self, event: &crate::event_store::ProxyEvent) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         crate::event_store::insert_event(&conn, event)
     }
 
     /// Query proxy events with structured filters (session, tool,
     /// status, path, FTS on content).
-    pub fn query_proxy_events(
-        &self,
-        filter: &crate::event_store::EventFilter,
-    ) -> anyhow::Result<Vec<crate::event_store::ProxyEvent>> {
+    pub fn query_proxy_events(&self, filter: &crate::event_store::EventFilter) -> anyhow::Result<Vec<crate::event_store::ProxyEvent>> {
         let conn = self.read_conn();
         crate::event_store::query_events(&conn, filter)
     }
@@ -363,42 +336,23 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        crate::diff_events::generate_and_store(
-            &conn,
-            session_id,
-            tool_call_id,
-            file_path,
-            before,
-            after,
-            ts,
-        )
+        crate::diff_events::generate_and_store(&conn, session_id, tool_call_id, file_path, before, after, ts)
     }
 
     /// Query file-level diff events (file-state diffs, not stream events).
-    pub fn query_diffs(
-        &self,
-        q: &crate::diff_events::DiffQuery,
-    ) -> anyhow::Result<Vec<crate::diff_events::DiffEvent>> {
+    pub fn query_diffs(&self, q: &crate::diff_events::DiffQuery) -> anyhow::Result<Vec<crate::diff_events::DiffEvent>> {
         let conn = self.read_conn();
         crate::diff_events::query_diffs(&conn, q)
     }
 
     /// Reconstruct file content by applying all recorded diffs in order.
-    pub fn reconstruct_file(
-        &self,
-        session_id: &str,
-        file_path: &str,
-        initial: &str,
-    ) -> anyhow::Result<String> {
+    pub fn reconstruct_file(&self, session_id: &str, file_path: &str, initial: &str) -> anyhow::Result<String> {
         let conn = self.read_conn();
         crate::diff_events::reconstruct_file(&conn, session_id, file_path, initial)
     }
 
     /// Find overlapping edits on the same file region (agent iterating).
-    pub fn find_overlapping_edits(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<Vec<(crate::diff_events::DiffEvent, crate::diff_events::DiffEvent)>> {
+    pub fn find_overlapping_edits(&self, session_id: &str) -> anyhow::Result<Vec<(crate::diff_events::DiffEvent, crate::diff_events::DiffEvent)>> {
         let conn = self.read_conn();
         crate::diff_events::find_overlapping_edits(&conn, session_id)
     }
@@ -410,27 +364,23 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS schema_meta (
                 version TEXT NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
+            );"
         )?;
         // FTS5 virtual table.  DROP + CREATE in separate calls to avoid
         // residual shadow-table state from a prior interrupted migration.
-        conn.execute_batch("DROP TABLE IF EXISTS messages_fts;")
-            .ok();
+        conn.execute_batch("DROP TABLE IF EXISTS messages_fts;").ok();
         conn.execute_batch(
             "CREATE VIRTUAL TABLE messages_fts
              USING fts5(content, role UNINDEXED, tokenize='unicode61');
-        ",
-        )?;
+        ")?;
 
         // Snippets FTS5 index for precision-critical value retrieval.
         // DROP first to avoid stale shadow-table state.
-        conn.execute_batch("DROP TABLE IF EXISTS snippets_fts;")
-            .ok();
+        conn.execute_batch("DROP TABLE IF EXISTS snippets_fts;").ok();
         conn.execute_batch(
             "CREATE VIRTUAL TABLE snippets_fts
              USING fts5(content, source_type UNINDEXED, node_id UNINDEXED, tokenize='unicode61');
-        ",
-        )?;
+        ")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversations (
@@ -513,8 +463,7 @@ impl Database {
                 dag_node_id INTEGER NOT NULL UNIQUE REFERENCES dag_nodes(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-        ",
-        )?;
+        ")?;
 
         // Graceful migration: add soft-delete columns if upgrading from earlier schema.
         // SQLite has no ADD COLUMN IF NOT EXISTS; we use PRAGMA table_info.
@@ -524,9 +473,7 @@ impl Database {
             .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
             .is_some();
         if !has_graph_revision {
-            conn.execute_batch(
-                "ALTER TABLE dag_nodes ADD COLUMN graph_revision INTEGER NOT NULL DEFAULT 0;",
-            )?;
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN graph_revision INTEGER NOT NULL DEFAULT 0;")?;
         }
 
         let has_deleted: bool = conn
@@ -541,9 +488,7 @@ impl Database {
             .is_some();
 
         if !has_deleted {
-            conn.execute_batch(
-                "ALTER TABLE dag_nodes ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;",
-            )?;
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;")?;
         }
         if !has_deleted_at {
             conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN deleted_at TEXT;")?;
@@ -556,9 +501,7 @@ impl Database {
             .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
             .is_some();
         if !has_semantic_hash {
-            conn.execute_batch(
-                "ALTER TABLE dag_nodes ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT '';",
-            )?;
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN semantic_hash TEXT NOT NULL DEFAULT '';")?;
         }
 
         // v0.5: access tracking for memory scoring
@@ -568,9 +511,7 @@ impl Database {
             .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
             .is_some();
         if !has_access_count {
-            conn.execute_batch(
-                "ALTER TABLE dag_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;",
-            )?;
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;")?;
         }
         let has_last_accessed: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('dag_nodes') WHERE name = 'last_accessed_at'")
@@ -588,9 +529,7 @@ impl Database {
             .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
             .is_some();
         if !has_reasoning {
-            conn.execute_batch(
-                "ALTER TABLE dag_nodes ADD COLUMN reasoning TEXT NOT NULL DEFAULT '';",
-            )?;
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN reasoning TEXT NOT NULL DEFAULT '';")?;
         }
 
         // v0.10: compaction_id for idempotent compaction dedup (P0-9)
@@ -600,14 +539,12 @@ impl Database {
             .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
             .is_some();
         if !has_compaction_id {
-            conn.execute_batch(
-                "ALTER TABLE dag_nodes ADD COLUMN compaction_id TEXT NOT NULL DEFAULT '';",
-            )?;
+            conn.execute_batch("ALTER TABLE dag_nodes ADD COLUMN compaction_id TEXT NOT NULL DEFAULT '';")?;
         }
         // Index for fast dedup lookup
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_dag_compaction_id
-                 ON dag_nodes(compaction_id) WHERE compaction_id != '';",
+                 ON dag_nodes(compaction_id) WHERE compaction_id != '';"
         )?;
 
         // Migration: content_hash for dedup (v0.6.6)
@@ -617,13 +554,11 @@ impl Database {
             .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
             .is_some();
         if !has_content_hash {
-            conn.execute_batch(
-                "ALTER TABLE messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
-            )?;
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';")?;
             // Backfill existing rows with a placeholder — they'll be skipped on re-insert
             conn.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup
-                     ON messages(conversation_id, content_hash) WHERE content_hash != '';",
+                     ON messages(conversation_id, content_hash) WHERE content_hash != '';"
             )?;
         }
 
@@ -654,7 +589,7 @@ impl Database {
                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_events_conv
-                ON dag_events(conv_id);",
+                ON dag_events(conv_id);"
         )?;
 
         // v0.7: execution units — agent memory atoms
@@ -676,62 +611,41 @@ impl Database {
 
         // v0.3.0: structured execution fields (additive, backward compatible)
         let has_tool_args_json: bool = conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_args_json'",
-            )
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_args_json'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_tool_args_json {
             conn.execute_batch("ALTER TABLE execution_units ADD COLUMN tool_args_json TEXT;")?;
         }
         let has_reasoning_steps: bool = conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('execution_units') WHERE name='reasoning_steps'",
-            )
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='reasoning_steps'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_reasoning_steps {
             conn.execute_batch("ALTER TABLE execution_units ADD COLUMN reasoning_steps TEXT NOT NULL DEFAULT '[]';")?;
         }
 
         // v0.6.3: token usage tracking per conversation
         let has_input_tokens: bool = conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('conversations') WHERE name='total_input_tokens'",
-            )
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name='total_input_tokens'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_input_tokens {
             conn.execute_batch("ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER NOT NULL DEFAULT 0;")?;
         }
         let has_output_tokens: bool = conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('conversations') WHERE name='total_output_tokens'",
-            )
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name='total_output_tokens'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_output_tokens {
             conn.execute_batch("ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0;")?;
         }
 
         // v0.3.0: artifact hashes for content-based cache invalidation
         let has_file_hashes: bool = conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('tool_cache') WHERE name='dependent_file_hashes'",
-            )
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .prepare("SELECT 1 FROM pragma_table_info('tool_cache') WHERE name='dependent_file_hashes'")
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_file_hashes {
             conn.execute_batch("ALTER TABLE tool_cache ADD COLUMN dependent_file_hashes TEXT NOT NULL DEFAULT '[]';")?;
         }
         // v0.9: multi-agent safe runtime
-        conn.execute_batch(
-            "
+        conn.execute_batch("
             CREATE TABLE IF NOT EXISTS agent_active_files (
                 agent_id        TEXT NOT NULL,
                 file_path       TEXT NOT NULL,
@@ -741,12 +655,9 @@ impl Database {
                 PRIMARY KEY (agent_id, file_path)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_files
-                ON agent_active_files(file_path);",
-        )?;
+                ON agent_active_files(file_path);")?;
         // Migration: add conv_id to existing agent_active_files (v0.5.3+)
-        let _ = conn.execute_batch(
-            "ALTER TABLE agent_active_files ADD COLUMN conv_id INTEGER NOT NULL DEFAULT 0;",
-        );
+        let _ = conn.execute_batch("ALTER TABLE agent_active_files ADD COLUMN conv_id INTEGER NOT NULL DEFAULT 0;");
         // v0.8: failure memory
         conn.execute_batch(crate::execution::FAILURE_MIGRATION)?;
         // v0.3.0: failure pattern environment fingerprint (after table creation)
@@ -807,15 +718,13 @@ impl Database {
                 messages_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
+            );"
         )?;
 
         // v0.5.0: tool_call_id for parallel group matching
         let has_tool_call_id: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='tool_call_id'")
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_tool_call_id {
             conn.execute_batch(crate::execution::MIGRATION_ALTER_V6)?;
         }
@@ -823,9 +732,7 @@ impl Database {
         // v0.6: audit P0 columns for execution_events
         let has_epoch_ms: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('execution_events') WHERE name='epoch_ms'")
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_epoch_ms {
             conn.execute_batch(crate::execution::EVENT_MIGRATION_ALTER_V6)?;
         }
@@ -833,9 +740,7 @@ impl Database {
         // v0.6: epoch_ms for execution_units (stable ordering)
         let has_unit_epoch_ms: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('execution_units') WHERE name='epoch_ms'")
-            .ok()
-            .and_then(|mut s| s.query_row([], |_| Ok(())).ok())
-            .is_some();
+            .ok().and_then(|mut s| s.query_row([], |_| Ok(())).ok()).is_some();
         if !has_unit_epoch_ms {
             conn.execute_batch(crate::execution::EXECUTION_UNITS_ALTER_V6)?;
         }
@@ -857,9 +762,7 @@ impl Database {
         let mut stmt = conn.prepare("SELECT id FROM conversations ORDER BY id")?;
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row?);
-        }
+        for row in rows { ids.push(row?); }
         Ok(ids)
     }
 
@@ -867,13 +770,11 @@ impl Database {
     /// Return the most recent conversation ID.
     pub fn last_conversation_id(&self) -> anyhow::Result<Option<i64>> {
         let conn = self.read_conn();
-        let id = conn
-            .query_row(
-                "SELECT id FROM conversations ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+        let id = conn.query_row(
+            "SELECT id FROM conversations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).ok();
         Ok(id)
     }
 
@@ -884,30 +785,20 @@ impl Database {
             "SELECT 1 FROM conversations WHERE id = ?1",
             rusqlite::params![conv_id],
             |_| Ok(()),
-        )
-        .is_ok()
+        ).is_ok()
     }
 
-    pub fn find_conversation_by_fingerprint(
-        &self,
-        fingerprint: &str,
-    ) -> anyhow::Result<Option<i64>> {
+    pub fn find_conversation_by_fingerprint(&self, fingerprint: &str) -> anyhow::Result<Option<i64>> {
         let conn = self.read_conn();
-        let id = conn
-            .query_row(
-                "SELECT id FROM conversations WHERE session_id = ?1 LIMIT 1",
-                rusqlite::params![fingerprint],
-                |row| row.get(0),
-            )
-            .ok();
+        let id = conn.query_row(
+            "SELECT id FROM conversations WHERE session_id = ?1 LIMIT 1",
+            rusqlite::params![fingerprint],
+            |row| row.get(0),
+        ).ok();
         Ok(id)
     }
 
-    pub fn find_or_create_conversation(
-        &self,
-        fingerprint: &str,
-        model: &str,
-    ) -> anyhow::Result<i64> {
+    pub fn find_or_create_conversation(&self, fingerprint: &str, model: &str) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Try to find existing conversation
         let existing: Option<i64> = conn
@@ -993,10 +884,9 @@ impl Database {
         tx.commit()?;
         let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count % CHECKPOINT_INTERVAL == 0
-            && let Err(e) = self.wal_checkpoint()
-        {
-            tracing::warn!(target: "deeplossless::db", error = %e, "WAL checkpoint failed");
-        }
+            && let Err(e) = self.wal_checkpoint() {
+                tracing::warn!(target: "deeplossless::db", error = %e, "WAL checkpoint failed");
+            }
         Ok(message_ids)
     }
 
@@ -1059,15 +949,8 @@ impl Database {
     }
 
     /// Legacy: create conversation + store messages in one call.
-    pub fn create_and_store(
-        &self,
-        model: &str,
-        messages: &serde_json::Value,
-    ) -> anyhow::Result<i64> {
-        let fp = crate::session::fingerprint(
-            messages.as_array().map(|a| a.as_slice()).unwrap_or(&[]),
-            3,
-        );
+    pub fn create_and_store(&self, model: &str, messages: &serde_json::Value) -> anyhow::Result<i64> {
+        let fp = crate::session::fingerprint(messages.as_array().map(|a| a.as_slice()).unwrap_or(&[]), 3);
         let conv_id = self.find_or_create_conversation(&fp, model)?;
         self.store_messages(conv_id, messages)?;
         Ok(conv_id)
@@ -1085,17 +968,7 @@ impl Database {
         child_ids: &[i64],
         is_leaf: bool,
     ) -> anyhow::Result<DagNode> {
-        self.insert_dag_node_full(
-            conversation_id,
-            level,
-            summary,
-            token_count,
-            parent_ids,
-            child_ids,
-            &[],
-            is_leaf,
-            false,
-        )
+        self.insert_dag_node_full(conversation_id, level, summary, token_count, parent_ids, child_ids, &[], is_leaf, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1171,15 +1044,16 @@ impl Database {
             return Ok(Vec::new());
         }
         let conn = self.read_conn();
-        let placeholders: Vec<String> = (1..=node_ids.len()).map(|i| format!("?{i}")).collect();
+        let placeholders: Vec<String> = (1..=node_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
         let sql = format!(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids, snippets, is_leaf, is_join, deleted, semantic_hash, access_count, last_accessed_at, reasoning, graph_revision, compaction_id
              FROM dag_nodes WHERE id IN ({}) AND deleted = 0",
             placeholders.join(","),
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = node_ids
-            .iter()
+        let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
         let rows = stmt.query_map(params.as_slice(), Self::row_to_node)?;
@@ -1193,11 +1067,7 @@ impl Database {
     /// Find nodes whose child_ids list contains the given node_id.
     /// For a given leaf, returns the summaries that include it.
     /// For a summary, returns higher-level summaries that compress it.
-    pub fn get_parent_nodes(
-        &self,
-        node_id: i64,
-        max_fanout: usize,
-    ) -> anyhow::Result<Vec<DagNode>> {
+    pub fn get_parent_nodes(&self, node_id: i64, max_fanout: usize) -> anyhow::Result<Vec<DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT n.id, n.conversation_id, n.level, n.summary,
@@ -1208,10 +1078,7 @@ impl Database {
              WHERE j.value = ?1 AND n.deleted = 0
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![node_id, max_fanout as i64],
-            Self::row_to_node,
-        )?;
+        let rows = stmt.query_map(rusqlite::params![node_id, max_fanout as i64], Self::row_to_node)?;
         let mut nodes = Vec::new();
         for row in rows {
             nodes.push(row?);
@@ -1231,9 +1098,7 @@ impl Database {
             return Ok(Vec::new());
         }
         let ids: Vec<i64> = child_ids.into_iter().take(max_fanout).collect();
-        let placeholders: Vec<String> = ids
-            .iter()
-            .enumerate()
+        let placeholders: Vec<String> = ids.iter().enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
@@ -1242,8 +1107,7 @@ impl Database {
             placeholders.join(","),
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = ids
-            .iter()
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
         let rows = stmt.query_map(params.as_slice(), Self::row_to_node)?;
@@ -1277,9 +1141,7 @@ impl Database {
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
         let mut nodes = Vec::new();
-        for row in rows {
-            nodes.push(row?);
-        }
+        for row in rows { nodes.push(row?); }
         Ok(nodes)
     }
 
@@ -1291,9 +1153,7 @@ impl Database {
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], Self::row_to_node)?;
         let mut nodes = Vec::new();
-        for row in rows {
-            nodes.push(row?);
-        }
+        for row in rows { nodes.push(row?); }
         Ok(nodes)
     }
 
@@ -1310,16 +1170,7 @@ impl Database {
         snippets: &[crate::snippet::Snippet],
         compaction_id: &str,
     ) -> anyhow::Result<DagNode> {
-        self.insert_summary_atomic_inner(
-            conversation_id,
-            level,
-            summary,
-            token_count,
-            source_ids,
-            snippets,
-            false,
-            compaction_id,
-        )
+        self.insert_summary_atomic_inner(conversation_id, level, summary, token_count, source_ids, snippets, false, compaction_id)
     }
     #[allow(clippy::too_many_arguments)]
     fn insert_summary_atomic_inner(
@@ -1351,13 +1202,11 @@ impl Database {
         // Without this, validate_dag reports orphan-parent because source nodes
         // don't know about the summary node that references them as children.
         for sid in source_ids {
-            let parent_str: String = tx
-                .query_row(
-                    "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
-                    rusqlite::params![sid],
-                    |row| row.get(0),
-                )
-                .unwrap_or_else(|_| "[]".to_string());
+            let parent_str: String = tx.query_row(
+                "SELECT parent_ids FROM dag_nodes WHERE id = ?1",
+                rusqlite::params![sid],
+                |row| row.get(0),
+            ).unwrap_or_else(|_| "[]".to_string());
             let mut parents: Vec<i64> = serde_json::from_str(&parent_str).unwrap_or_default();
             if !parents.contains(&new_id) {
                 parents.push(new_id);
@@ -1492,16 +1341,7 @@ impl Database {
         source_ids: &[i64],
         snippets: &[crate::snippet::Snippet],
     ) -> anyhow::Result<DagNode> {
-        self.insert_summary_atomic_inner(
-            conversation_id,
-            0,
-            summary,
-            token_count,
-            source_ids,
-            snippets,
-            true,
-            "",
-        )
+        self.insert_summary_atomic_inner(conversation_id, 0, summary, token_count, source_ids, snippets, true, "")
     }
 
     /// Update the reasoning chain for a node (execution provenance).
@@ -1531,14 +1371,15 @@ impl Database {
             return Ok(());
         }
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let placeholders: Vec<String> = (1..=node_ids.len()).map(|i| format!("?{i}")).collect();
+        let placeholders: Vec<String> = (1..=node_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect();
         let sql = format!(
             "UPDATE dag_nodes SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id IN ({})",
             placeholders.join(","),
         );
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = node_ids
-            .iter()
+        let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
         stmt.execute(params.as_slice())?;
@@ -1547,13 +1388,7 @@ impl Database {
 
     /// Append an event to the DAG event log for audit and rollback.
     /// Respects AuditMode: only writes in Full mode.
-    pub fn record_event(
-        &self,
-        event_type: &str,
-        node_id: i64,
-        conv_id: i64,
-        payload: &str,
-    ) -> anyhow::Result<()> {
+    pub fn record_event(&self, event_type: &str, node_id: i64, conv_id: i64, payload: &str) -> anyhow::Result<()> {
         if !self.audit_mode().should_write_audit() {
             return Ok(());
         }
@@ -1567,17 +1402,14 @@ impl Database {
 
     /// List recent conversations with basic stats for the session selector.
     #[allow(clippy::type_complexity)]
-    pub fn list_sessions(
-        &self,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(i64, String, String, i64, i64)>> {
+    pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<(i64, String, String, i64, i64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.session_id, c.model,
                     (SELECT COUNT(*) FROM execution_events WHERE conv_id = c.id) AS event_count,
                     c.total_input_tokens + c.total_output_tokens AS total_tokens
              FROM conversations c
-             ORDER BY c.id DESC LIMIT ?1",
+             ORDER BY c.id DESC LIMIT ?1"
         )?;
         let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
             Ok((
@@ -1589,18 +1421,12 @@ impl Database {
             ))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Get tool result messages that contain patch-like content (diff, code changes).
-    pub fn get_session_patches(
-        &self,
-        conv_id: i64,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, String)>> {
+    pub fn get_session_patches(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT role, substr(content, 1, 4000)
@@ -1615,25 +1441,18 @@ impl Database {
                  OR content LIKE '%modified%'
                  OR content LIKE '%changed%')
              ORDER BY id DESC
-             LIMIT ?2",
+             LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Accumulate token usage for a conversation from DeepSeek response data.
-    pub fn accumulate_usage(
-        &self,
-        conv_id: i64,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-    ) -> anyhow::Result<()> {
+    pub fn accumulate_usage(&self, conv_id: i64, prompt_tokens: u64, completion_tokens: u64) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE conversations SET total_input_tokens = COALESCE(total_input_tokens, 0) + ?1,
@@ -1657,16 +1476,13 @@ impl Database {
     /// Get system prompts for a session, deduplicating consecutive identical entries.
     /// Returns (id, content, token_count, stored_at) for each unique system prompt
     /// in chronological order, skipping repeats that are identical to the previous one.
-    pub fn get_system_prompts_deduped(
-        &self,
-        conv_id: i64,
-    ) -> anyhow::Result<Vec<(i64, String, i64, String)>> {
+    pub fn get_system_prompts_deduped(&self, conv_id: i64) -> anyhow::Result<Vec<(i64, String, i64, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, content, token_count, stored_at
              FROM messages
              WHERE conversation_id = ?1 AND role = 'system'
-             ORDER BY id ASC",
+             ORDER BY id ASC"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], |row| {
             Ok((
@@ -1700,27 +1516,20 @@ impl Database {
              FROM execution_events
              WHERE conv_id = ?1 AND event_kind = 'execution_completed'
              GROUP BY tool
-             ORDER BY cnt DESC",
+             ORDER BY cnt DESC"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id], |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_default(),
-                row.get::<_, i64>(1)?,
-            ))
+            Ok((row.get::<_, String>(0).unwrap_or_default(), row.get::<_, i64>(1)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Get execution events for a conversation, simplified for the UI.
     #[allow(clippy::type_complexity)]
     pub fn get_session_events(
-        &self,
-        conv_id: i64,
-        limit: usize,
+        &self, conv_id: i64, limit: usize,
     ) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
@@ -1728,7 +1537,7 @@ impl Database {
              FROM execution_events
              WHERE conv_id = ?1
              ORDER BY epoch_ms DESC, id DESC
-             LIMIT ?2",
+             LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
             Ok((
@@ -1740,19 +1549,13 @@ impl Database {
             ))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Get event log for a conversation, ordered by time.
     #[allow(clippy::type_complexity)]
-    pub fn get_events(
-        &self,
-        conv_id: i64,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, Option<i64>, String, String)>> {
+    pub fn get_events(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(String, Option<i64>, String, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT event_type, node_id, payload, created_at FROM dag_events WHERE conv_id = ?1 ORDER BY id DESC LIMIT ?2"
@@ -1766,9 +1569,7 @@ impl Database {
             ))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
@@ -1788,20 +1589,9 @@ impl Database {
         related_nodes: &[i64],
     ) -> anyhow::Result<i64> {
         self.store_execution_unit_with_span(
-            conv_id,
-            reasoning_before,
-            tool_name,
-            tool_args,
-            tool_result,
-            reasoning_after,
-            outcome,
-            related_nodes,
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
+            conv_id, reasoning_before, tool_name, tool_args,
+            tool_result, reasoning_after, outcome, related_nodes,
+            "", "", "", "", "", "",
         )
     }
 
@@ -1952,13 +1742,7 @@ impl Database {
                         ],
                     )?;
                 } else {
-                    self.buffer_audit_event(
-                        "execution_completed",
-                        &payload_str,
-                        epoch_ms,
-                        Some(conv_id),
-                        epoch_ms,
-                    );
+                    self.buffer_audit_event("execution_completed", &payload_str, epoch_ms, Some(conv_id), epoch_ms);
                 }
             }
             crate::runtime::AuditMode::Off => {
@@ -1983,7 +1767,7 @@ impl Database {
                     epoch_ms, replay_session_id
              FROM execution_units
              WHERE conversation_id = ?1
-             ORDER BY id DESC LIMIT ?2",
+             ORDER BY id DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
             let related_str: String = row.get(8)?;
@@ -1995,8 +1779,9 @@ impl Database {
                 tool_args: row.get(4)?,
                 tool_result: row.get(5)?,
                 reasoning_after: row.get(6)?,
-                outcome: crate::execution::ExecutionOutcome::from_str(&row.get::<_, String>(7)?)
-                    .unwrap_or(crate::execution::ExecutionOutcome::Success),
+                outcome: crate::execution::ExecutionOutcome::from_str(
+                    &row.get::<_, String>(7)?
+                ).unwrap_or(crate::execution::ExecutionOutcome::Success),
                 related_nodes: serde_json::from_str(&related_str).unwrap_or_default(),
                 created_at: row.get(9)?,
                 tool_args_json: None,
@@ -2032,7 +1817,7 @@ impl Database {
                 OR reasoning_before LIKE ?1 ESCAPE '\\'
                 OR reasoning_after LIKE ?1 ESCAPE '\\'
                 OR tool_result LIKE ?1 ESCAPE '\\'
-             ORDER BY id DESC LIMIT ?2",
+             ORDER BY id DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
             Ok(crate::execution::ExecutionUnitRef {
@@ -2092,15 +1877,10 @@ impl Database {
              WHERE file_path LIKE ?1 ESCAPE '\\'
                 OR symbols_changed LIKE ?1 ESCAPE '\\'
                 OR error_before LIKE ?1 ESCAPE '\\'
-             ORDER BY id DESC LIMIT ?2",
+             ORDER BY id DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -2119,9 +1899,7 @@ impl Database {
         limit: usize,
     ) -> anyhow::Result<Vec<crate::execution::ExecutionUnitRef>> {
         // Code changes return the most actionable results first
-        let code_results = self
-            .search_code_changes(query, limit / 2)
-            .unwrap_or_default();
+        let code_results = self.search_code_changes(query, limit / 2).unwrap_or_default();
         let mut seen = std::collections::HashSet::new();
 
         // Convert code change results to execution refs
@@ -2135,11 +1913,7 @@ impl Database {
                 format!("changed {} — {} symbols", file_path, sym.len())
             } else if !errors.is_empty() {
                 let err: Vec<String> = serde_json::from_str(errors).unwrap_or_default();
-                format!(
-                    "{} — fixed: {}",
-                    file_path,
-                    err.first().map(|s| s.as_str()).unwrap_or("?")
-                )
+                format!("{} — fixed: {}", file_path, err.first().map(|s| s.as_str()).unwrap_or("?"))
             } else {
                 file_path.clone()
             };
@@ -2152,9 +1926,7 @@ impl Database {
         }
 
         // Then add execution unit results
-        let exec_results = self
-            .search_execution_units(query, limit - results.len().min(limit))
-            .unwrap_or_default();
+        let exec_results = self.search_execution_units(query, limit - results.len().min(limit)).unwrap_or_default();
         for refr in exec_results {
             if seen.insert(refr.id) {
                 results.push(refr);
@@ -2170,18 +1942,10 @@ impl Database {
     /// Summary counts for debug dump — no user content exposed.
     pub fn debug_counts(&self) -> anyhow::Result<(i64, i64, i64, i64, i64)> {
         let conn = self.read_conn();
-        let nodes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM dag_nodes WHERE deleted=0", [], |r| {
-                r.get(0)
-            })?;
+        let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM dag_nodes WHERE deleted=0", [], |r| r.get(0))?;
         let convs: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
-        let embeddings: i64 =
-            conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
-        let plans: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM plan_states WHERE is_active=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let embeddings: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?;
+        let plans: i64 = conn.query_row("SELECT COUNT(*) FROM plan_states WHERE is_active=1", [], |r| r.get(0))?;
         let events: i64 = conn.query_row("SELECT COUNT(*) FROM dag_events", [], |r| r.get(0))?;
         Ok((nodes, convs, embeddings, plans, events))
     }
@@ -2201,9 +1965,7 @@ impl Database {
             rusqlite::params![conv_id], |r| r.get(0))?;
         let failure_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM failure_patterns WHERE conversation_id = ?1",
-            rusqlite::params![conv_id],
-            |r| r.get(0),
-        )?;
+            rusqlite::params![conv_id], |r| r.get(0))?;
         Ok((leaf_count, summary_count, total_tokens, failure_count))
     }
 
@@ -2217,17 +1979,15 @@ impl Database {
              WHERE conversation_id = ?1
              ORDER BY id ASC",
         )?;
-        let rows: Vec<(String, String, i64, String)> = stmt
-            .query_map(rusqlite::params![conv_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2).unwrap_or(0),
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+        let rows: Vec<(String, String, i64, String)> = stmt.query_map(
+            rusqlite::params![conv_id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2).unwrap_or(0),
+                row.get::<_, String>(3)?,
+            )),
+        )?.filter_map(|r| r.ok()).collect();
 
         if rows.is_empty() {
             return Ok(serde_json::json!({"conversation_id": conv_id, "empty": true}));
@@ -2262,10 +2022,7 @@ impl Database {
             for m in msgs {
                 total_content_bytes += m.1.len();
                 // Normalize content for dedup (strip whitespace)
-                let normalized =
-                    m.1.chars()
-                        .filter(|c| !c.is_whitespace())
-                        .collect::<String>();
+                let normalized = m.1.chars().filter(|c| !c.is_whitespace()).collect::<String>();
                 if !normalized.is_empty() && !seen_content.insert(normalized) {
                     redundant_bytes += m.1.len();
                 }
@@ -2300,54 +2057,35 @@ impl Database {
             }
         }
         let total_bytes = tool_bytes + assistant_bytes + user_bytes + system_bytes;
-        let pct = |v: usize| {
-            if total_bytes > 0 {
-                ((v as f64 / total_bytes as f64) * 100.0 * 10.0).round() / 10.0
-            } else {
-                0.0
-            }
-        };
+        let pct = |v: usize| if total_bytes > 0 { ((v as f64 / total_bytes as f64) * 100.0 * 10.0).round() / 10.0 } else { 0.0 };
         let total_tokens: i64 = rows.iter().map(|r| r.2).sum();
 
         // Top offenders: largest single messages by content length
-        let mut offenders: Vec<(usize, &str, &str)> = rows
-            .iter()
+        let mut offenders: Vec<(usize, &str, &str)> = rows.iter()
             .map(|r| (r.1.len(), r.1.as_str(), r.0.as_str()))
             .collect();
         offenders.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
-        let top_offenders: Vec<serde_json::Value> = offenders
-            .iter()
-            .take(10)
-            .map(|(size, content, role)| {
-                let source = Self::identify_content_source(content, role);
-                let impact = if *size > 500_000 {
-                    "HIGH"
-                } else if *size > 100_000 {
-                    "MED"
-                } else {
-                    "LOW"
-                };
-                let preview: String = content.chars().take(200).collect();
-                serde_json::json!({
-                    "source": source,
-                    "size_bytes": size,
-                    "impact": impact,
-                    "role": role,
-                    "preview": preview,
-                })
+        let top_offenders: Vec<serde_json::Value> = offenders.iter().take(10).map(|(size, content, role)| {
+            let source = Self::identify_content_source(content, role);
+            let impact = if *size > 500_000 { "HIGH" } else if *size > 100_000 { "MED" } else { "LOW" };
+            let preview: String = content.chars().take(200).collect();
+            serde_json::json!({
+                "source": source,
+                "size_bytes": size,
+                "impact": impact,
+                "role": role,
+                "preview": preview,
             })
-            .collect();
+        }).collect();
 
         // Redundancy summary
         let tool_output_ratio = pct(tool_bytes);
-        let overall_redundancy = timeline_with_redundancy
-            .last()
+        let overall_redundancy = timeline_with_redundancy.last()
             .and_then(|t| t["redundancy_pct"].as_f64())
             .unwrap_or(0.0);
 
         // Total request body estimate: content + framing for all rounds
-        let total_request_bytes: usize = timeline_with_redundancy
-            .iter()
+        let total_request_bytes: usize = timeline_with_redundancy.iter()
             .filter_map(|r| r["request_bytes"].as_u64().map(|v| v as usize))
             .sum();
         let total_content_bytes_raw: usize = rows.iter().map(|r| r.1.len()).sum();
@@ -2398,15 +2136,10 @@ impl Database {
     /// Fetch execution scoring data for a conversation.
     /// Returns (execution_units, dag_metrics) for `score_execution`.
     pub fn get_scoring_data(
-        &self,
-        conv_id: i64,
-    ) -> anyhow::Result<(
-        Vec<crate::execution::ExecutionUnit>,
-        crate::execution::DagMetrics,
-    )> {
+        &self, conv_id: i64,
+    ) -> anyhow::Result<(Vec<crate::execution::ExecutionUnit>, crate::execution::DagMetrics)> {
         let units = self.get_execution_units(conv_id, 1000)?;
-        let (leaf_count, summary_count, total_tokens, _failure_count) =
-            self.collect_session_metrics(conv_id)?;
+        let (leaf_count, summary_count, total_tokens, _failure_count) = self.collect_session_metrics(conv_id)?;
         let conn = self.read_conn();
         let total_edges: i64 = conn.query_row(
             "SELECT COUNT(*) FROM dag_edges WHERE from_id IN (SELECT id FROM dag_nodes WHERE conversation_id = ?1 AND deleted = 0)",
@@ -2442,13 +2175,11 @@ impl Database {
     /// Retrieve stored reasoning_content for a conversation.
     pub fn get_reasoning(&self, conv_fingerprint: &str) -> anyhow::Result<Option<String>> {
         let conn = self.read_conn();
-        let result = conn
-            .query_row(
-                "SELECT reasoning_content FROM reasoning_store WHERE conv_fingerprint = ?1",
-                rusqlite::params![conv_fingerprint],
-                |row| row.get(0),
-            )
-            .ok();
+        let result = conn.query_row(
+            "SELECT reasoning_content FROM reasoning_store WHERE conv_fingerprint = ?1",
+            rusqlite::params![conv_fingerprint],
+            |row| row.get(0),
+        ).ok();
         Ok(result)
     }
 
@@ -2493,10 +2224,7 @@ impl Database {
     }
 
     /// Compute and return the execution score for a conversation.
-    pub fn compute_execution_score(
-        &self,
-        conv_id: i64,
-    ) -> anyhow::Result<crate::execution::ExecutionScore> {
+    pub fn compute_execution_score(&self, conv_id: i64) -> anyhow::Result<crate::execution::ExecutionScore> {
         let (units, dag) = self.get_scoring_data(conv_id)?;
         Ok(crate::execution::ExecutionScore::from_units(&units, &dag))
     }
@@ -2511,32 +2239,24 @@ impl Database {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Look up a cached tool result. Returns (result, hit_count) if found.
     /// Checks L1 in-memory cache first, falls back to SQLite.
-    pub fn tool_cache_get(
-        &self,
-        tool_name: &str,
-        args_hash: &str,
-    ) -> anyhow::Result<Option<(String, i64)>> {
+    pub fn tool_cache_get(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<(String, i64)>> {
         // L1 hot cache check (no SQLite round-trip)
         if let Some((result, _count)) = self.tool_cache_l1.get(tool_name, args_hash) {
             return Ok(Some((result.to_string(), 1)));
         }
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT result, hit_count FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2",
+            "SELECT result, hit_count FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2"
         )?;
-        let result = stmt
-            .query_row(rusqlite::params![tool_name, args_hash], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .ok();
+        let result = stmt.query_row(rusqlite::params![tool_name, args_hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).ok();
         if let Some((_res, _)) = &result {
             // Bump hit count
             let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -2568,13 +2288,7 @@ impl Database {
         dependent_files: &[String],
         file_hashes: &[String],
     ) -> anyhow::Result<()> {
-        self.tool_cache_l1.put_with_hashes(
-            tool_name,
-            args_hash,
-            result,
-            dependent_files,
-            file_hashes,
-        );
+        self.tool_cache_l1.put_with_hashes(tool_name, args_hash, result, dependent_files, file_hashes);
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let files_json = serde_json::to_string(dependent_files)?;
         let hashes_json = serde_json::to_string(file_hashes).unwrap_or_else(|_| "[]".into());
@@ -2603,35 +2317,21 @@ impl Database {
     }
 
     /// Invalidate with optional content hashes for precise matching.
-    pub fn tool_cache_invalidate_with_hashes(
-        &self,
-        changed_files: &[String],
-        new_hashes: &[String],
-    ) -> anyhow::Result<usize> {
+    pub fn tool_cache_invalidate_with_hashes(&self, changed_files: &[String], new_hashes: &[String]) -> anyhow::Result<usize> {
         if changed_files.is_empty() {
             return Ok(0);
         }
         self.tool_cache_l1.invalidate(changed_files);
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT id, dependent_files, dependent_file_hashes FROM tool_cache")?;
-        let rows: Vec<(i64, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut stmt = conn.prepare("SELECT id, dependent_files, dependent_file_hashes FROM tool_cache")?;
+        let rows: Vec<(i64, String, String)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?.filter_map(|r| r.ok()).collect();
         drop(stmt);
         drop(conn);
 
-        let changed_set: std::collections::HashSet<&str> =
-            changed_files.iter().map(|s| s.as_str()).collect();
-        let hash_set: std::collections::HashSet<&str> =
-            new_hashes.iter().map(|s| s.as_str()).collect();
+        let changed_set: std::collections::HashSet<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+        let hash_set: std::collections::HashSet<&str> = new_hashes.iter().map(|s| s.as_str()).collect();
         let use_hashes = !hash_set.is_empty();
         let mut invalidated = 0;
         let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -2647,10 +2347,7 @@ impl Database {
                 deps.iter().any(|f| changed_set.contains(f.as_str()))
             };
             if should_invalidate {
-                w.execute(
-                    "DELETE FROM tool_cache WHERE id = ?1",
-                    rusqlite::params![id],
-                )?;
+                w.execute("DELETE FROM tool_cache WHERE id = ?1", rusqlite::params![id])?;
                 invalidated += 1;
             }
         }
@@ -2661,10 +2358,7 @@ impl Database {
 
     /// Store a complete execution artifact (input + dep snapshot + output).
     /// Also records dependency edges in the `dependency_edges` table.
-    pub fn store_artifact(
-        &self,
-        artifact: &crate::artifacts::ExecutionArtifact,
-    ) -> anyhow::Result<i64> {
+    pub fn store_artifact(&self, artifact: &crate::artifacts::ExecutionArtifact) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let deps_json = serde_json::to_string(&artifact.dependent_files)?;
         let hashes_json = serde_json::to_string(&artifact.file_hashes)?;
@@ -2673,16 +2367,9 @@ impl Database {
              dependent_files, file_hashes, environment_fingerprint, created_at, hit_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
-                artifact.execution_key,
-                artifact.tool_name,
-                artifact.args,
-                artifact.args_hash,
-                artifact.result,
-                deps_json,
-                hashes_json,
-                artifact.environment_fingerprint,
-                artifact.created_at,
-                artifact.hit_count,
+                artifact.execution_key, artifact.tool_name, artifact.args,
+                artifact.args_hash, artifact.result, deps_json, hashes_json,
+                artifact.environment_fingerprint, artifact.created_at, artifact.hit_count,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -2707,15 +2394,12 @@ impl Database {
     }
 
     /// Look up an execution artifact by its canonical execution key.
-    pub fn get_artifact_by_key(
-        &self,
-        execution_key: &str,
-    ) -> anyhow::Result<Option<crate::artifacts::ExecutionArtifact>> {
+    pub fn get_artifact_by_key(&self, execution_key: &str) -> anyhow::Result<Option<crate::artifacts::ExecutionArtifact>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, execution_key, tool_name, args, args_hash, result,
                     dependent_files, file_hashes, environment_fingerprint, created_at, hit_count
-             FROM execution_artifacts WHERE execution_key = ?1 ORDER BY id DESC LIMIT 1",
+             FROM execution_artifacts WHERE execution_key = ?1 ORDER BY id DESC LIMIT 1"
         )?;
         let result = stmt.query_row(rusqlite::params![execution_key], |row| {
             let deps_str: String = row.get(6)?;
@@ -2742,18 +2426,14 @@ impl Database {
     }
 
     /// Look up an execution artifact by tool_name + args_hash (legacy tool cache key).
-    pub fn get_artifact_by_tool_hash(
-        &self,
-        tool_name: &str,
-        args_hash: &str,
-    ) -> anyhow::Result<Option<crate::artifacts::ExecutionArtifact>> {
+    pub fn get_artifact_by_tool_hash(&self, tool_name: &str, args_hash: &str) -> anyhow::Result<Option<crate::artifacts::ExecutionArtifact>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, execution_key, tool_name, args, args_hash, result,
                     dependent_files, file_hashes, environment_fingerprint, created_at, hit_count
              FROM execution_artifacts
              WHERE tool_name = ?1 AND args_hash = ?2
-             ORDER BY id DESC LIMIT 1",
+             ORDER BY id DESC LIMIT 1"
         )?;
         let result = stmt.query_row(rusqlite::params![tool_name, args_hash], |row| {
             let deps_str: String = row.get(6)?;
@@ -2804,14 +2484,8 @@ impl Database {
 
         // Store full artifact
         let artifact = crate::artifacts::ExecutionArtifact::new(
-            &execution_key,
-            tool_name,
-            args,
-            &args_hash,
-            result,
-            dependent_files.to_vec(),
-            vec![],
-            "",
+            &execution_key, tool_name, args, &args_hash,
+            result, dependent_files.to_vec(), vec![], "",
         );
         let id = self.store_artifact(&artifact)?;
 
@@ -2823,12 +2497,11 @@ impl Database {
 
     /// Invalidate artifacts whose dependent files have changed.
     /// Returns the number of invalidated artifacts.
-    pub fn invalidate_artifacts_for_files(
-        &self,
-        changed_files: &[String],
-    ) -> anyhow::Result<usize> {
+    pub fn invalidate_artifacts_for_files(&self, changed_files: &[String]) -> anyhow::Result<usize> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT id, dependent_files FROM execution_artifacts")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dependent_files FROM execution_artifacts"
+        )?;
         let mut to_delete: Vec<i64> = Vec::new();
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
@@ -2843,10 +2516,7 @@ impl Database {
             }
         }
         for id in &to_delete {
-            conn.execute(
-                "DELETE FROM execution_artifacts WHERE id = ?1",
-                rusqlite::params![id],
-            )?;
+            conn.execute("DELETE FROM execution_artifacts WHERE id = ?1", rusqlite::params![id])?;
         }
         Ok(to_delete.len())
     }
@@ -2874,18 +2544,13 @@ impl Database {
     }
 
     /// Load a persisted Responses API envelope.
-    pub fn get_response_object(
-        &self,
-        response_id: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
+    pub fn get_response_object(&self, response_id: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let conn = self.read_conn();
-        let payload = conn
-            .query_row(
-                "SELECT response_json FROM response_objects WHERE response_id = ?1",
-                rusqlite::params![response_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
+        let payload = conn.query_row(
+            "SELECT response_json FROM response_objects WHERE response_id = ?1",
+            rusqlite::params![response_id],
+            |row| row.get::<_, String>(0),
+        ).ok();
         match payload {
             Some(payload) => Ok(Some(serde_json::from_str(&payload)?)),
             None => Ok(None),
@@ -2913,18 +2578,13 @@ impl Database {
     }
 
     /// Load persisted Chat Completions-format messages for a Responses session.
-    pub fn get_response_session(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+    pub fn get_response_session(&self, session_id: &str) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
         let conn = self.read_conn();
-        let payload = conn
-            .query_row(
-                "SELECT messages_json FROM response_sessions WHERE session_id = ?1",
-                rusqlite::params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
+        let payload = conn.query_row(
+            "SELECT messages_json FROM response_sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        ).ok();
         match payload {
             Some(payload) => Ok(Some(serde_json::from_str(&payload)?)),
             None => Ok(None),
@@ -2956,24 +2616,16 @@ impl Database {
     }
 
     /// Search failure patterns by signature or related files.
-    pub fn search_failure_patterns(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(i64, String, String)>> {
+    pub fn search_failure_patterns(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(i64, String, String)>> {
         let conn = self.read_conn();
         let pattern = format!("%{}%", query.replace('%', "%%").replace('_', "\\_"));
         let mut stmt = conn.prepare(
             "SELECT id, signature, why_failed FROM failure_patterns
              WHERE signature LIKE ?1 ESCAPE '\\' OR why_failed LIKE ?1 ESCAPE '\\'
-             ORDER BY id DESC LIMIT ?2",
+             ORDER BY id DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })?;
         let mut results = Vec::new();
         for row in rows {
@@ -2985,16 +2637,14 @@ impl Database {
     /// Get full failure pattern data (with all fields) by signature.
     #[allow(clippy::type_complexity)]
     pub fn get_failure_pattern_by_signature(
-        &self,
-        conv_id: i64,
-        signature: &str,
+        &self, conv_id: i64, signature: &str,
     ) -> anyhow::Result<Option<(String, String, Vec<String>, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT attempted_fix, why_failed, invalidated_assumptions, environment_fingerprint
              FROM failure_patterns
              WHERE conversation_id = ?1 AND signature = ?2
-             ORDER BY id DESC LIMIT 1",
+             ORDER BY id DESC LIMIT 1"
         )?;
         let result = stmt.query_row(rusqlite::params![conv_id, signature], |row| {
             let assump_str: String = row.get(2)?;
@@ -3016,9 +2666,7 @@ impl Database {
     /// Get the most recent failure patterns for a conversation.
     /// Returns full [`crate::execution::FailurePattern`] objects ordered by recency (newest first).
     pub fn get_recent_failure_patterns(
-        &self,
-        conv_id: i64,
-        limit: usize,
+        &self, conv_id: i64, limit: usize,
     ) -> anyhow::Result<Vec<crate::execution::FailurePattern>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
@@ -3027,7 +2675,7 @@ impl Database {
                     execution_key, environment_fingerprint, created_at
              FROM failure_patterns
              WHERE conversation_id = ?1
-             ORDER BY id DESC LIMIT ?2",
+             ORDER BY id DESC LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
             let assump_str: String = row.get(5)?;
@@ -3095,22 +2743,17 @@ impl Database {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, goal, pending_steps, completed_steps, assumptions FROM plan_states
-             WHERE conversation_id = ?1 AND is_active = 1 ORDER BY id DESC LIMIT 1",
+             WHERE conversation_id = ?1 AND is_active = 1 ORDER BY id DESC LIMIT 1"
         )?;
-        Ok(stmt
-            .query_row(rusqlite::params![conv_id], |row| {
-                let pending_str: String = row.get(2)?;
-                let completed_str: String = row.get(3)?;
-                let assump_str: String = row.get(4)?;
-                let pending: serde_json::Value =
-                    serde_json::from_str(&pending_str).unwrap_or(serde_json::Value::Array(vec![]));
-                let completed: serde_json::Value = serde_json::from_str(&completed_str)
-                    .unwrap_or(serde_json::Value::Array(vec![]));
-                let assumptions: serde_json::Value =
-                    serde_json::from_str(&assump_str).unwrap_or(serde_json::Value::Array(vec![]));
-                Ok((row.get(0)?, row.get(1)?, pending, completed, assumptions))
-            })
-            .ok())
+        Ok(stmt.query_row(rusqlite::params![conv_id], |row| {
+            let pending_str: String = row.get(2)?;
+            let completed_str: String = row.get(3)?;
+            let assump_str: String = row.get(4)?;
+            let pending: serde_json::Value = serde_json::from_str(&pending_str).unwrap_or(serde_json::Value::Array(vec![]));
+            let completed: serde_json::Value = serde_json::from_str(&completed_str).unwrap_or(serde_json::Value::Array(vec![]));
+            let assumptions: serde_json::Value = serde_json::from_str(&assump_str).unwrap_or(serde_json::Value::Array(vec![]));
+            Ok((row.get(0)?, row.get(1)?, pending, completed, assumptions))
+        }).ok())
     }
 
     /// Deactivate (soft-delete) a plan by ID. Returns true if a row was updated.
@@ -3126,8 +2769,7 @@ impl Database {
     /// Update plan steps. Each step list replaces the existing column value entirely.
     /// Pass `None` for columns you don't want to change.
     pub fn update_plan_steps(
-        &self,
-        plan_id: i64,
+        &self, plan_id: i64,
         completed_steps: Option<&[String]>,
         blocked_steps: Option<&[String]>,
         invalidated_steps: Option<&[String]>,
@@ -3149,8 +2791,7 @@ impl Database {
         }
         sql.push_str(" WHERE id = ?");
         params.push(Box::new(plan_id));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let rows = conn.execute(&sql, rusqlite::params_from_iter(param_refs))?;
         Ok(rows > 0)
     }
@@ -3159,14 +2800,7 @@ impl Database {
 
     /// Store a new decision record. Returns ID.
     /// `accepted` and `outcome` are initially NULL (pending).
-    pub fn store_decision_record(
-        &self,
-        conv_id: i64,
-        action: &str,
-        confidence: f64,
-        reason: &str,
-        estimated_token_saving: u64,
-    ) -> anyhow::Result<i64> {
+    pub fn store_decision_record(&self, conv_id: i64, action: &str, confidence: f64, reason: &str, estimated_token_saving: u64) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO runtime_decision_records (conversation_id, action, confidence, reason, accepted, outcome, estimated_token_saving, actual_token_saving)
@@ -3187,12 +2821,7 @@ impl Database {
     }
 
     /// Record the execution outcome for a decision record.
-    pub fn evaluate_decision(
-        &self,
-        id: i64,
-        outcome: &str,
-        actual_token_saving: Option<u64>,
-    ) -> anyhow::Result<bool> {
+    pub fn evaluate_decision(&self, id: i64, outcome: &str, actual_token_saving: Option<u64>) -> anyhow::Result<bool> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let rows = conn.execute(
             "UPDATE runtime_decision_records SET outcome = ?1, actual_token_saving = ?2 WHERE id = ?3",
@@ -3203,10 +2832,7 @@ impl Database {
 
     /// Query decision outcomes across all conversations, grouped by action type.
     /// Returns (action, success_count, total_count) for the most recent N records.
-    pub fn query_decision_outcomes_by_action(
-        &self,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, u64, u64)>> {
+    pub fn query_decision_outcomes_by_action(&self, limit: usize) -> anyhow::Result<Vec<(String, u64, u64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT action,
@@ -3218,38 +2844,17 @@ impl Database {
                  ORDER BY id DESC
                  LIMIT ?1
              )
-             GROUP BY action",
+             GROUP BY action"
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// Query decision records for a conversation (most recent first).
     #[allow(clippy::type_complexity)]
-    pub fn query_decision_records(
-        &self,
-        conv_id: i64,
-        limit: usize,
-    ) -> anyhow::Result<
-        Vec<(
-            i64,
-            String,
-            f64,
-            Option<bool>,
-            Option<String>,
-            u64,
-            Option<u64>,
-            String,
-        )>,
-    > {
+    pub fn query_decision_records(&self, conv_id: i64, limit: usize) -> anyhow::Result<Vec<(i64, String, f64, Option<bool>, Option<String>, u64, Option<u64>, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, action, confidence, accepted, outcome, estimated_token_saving, actual_token_saving, created_at
@@ -3282,15 +2887,7 @@ impl Database {
     /// Called from stream handlers as events flow through the proxy.
     /// `epoch_ms` is a Unix timestamp in milliseconds for stable ordering.
     /// Respects AuditMode: Full writes immediately, OnError buffers, Off skips.
-    pub fn store_execution_event(
-        &self,
-        execution_id: Option<i64>,
-        event_kind: &str,
-        event_payload: &str,
-        seq_no: i64,
-        conv_id: Option<i64>,
-        epoch_ms: i64,
-    ) -> anyhow::Result<i64> {
+    pub fn store_execution_event(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64) -> anyhow::Result<i64> {
         self.store_execution_event_with_replay(
             execution_id,
             event_kind,
@@ -3304,16 +2901,7 @@ impl Database {
 
     /// Store a single execution event with replay identity metadata.
     /// `replay_session_id` groups stream events that belong to the same request.
-    pub fn store_execution_event_with_replay(
-        &self,
-        execution_id: Option<i64>,
-        event_kind: &str,
-        event_payload: &str,
-        seq_no: i64,
-        conv_id: Option<i64>,
-        epoch_ms: i64,
-        replay_session_id: &str,
-    ) -> anyhow::Result<i64> {
+    pub fn store_execution_event_with_replay(&self, execution_id: Option<i64>, event_kind: &str, event_payload: &str, seq_no: i64, conv_id: Option<i64>, epoch_ms: i64, replay_session_id: &str) -> anyhow::Result<i64> {
         match self.audit_mode() {
             crate::runtime::AuditMode::Full => {
                 let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -3328,31 +2916,22 @@ impl Database {
                 // Return a synthetic ID — buffer entries don't have DB IDs
                 Ok(-(seq_no.wrapping_abs()))
             }
-            crate::runtime::AuditMode::Off => Ok(0),
+            crate::runtime::AuditMode::Off => {
+                Ok(0)
+            }
         }
     }
 
     #[allow(clippy::type_complexity)]
     /// Read all events for an execution in seq_no order (replay).
-    pub fn get_execution_events(
-        &self,
-        execution_id: i64,
-    ) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
+    pub fn get_execution_events(&self, execution_id: i64) -> anyhow::Result<Vec<(i64, String, String, i64, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, event_kind, event_payload, seq_no, created_at FROM execution_events WHERE execution_id = ?1 ORDER BY seq_no"
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![execution_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(rusqlite::params![execution_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -3361,25 +2940,8 @@ impl Database {
     /// Returns (id, execution_id, event_kind, event_payload, seq_no, created_at, span_id,
     ///          parent_span_id, span_mode, parallel_group, tool_call_id, epoch_ms).
     pub fn get_execution_events_by_conv(
-        &self,
-        conv_id: i64,
-        limit: usize,
-    ) -> anyhow::Result<
-        Vec<(
-            i64,
-            Option<i64>,
-            String,
-            String,
-            i64,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-        )>,
-    > {
+        &self, conv_id: i64, limit: usize,
+    ) -> anyhow::Result<Vec<(i64, Option<i64>, String, String, i64, String, String, String, String, String, String, i64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, event_kind, event_payload, seq_no, created_at,
@@ -3387,26 +2949,15 @@ impl Database {
              FROM execution_events
              WHERE conv_id = ?1
              ORDER BY epoch_ms DESC, id DESC
-             LIMIT ?2",
+             LIMIT ?2"
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![conv_id, limit as i64], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(rusqlite::params![conv_id, limit as i64], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+            ))
+        })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -3415,37 +2966,26 @@ impl Database {
     /// ordered by insertion order (id ascending) for deterministic replay.
     #[allow(clippy::type_complexity)]
     pub fn get_execution_events_by_session(
-        &self,
-        session_id: &str,
+        &self, session_id: &str,
     ) -> anyhow::Result<Vec<(i64, Option<i64>, String, String, i64, String, i64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, execution_id, event_kind, event_payload, seq_no, created_at, epoch_ms
              FROM execution_events
              WHERE replay_session_id = ?1
-             ORDER BY id ASC",
+             ORDER BY id ASC"
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![session_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?,
+            ))
+        })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     /// List recent replay sessions with event counts and timestamps.
-    pub fn list_replay_sessions(
-        &self,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, i64, String, i64)>> {
+    pub fn list_replay_sessions(&self, limit: usize) -> anyhow::Result<Vec<(String, i64, String, i64)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT replay_session_id, COUNT(*) as cnt, MIN(created_at) as first_seen, MAX(epoch_ms) as last_epoch
@@ -3455,11 +2995,9 @@ impl Database {
              ORDER BY MAX(epoch_ms) DESC
              LIMIT ?1"
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -3486,24 +3024,20 @@ impl Database {
     /// Read lineage edges pointing TO a given node.
     pub fn get_lineage_to(&self, to_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT from_id, to_id, kind FROM lineage_edges WHERE to_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, kind FROM lineage_edges WHERE to_id = ?1",
+        )?;
         let rows = stmt.query_map(rusqlite::params![to_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
+        for row in rows { result.push(row?); }
         Ok(result)
     }
 
     /// Get file paths that a specific execution unit depends on.
     /// Projects execution_units -> tool_cache by canonical tool cache key.
-    pub fn get_dependent_files_for_unit(
-        &self,
-        execution_unit_id: i64,
-    ) -> anyhow::Result<Vec<String>> {
+    pub fn get_dependent_files_for_unit(&self, execution_unit_id: i64) -> anyhow::Result<Vec<String>> {
         let conn = self.read_conn();
         let unit = conn.query_row(
             "SELECT tool_name, tool_args, COALESCE(tool_args_json, '') FROM execution_units WHERE id = ?1",
@@ -3527,13 +3061,11 @@ impl Database {
             tool_args_json.as_str()
         };
         let (cache_tool_name, args_hash) = crate::tool_cache::cache_key(&tool_name, args);
-        let dependent_files: Option<String> = conn
-            .query_row(
-                "SELECT dependent_files FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2",
-                rusqlite::params![cache_tool_name, args_hash],
-                |row| row.get(0),
-            )
-            .ok();
+        let dependent_files: Option<String> = conn.query_row(
+            "SELECT dependent_files FROM tool_cache WHERE tool_name = ?1 AND args_hash = ?2",
+            rusqlite::params![cache_tool_name, args_hash],
+            |row| row.get(0),
+        ).ok();
         let Some(dependent_files) = dependent_files else {
             return Ok(Vec::new());
         };
@@ -3563,11 +3095,8 @@ impl Database {
 
     /// Create a new memory version, linked to a parent. Returns the new version id.
     pub fn create_memory_version(
-        &self,
-        parent_version_id: Option<i64>,
-        mutation_kind: &str,
-        mutation_desc: &str,
-        dag_root_id: Option<i64>,
+        &self, parent_version_id: Option<i64>, mutation_kind: &str,
+        mutation_desc: &str, dag_root_id: Option<i64>,
     ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
@@ -3578,26 +3107,21 @@ impl Database {
     }
 
     /// List memory versions in reverse chronological order.
-    pub fn list_memory_versions(
-        &self,
-        limit: usize,
-    ) -> anyhow::Result<Vec<crate::snapshot::MemoryVersion>> {
+    pub fn list_memory_versions(&self, limit: usize) -> anyhow::Result<Vec<crate::snapshot::MemoryVersion>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, parent_version_id, mutation_kind, mutation_desc, dag_root_id, created_at FROM memory_versions ORDER BY id DESC LIMIT ?1"
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                Ok(crate::snapshot::MemoryVersion {
-                    id: row.get(0)?,
-                    parent_version_id: row.get(1)?,
-                    mutation_kind: row.get(2)?,
-                    mutation_desc: row.get(3)?,
-                    dag_root_id: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok(crate::snapshot::MemoryVersion {
+                id: row.get(0)?,
+                parent_version_id: row.get(1)?,
+                mutation_kind: row.get(2)?,
+                mutation_desc: row.get(3)?,
+                dag_root_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -3607,16 +3131,9 @@ impl Database {
     /// `last_event_seq_no`, `boundary_hash`, `integrity_hash` are computed
     /// from the authoritative execution event sequence for continuity verification.
     pub fn take_snapshot(
-        &self,
-        execution_id: i64,
-        memory_version_id: i64,
-        tier: i32,
-        data: &str,
-        size_bytes: i64,
-        retention_ttl: Option<i64>,
-        last_event_seq_no: i64,
-        boundary_hash: &str,
-        integrity_hash: &str,
+        &self, execution_id: i64, memory_version_id: i64,
+        tier: i32, data: &str, size_bytes: i64, retention_ttl: Option<i64>,
+        last_event_seq_no: i64, boundary_hash: &str, integrity_hash: &str,
     ) -> anyhow::Result<i64> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
@@ -3632,10 +3149,7 @@ impl Database {
     }
 
     /// Restore a snapshot by id.
-    pub fn restore_snapshot(
-        &self,
-        id: i64,
-    ) -> anyhow::Result<Option<crate::snapshot::ExecutionSnapshot>> {
+    pub fn restore_snapshot(&self, id: i64) -> anyhow::Result<Option<crate::snapshot::ExecutionSnapshot>> {
         let conn = self.read_conn();
         let row = conn.query_row(
             "SELECT id, execution_id, memory_version_id, schema_version, tier, snapshot_data, last_event_seq_no, boundary_hash, integrity_hash, size_bytes, retention_ttl, created_at FROM execution_snapshots WHERE id = ?1",
@@ -3660,19 +3174,12 @@ impl Database {
 
     /// Enforce snapshot budget — evicts oldest snapshots when over limit.
     /// Returns the number evicted.
-    pub fn enforce_snapshot_budget(
-        &self,
-        budget: &crate::snapshot::SnapshotBudget,
-    ) -> anyhow::Result<usize> {
+    pub fn enforce_snapshot_budget(&self, budget: &crate::snapshot::SnapshotBudget) -> anyhow::Result<usize> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut evicted = 0;
 
         // L0 ring buffer: keep max_hot_snapshots, evict oldest
-        let l0_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM execution_snapshots WHERE tier = 0",
-            [],
-            |r| r.get(0),
-        )?;
+        let l0_count: i64 = conn.query_row("SELECT COUNT(*) FROM execution_snapshots WHERE tier = 0", [], |r| r.get(0))?;
         if l0_count > budget.max_hot_snapshots as i64 {
             let to_remove = l0_count - budget.max_hot_snapshots as i64;
             conn.execute(
@@ -3683,11 +3190,7 @@ impl Database {
         }
 
         // L2 soft limit
-        let l2_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM execution_snapshots WHERE tier = 2",
-            [],
-            |r| r.get(0),
-        )?;
+        let l2_count: i64 = conn.query_row("SELECT COUNT(*) FROM execution_snapshots WHERE tier = 2", [], |r| r.get(0))?;
         if l2_count > budget.max_full_snapshots as i64 {
             let to_remove = l2_count - budget.max_full_snapshots as i64;
             conn.execute(
@@ -3698,11 +3201,7 @@ impl Database {
         }
 
         // Hard size cap: remove oldest non-frozen (L3)
-        let total_size: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM execution_snapshots",
-            [],
-            |r| r.get(0),
-        )?;
+        let total_size: i64 = conn.query_row("SELECT COALESCE(SUM(size_bytes), 0) FROM execution_snapshots", [], |r| r.get(0))?;
         if total_size > budget.max_total_size_bytes as i64 {
             // Evict oldest non-frozen until under budget (simple: delete a batch)
             conn.execute(
@@ -3725,22 +3224,14 @@ impl Database {
 
     /// Claim a file for an agent. Returns Ok(()) if claim succeeds,
     /// Err with conflicting agent_id if another agent already holds the file.
-    pub fn claim_file(
-        &self,
-        agent_id: &str,
-        file_path: &str,
-        operation: &str,
-        conv_id: i64,
-    ) -> anyhow::Result<Result<(), String>> {
+    pub fn claim_file(&self, agent_id: &str, file_path: &str, operation: &str, conv_id: i64) -> anyhow::Result<Result<(), String>> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         // Check for existing claim from a different conversation
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT agent_id FROM agent_active_files WHERE file_path = ?1 AND conv_id != ?2",
-                rusqlite::params![file_path, conv_id],
-                |row| row.get(0),
-            )
-            .ok();
+        let existing: Option<String> = conn.query_row(
+            "SELECT agent_id FROM agent_active_files WHERE file_path = ?1 AND conv_id != ?2",
+            rusqlite::params![file_path, conv_id],
+            |row| row.get(0),
+        ).ok();
         if let Some(other_agent) = existing {
             return Ok(Err(other_agent));
         }
@@ -3776,34 +3267,27 @@ impl Database {
     pub fn list_all_file_claims(&self) -> anyhow::Result<Vec<(String, String, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT agent_id, file_path, operation FROM agent_active_files ORDER BY claimed_at",
+            "SELECT agent_id, file_path, operation FROM agent_active_files ORDER BY claimed_at"
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Get files currently claimed by an agent.
     pub fn get_agent_files(&self, agent_id: &str) -> anyhow::Result<Vec<(String, String)>> {
         let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare("SELECT file_path, operation FROM agent_active_files WHERE agent_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, operation FROM agent_active_files WHERE agent_id = ?1"
+        )?;
         let rows = stmt.query_map(rusqlite::params![agent_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
@@ -3820,11 +3304,7 @@ impl Database {
             while let Some(parent) = path.parent() {
                 let dir = parent.to_string_lossy().to_string();
                 if !dir.is_empty() && dir != "." {
-                    let dir_with_sep = if dir.ends_with('/') {
-                        dir.clone()
-                    } else {
-                        format!("{dir}/")
-                    };
+                    let dir_with_sep = if dir.ends_with('/') { dir.clone() } else { format!("{dir}/") };
                     expanded.push(dir_with_sep);
                     path = parent;
                 } else {
@@ -3872,8 +3352,7 @@ impl Database {
                 "SELECT conversation_id FROM dag_nodes WHERE id = ?1",
                 rusqlite::params![node_id],
                 |row| row.get(0),
-            )
-            .unwrap_or(-1)
+            ).unwrap_or(-1)
         };
         // Writer lock scope (release before record_event to avoid deadlock)
         {
@@ -3893,10 +3372,7 @@ impl Database {
     /// Hard-delete a node (used by GC for fully unreachable ghosts).
     pub fn purge_dag_node(&self, node_id: i64) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "DELETE FROM dag_nodes WHERE id = ?1",
-            rusqlite::params![node_id],
-        )?;
+        conn.execute("DELETE FROM dag_nodes WHERE id = ?1", rusqlite::params![node_id])?;
         Ok(())
     }
 
@@ -4022,8 +3498,9 @@ impl Database {
     /// Query edges by kind. Returns (from_id, to_id, kind) tuples.
     pub fn get_edges_by_kind(&self, kind: &str) -> anyhow::Result<Vec<(i64, i64, String)>> {
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT from_id, to_id, kind FROM dag_edges WHERE kind = ?1 ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT from_id, to_id, kind FROM dag_edges WHERE kind = ?1 ORDER BY id"
+        )?;
         let rows = stmt.query_map(rusqlite::params![kind], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
@@ -4035,11 +3512,7 @@ impl Database {
     }
 
     /// Gather mutation candidates: finds nodes with low access_count or stale last_accessed_at.
-    pub fn find_decay_candidates(
-        &self,
-        conv_id: i64,
-        min_access: i64,
-    ) -> anyhow::Result<Vec<crate::dag::DagNode>> {
+    pub fn find_decay_candidates(&self, conv_id: i64, min_access: i64) -> anyhow::Result<Vec<crate::dag::DagNode>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, level, summary, token_count, parent_ids, child_ids,
@@ -4050,17 +3523,14 @@ impl Database {
         )?;
         let rows = stmt.query_map(rusqlite::params![conv_id, min_access], |row| {
             Ok(crate::dag::DagNode {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                level: row.get(2)?,
-                summary: row.get(3)?,
-                token_count: row.get(4)?,
-                parent_ids: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                child_ids: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                is_leaf: row.get::<_, i64>(7)? != 0,
-                is_join: row.get::<_, i64>(8)? != 0,
-                snippets: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
-                deleted: row.get::<_, i64>(10)? != 0,
+                id: row.get(0)?, conversation_id: row.get(1)?, level: row.get(2)?,
+                summary: row.get(3)?, token_count: row.get(4)?,
+                parent_ids: serde_json::from_str(&row.get::<_,String>(5)?).unwrap_or_default(),
+                child_ids: serde_json::from_str(&row.get::<_,String>(6)?).unwrap_or_default(),
+                is_leaf: row.get::<_,i64>(7)? != 0,
+                is_join: row.get::<_,i64>(8)? != 0,
+                snippets: serde_json::from_str(&row.get::<_,String>(9)?).unwrap_or_default(),
+                deleted: row.get::<_,i64>(10)? != 0,
                 semantic_hash: row.get(11)?,
                 access_count: row.get(12)?,
                 last_accessed_at: row.get(13)?,
@@ -4070,47 +3540,35 @@ impl Database {
             })
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Get all outgoing edges from a node.
     pub fn get_edges_from(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT id, to_id, kind FROM dag_edges WHERE from_id = ?1 ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, to_id, kind FROM dag_edges WHERE from_id = ?1 ORDER BY id",
+        )?;
         let rows = stmt.query_map(rusqlite::params![node_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Get all incoming edges to a node.
     pub fn get_edges_to(&self, node_id: i64) -> anyhow::Result<Vec<(i64, i64, String)>> {
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT id, from_id, kind FROM dag_edges WHERE to_id = ?1 ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, from_id, kind FROM dag_edges WHERE to_id = ?1 ORDER BY id",
+        )?;
         let rows = stmt.query_map(rusqlite::params![node_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
@@ -4131,8 +3589,7 @@ impl Database {
         while !queue.is_empty() && depth < max_depth {
             let mut next = Vec::new();
             for node_id in &queue {
-                let rows =
-                    stmt.query_map(rusqlite::params![node_id], |row| row.get::<_, i64>(0))?;
+                let rows = stmt.query_map(rusqlite::params![node_id], |row| row.get::<_, i64>(0))?;
                 for row in rows {
                     let target = row?;
                     if target == to_id {
@@ -4154,12 +3611,7 @@ impl Database {
     /// Search messages in a conversation using FTS5 full-text search.
     /// Returns `(id, role, snippet, token_count)` ranked by relevance.
     /// Get raw message content in a range of message IDs.
-    pub fn get_messages_in_range(
-        &self,
-        conv_id: i64,
-        from_id: i64,
-        to_id: i64,
-    ) -> anyhow::Result<Vec<String>> {
+    pub fn get_messages_in_range(&self, conv_id: i64, from_id: i64, to_id: i64) -> anyhow::Result<Vec<String>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT content FROM messages
@@ -4176,11 +3628,7 @@ impl Database {
         Ok(results)
     }
 
-    pub fn search_messages(
-        &self,
-        conv_id: i64,
-        query: &str,
-    ) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+    pub fn search_messages(&self, conv_id: i64, query: &str) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
         let conn = self.read_conn();
         if query.is_empty() {
             return Ok(Vec::new());
@@ -4245,8 +3693,9 @@ impl Database {
             ";
             let mut seen = std::collections::HashSet::new();
             if let Ok(mut stmt) = conn.prepare(sql)
-                && let Ok(rows) =
-                    stmt.query_map(rusqlite::params![fts_query, conv_id, limit as i64], |row| {
+                && let Ok(rows) = stmt.query_map(
+                    rusqlite::params![fts_query, conv_id, limit as i64],
+                    |row| {
                         Ok(UnifiedSearchResult {
                             id: row.get(0)?,
                             source: row.get(1)?,
@@ -4255,17 +3704,14 @@ impl Database {
                             token_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
                             bm25_score: row.get::<_, Option<f64>>(5)?.map(|s| -s),
                         })
-                    })
+                    },
+                )
             {
                 let mut results: Vec<UnifiedSearchResult> = rows.filter_map(|r| r.ok()).collect();
                 for r in &results {
                     seen.insert((r.source.clone(), r.id));
                 }
-                results.sort_by(|a, b| {
-                    a.bm25_score
-                        .partial_cmp(&b.bm25_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                results.sort_by(|a, b| a.bm25_score.partial_cmp(&b.bm25_score).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Phase B: also search dag_nodes summaries with LIKE (summaries have
                 // richest semantic content but no FTS5 index). Combine with FTS5 results
@@ -4281,17 +3727,16 @@ impl Database {
                 ";
                 let summary_limit = (limit / 2).max(5) as i64;
                 if let Ok(mut sstmt) = conn.prepare(summary_sql)
-                    && let Ok(srows) =
-                        sstmt.query_map(rusqlite::params![conv_id, pattern, summary_limit], |row| {
-                            Ok(UnifiedSearchResult {
-                                id: row.get(0)?,
-                                source: "summary".to_string(),
-                                label: row.get::<_, String>(2).unwrap_or_default(),
-                                excerpt: row.get::<_, String>(3).unwrap_or_default(),
-                                token_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                                bm25_score: None,
-                            })
+                    && let Ok(srows) = sstmt.query_map(rusqlite::params![conv_id, pattern, summary_limit], |row| {
+                        Ok(UnifiedSearchResult {
+                            id: row.get(0)?,
+                            source: "summary".to_string(),
+                            label: row.get::<_, String>(2).unwrap_or_default(),
+                            excerpt: row.get::<_, String>(3).unwrap_or_default(),
+                            token_count: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                            bm25_score: None,
                         })
+                    })
                 {
                     for sr in srows.filter_map(|r| r.ok()) {
                         if seen.insert((sr.source.clone(), sr.id)) {
@@ -4365,11 +3810,7 @@ impl Database {
         // If query is already quoted, extract the phrase inside
         let trimmed = query.trim();
         let is_quoted = trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 2;
-        let inner = if is_quoted {
-            &trimmed[1..trimmed.len() - 1]
-        } else {
-            trimmed
-        };
+        let inner = if is_quoted { &trimmed[1..trimmed.len()-1] } else { trimmed };
         let escaped = Self::fts_escape(inner);
         let cleaned = escaped.trim();
         if cleaned.is_empty() {
@@ -4387,13 +3828,7 @@ impl Database {
     // ── Embedding vector storage (v0.5) ───────────────────────────────
 
     /// Store an embedding vector for a DAG node.
-    pub fn store_embedding(
-        &self,
-        node_id: i64,
-        vector: &[f32],
-        model: &str,
-        dims: i32,
-    ) -> anyhow::Result<()> {
+    pub fn store_embedding(&self, node_id: i64, vector: &[f32], model: &str, dims: i32) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         conn.execute(
@@ -4406,15 +3841,13 @@ impl Database {
     /// Get the embedding vector for a node.
     pub fn get_embedding(&self, node_id: i64) -> anyhow::Result<Option<Vec<f32>>> {
         let conn = self.read_conn();
-        let mut stmt =
-            conn.prepare("SELECT vector, dimensions FROM embeddings WHERE node_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT vector, dimensions FROM embeddings WHERE node_id = ?1")?;
         let mut rows = stmt.query_map(rusqlite::params![node_id], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
         })?;
         if let Some(row) = rows.next() {
             let (bytes, dims) = row?;
-            let floats: Vec<f32> = bytes
-                .chunks(4)
+            let floats: Vec<f32> = bytes.chunks(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             if floats.len() == dims as usize {
@@ -4433,28 +3866,25 @@ impl Database {
     ) -> anyhow::Result<Option<(i64, f32)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
-            "SELECT node_id, vector, dimensions FROM embeddings WHERE model = 'deepseek-embed'",
+            "SELECT node_id, vector, dimensions FROM embeddings WHERE model = 'deepseek-embed'"
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i32>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i32>(2)?))
         })?;
 
         let mut best: Option<(i64, f32)> = None;
         for row in rows {
             let (nid, bytes, dims) = row?;
-            let floats: Vec<f32> = bytes
-                .chunks(4)
+            let floats: Vec<f32> = bytes.chunks(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             if floats.len() != dims as usize || floats.len() != query_vec.len() {
                 continue;
             }
             let sim = cosine_similarity(query_vec, &floats);
-            if sim >= min_similarity && best.is_none_or(|(_, s)| sim > s) {
+            if sim >= min_similarity
+                && best.is_none_or(|(_, s)| sim > s)
+            {
                 best = Some((nid, sim));
             }
         }
@@ -4465,10 +3895,7 @@ impl Database {
 
     /// Find nodes with the same semantic hash across ALL conversations.
     /// Returns (hash, node_id, conversation_id, summary_preview).
-    pub fn find_similar_by_hash(
-        &self,
-        hash: &str,
-    ) -> anyhow::Result<Vec<(String, i64, i64, String)>> {
+    pub fn find_similar_by_hash(&self, hash: &str) -> anyhow::Result<Vec<(String, i64, i64, String)>> {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT hash, node_id, conversation_id, summary_preview
@@ -4483,9 +3910,7 @@ impl Database {
             ))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
@@ -4503,31 +3928,18 @@ impl Database {
              FROM dag_nodes n
              WHERE n.summary LIKE ?1 ESCAPE '\\' AND n.deleted = 0
              ORDER BY n.level DESC, n.access_count DESC, n.id DESC
-             LIMIT ?2",
+             LIMIT ?2"
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Index a node in the semantic_index for cross-conversation lookup.
-    pub fn index_semantic(
-        &self,
-        hash: &str,
-        node_id: i64,
-        conv_id: i64,
-        preview: &str,
-    ) -> anyhow::Result<()> {
+    pub fn index_semantic(&self, hash: &str, node_id: i64, conv_id: i64, preview: &str) -> anyhow::Result<()> {
         let conn = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR IGNORE INTO semantic_index (hash, node_id, conversation_id, summary_preview)
@@ -4565,16 +3977,10 @@ impl Database {
              WHERE p.summary_node_id = ?1 ORDER BY p.sentence_offset",
         )?;
         let rows = stmt.query_map(rusqlite::params![summary_node_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i32>(1)?,
-                row.get::<_, i32>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
@@ -4607,7 +4013,7 @@ impl Database {
              FROM provenance p
              JOIN dag_nodes n ON n.id = p.source_node_id AND n.deleted = 0
              WHERE p.summary_node_id = ?1
-             ORDER BY p.sentence_offset",
+             ORDER BY p.sentence_offset"
         )?;
         let rows = stmt.query_map(rusqlite::params![summary_node_id], |row| {
             Ok((
@@ -4618,135 +4024,120 @@ impl Database {
             ))
         })?;
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
+        for row in rows { results.push(row?); }
         Ok(results)
     }
 
     /// Strip JSON markup from content so FTS5 indexes only the plain text.
-    /// Content can be either a plain string or a JSON array of content blocks.
-    fn strip_json_markup(content: &str) -> String {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-            match val {
-                serde_json::Value::String(s) => return s,
-                serde_json::Value::Array(arr) => {
-                    let mut out = String::new();
-                    for block in arr {
-                        if let Some(text) = block["text"].as_str() {
-                            if !out.is_empty() {
-                                out.push(' ');
-                            }
-                            out.push_str(text);
-                        }
+/// Content can be either a plain string or a JSON array of content blocks.
+fn strip_json_markup(content: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+        match val {
+            serde_json::Value::String(s) => return s,
+            serde_json::Value::Array(arr) => {
+                let mut out = String::new();
+                for block in arr {
+                    if let Some(text) = block["text"].as_str() {
+                        if !out.is_empty() { out.push(' '); }
+                        out.push_str(text);
                     }
-                    return out;
                 }
-                _ => {}
+                return out;
             }
+            _ => {}
         }
-        content.to_string()
     }
+    content.to_string()
+}
 
-    /// Identify a human-readable content source from message content and role.
-    fn identify_content_source(content: &str, role: &str) -> String {
-        let lower = content.to_lowercase();
-        if role == "tool" {
-            if lower.contains("cargo build")
-                || lower.contains("error[")
-                || lower.contains("warning[")
-            {
-                return "cargo build output".into();
-            }
-            if lower.contains("error: could not compile") {
-                return "compilation error".into();
-            }
-            if lower.contains("diff --git") || lower.contains("@@ -") {
-                return "git diff output".into();
-            }
-            if lower.contains("grep") && (lower.contains("match") || lower.contains("found")) {
-                return "grep results".into();
-            }
-            if lower.contains("test result:") {
-                return "test output".into();
-            }
-            if lower.contains("total ") && (lower.contains("drwx") || lower.contains("-rw")) {
-                return "ls / file listing".into();
-            }
-            if lower.len() > 5000 {
-                if lower.contains("error") || lower.contains("fail") {
-                    return "large error output".into();
-                }
-                return "large tool output".into();
-            }
-            if lower.contains("error") || lower.contains("fail") || lower.contains("panic") {
-                return "error output".into();
-            }
-            return "tool output".into();
+/// Identify a human-readable content source from message content and role.
+fn identify_content_source(content: &str, role: &str) -> String {
+    let lower = content.to_lowercase();
+    if role == "tool" {
+        if lower.contains("cargo build") || lower.contains("error[") || lower.contains("warning[") {
+            return "cargo build output".into();
         }
-        if role == "assistant" {
-            if lower.contains("tool_use") {
-                return "assistant tool call".into();
-            }
-            if lower.contains("thinking") {
-                return "assistant thinking".into();
-            }
-            if content.len() > 2000 {
-                return "large assistant response".into();
-            }
-            return "assistant message".into();
+        if lower.contains("error: could not compile") {
+            return "compilation error".into();
         }
-        if role == "user" {
-            if content.len() > 5000 {
-                return "large user message".into();
+        if lower.contains("diff --git") || lower.contains("@@ -") {
+            return "git diff output".into();
+        }
+        if lower.contains("grep") && (lower.contains("match") || lower.contains("found")) {
+            return "grep results".into();
+        }
+        if lower.contains("test result:") {
+            return "test output".into();
+        }
+        if lower.contains("total ") && (lower.contains("drwx") || lower.contains("-rw")) {
+            return "ls / file listing".into();
+        }
+        if lower.len() > 5000 {
+            if lower.contains("error") || lower.contains("fail") {
+                return "large error output".into();
             }
-            return "user message".into();
+            return "large tool output".into();
         }
-        if role == "system" {
-            return "system prompt".into();
+        if lower.contains("error") || lower.contains("fail") || lower.contains("panic") {
+            return "error output".into();
         }
-        "unknown".into()
+        return "tool output".into();
     }
-
-    /// Compute a semantic fingerprint for a node: SHA-256 of summary text
-    /// concatenated with snippet contents, then truncated to 16 hex chars.
-    /// Equal hashes mean the summary content is semantically identical
-    /// (or close enough for dedup), enabling cross-conversation reuse.
-    pub fn semantic_hash(summary: &str, snippets: &[crate::snippet::Snippet]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(summary.as_bytes());
-        for s in snippets {
-            hasher.update(s.content.as_bytes());
-            let label = match s.snippet_type {
-                crate::snippet::SnippetType::CodeBlock => "code",
-                crate::snippet::SnippetType::FilePath => "path",
-                crate::snippet::SnippetType::NumericConstant => "num",
-                crate::snippet::SnippetType::ErrorMessage => "err",
-                crate::snippet::SnippetType::ProperNoun => "ref",
-            };
-            hasher.update(label.as_bytes());
-        }
-        let result = hasher.finalize();
-        hex::encode(&result[..8]) // 16 hex chars
+    if role == "assistant" {
+        if lower.contains("tool_use") { return "assistant tool call".into(); }
+        if lower.contains("thinking") { return "assistant thinking".into(); }
+        if content.len() > 2000 { return "large assistant response".into(); }
+        return "assistant message".into();
     }
+    if role == "user" {
+        if content.len() > 5000 { return "large user message".into(); }
+        return "user message".into();
+    }
+    if role == "system" {
+        return "system prompt".into();
+    }
+    "unknown".into()
+}
 
-    /// Escape a user query for FTS5 MATCH syntax.
-    /// FTS5 special chars: ^ * " ( ) + - ~ ` `
-    pub fn fts_escape(query: &str) -> String {
-        let mut out = String::with_capacity(query.len());
-        for ch in query.chars() {
-            match ch {
-                '"' | '\'' | '*' | '^' | '(' | ')' | '+' | '-' | '~' | '`' => {
-                    out.push(' ');
-                }
-                c => out.push(c),
+/// Compute a semantic fingerprint for a node: SHA-256 of summary text
+/// concatenated with snippet contents, then truncated to 16 hex chars.
+/// Equal hashes mean the summary content is semantically identical
+/// (or close enough for dedup), enabling cross-conversation reuse.
+pub fn semantic_hash(summary: &str, snippets: &[crate::snippet::Snippet]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(summary.as_bytes());
+    for s in snippets {
+        hasher.update(s.content.as_bytes());
+        let label = match s.snippet_type {
+            crate::snippet::SnippetType::CodeBlock => "code",
+            crate::snippet::SnippetType::FilePath => "path",
+            crate::snippet::SnippetType::NumericConstant => "num",
+            crate::snippet::SnippetType::ErrorMessage => "err",
+            crate::snippet::SnippetType::ProperNoun => "ref",
+        };
+        hasher.update(label.as_bytes());
+    }
+    let result = hasher.finalize();
+    hex::encode(&result[..8]) // 16 hex chars
+}
+
+/// Escape a user query for FTS5 MATCH syntax.
+/// FTS5 special chars: ^ * " ( ) + - ~ ` `
+pub fn fts_escape(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for ch in query.chars() {
+        match ch {
+            '"' | '\'' | '*' | '^' | '(' | ')' | '+' | '-' | '~' | '`' => {
+                out.push(' ');
             }
+            c => out.push(c),
         }
-        out.trim().to_string()
     }
+    out.trim().to_string()
+}
 
-    fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
+fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<DagNode> {
         let parent_str: String = row.get(5)?;
         let child_str: String = row.get(6)?;
         let snippet_str: String = row.get(7)?;
@@ -4782,17 +4173,11 @@ impl Database {
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let (dot, na, nb) = a
-        .iter()
-        .zip(b.iter())
+    let (dot, na, nb) = a.iter().zip(b.iter())
         .fold((0.0f32, 0.0f32, 0.0f32), |(d, na, nb), (x, y)| {
             (d + x * y, na + x * x, nb + y * y)
         });
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na.sqrt() * nb.sqrt())
-    }
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt() * nb.sqrt()) }
 }
 
 #[cfg(test)]
@@ -4827,30 +4212,11 @@ mod tests {
             "CREATE VIRTUAL TABLE te USING fts5(content);
              INSERT INTO te VALUES ('hello world Gartner test');
              CREATE VIRTUAL TABLE tc USING fts5(content);
-             INSERT INTO tc VALUES ('一份来自Gartner的2026年报告');",
-        )
-        .unwrap();
-        let e1: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM te WHERE te MATCH 'Gartner'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let c1: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM tc WHERE tc MATCH 'Gartner'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let c2: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM tc WHERE content LIKE '%Gartner%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+             INSERT INTO tc VALUES ('一份来自Gartner的2026年报告');"
+        ).unwrap();
+        let e1: i64 = conn.query_row("SELECT count(*) FROM te WHERE te MATCH 'Gartner'", [], |r| r.get(0)).unwrap();
+        let c1: i64 = conn.query_row("SELECT count(*) FROM tc WHERE tc MATCH 'Gartner'", [], |r| r.get(0)).unwrap();
+        let c2: i64 = conn.query_row("SELECT count(*) FROM tc WHERE content LIKE '%Gartner%'", [], |r| r.get(0)).unwrap();
         println!("  English MATCH: {e1}, CJK MATCH: {c1}, CJK LIKE: {c2}");
         assert_eq!(e1, 1, "English text MATCH must work");
         assert_eq!(c2, 1, "CJK LIKE must work");
@@ -4921,10 +4287,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            count, 2,
-            "duplicate store_messages calls must not create duplicate rows"
-        );
+        assert_eq!(count, 2, "duplicate store_messages calls must not create duplicate rows");
     }
 
     #[tokio::test]
@@ -4959,10 +4322,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            count, 4,
-            "only new messages should be added (2 original + 2 new)"
-        );
+        assert_eq!(count, 4, "only new messages should be added (2 original + 2 new)");
     }
 
     #[tokio::test]
@@ -4992,9 +4352,7 @@ mod tests {
             .unwrap();
 
         // Insert a real conversation
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}])).unwrap();
         // Try to store empty — should succeed (no messages to insert)
         assert!(db.store_messages(conv_id, &json!([])).is_ok());
 
@@ -5013,18 +4371,17 @@ mod tests {
             .unwrap();
         let conv_id = db.find_or_create_conversation("ids", "test").unwrap();
 
-        let first = db
-            .store_messages_with_ids(conv_id, &json!([{"role":"user","content":"a"}]))
-            .unwrap();
-        let replay = db
-            .store_messages_with_ids(
-                conv_id,
-                &json!([
-                    {"role":"user","content":"a"},
-                    {"role":"assistant","content":"b"}
-                ]),
-            )
-            .unwrap();
+        let first = db.store_messages_with_ids(
+            conv_id,
+            &json!([{"role":"user","content":"a"}]),
+        ).unwrap();
+        let replay = db.store_messages_with_ids(
+            conv_id,
+            &json!([
+                {"role":"user","content":"a"},
+                {"role":"assistant","content":"b"}
+            ]),
+        ).unwrap();
 
         assert_eq!(first.len(), 1);
         assert_eq!(replay.len(), 2);
@@ -5040,22 +4397,14 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .find_or_create_conversation("leaf-source", "test")
-            .unwrap();
-        let ids = db
-            .store_messages_with_ids(
-                conv_id,
-                &json!([{"role":"assistant","content":"already persisted"}]),
-            )
-            .unwrap();
+        let conv_id = db.find_or_create_conversation("leaf-source", "test").unwrap();
+        let ids = db.store_messages_with_ids(
+            conv_id,
+            &json!([{"role":"assistant","content":"already persisted"}]),
+        ).unwrap();
 
-        let first = db
-            .insert_message_leaf_if_absent(conv_id, ids[0], "already persisted", 4)
-            .unwrap();
-        let second = db
-            .insert_message_leaf_if_absent(conv_id, ids[0], "already persisted", 4)
-            .unwrap();
+        let first = db.insert_message_leaf_if_absent(conv_id, ids[0], "already persisted", 4).unwrap();
+        let second = db.insert_message_leaf_if_absent(conv_id, ids[0], "already persisted", 4).unwrap();
 
         assert!(first.is_some());
         assert!(second.is_none());
@@ -5073,22 +4422,16 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "start"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
 
-        let node = db
-            .insert_dag_node(conv_id, 0, "test leaf", 10, &[], &[], true)
-            .unwrap();
+        let node = db.insert_dag_node(conv_id, 0, "test leaf", 10, &[], &[], true).unwrap();
         assert_eq!(node.level, 0);
         assert!(node.is_leaf);
 
         let fetched = db.get_node(node.id).unwrap().unwrap();
         assert_eq!(fetched.summary, "test leaf");
 
-        let parent = db
-            .insert_dag_node(conv_id, 1, "summary", 5, &[node.id], &[], false)
-            .unwrap();
+        let parent = db.insert_dag_node(conv_id, 1, "summary", 5, &[node.id], &[], false).unwrap();
         db.add_child_to_node(node.id, parent.id).unwrap();
 
         let children = db.get_child_nodes(node.id, 10).unwrap();
@@ -5108,19 +4451,11 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "start"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
 
-        let n1 = db
-            .insert_dag_node(conv_id, 0, "leaf a", 10, &[], &[], true)
-            .unwrap();
-        let n2 = db
-            .insert_dag_node(conv_id, 0, "leaf b", 20, &[], &[], true)
-            .unwrap();
-        let n3 = db
-            .insert_dag_node(conv_id, 1, "summary", 5, &[n1.id, n2.id], &[], false)
-            .unwrap();
+        let n1 = db.insert_dag_node(conv_id, 0, "leaf a", 10, &[], &[], true).unwrap();
+        let n2 = db.insert_dag_node(conv_id, 0, "leaf b", 20, &[], &[], true).unwrap();
+        let n3 = db.insert_dag_node(conv_id, 1, "summary", 5, &[n1.id, n2.id], &[], false).unwrap();
 
         // Fetch all three
         let batch = db.get_nodes_batch(&[n1.id, n2.id, n3.id]).unwrap();
@@ -5150,16 +4485,10 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "start"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
 
-        let n1 = db
-            .insert_dag_node(conv_id, 0, "leaf a", 10, &[], &[], true)
-            .unwrap();
-        let n2 = db
-            .insert_dag_node(conv_id, 0, "leaf b", 20, &[], &[], true)
-            .unwrap();
+        let n1 = db.insert_dag_node(conv_id, 0, "leaf a", 10, &[], &[], true).unwrap();
+        let n2 = db.insert_dag_node(conv_id, 0, "leaf b", 20, &[], &[], true).unwrap();
 
         assert_eq!(n1.access_count, 0);
         assert_eq!(n2.access_count, 0);
@@ -5190,20 +4519,10 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "start"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "start"}])).unwrap();
 
         // Simulate proxy path: cache hit → store decision record
-        let rec_id = db
-            .store_decision_record(
-                conv_id,
-                "ReuseToolCache",
-                0.8,
-                "cache hit for tool=grep",
-                100,
-            )
-            .unwrap();
+        let rec_id = db.store_decision_record(conv_id, "ReuseToolCache", 0.8, "cache hit for tool=grep", 100).unwrap();
 
         // Verify record is stored
         let records = db.query_decision_records(conv_id, 10).unwrap();
@@ -5211,8 +4530,7 @@ mod tests {
         assert_eq!(records[0].1, "ReuseToolCache");
 
         // Simulate proxy path: failure reported → evaluate pending cache decisions
-        db.evaluate_decision(rec_id, "cache_invalidated", Some(0))
-            .unwrap();
+        db.evaluate_decision(rec_id, "cache_invalidated", Some(0)).unwrap();
 
         // Verify evaluation was written
         let records2 = db.query_decision_records(conv_id, 10).unwrap();
@@ -5220,15 +4538,7 @@ mod tests {
         assert_eq!(records2[0].6, Some(0));
 
         // Simulate proxy path: store failure decision
-        let fail_id = db
-            .store_decision_record(
-                conv_id,
-                "RetryWithFix",
-                0.7,
-                "failure pattern stored: signature=E0308",
-                0,
-            )
-            .unwrap();
+        let fail_id = db.store_decision_record(conv_id, "RetryWithFix", 0.7, "failure pattern stored: signature=E0308", 0).unwrap();
         assert!(fail_id > 0);
 
         // Verify both records present, ordered newest first
@@ -5249,21 +4559,13 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = db
-            .create_and_store(
-                "test",
-                &json!([
-                    {"role": "user", "content": "hello world"},
-                    {"role": "assistant", "content": "hello back"}
-                ]),
-            )
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hello back"}
+        ])).unwrap();
 
         let results = db.search_messages(conv_id, "hello").unwrap();
-        assert!(
-            !results.is_empty(),
-            "should find messages containing 'hello'"
-        );
+        assert!(!results.is_empty(), "should find messages containing 'hello'");
 
         let empty = db.search_messages(conv_id, "zzz_nonexistent").unwrap();
         assert!(empty.is_empty(), "should not find nonexistent content");
@@ -5287,8 +4589,7 @@ mod tests {
         }
 
         // Checkpoint should succeed without panicking
-        db.wal_checkpoint()
-            .expect("WAL checkpoint should succeed after writes");
+        db.wal_checkpoint().expect("WAL checkpoint should succeed after writes");
     }
 
     // ── P3: Unified search ───────────────────────────────────────────
@@ -5325,18 +4626,7 @@ mod tests {
                 frequency: 0,
             },
         ];
-        db.insert_dag_node_full(
-            conv_id,
-            1,
-            "fixed port binding error",
-            15,
-            &[],
-            &[],
-            &snippets,
-            false,
-            false,
-        )
-        .unwrap();
+        db.insert_dag_node_full(conv_id, 1, "fixed port binding error", 15, &[], &[], &snippets, false, false).unwrap();
 
         // Search for "port" — should find the summary
         let results = db.search_unified(conv_id, "port", 20).unwrap();
@@ -5364,13 +4654,11 @@ mod tests {
     #[tokio::test]
     async fn phase1_retrieval_scored_context_assembly() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase1_ctx.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_ctx.db"))
+            .build()
+            .await
+            .unwrap());
 
         let conv_id = db.create_and_store("test", &json!([
             {"role": "user", "content": "what is rust programming language"},
@@ -5379,73 +4667,41 @@ mod tests {
             {"role": "assistant", "content": "Install via rustup: curl https://sh.rustup.rs | sh"}
         ])).unwrap();
 
-        let engine = crate::dag::DagEngine::builder()
-            .max_level(3)
-            .build(db.clone());
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
 
         let l1 = engine.insert_leaf(conv_id, "what is rust", 10).unwrap();
-        let l2 = engine
-            .insert_leaf(conv_id, "Rust is a systems language", 15)
-            .unwrap();
-        let _l3 = engine
-            .insert_leaf(conv_id, "how do I install cargo", 10)
-            .unwrap();
-        let _l4 = engine
-            .insert_leaf(conv_id, "curl rustup.rs | sh", 15)
-            .unwrap();
+        let l2 = engine.insert_leaf(conv_id, "Rust is a systems language", 15).unwrap();
+        let _l3 = engine.insert_leaf(conv_id, "how do I install cargo", 10).unwrap();
+        let _l4 = engine.insert_leaf(conv_id, "curl rustup.rs | sh", 15).unwrap();
 
-        engine
-            .compress_group(
-                conv_id,
-                &[l1.id, l2.id],
-                "Rust is a systems programming language",
-                12,
-                1,
-            )
-            .unwrap();
+        engine.compress_group(conv_id, &[l1.id, l2.id], "Rust is a systems programming language", 12, 1).unwrap();
 
-        let ctx = engine
-            .assemble_context(conv_id, 200, Some("install cargo"))
-            .unwrap();
+        let ctx = engine.assemble_context(conv_id, 200, Some("install cargo")).unwrap();
         assert!(!ctx.is_empty());
 
-        let has_cargo = ctx
-            .iter()
-            .any(|n| n.summary.contains("cargo") || n.summary.contains("rustup"));
-        assert!(
-            has_cargo,
-            "query-aware context should include cargo-related content"
-        );
+        let has_cargo = ctx.iter().any(|n| n.summary.contains("cargo") || n.summary.contains("rustup"));
+        assert!(has_cargo, "query-aware context should include cargo-related content");
     }
 
     #[tokio::test]
     async fn phase1_semantic_dedup_sha256_fallback() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase1_dedup.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_dedup.db"))
+            .build()
+            .await
+            .unwrap());
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
             .unwrap();
 
-        let engine = crate::dag::DagEngine::builder()
-            .max_level(3)
-            .build(db.clone());
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
 
         let a = engine.insert_leaf(conv_id, "leaf A", 5).unwrap();
         let b = engine.insert_leaf(conv_id, "leaf B", 5).unwrap();
 
-        let s1 = engine
-            .dedup_and_reuse(conv_id, &[a.id, b.id], "same text", 5, 1, &[])
-            .unwrap();
-        let s2 = engine
-            .dedup_and_reuse(conv_id, &[a.id], "same text", 5, 1, &[])
-            .unwrap();
+        let s1 = engine.dedup_and_reuse(conv_id, &[a.id, b.id], "same text", 5, 1, &[]).unwrap();
+        let s2 = engine.dedup_and_reuse(conv_id, &[a.id], "same text", 5, 1, &[]).unwrap();
 
         assert_eq!(s1.id, s2.id, "identical text should dedup via SHA-256");
         assert_eq!(s1.semantic_hash, s2.semantic_hash);
@@ -5454,66 +4710,49 @@ mod tests {
     #[tokio::test]
     async fn phase1_cycle_detection_prevents_loop() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase1_cycle.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_cycle.db"))
+            .build()
+            .await
+            .unwrap());
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
             .unwrap();
 
-        let engine = crate::dag::DagEngine::builder()
-            .max_level(3)
-            .build(db.clone());
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
 
         let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
         let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
-        let summary = engine
-            .compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1)
-            .unwrap();
+        let summary = engine.compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1).unwrap();
 
         // Verify no cycle exists in healthy tree
         assert!(!engine.db().has_path(a.id, summary.id, 20).unwrap());
         assert!(!engine.db().has_path(b.id, summary.id, 20).unwrap());
 
         // Create a path B → summary (would form cycle if summary could reach B)
-        engine
-            .db()
-            .insert_edge(b.id, summary.id, "summarizes")
-            .unwrap();
+        engine.db().insert_edge(b.id, summary.id, "summarizes").unwrap();
         assert!(engine.db().has_path(b.id, summary.id, 20).unwrap());
     }
 
     #[tokio::test]
     async fn phase1_shared_node_visited_set() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase1_shared.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase1_shared.db"))
+            .build()
+            .await
+            .unwrap());
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
             .unwrap();
 
-        let engine = crate::dag::DagEngine::builder()
-            .max_level(3)
-            .build(db.clone());
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
 
         let a = engine.insert_leaf(conv_id, "A", 5).unwrap();
         let b = engine.insert_leaf(conv_id, "B", 5).unwrap();
         let c = engine.insert_leaf(conv_id, "C", 5).unwrap();
 
-        let summary = engine
-            .compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1)
-            .unwrap();
+        let summary = engine.compress_group(conv_id, &[a.id, b.id], "summary AB", 8, 1).unwrap();
         engine.db().add_child_to_node(summary.id, c.id).unwrap();
         engine.db().add_parent_to_node(c.id, summary.id).unwrap();
 
@@ -5528,26 +4767,18 @@ mod tests {
     async fn phase2_concurrent_reads_do_not_block() {
         use std::time::Instant;
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase2_conc.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase2_conc.db"))
+            .build()
+            .await
+            .unwrap());
 
-        let conv_id = db
-            .create_and_store(
-                "test",
-                &json!([
-                    {"role": "user", "content": "hello"}
-                ]),
-            )
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([
+            {"role": "user", "content": "hello"}
+        ])).unwrap();
 
         for i in 0..100 {
-            db.insert_dag_node(conv_id, 0, &format!("node {i}"), 5, &[], &[], true)
-                .unwrap();
+            db.insert_dag_node(conv_id, 0, &format!("node {i}"), 5, &[], &[], true).unwrap();
         }
 
         let start = Instant::now();
@@ -5565,10 +4796,7 @@ mod tests {
             h.await.unwrap();
         }
         let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_secs() < 5,
-            "concurrent reads took too long: {elapsed:?}"
-        );
+        assert!(elapsed.as_secs() < 5, "concurrent reads took too long: {elapsed:?}");
     }
 
     // ── Phase 2: Provenance + Hierarchical rendering ──────────────────
@@ -5576,88 +4804,56 @@ mod tests {
     #[tokio::test]
     async fn phase2_provenance_spans_persist() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase2_prov.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase2_prov.db"))
+            .build()
+            .await
+            .unwrap());
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
             .unwrap();
-        let engine = crate::dag::DagEngine::builder()
-            .max_level(3)
-            .build(db.clone());
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
 
-        let l1 = engine
-            .insert_leaf(conv_id, "Rust is fast. It has zero-cost abstractions.", 10)
-            .unwrap();
-        let l2 = engine
-            .insert_leaf(conv_id, "Memory safety is key.", 5)
-            .unwrap();
+        let l1 = engine.insert_leaf(conv_id, "Rust is fast. It has zero-cost abstractions.", 10).unwrap();
+        let l2 = engine.insert_leaf(conv_id, "Memory safety is key.", 5).unwrap();
 
-        let summary = engine
-            .compress_group(
-                conv_id,
-                &[l1.id, l2.id],
-                "Rust is fast. Memory safety is key.",
-                8,
-                1,
-            )
-            .unwrap();
+        let summary = engine.compress_group(
+            conv_id, &[l1.id, l2.id],
+            "Rust is fast. Memory safety is key.",
+            8, 1,
+        ).unwrap();
 
         let prov = db.get_provenance(summary.id).unwrap();
         assert!(!prov.is_empty(), "provenance records should be created");
         let has_real_spans = prov.iter().any(|(_sid, _off, len)| *len > 0);
-        assert!(
-            has_real_spans,
-            "should have real provenance span, got: {prov:?}"
-        );
+        assert!(has_real_spans, "should have real provenance span, got: {prov:?}");
     }
 
     #[tokio::test]
     async fn phase2_hierarchical_render_has_three_tiers() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("phase2_render.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let db = Arc::new(Database::builder()
+            .path(dir.path().join("phase2_render.db"))
+            .build()
+            .await
+            .unwrap());
 
-        let conv_id = db
-            .create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
+        let conv_id = db.create_and_store("test", &json!([{"role": "user", "content": "hi"}]))
             .unwrap();
-        let engine = crate::dag::DagEngine::builder()
-            .max_level(3)
-            .build(db.clone());
+        let engine = crate::dag::DagEngine::builder().max_level(3).build(db.clone());
 
         let l1 = engine.insert_leaf(conv_id, "hello", 5).unwrap();
         let l2 = engine.insert_leaf(conv_id, "world", 5).unwrap();
-        engine
-            .compress_group(conv_id, &[l1.id, l2.id], "hello world summary", 8, 1)
-            .unwrap();
+        engine.compress_group(conv_id, &[l1.id, l2.id], "hello world summary", 8, 1).unwrap();
         // Add a 3rd leaf not covered by the summary
         engine.insert_leaf(conv_id, "extra message", 5).unwrap();
 
         let ctx = engine.assemble_context(conv_id, 200, None).unwrap();
         let rendered = crate::pipeline::render_dag_context(&ctx);
 
-        assert!(
-            rendered.contains("── Summaries ──"),
-            "should have summaries tier"
-        );
-        assert!(
-            rendered.contains("── Recent Messages ──"),
-            "should have recent messages tier"
-        );
-        assert!(
-            rendered.contains("← sources:"),
-            "should show source provenance"
-        );
+        assert!(rendered.contains("── Summaries ──"), "should have summaries tier");
+        assert!(rendered.contains("── Recent Messages ──"), "should have recent messages tier");
+        assert!(rendered.contains("← sources:"), "should show source provenance");
     }
 
     /// Bug reproduction: FTS5 search path only searches messages, not summaries.
@@ -5665,38 +4861,20 @@ mod tests {
     #[tokio::test]
     async fn search_unified_must_return_summaries_for_english_queries() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("s1.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
-        let conv_id = db
-            .create_and_store(
-                "test",
-                &serde_json::json!([
-                    {"role": "user", "content": "What is the wifi password?"}
-                ]),
-            )
-            .unwrap();
+        let db = Arc::new(Database::builder().path(dir.path().join("s1.db")).build().await.unwrap());
+        let conv_id = db.create_and_store("test", &serde_json::json!([
+            {"role": "user", "content": "What is the wifi password?"}
+        ])).unwrap();
 
         // Store a summary with content NOT present in any message
-        db.insert_summary_atomic(conv_id, 1, "The wifi password is hunter2", 5, &[], &[], "")
-            .unwrap();
+        db.insert_summary_atomic(conv_id, 1, "The wifi password is hunter2", 5, &[], &[], "").unwrap();
 
         // Search for unique summary content — should find the summary
         let results = db.search_unified(conv_id, "hunter2", 20).unwrap();
         let has_summary = results.iter().any(|r| r.source == "summary");
-        assert!(
-            has_summary,
+        assert!(has_summary,
             "BUG: FTS5 path returns only messages, summary 'hunter2' is invisible. Got {} results: {:?}",
-            results.len(),
-            results
-                .iter()
-                .map(|r| format!("{}:{}", r.source, r.excerpt))
-                .collect::<Vec<_>>()
-        );
+            results.len(), results.iter().map(|r| format!("{}:{}", r.source, r.excerpt)).collect::<Vec<_>>());
     }
 
     /// Bug reproduction: search_unified returns message IDs, but assemble_context
@@ -5705,58 +4883,28 @@ mod tests {
     async fn assemble_context_query_boost_must_resolve_to_dag_nodes() {
         use crate::dag::DagEngine;
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(
-            Database::builder()
-                .path(dir.path().join("s2.db"))
-                .build()
-                .await
-                .unwrap(),
-        );
-        let dag = DagEngine::builder()
-            .max_level(3)
-            .recent_messages(5)
-            .build(db.clone());
+        let db = Arc::new(Database::builder().path(dir.path().join("s2.db")).build().await.unwrap());
+        let dag = DagEngine::builder().max_level(3).recent_messages(5).build(db.clone());
         // Store messages — these create dag leaf nodes automatically
-        let conv_id = db
-            .create_and_store(
-                "test",
-                &serde_json::json!([
-                    {"role": "user", "content": "Find all Rust structs in the codebase."},
-                    {"role": "assistant", "content": "I found Config, Database, and AppState."},
-                    {"role": "user", "content": "Show me Config."}
-                ]),
-            )
-            .unwrap();
+        let conv_id = db.create_and_store("test", &serde_json::json!([
+            {"role": "user", "content": "Find all Rust structs in the codebase."},
+            {"role": "assistant", "content": "I found Config, Database, and AppState."},
+            {"role": "user", "content": "Show me Config."}
+        ])).unwrap();
         // Manually create leaves (normally done by pipeline)
-        dag.insert_leaf(conv_id, "Find all Rust structs in the codebase.", 8)
-            .unwrap();
-        dag.insert_leaf(conv_id, "I found Config, Database, and AppState.", 10)
-            .unwrap();
+        dag.insert_leaf(conv_id, "Find all Rust structs in the codebase.", 8).unwrap();
+        dag.insert_leaf(conv_id, "I found Config, Database, and AppState.", 10).unwrap();
         dag.insert_leaf(conv_id, "Show me Config.", 4).unwrap();
         // Compress first two into a summary
-        dag.compress_group(
-            conv_id,
-            &[1, 2],
-            "User asked about Rust structs, assistant found Config, Database, AppState.",
-            12,
-            1,
-        )
-        .unwrap();
+        dag.compress_group(conv_id, &[1, 2], "User asked about Rust structs, assistant found Config, Database, AppState.", 12, 1).unwrap();
 
         // assemble_context with a query — step 3 query boost should find the summary
-        let ctx = dag
-            .assemble_context(conv_id, 500, Some("Config Database AppState"))
-            .unwrap();
+        let ctx = dag.assemble_context(conv_id, 500, Some("Config Database AppState")).unwrap();
         // The compressed summary should be findable via the query
         let has_summary = ctx.iter().any(|n| n.level > 0);
-        assert!(
-            has_summary,
+        assert!(has_summary,
             "BUG: assemble_context query boost can't resolve search results to DAG nodes. Context has {} nodes: {:?}",
-            ctx.len(),
-            ctx.iter()
-                .map(|n| format!("L{}:{}", n.level, &n.summary[..n.summary.len().min(60)]))
-                .collect::<Vec<_>>()
-        );
+            ctx.len(), ctx.iter().map(|n| format!("L{}:{}", n.level, &n.summary[..n.summary.len().min(60)])).collect::<Vec<_>>());
     }
 
     // Bug 3: tool messages (role="tool") were not given DAG leaf nodes
@@ -5835,10 +4983,7 @@ mod tests {
         assert_eq!(result1, "out");
         // Second get should still return the cached result
         let (result2, _) = db.tool_cache_get("cmd", "k1").unwrap().unwrap();
-        assert_eq!(
-            result2, "out",
-            "repeated gets should return the cached result"
-        );
+        assert_eq!(result2, "out", "repeated gets should return the cached result");
     }
 
     #[tokio::test]
@@ -5846,7 +4991,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("responses.db");
         {
-            let db = Database::builder().path(&path).build().await.unwrap();
+            let db = Database::builder()
+                .path(&path)
+                .build()
+                .await
+                .unwrap();
             db.store_response_object(
                 "resp_persisted",
                 "session-a",
@@ -5864,13 +5013,20 @@ mod tests {
             .unwrap();
         }
 
-        let reopened = Database::builder().path(&path).build().await.unwrap();
+        let reopened = Database::builder()
+            .path(&path)
+            .build()
+            .await
+            .unwrap();
         let response = reopened
             .get_response_object("resp_persisted")
             .unwrap()
             .unwrap();
         assert_eq!(response["id"], "resp_persisted");
-        let session = reopened.get_response_session("session-a").unwrap().unwrap();
+        let session = reopened
+            .get_response_session("session-a")
+            .unwrap()
+            .unwrap();
         assert_eq!(session.len(), 1);
         assert_eq!(session[0]["content"], "hello");
     }
@@ -5887,10 +5043,7 @@ mod tests {
             .unwrap();
         let id1 = db.find_or_create_conversation("fp-alpha", "gpt-4").unwrap();
         let id2 = db.find_or_create_conversation("fp-beta", "gpt-4").unwrap();
-        assert_ne!(
-            id1, id2,
-            "different fingerprints should get different conversations"
-        );
+        assert_ne!(id1, id2, "different fingerprints should get different conversations");
     }
 
     #[tokio::test]
@@ -5916,10 +5069,7 @@ mod tests {
             .unwrap();
         let id1 = db.find_or_create_conversation("fp-x", "model-a").unwrap();
         let id2 = db.find_or_create_conversation("fp-x", "model-b").unwrap();
-        assert_eq!(
-            id1, id2,
-            "model param is only used on creation, should match by fingerprint"
-        );
+        assert_eq!(id1, id2, "model param is only used on creation, should match by fingerprint");
     }
 
     // ── Runtime Decision Record tests (v0.8) ──────────────────────────
@@ -5932,13 +5082,9 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
-        let id = db
-            .store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500)
-            .unwrap();
+        let id = db.store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500).unwrap();
         assert!(id > 0, "expected valid record ID");
 
         let records = db.query_decision_records(conv_id, 10).unwrap();
@@ -5956,13 +5102,9 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
-        let id = db
-            .store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500)
-            .unwrap();
+        let id = db.store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500).unwrap();
 
         let updated = db.mark_decision_accepted(id, true).unwrap();
         assert!(updated, "expected row to be updated");
@@ -5985,19 +5127,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
-        let _id1 = db
-            .store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500)
-            .unwrap();
-        let _id2 = db
-            .store_decision_record(conv_id, "RetryWithFix", 0.7, "retry fix", 200)
-            .unwrap();
-        let _id3 = db
-            .store_decision_record(conv_id, "DelegateToModel", 0.0, "no opt", 0)
-            .unwrap();
+        let _id1 = db.store_decision_record(conv_id, "ReuseToolCache", 0.95, "cache hit", 500).unwrap();
+        let _id2 = db.store_decision_record(conv_id, "RetryWithFix", 0.7, "retry fix", 200).unwrap();
+        let _id3 = db.store_decision_record(conv_id, "DelegateToModel", 0.0, "no opt", 0).unwrap();
 
         let records = db.query_decision_records(conv_id, 10).unwrap();
         assert_eq!(records.len(), 3, "expected 3 records");
@@ -6016,9 +5150,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
         let records = db.query_decision_records(conv_id, 10).unwrap();
         assert!(records.is_empty(), "no records yet");
@@ -6034,29 +5166,19 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
         let assumptions = vec!["src/lib.rs".to_string(), "Cargo.toml".to_string()];
         let files = vec!["src/lib.rs".to_string()];
-        let fp_id = db
-            .store_failure_pattern(
-                conv_id,
-                "compile_error",
-                "add mutex",
-                "SQLite connection shared globally",
-                &assumptions,
-                &files,
-                None,
-            )
-            .unwrap();
+        let fp_id = db.store_failure_pattern(
+            conv_id, "compile_error", "add mutex",
+            "SQLite connection shared globally",
+            &assumptions, &files, None,
+        ).unwrap();
         assert!(fp_id > 0);
 
         // Retrieve by signature
-        let result = db
-            .get_failure_pattern_by_signature(conv_id, "compile_error")
-            .unwrap();
+        let result = db.get_failure_pattern_by_signature(conv_id, "compile_error").unwrap();
         assert!(result.is_some(), "should find the pattern");
         let (fix, why, stored_assumptions, _) = result.unwrap();
         assert_eq!(fix, "add mutex");
@@ -6064,15 +5186,11 @@ mod tests {
         assert_eq!(stored_assumptions, assumptions);
 
         // Retry count
-        let count = db
-            .get_failure_retry_count(conv_id, "compile_error")
-            .unwrap();
+        let count = db.get_failure_retry_count(conv_id, "compile_error").unwrap();
         assert_eq!(count, 1, "one failure stored");
 
         // Non-existent signature
-        let missing = db
-            .get_failure_pattern_by_signature(conv_id, "no_such_error")
-            .unwrap();
+        let missing = db.get_failure_pattern_by_signature(conv_id, "no_such_error").unwrap();
         assert!(missing.is_none(), "should not find non-existent pattern");
     }
 
@@ -6084,20 +5202,12 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
         // Store three patterns
-        let _id1 = db
-            .store_failure_pattern(conv_id, "err_a", "fix_a", "why_a", &[], &[], None)
-            .unwrap();
-        let _id2 = db
-            .store_failure_pattern(conv_id, "err_b", "fix_b", "why_b", &[], &[], None)
-            .unwrap();
-        let _id3 = db
-            .store_failure_pattern(conv_id, "err_c", "fix_c", "why_c", &[], &[], None)
-            .unwrap();
+        let _id1 = db.store_failure_pattern(conv_id, "err_a", "fix_a", "why_a", &[], &[], None).unwrap();
+        let _id2 = db.store_failure_pattern(conv_id, "err_b", "fix_b", "why_b", &[], &[], None).unwrap();
+        let _id3 = db.store_failure_pattern(conv_id, "err_c", "fix_c", "why_c", &[], &[], None).unwrap();
 
         // Get recent 2
         let patterns = db.get_recent_failure_patterns(conv_id, 2).unwrap();
@@ -6126,15 +5236,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
         let steps = vec!["step 1".to_string(), "step 2".to_string()];
         let assumptions = vec!["src/main.rs".to_string()];
-        let plan_id = db
-            .store_plan_state(conv_id, "fix bug", &steps, &assumptions)
-            .unwrap();
+        let plan_id = db.store_plan_state(conv_id, "fix bug", &steps, &assumptions).unwrap();
         assert!(plan_id > 0);
 
         let result = db.get_active_plan(conv_id).unwrap();
@@ -6155,26 +5261,21 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
         let steps = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let plan_id = db.store_plan_state(conv_id, "goal", &steps, &[]).unwrap();
 
         // Mark first step as completed
         let completed = vec!["a".to_string()];
-        db.update_plan_steps(plan_id, Some(&completed), None, None)
-            .unwrap();
+        db.update_plan_steps(plan_id, Some(&completed), None, None).unwrap();
 
         let result = db.get_active_plan(conv_id).unwrap().unwrap();
         let stored_completed: Vec<String> = serde_json::from_value(result.3).unwrap();
         assert_eq!(stored_completed, vec!["a"]);
 
         // Unknown plan ID (already deactivated) — no error, just 0 rows
-        let ok = db
-            .update_plan_steps(999, None, None, Some(&["x".to_string()]))
-            .unwrap();
+        let ok = db.update_plan_steps(999, None, None, Some(&["x".to_string()])).unwrap();
         assert!(!ok, "no rows for non-existent plan");
     }
 
@@ -6189,14 +5290,9 @@ mod tests {
             .await
             .unwrap();
         let artifact = crate::artifacts::ExecutionArtifact::new(
-            "grep:abc123",
-            "grep",
-            "search init",
-            "abc123",
-            "src/main.rs: found init()",
-            vec!["src/main.rs".to_string()],
-            vec![],
-            "deepseek-chat",
+            "grep:abc123", "grep", "search init", "abc123",
+            "src/main.rs: found init()", vec!["src/main.rs".to_string()],
+            vec![], "deepseek-chat",
         );
         let id = db.store_artifact(&artifact).unwrap();
         assert!(id > 0);
@@ -6220,9 +5316,7 @@ mod tests {
             .await
             .unwrap();
         let deps = vec!["src/lib.rs".to_string()];
-        let id = db
-            .store_tool_artifact("grep", "search foo --pattern bar", "found bar", &deps)
-            .unwrap();
+        let id = db.store_tool_artifact("grep", "search foo --pattern bar", "found bar", &deps).unwrap();
         assert!(id > 0);
 
         // Should also be findable via tool_cache (backward compat)
@@ -6250,25 +5344,13 @@ mod tests {
         // Insert events with replay_session_id
         let session_id = "test_session_1";
         db.store_execution_event_with_replay(
-            None,
-            "TextDelta",
-            r#"{"type":"text_delta","text":"hello"}"#,
-            1,
-            Some(1),
-            1000,
-            session_id,
-        )
-        .unwrap();
+            None, "TextDelta", r#"{"type":"text_delta","text":"hello"}"#,
+            1, Some(1), 1000, session_id,
+        ).unwrap();
         db.store_execution_event_with_replay(
-            None,
-            "TextDelta",
-            r#"{"type":"text_delta","text":"world"}"#,
-            2,
-            Some(1),
-            1001,
-            session_id,
-        )
-        .unwrap();
+            None, "TextDelta", r#"{"type":"text_delta","text":"world"}"#,
+            2, Some(1), 1001, session_id,
+        ).unwrap();
 
         // Query by session
         let events = db.get_execution_events_by_session(session_id).unwrap();
@@ -6300,48 +5382,21 @@ mod tests {
             .unwrap();
 
         db.store_execution_event_with_replay(
-            None,
-            "TextDelta",
-            "{}",
-            1,
-            Some(1),
-            1000,
-            "session_a",
-        )
-        .unwrap();
+            None, "TextDelta", "{}", 1, Some(1), 1000, "session_a",
+        ).unwrap();
         db.store_execution_event_with_replay(
-            None,
-            "TextDelta",
-            "{}",
-            2,
-            Some(1),
-            1001,
-            "session_a",
-        )
-        .unwrap();
+            None, "TextDelta", "{}", 2, Some(1), 1001, "session_a",
+        ).unwrap();
         db.store_execution_event_with_replay(
-            None,
-            "TextDelta",
-            "{}",
-            1,
-            Some(1),
-            2000,
-            "session_b",
-        )
-        .unwrap();
+            None, "TextDelta", "{}", 1, Some(1), 2000, "session_b",
+        ).unwrap();
 
         let sessions = db.list_replay_sessions(10).unwrap();
         assert_eq!(sessions.len(), 2, "should find 2 sessions");
         // session_a has 2 events, session_b has 1
-        let a = sessions
-            .iter()
-            .find(|(sid, ..)| sid == "session_a")
-            .unwrap();
+        let a = sessions.iter().find(|(sid, ..)| sid == "session_a").unwrap();
         assert_eq!(a.1, 2, "session_a should have 2 events");
-        let b = sessions
-            .iter()
-            .find(|(sid, ..)| sid == "session_b")
-            .unwrap();
+        let b = sessions.iter().find(|(sid, ..)| sid == "session_b").unwrap();
         assert_eq!(b.1, 1, "session_b should have 1 event");
     }
 
@@ -6357,51 +5412,27 @@ mod tests {
         let session_id = "full_test_session";
         // Stream event
         db.store_execution_event_with_replay(
-            None,
-            "TextDelta",
-            r#"{"type":"text_delta","text":"hello"}"#,
-            1,
-            Some(1),
-            1000,
-            session_id,
-        )
-        .unwrap();
+            None, "TextDelta", r#"{"type":"text_delta","text":"hello"}"#,
+            1, Some(1), 1000, session_id,
+        ).unwrap();
         // Internal event (should be skipped)
         db.store_execution_event_with_replay(
-            None,
-            "execution_completed",
-            r#"{"tool_name":"grep","outcome":"success"}"#,
-            2,
-            Some(1),
-            1001,
-            session_id,
-        )
-        .unwrap();
+            None, "execution_completed", r#"{"tool_name":"grep","outcome":"success"}"#,
+            2, Some(1), 1001, session_id,
+        ).unwrap();
         // Another stream event (MessageEnd has no fields, easy to construct)
         db.store_execution_event_with_replay(
-            None,
-            "MessageEnd",
-            r#"{"type":"message_end"}"#,
-            3,
-            Some(1),
-            1002,
-            session_id,
-        )
-        .unwrap();
+            None, "MessageEnd", r#"{"type":"message_end"}"#,
+            3, Some(1), 1002, session_id,
+        ).unwrap();
 
         let result = crate::replay::replay_session(&db, session_id).unwrap();
         assert_eq!(result.events.len(), 2, "should only include stream events");
         assert_eq!(result.corrupt_count, 0, "no corrupt events");
         // First event should be TextDelta
-        assert!(matches!(
-            result.events[0].event,
-            crate::protocol::canonical::StreamEvent::TextDelta { .. }
-        ));
+        assert!(matches!(result.events[0].event, crate::protocol::canonical::StreamEvent::TextDelta { .. }));
         // Second should be MessageEnd
-        assert!(matches!(
-            result.events[1].event,
-            crate::protocol::canonical::StreamEvent::MessageEnd
-        ));
+        assert!(matches!(result.events[1].event, crate::protocol::canonical::StreamEvent::MessageEnd));
     }
 
     // ── Online Evaluation ───────────────────────────────────────────────
@@ -6414,27 +5445,18 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let conv_id = db
-            .create_and_store("test", &json!([{"role":"user","content":"hi"}]))
-            .unwrap();
+        let conv_id = db.create_and_store("test", &json!([{"role":"user","content":"hi"}])).unwrap();
 
         // Store some decisions and outcomes
-        let id1 = db
-            .store_decision_record(conv_id, "ReuseToolCache", 0.9, "cache hit", 500)
-            .unwrap();
-        let id2 = db
-            .store_decision_record(conv_id, "ReuseToolCache", 0.8, "cache hit", 400)
-            .unwrap();
-        let id3 = db
-            .store_decision_record(conv_id, "RetryWithFix", 0.7, "retry", 200)
-            .unwrap();
+        let id1 = db.store_decision_record(conv_id, "ReuseToolCache", 0.9, "cache hit", 500).unwrap();
+        let id2 = db.store_decision_record(conv_id, "ReuseToolCache", 0.8, "cache hit", 400).unwrap();
+        let id3 = db.store_decision_record(conv_id, "RetryWithFix", 0.7, "retry", 200).unwrap();
 
         // Mark outcomes
         db.mark_decision_accepted(id1, true).unwrap();
         db.evaluate_decision(id1, "success", Some(480)).unwrap();
         db.mark_decision_accepted(id2, true).unwrap();
-        db.evaluate_decision(id2, "cache_invalidated", None)
-            .unwrap();
+        db.evaluate_decision(id2, "cache_invalidated", None).unwrap();
         db.mark_decision_accepted(id3, true).unwrap();
         db.evaluate_decision(id3, "success", Some(150)).unwrap();
 
@@ -6442,10 +5464,7 @@ mod tests {
         let outcomes = db.query_decision_outcomes_by_action(100).unwrap();
         assert_eq!(outcomes.len(), 2, "two action types");
 
-        let cache = outcomes
-            .iter()
-            .find(|(a, ..)| a == "ReuseToolCache")
-            .unwrap();
+        let cache = outcomes.iter().find(|(a, ..)| a == "ReuseToolCache").unwrap();
         assert_eq!(cache.1, 1, "ReuseToolCache: 1 success out of 2");
         assert_eq!(cache.2, 2, "ReuseToolCache: 2 total");
 
