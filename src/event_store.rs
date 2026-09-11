@@ -128,8 +128,40 @@ CREATE VIRTUAL TABLE IF NOT EXISTS proxy_events_fts
 /// Run the schema migration (called once during `Database::open`).
 pub fn create_tables(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(MIGRATION)?;
+    ensure_source_identity_schema(conn)?;
     conn.execute_batch(FTS_MIGRATION)?;
     backfill_fts(conn)?;
+    Ok(())
+}
+
+/// Add source identity to existing proxy-event stores without rebuilding them.
+fn ensure_source_identity_schema(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(proxy_events)")?;
+    let columns: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    if !columns.contains("source_message_id") {
+        conn.execute(
+            "ALTER TABLE proxy_events ADD COLUMN source_message_id INTEGER",
+            [],
+        )?;
+    }
+    if !columns.contains("source_kind") {
+        conn.execute("ALTER TABLE proxy_events ADD COLUMN source_kind TEXT", [])?;
+    }
+    if !columns.contains("source_ordinal") {
+        conn.execute(
+            "ALTER TABLE proxy_events ADD COLUMN source_ordinal INTEGER",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pe_source
+         ON proxy_events(source_message_id, source_kind, source_ordinal)
+         WHERE source_message_id IS NOT NULL;",
+    )?;
     Ok(())
 }
 
@@ -180,6 +212,48 @@ pub fn insert_event(conn: &Connection, event: &ProxyEvent) -> anyhow::Result<i64
     }
 
     Ok(id)
+}
+
+/// Insert an event derived from one durable message exactly once.
+pub fn insert_source_event(
+    conn: &Connection,
+    event: &ProxyEvent,
+    source_message_id: i64,
+    source_kind: &str,
+    source_ordinal: usize,
+) -> anyhow::Result<Option<i64>> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO proxy_events
+         (event_type, session_id, timestamp, tool_name, path, status, content, content_len, metadata,
+          source_message_id, source_kind, source_ordinal)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            event.event_type.as_str(),
+            event.session_id,
+            event.timestamp,
+            event.tool_name,
+            event.path,
+            event.status,
+            event.content,
+            event.content.len() as i64,
+            serde_json::to_string(&event.metadata).unwrap_or_default(),
+            source_message_id,
+            source_kind,
+            source_ordinal as i64,
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+
+    let id = conn.last_insert_rowid();
+    if !event.content.is_empty() {
+        conn.execute(
+            "INSERT INTO proxy_events_fts (rowid, content, event_type, session_id) VALUES (?1, ?2, ?3, ?4)",
+            params![id, event.content, event.event_type.as_str(), event.session_id],
+        )?;
+    }
+    Ok(Some(id))
 }
 
 /// Query events with structured filters. Returns newest-first.
@@ -265,10 +339,56 @@ pub fn extract_and_insert(
     session_id: &str,
     messages: &[serde_json::Value],
 ) -> anyhow::Result<usize> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut count = 0;
+    extract_and_insert_impl(conn, session_id, messages, None)
+}
 
-    for msg in messages {
+/// Source-backed variant used by the durable message pipeline.
+pub fn extract_and_insert_with_message_ids(
+    conn: &Connection,
+    session_id: &str,
+    messages: &[serde_json::Value],
+    message_ids: &[i64],
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        messages.len() == message_ids.len(),
+        "messages/message_ids length mismatch: {} != {}",
+        messages.len(),
+        message_ids.len()
+    );
+    extract_and_insert_impl(conn, session_id, messages, Some(message_ids))
+}
+
+fn extract_and_insert_impl(
+    conn: &Connection,
+    session_id: &str,
+    messages: &[serde_json::Value],
+    message_ids: Option<&[i64]>,
+) -> anyhow::Result<usize> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut count = 0usize;
+
+    for (message_index, msg) in messages.iter().enumerate() {
+        let mut emit =
+            |source_kind: &str, source_ordinal: usize, event: ProxyEvent| -> anyhow::Result<()> {
+                let inserted = if let Some(ids) = message_ids {
+                    insert_source_event(
+                        conn,
+                        &event,
+                        ids[message_index],
+                        source_kind,
+                        source_ordinal,
+                    )?
+                    .is_some()
+                } else {
+                    insert_event(conn, &event)?;
+                    true
+                };
+                if inserted {
+                    count += 1;
+                }
+                Ok(())
+            };
+
         let role = msg["role"].as_str().unwrap_or("");
         match role {
             "user" => {
@@ -276,9 +396,10 @@ pub fn extract_and_insert(
                 if content.is_empty() {
                     continue;
                 }
-                insert_event(
-                    conn,
-                    &ProxyEvent {
+                emit(
+                    "user_text",
+                    0,
+                    ProxyEvent {
                         id: None,
                         event_type: EventType::UserMessage,
                         session_id: session_id.to_string(),
@@ -290,16 +411,14 @@ pub fn extract_and_insert(
                         metadata: serde_json::json!({"role": role}),
                     },
                 )?;
-                count += 1;
             }
-
             "assistant" => {
-                // Emit assistant text content (if any)
                 let content = msg["content"].as_str().unwrap_or("");
                 if !content.is_empty() {
-                    insert_event(
-                        conn,
-                        &ProxyEvent {
+                    emit(
+                        "assistant_text",
+                        0,
+                        ProxyEvent {
                             id: None,
                             event_type: EventType::AssistantMessage,
                             session_id: session_id.to_string(),
@@ -311,18 +430,16 @@ pub fn extract_and_insert(
                             metadata: serde_json::json!({"role": role}),
                         },
                     )?;
-                    count += 1;
                 }
-
-                // Emit tool calls
                 if let Some(tool_calls) = msg["tool_calls"].as_array() {
-                    for tc in tool_calls {
+                    for (ordinal, tc) in tool_calls.iter().enumerate() {
                         let name = tc["function"]["name"].as_str().unwrap_or("");
                         let args = tc["function"]["arguments"].as_str().unwrap_or("");
                         let tc_id = tc["id"].as_str().unwrap_or("");
-                        insert_event(
-                            conn,
-                            &ProxyEvent {
+                        emit(
+                            "tool_call",
+                            ordinal,
+                            ProxyEvent {
                                 id: None,
                                 event_type: EventType::ToolCall,
                                 session_id: session_id.to_string(),
@@ -334,22 +451,21 @@ pub fn extract_and_insert(
                                 metadata: serde_json::json!({"tool_call_id": tc_id, "tool_name": name, "args": args}),
                             },
                         )?;
-                        count += 1;
                     }
                 }
             }
-
             "tool" => {
                 let content = msg["content"].as_str().unwrap_or("");
                 let tc_id = msg["tool_call_id"].as_str().unwrap_or("");
-                insert_event(
-                    conn,
-                    &ProxyEvent {
+                emit(
+                    "tool_result",
+                    0,
+                    ProxyEvent {
                         id: None,
                         event_type: EventType::ToolResult,
                         session_id: session_id.to_string(),
                         timestamp: now.clone(),
-                        tool_name: None, // could extract from context
+                        tool_name: None,
                         path: None,
                         status: if content.contains("error") || content.contains("Error") {
                             Some("error".into())
@@ -360,14 +476,11 @@ pub fn extract_and_insert(
                         metadata: serde_json::json!({"tool_call_id": tc_id}),
                     },
                 )?;
-                count += 1;
             }
-
             _ => {}
         }
     }
 
-    // Also emit a RequestStart for session tracking
     insert_event(
         conn,
         &ProxyEvent {
@@ -383,7 +496,6 @@ pub fn extract_and_insert(
         },
     )?;
     count += 1;
-
     Ok(count)
 }
 
@@ -996,5 +1108,64 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, "ses_reopen");
+    }
+
+    #[test]
+    fn source_event_is_idempotent_and_fts_is_not_duplicated() {
+        let conn = temp_conn();
+        let event = ev(EventType::UserMessage, "durable needle");
+        assert!(
+            insert_source_event(&conn, &event, 41, "user_text", 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            insert_source_event(&conn, &event, 41, "user_text", 0)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count(&conn), 1);
+        let f = EventFilter {
+            content_match: Some("durable".into()),
+            ..Default::default()
+        };
+        assert_eq!(query_events(&conn, &f).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cumulative_history_replay_only_adds_request_start() {
+        let conn = temp_conn();
+        let messages = serde_json::json!([
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi","tool_calls":[
+                {"id":"c1","function":{"name":"read_file","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"c1","content":"contents"}
+        ]);
+        let arr = messages.as_array().unwrap();
+        let ids = [101, 102, 103];
+        let first = extract_and_insert_with_message_ids(&conn, "s", arr, &ids).unwrap();
+        let total_after_first = count(&conn);
+        let second = extract_and_insert_with_message_ids(&conn, "s", arr, &ids).unwrap();
+        assert_eq!(first, 5);
+        assert_eq!(second, 1);
+        assert_eq!(count(&conn), total_after_first + 1);
+    }
+
+    #[test]
+    fn same_content_from_distinct_messages_is_preserved() {
+        let conn = temp_conn();
+        let event = ev(EventType::UserMessage, "same text");
+        assert!(
+            insert_source_event(&conn, &event, 1, "user_text", 0)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            insert_source_event(&conn, &event, 2, "user_text", 0)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(count(&conn), 2);
     }
 }

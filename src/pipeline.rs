@@ -229,7 +229,7 @@ impl ChatPipeline {
             // committed state.
             if let Some(arr) = msgs.as_array() {
                 let conn = db.writer_conn();
-                if let Err(e) = crate::event_store::extract_and_insert(&conn, &event_session_id, arr) {
+                if let Err(e) = crate::event_store::extract_and_insert_with_message_ids(&conn, &event_session_id, arr, &message_ids) {
                     crate::metrics::OBSERVABILITY_WRITE_FAILED
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(target: "deeplossless::pipeline", "failed to extract proxy events: {e}");
@@ -484,7 +484,10 @@ impl ChatPipeline {
         self.inject_reasoning_content(&mut injected);
 
         // DS4-14: ContextPack importance ordering (default Preserve = no-op)
-        if !matches!(self.context_ordering, crate::context_pack::ImportanceOrdering::Preserve) {
+        if !matches!(
+            self.context_ordering,
+            crate::context_pack::ImportanceOrdering::Preserve
+        ) {
             use crate::context_pack::ContextPack;
             if let Some(msgs) = injected["messages"].as_array_mut() {
                 let mut pack = ContextPack::new(msgs);
