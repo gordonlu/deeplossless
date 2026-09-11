@@ -67,7 +67,11 @@ pub const LINEAGE_MIGRATION: &str = "
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_lineage_from ON lineage_edges(from_id);
-    CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_id);";
+    CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_id);
+    DELETE FROM lineage_edges
+      WHERE id NOT IN (
+        SELECT MIN(id) FROM lineage_edges GROUP BY from_id, to_id, kind
+      );";
 
 // ── Structured Reasoning ──────────────────────────────────────────────
 
@@ -121,9 +125,7 @@ const LINEAGE_TTL: usize = 1000;
 
 /// Apply TTL-based lineage compaction: keep only the most recent edges,
 /// squash intermediate DerivedFrom chains, drop edges beyond TTL.
-pub fn compact_lineage_with_ttl(
-    edges: &[(i64, i64, LineageEdge)],
-) -> Vec<(i64, i64, LineageEdge)> {
+pub fn compact_lineage_with_ttl(edges: &[(i64, i64, LineageEdge)]) -> Vec<(i64, i64, LineageEdge)> {
     if edges.len() <= LINEAGE_TTL {
         return compact_lineage(edges);
     }
@@ -134,9 +136,7 @@ pub fn compact_lineage_with_ttl(
 
 /// Compress lineage by transitive collapse of DerivedFrom edges.
 /// A → B → C becomes A → C (preserves the full causation chain).
-pub fn compact_lineage(
-    edges: &[(i64, i64, LineageEdge)],
-) -> Vec<(i64, i64, LineageEdge)> {
+pub fn compact_lineage(edges: &[(i64, i64, LineageEdge)]) -> Vec<(i64, i64, LineageEdge)> {
     use std::collections::{HashMap, HashSet};
 
     // Build adjacency: from → [(to, kind)]
@@ -157,7 +157,8 @@ pub fn compact_lineage(
                 let mut depth = 0;
                 while depth < 10 {
                     if let Some(nexts) = adj.get(&current)
-                        && let Some((next, LineageEdge::DerivedFrom)) = nexts.first() {
+                        && let Some((next, LineageEdge::DerivedFrom)) = nexts.first()
+                    {
                         current = *next;
                         depth += 1;
                         continue;
@@ -191,19 +192,26 @@ pub struct ReasoningSummary {
 impl ReasoningSummary {
     /// Extract a structured summary from reasoning steps.
     pub fn from_steps(steps: &[ReasoningStep]) -> Self {
-        let assumptions: Vec<String> = steps.iter()
+        let assumptions: Vec<String> = steps
+            .iter()
             .filter(|s| s.kind == ReasoningKind::Assumption)
             .map(|s| s.content.clone())
             .collect();
-        let failures: Vec<String> = steps.iter()
+        let failures: Vec<String> = steps
+            .iter()
             .filter(|s| s.kind == ReasoningKind::Failure)
             .map(|s| s.content.clone())
             .collect();
-        let resolutions: Vec<String> = steps.iter()
+        let resolutions: Vec<String> = steps
+            .iter()
             .filter(|s| s.kind == ReasoningKind::Resolution)
             .map(|s| s.content.clone())
             .collect();
-        Self { assumptions, failures, resolutions }
+        Self {
+            assumptions,
+            failures,
+            resolutions,
+        }
     }
 }
 
@@ -212,9 +220,15 @@ impl ReasoningSummary {
 pub fn distill_reasoning(steps: &[ReasoningStep]) -> String {
     let summary = ReasoningSummary::from_steps(steps);
     let mut out = String::new();
-    for a in &summary.assumptions { out.push_str(&format!("Assumed: {a}\n")); }
-    for f in &summary.failures { out.push_str(&format!("Failed: {f}\n")); }
-    for r in &summary.resolutions { out.push_str(&format!("Resolved: {r}\n")); }
+    for a in &summary.assumptions {
+        out.push_str(&format!("Assumed: {a}\n"));
+    }
+    for f in &summary.failures {
+        out.push_str(&format!("Failed: {f}\n"));
+    }
+    for r in &summary.resolutions {
+        out.push_str(&format!("Resolved: {r}\n"));
+    }
     out.trim().to_string()
 }
 
@@ -351,9 +365,19 @@ impl ExecutionUnit {
         tool_call_id: &str,
     ) -> Self {
         Self::new_with_span(
-            conversation_id, reasoning_before, tool_name, tool_args,
-            tool_result, reasoning_after, outcome, related_nodes,
-            "", "", "", "", tool_call_id,
+            conversation_id,
+            reasoning_before,
+            tool_name,
+            tool_args,
+            tool_result,
+            reasoning_after,
+            outcome,
+            related_nodes,
+            "",
+            "",
+            "",
+            "",
+            tool_call_id,
         )
     }
 
@@ -423,7 +447,9 @@ fn parse_exit_code(text: &str) -> Option<i32> {
                 .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '('))
                 .split(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';'))
                 .next()?;
-            if let Ok(code) = token.parse::<i32>() { return Some(code); }
+            if let Ok(code) = token.parse::<i32>() {
+                return Some(code);
+            }
         }
     }
     None
@@ -464,7 +490,9 @@ pub fn group_execution_chain(
                         tool_result.push_str(&next.content);
                     }
                     // Stop at next assistant message (end of tool chain)
-                    if next.role == "assistant" { break; }
+                    if next.role == "assistant" {
+                        break;
+                    }
                     j += 1;
                 }
                 last_tool_end = j; // remember furthest advance
@@ -474,12 +502,18 @@ pub fn group_execution_chain(
                 let outcome = {
                     let lower = tool_result.to_lowercase();
                     let nonzero_exit = parse_exit_code(&lower).is_some_and(|code| code != 0);
-                    if tool_result.contains("Error:") || tool_result.contains("error:")
-                        || tool_result.contains("error[") || tool_result.contains("Error[")
-                        || tool_result.contains("\nerror") || tool_result.starts_with("error")
-                        || lower.contains("failed:") || nonzero_exit
-                        || lower.contains("timed out") || lower.contains("permission denied")
-                        || lower.contains("not found") || lower.starts_with("err:")
+                    if tool_result.contains("Error:")
+                        || tool_result.contains("error:")
+                        || tool_result.contains("error[")
+                        || tool_result.contains("Error[")
+                        || tool_result.contains("\nerror")
+                        || tool_result.starts_with("error")
+                        || lower.contains("failed:")
+                        || nonzero_exit
+                        || lower.contains("timed out")
+                        || lower.contains("permission denied")
+                        || lower.contains("not found")
+                        || lower.starts_with("err:")
                     {
                         ExecutionOutcome::RecoveredFailure
                     } else if tool_result.is_empty() {
@@ -932,13 +966,12 @@ impl ExecutionScore {
         let total = summary.total_count.max(1) as f64;
 
         let success_rate =
-            (summary.success_count + summary.cache_hit_count + summary.replayed_count) as f64 / total;
+            (summary.success_count + summary.cache_hit_count + summary.replayed_count) as f64
+                / total;
 
-        let retry_burden =
-            (summary.recovered_count + summary.blocked_count) as f64 / total;
+        let retry_burden = (summary.recovered_count + summary.blocked_count) as f64 / total;
 
-        let reuse_fraction =
-            (summary.cache_hit_count + summary.replayed_count) as f64 / total;
+        let reuse_fraction = (summary.cache_hit_count + summary.replayed_count) as f64 / total;
 
         let budget = dag.max_budget_tokens.max(1) as f64;
         let token_ratio = (dag.total_tokens as f64 / budget).clamp(0.0, 1.0);
@@ -989,24 +1022,34 @@ mod scoring_tests {
     fn event_summary_all_success() {
         let units = vec![
             ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "ok".into(),
+                id: 1,
+                conversation_id: 1,
+                reasoning_before: String::new(),
+                tool_name: "grep".into(),
+                tool_args: String::new(),
+                tool_result: "ok".into(),
                 reasoning_after: String::new(),
                 outcome: ExecutionOutcome::Success,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
-            ..Default::default()
+                related_nodes: vec![],
+                created_at: String::new(),
+                tool_args_json: None,
+                reasoning_steps: vec![],
+                ..Default::default()
             },
             ExecutionUnit {
-                id: 2, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "read_file".into(),
-                tool_args: String::new(), tool_result: "data".into(),
+                id: 2,
+                conversation_id: 1,
+                reasoning_before: String::new(),
+                tool_name: "read_file".into(),
+                tool_args: String::new(),
+                tool_result: "data".into(),
                 reasoning_after: String::new(),
                 outcome: ExecutionOutcome::CacheHit,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
-            ..Default::default()
+                related_nodes: vec![],
+                created_at: String::new(),
+                tool_args_json: None,
+                reasoning_steps: vec![],
+                ..Default::default()
             },
         ];
         let summary = EventSummary::from_units(&units);
@@ -1017,18 +1060,21 @@ mod scoring_tests {
 
     #[test]
     fn score_pure_success_is_high() {
-        let units = vec![
-            ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "ok".into(),
-                reasoning_after: String::new(),
-                outcome: ExecutionOutcome::Success,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
+        let units = vec![ExecutionUnit {
+            id: 1,
+            conversation_id: 1,
+            reasoning_before: String::new(),
+            tool_name: "grep".into(),
+            tool_args: String::new(),
+            tool_result: "ok".into(),
+            reasoning_after: String::new(),
+            outcome: ExecutionOutcome::Success,
+            related_nodes: vec![],
+            created_at: String::new(),
+            tool_args_json: None,
+            reasoning_steps: vec![],
             ..Default::default()
-            },
-        ];
+        }];
         let dag = DagMetrics::default();
         let score = ExecutionScore::from_units(&units, &dag);
         // 0.85 = max with zero reuse fraction (weighted: 0.35+0.25+0+0.15+0.10)
@@ -1040,29 +1086,43 @@ mod scoring_tests {
     fn score_all_failures_is_low() {
         let units = vec![
             ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "Error: not found".into(),
+                id: 1,
+                conversation_id: 1,
+                reasoning_before: String::new(),
+                tool_name: "grep".into(),
+                tool_args: String::new(),
+                tool_result: "Error: not found".into(),
                 reasoning_after: String::new(),
                 outcome: ExecutionOutcome::Blocked,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
-            ..Default::default()
+                related_nodes: vec![],
+                created_at: String::new(),
+                tool_args_json: None,
+                reasoning_steps: vec![],
+                ..Default::default()
             },
             ExecutionUnit {
-                id: 2, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "build".into(),
-                tool_args: String::new(), tool_result: "fail".into(),
+                id: 2,
+                conversation_id: 1,
+                reasoning_before: String::new(),
+                tool_name: "build".into(),
+                tool_args: String::new(),
+                tool_result: "fail".into(),
                 reasoning_after: String::new(),
                 outcome: ExecutionOutcome::RecoveredFailure,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
-            ..Default::default()
+                related_nodes: vec![],
+                created_at: String::new(),
+                tool_args_json: None,
+                reasoning_steps: vec![],
+                ..Default::default()
             },
         ];
         let dag = DagMetrics::default();
         let score = ExecutionScore::from_units(&units, &dag);
-        assert!(score.composite < 0.5, "composite should be low for all failures: {}", score.composite);
+        assert!(
+            score.composite < 0.5,
+            "composite should be low for all failures: {}",
+            score.composite
+        );
         assert!(score.success_rate < 0.1);
         assert!(score.retry_burden > 0.9);
     }
@@ -1071,87 +1131,124 @@ mod scoring_tests {
     fn score_cache_hits_higher_reuse() {
         let units = vec![
             ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "ok".into(),
+                id: 1,
+                conversation_id: 1,
+                reasoning_before: String::new(),
+                tool_name: "grep".into(),
+                tool_args: String::new(),
+                tool_result: "ok".into(),
                 reasoning_after: String::new(),
                 outcome: ExecutionOutcome::Success,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
-            ..Default::default()
+                related_nodes: vec![],
+                created_at: String::new(),
+                tool_args_json: None,
+                reasoning_steps: vec![],
+                ..Default::default()
             },
             ExecutionUnit {
-                id: 2, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "cached".into(),
+                id: 2,
+                conversation_id: 1,
+                reasoning_before: String::new(),
+                tool_name: "grep".into(),
+                tool_args: String::new(),
+                tool_result: "cached".into(),
                 reasoning_after: String::new(),
                 outcome: ExecutionOutcome::CacheHit,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
-            ..Default::default()
+                related_nodes: vec![],
+                created_at: String::new(),
+                tool_args_json: None,
+                reasoning_steps: vec![],
+                ..Default::default()
             },
         ];
         let dag = DagMetrics::default();
         let score = ExecutionScore::from_units(&units, &dag);
-        assert!(score.reuse_fraction > 0.4, "should have significant reuse: {}", score.reuse_fraction);
+        assert!(
+            score.reuse_fraction > 0.4,
+            "should have significant reuse: {}",
+            score.reuse_fraction
+        );
     }
 
     #[test]
     fn score_stale_cache_increases_risk() {
-        let clean = vec![
-            ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "ok".into(),
-                reasoning_after: String::new(),
-                outcome: ExecutionOutcome::Success,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
+        let clean = vec![ExecutionUnit {
+            id: 1,
+            conversation_id: 1,
+            reasoning_before: String::new(),
+            tool_name: "grep".into(),
+            tool_args: String::new(),
+            tool_result: "ok".into(),
+            reasoning_after: String::new(),
+            outcome: ExecutionOutcome::Success,
+            related_nodes: vec![],
+            created_at: String::new(),
+            tool_args_json: None,
+            reasoning_steps: vec![],
             ..Default::default()
-            },
-        ];
-        let stale_units = vec![
-            ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "stale".into(),
-                reasoning_after: String::new(),
-                outcome: ExecutionOutcome::Stale,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
+        }];
+        let stale_units = vec![ExecutionUnit {
+            id: 1,
+            conversation_id: 1,
+            reasoning_before: String::new(),
+            tool_name: "grep".into(),
+            tool_args: String::new(),
+            tool_result: "stale".into(),
+            reasoning_after: String::new(),
+            outcome: ExecutionOutcome::Stale,
+            related_nodes: vec![],
+            created_at: String::new(),
+            tool_args_json: None,
+            reasoning_steps: vec![],
             ..Default::default()
-            },
-        ];
+        }];
         let dag = DagMetrics::default();
         let clean_score = ExecutionScore::from_units(&clean, &dag);
         let stale_score = ExecutionScore::from_units(&stale_units, &dag);
-        assert!(stale_score.hallucination_risk > clean_score.hallucination_risk,
-            "stale cache should increase hallucination risk");
+        assert!(
+            stale_score.hallucination_risk > clean_score.hallucination_risk,
+            "stale cache should increase hallucination risk"
+        );
     }
 
     #[test]
     fn score_dag_budget_scales_latency() {
-        let units = vec![
-            ExecutionUnit {
-                id: 1, conversation_id: 1,
-                reasoning_before: String::new(), tool_name: "grep".into(),
-                tool_args: String::new(), tool_result: "ok".into(),
-                reasoning_after: String::new(),
-                outcome: ExecutionOutcome::Success,
-                related_nodes: vec![], created_at: String::new(),
-                tool_args_json: None, reasoning_steps: vec![],
+        let units = vec![ExecutionUnit {
+            id: 1,
+            conversation_id: 1,
+            reasoning_before: String::new(),
+            tool_name: "grep".into(),
+            tool_args: String::new(),
+            tool_result: "ok".into(),
+            reasoning_after: String::new(),
+            outcome: ExecutionOutcome::Success,
+            related_nodes: vec![],
+            created_at: String::new(),
+            tool_args_json: None,
+            reasoning_steps: vec![],
             ..Default::default()
-            },
-        ];
+        }];
         // Tight budget → high latency cost
-        let tight_dag = DagMetrics { total_tokens: 100_000, max_budget_tokens: 128_000, ..Default::default() };
+        let tight_dag = DagMetrics {
+            total_tokens: 100_000,
+            max_budget_tokens: 128_000,
+            ..Default::default()
+        };
         // Generous budget → low latency cost
-        let loose_dag = DagMetrics { total_tokens: 1_000, max_budget_tokens: 128_000, ..Default::default() };
+        let loose_dag = DagMetrics {
+            total_tokens: 1_000,
+            max_budget_tokens: 128_000,
+            ..Default::default()
+        };
         let tight_score = ExecutionScore::from_units(&units, &tight_dag);
         let loose_score = ExecutionScore::from_units(&units, &loose_dag);
-        assert!(tight_score.latency_cost > loose_score.latency_cost,
-            "tight budget should have higher latency cost");
-        assert!(tight_score.composite < loose_score.composite,
-            "tight budget should lower composite");
+        assert!(
+            tight_score.latency_cost > loose_score.latency_cost,
+            "tight budget should have higher latency cost"
+        );
+        assert!(
+            tight_score.composite < loose_score.composite,
+            "tight budget should lower composite"
+        );
     }
 }

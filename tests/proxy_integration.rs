@@ -374,7 +374,9 @@ async fn responses_previous_response_id_restores_session_without_prompt_cache_ke
     assert!(first_resp.status().is_success());
     let first_body: Value = first_resp.json().await.unwrap();
     let first_id = first_body["id"].as_str().expect("first response id");
-    let session_key = first_body["prompt_cache_key"].as_str().expect("session key");
+    let session_key = first_body["prompt_cache_key"]
+        .as_str()
+        .expect("session key");
     assert_ne!(session_key, "(none)");
 
     let second_resp = client
@@ -404,15 +406,21 @@ async fn responses_previous_response_id_restores_session_without_prompt_cache_ke
         .filter_map(|msg| msg["content"].as_str())
         .collect();
     assert!(
-        contents.iter().any(|content| content.contains("first turn")),
+        contents
+            .iter()
+            .any(|content| content.contains("first turn")),
         "second turn should include first user message, got {contents:?}"
     );
     assert!(
-        contents.iter().any(|content| content.contains("Mock response 1")),
+        contents
+            .iter()
+            .any(|content| content.contains("Mock response 1")),
         "second turn should include first assistant response, got {contents:?}"
     );
     assert!(
-        contents.iter().any(|content| content.contains("second turn")),
+        contents
+            .iter()
+            .any(|content| content.contains("second turn")),
         "second turn should include latest user message, got {contents:?}"
     );
 }
@@ -668,7 +676,10 @@ async fn responses_api_streaming_round_trip() {
     );
 
     let replay_resp = client
-        .get(format!("http://{}/v1/lcm/replay/{execution_id}", proxy_addr))
+        .get(format!(
+            "http://{}/v1/lcm/replay/{execution_id}",
+            proxy_addr
+        ))
         .header("authorization", "Bearer test-key")
         .send()
         .await
@@ -688,7 +699,6 @@ async fn responses_api_streaming_round_trip() {
             .iter()
             .any(|event| event["event"]["type"].as_str() == Some("text_delta")),
         "replay should include text deltas: {replay_json}"
-
     );
 }
 
@@ -719,7 +729,9 @@ async fn ds4_think_tag_normalized_to_reasoning_delta() {
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
             .await
             .unwrap();
     });
@@ -753,8 +765,14 @@ async fn ds4_think_tag_normalized_to_reasoning_delta() {
         if sse_body.len() > 500 { "..." } else { "" }
     );
     // Should still contain the text deltas (before and after think tag)
-    assert!(sse_body.contains("Hello"), "should preserve text before think tag");
-    assert!(sse_body.contains("world"), "should preserve text after think tag");
+    assert!(
+        sse_body.contains("Hello"),
+        "should preserve text before think tag"
+    );
+    assert!(
+        sse_body.contains("world"),
+        "should preserve text after think tag"
+    );
     // Should end with [DONE]
     assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
 }
@@ -786,7 +804,9 @@ async fn ds4_dsml_tool_call_extracted() {
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { rx.await.ok(); })
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
             .await
             .unwrap();
     });
@@ -820,7 +840,10 @@ async fn ds4_dsml_tool_call_extracted() {
         if sse_body.len() > 500 { "..." } else { "" }
     );
     // Text around DSML markup should be preserved
-    assert!(sse_body.contains("Using tool"), "should preserve text before DSML");
+    assert!(
+        sse_body.contains("Using tool"),
+        "should preserve text before DSML"
+    );
     assert!(sse_body.contains("now"), "should preserve text after DSML");
     assert!(sse_body.contains("[DONE]"), "should end with [DONE]");
 }
@@ -3494,8 +3517,8 @@ async fn execution_unit_dedup_same_tool_call_id() {
         .unwrap();
     assert!(id1 > 0, "first insert must succeed");
     assert_eq!(
-        id2, 0,
-        "second insert with same tool_call_id must return 0 (dedup'd)"
+        id2, id1,
+        "second insert with same tool_call_id must return the durable existing id"
     );
 }
 
@@ -3643,26 +3666,45 @@ struct RouteInventoryEntry {
 /// Helper: check that a route responds (not an axum 404 = unregistered).
 async fn check_route(client: &reqwest::Client, base: &str, entry: &RouteInventoryEntry) {
     let url = format!("{base}{path}", path = entry.path);
-    let req = client.request(entry.method.clone(), &url).header("authorization", "Bearer test-key");
-    let resp = req.send().await.unwrap_or_else(|e| panic!("request to {url} failed: {e}"));
+    let req = client
+        .request(entry.method.clone(), &url)
+        .header("authorization", "Bearer test-key");
+    let resp = req
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("request to {url} failed: {e}"));
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
 
     if status == StatusCode::NOT_FOUND {
         let body = resp.text().await.unwrap_or_default();
         // Axum returns "Not Found" or empty body for unmatched routes
-        let is_axum_404 = body.trim().is_empty() || body.trim() == "Not Found" || body.contains("NotFound");
+        let is_axum_404 =
+            body.trim().is_empty() || body.trim() == "Not Found" || body.contains("NotFound");
         if is_axum_404 {
-            panic!("route {method} {path}: not registered (axum 404)",
-                method = entry.method, path = entry.path);
+            panic!(
+                "route {method} {path}: not registered (axum 404)",
+                method = entry.method,
+                path = entry.path
+            );
         }
         // Handler returned 404 with JSON — route is registered
-        eprintln!("NOTE: route {method} {path} returned 404 with body — handler needs data",
-            method = entry.method, path = entry.path);
+        eprintln!(
+            "NOTE: route {method} {path} returned 404 with body — handler needs data",
+            method = entry.method,
+            path = entry.path
+        );
     } else if status.is_server_error() && !entry.not_found_ok {
-        panic!("route {method} {path}: unexpected 500", method = entry.method, path = entry.path);
+        panic!(
+            "route {method} {path}: unexpected 500",
+            method = entry.method,
+            path = entry.path
+        );
     } else if status.is_server_error() {
-        eprintln!("WARN: route {method} {path} returned 500 — handler may need data set up",
-            method = entry.method, path = entry.path);
+        eprintln!(
+            "WARN: route {method} {path} returned 500 — handler may need data set up",
+            method = entry.method,
+            path = entry.path
+        );
     }
 }
 
@@ -3679,34 +3721,138 @@ async fn route_inventory_documented_endpoints_are_registered() {
 
     let routes = vec![
         // Data-independent routes (must return non-404/non-500)
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/models".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/runtime/stats".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/runtime/debug-dump".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/sessions".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/latency".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/latency/summary".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/cache/stability".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/versions".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/health".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/file/conflicts".into(), not_found_ok: false },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/models".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/runtime/stats".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/runtime/debug-dump".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/sessions".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/latency".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/latency/summary".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/cache/stability".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/versions".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/health".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/file/conflicts".into(),
+            not_found_ok: false,
+        },
         // Data-dependent routes (accept 404 if data not set up)
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/grep/1?query=test".into(), not_found_ok: true },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/expand/1".into(), not_found_ok: true },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/status/1".into(), not_found_ok: true },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/snippets/1".into(), not_found_ok: true },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/trace/1".into(), not_found_ok: true },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/replay/1".into(), not_found_ok: true },
-        RouteInventoryEntry { method: reqwest::Method::GET, path: "/v1/lcm/cache?tool=test&args=test".into(), not_found_ok: true },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/grep/1?query=test".into(),
+            not_found_ok: true,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/expand/1".into(),
+            not_found_ok: true,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/status/1".into(),
+            not_found_ok: true,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/snippets/1".into(),
+            not_found_ok: true,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/trace/1".into(),
+            not_found_ok: true,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/replay/1".into(),
+            not_found_ok: true,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::GET,
+            path: "/v1/lcm/cache?tool=test&args=test".into(),
+            not_found_ok: true,
+        },
         // Mutation/data-push routes
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/failure".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/plan".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/file/claim".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/file/release".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/compress".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/delete".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/rollback".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/inject".into(), not_found_ok: false },
-        RouteInventoryEntry { method: reqwest::Method::POST, path: "/v1/lcm/chat/completions".into(), not_found_ok: false },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/failure".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/plan".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/file/claim".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/file/release".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/compress".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/delete".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/rollback".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/inject".into(),
+            not_found_ok: false,
+        },
+        RouteInventoryEntry {
+            method: reqwest::Method::POST,
+            path: "/v1/lcm/chat/completions".into(),
+            not_found_ok: false,
+        },
     ];
 
     for entry in &routes {
@@ -3726,48 +3872,66 @@ async fn start_tool_call_mock_upstream(
     use axum::routing::post;
     use futures::stream;
 
-    let app = Router::new().route("/v1/chat/completions", post(move |body: Json<Value>| {
-        let sse_chunks = sse_chunks.clone();
-        async move {
-            let is_streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-            if is_streaming {
-                let stream = stream::iter(sse_chunks.into_iter().map(|c| {
-                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(c))
-                }));
-                ([(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")], Body::from_stream(stream))
-            } else {
-                // Non-streaming: return a tool call in standard JSON
-                let resp = json!({
-                    "id": "mock-cmpl-001",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": null,
-                            "tool_calls": [{
-                                "index": 0,
-                                "id": "call_mock",
-                                "type": "function",
-                                "function": {
-                                    "name": "grep",
-                                    "arguments": r#"{"pattern":"foo"}"#
-                                }
-                            }]
-                        },
-                        "finish_reason": "tool_calls"
-                    }],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-                });
-                ([(header::CONTENT_TYPE, "application/json")], Body::from(serde_json::to_string(&resp).unwrap()))
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Json<Value>| {
+            let sse_chunks = sse_chunks.clone();
+            async move {
+                let is_streaming = body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_streaming {
+                    let stream =
+                        stream::iter(sse_chunks.into_iter().map(|c| {
+                            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(c))
+                        }));
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")],
+                        Body::from_stream(stream),
+                    )
+                } else {
+                    // Non-streaming: return a tool call in standard JSON
+                    let resp = json!({
+                        "id": "mock-cmpl-001",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_mock",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "grep",
+                                        "arguments": r#"{"pattern":"foo"}"#
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    });
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Body::from(serde_json::to_string(&resp).unwrap()),
+                    )
+                }
             }
-        }
-    }));
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
-        axum::serve(listener, app).with_graceful_shutdown(async { rx.await.ok(); }).await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
     });
     (addr, tx)
 }
@@ -3791,12 +3955,25 @@ async fn tool_call_duplicate_arg_chunks_still_assembles() {
         .post(format!("http://{proxy_addr}/v1/responses"))
         .header("Authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","input":"search","stream":true}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert!(status.is_success(), "duplicate arg chunks should produce valid SSE stream: {} — body: {}", status, body);
-    assert!(body.contains("grep"), "response should contain tool call name: {body}");
-    assert!(body.contains("pattern"), "response should contain tool call args: {body}");
+    assert!(
+        status.is_success(),
+        "duplicate arg chunks should produce valid SSE stream: {} — body: {}",
+        status,
+        body
+    );
+    assert!(
+        body.contains("grep"),
+        "response should contain tool call name: {body}"
+    );
+    assert!(
+        body.contains("pattern"),
+        "response should contain tool call args: {body}"
+    );
 }
 
 #[tokio::test]
@@ -3817,11 +3994,21 @@ async fn tool_call_partial_args_graceful_degradation() {
         .post(format!("http://{proxy_addr}/v1/responses"))
         .header("Authorization", "Bearer test-key")
         .json(&json!({"model":"deepseek-v4-flash","input":"search","stream":false}))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let status = resp.status();
     let body = resp.text().await.unwrap();
-    assert!(status.is_success(), "partial tool call args should produce valid response: {} — body: {}", status, body);
-    assert!(body.contains("grep"), "response should contain tool call name even with partial args: {body}");
+    assert!(
+        status.is_success(),
+        "partial tool call args should produce valid response: {} — body: {}",
+        status,
+        body
+    );
+    assert!(
+        body.contains("grep"),
+        "response should contain tool call name even with partial args: {body}"
+    );
 }
 
 // ── Cache invalidation via file observation ───────────────────────────────
@@ -3839,12 +4026,21 @@ async fn file_observation_content_change_invalidates_tool_cache() {
     // 2. Populate tool cache with an entry dependent on "src/main.rs"
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"foo"}"#);
-    state.storage.db.tool_cache_put(
-        &cname, &args_hash, "cached result",
-        &["src/main.rs".to_string()],
-    ).unwrap();
+    state
+        .storage
+        .db
+        .tool_cache_put(
+            &cname,
+            &args_hash,
+            "cached result",
+            &["src/main.rs".to_string()],
+        )
+        .unwrap();
     let before = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
-    assert!(before.is_some(), "cache entry should exist before content change");
+    assert!(
+        before.is_some(),
+        "cache entry should exist before content change"
+    );
 
     // 3. Observe the file again with NEW content (hash differs → invalidate)
     let obs_new = deeplossless::file_observation::observe_file("src/main.rs", "new content here");
@@ -3852,7 +4048,10 @@ async fn file_observation_content_change_invalidates_tool_cache() {
 
     // 4. Verify cache entry was invalidated
     let after = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
-    assert!(after.is_none(), "cache entry should be invalidated after content change");
+    assert!(
+        after.is_none(),
+        "cache entry should be invalidated after content change"
+    );
 }
 
 #[tokio::test]
@@ -3863,10 +4062,16 @@ async fn file_observation_same_content_does_not_invalidate_cache() {
     // 1. Populate tool cache
     use deeplossless::tool_cache;
     let (cname, args_hash) = tool_cache::cache_key("grep", r#"{"pattern":"bar"}"#);
-    state.storage.db.tool_cache_put(
-        &cname, &args_hash, "cached result",
-        &["src/lib.rs".to_string()],
-    ).unwrap();
+    state
+        .storage
+        .db
+        .tool_cache_put(
+            &cname,
+            &args_hash,
+            "cached result",
+            &["src/lib.rs".to_string()],
+        )
+        .unwrap();
     let before = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
     assert!(before.is_some());
 
@@ -3880,5 +4085,8 @@ async fn file_observation_same_content_does_not_invalidate_cache() {
 
     // 4. Cache entry should SURVIVE (content hash unchanged)
     let after = state.storage.db.tool_cache_get(&cname, &args_hash).unwrap();
-    assert!(after.is_some(), "cache entry should survive when content unchanged");
+    assert!(
+        after.is_some(),
+        "cache entry should survive when content unchanged"
+    );
 }
